@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 
-use crate::{MindroidError, PipelineContext, PipelineStage, Result, StreamEvent, StreamingStage};
 use crate::llm_client::{ChatRequest, LlmClient};
+use crate::{MindroidError, PipelineContext, PipelineStage, Result, StreamEvent, StreamingStage};
 
 /// Collect a stream of [`StreamEvent`]s into a `(content, Option<error_message>)` tuple.
 ///

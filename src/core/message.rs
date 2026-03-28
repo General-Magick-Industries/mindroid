@@ -73,13 +73,18 @@ impl MessageContext {
 
     /// Send a response back through the transport.
     pub async fn respond(&self, content: &str) -> Result<Option<String>> {
-        let response = Response::new(content, &self.message.channel_id, &self.agent_config.agent_id)
-            .reply_to(&self.message.id);
+        let response = Response::new(
+            content,
+            &self.message.channel_id,
+            &self.agent_config.agent_id,
+        )
+        .reply_to(&self.message.id);
 
         let result = self.transport.send(&response).await?;
 
         for obs in self.observers.iter() {
-            obs.on_response_sent(&self.message.channel_id, content).await;
+            obs.on_response_sent(&self.message.channel_id, content)
+                .await;
         }
 
         Ok(result)

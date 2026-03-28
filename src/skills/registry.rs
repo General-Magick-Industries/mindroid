@@ -212,20 +212,19 @@ impl SkillRegistry {
             }
 
             // Case 2: Flat SKILL.md directly in the directory
-            if meta.is_file() {
-                if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
-                    if fname == "SKILL.md" {
-                        count += 1;
-                        let source = make_source(dir.to_path_buf());
-                        match load_and_validate_skill(&path, trust, source).await {
-                            Ok((name, skill)) => {
-                                tracing::info!("Loaded skill: {}", name);
-                                results.push((name, skill));
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to load skill from {:?}: {}", fname, e);
-                            }
-                        }
+            if meta.is_file()
+                && let Some(fname) = path.file_name().and_then(|f| f.to_str())
+                && fname == "SKILL.md"
+            {
+                count += 1;
+                let source = make_source(dir.to_path_buf());
+                match load_and_validate_skill(&path, trust, source).await {
+                    Ok((name, skill)) => {
+                        tracing::info!("Loaded skill: {}", name);
+                        results.push((name, skill));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load skill from {:?}: {}", fname, e);
                     }
                 }
             }
@@ -1001,7 +1000,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = SkillRegistry::new(dir.path().to_path_buf());
 
-        let content = "---\nname: builtin-skill\ndescription: A bundled skill\n---\n\nBuiltin prompt.\n";
+        let content =
+            "---\nname: builtin-skill\ndescription: A bundled skill\n---\n\nBuiltin prompt.\n";
         let name = registry.register_builtin(content).unwrap();
 
         assert_eq!(name, "builtin-skill");

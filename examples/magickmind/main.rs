@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
-use mindroid::{MindroidConfig, Runtime};
 use mindroid::auth::apikey::ApiKeyAuth;
 use mindroid::memory::magickmind::MagickmindMemory;
 use mindroid::observer::log::LogObserver;
 use mindroid::pipeline::presets::magickmind::magickmind_pipeline;
 use mindroid::transport::centrifugo::CentrifugoTransport;
+use mindroid::{MindroidConfig, Runtime};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -48,7 +48,12 @@ async fn main() -> anyhow::Result<()> {
     let agent_id = &config.agent.agent_id;
 
     let transport = CentrifugoTransport::new(ws_url, agent_id, identity.clone());
-    let pipeline = magickmind_pipeline(identity.clone(), base_url, api_key, config.agent.compute_power)?;
+    let pipeline = magickmind_pipeline(
+        identity.clone(),
+        base_url,
+        api_key,
+        config.agent.compute_power,
+    )?;
     let memory = MagickmindMemory::new(base_url, identity.clone());
 
     let mut runtime = Runtime::builder()

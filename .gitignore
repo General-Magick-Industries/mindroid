@@ -25,6 +25,10 @@ Thumbs.db
 *.pdb
 **/*.rs.bk
 
+# CI artifacts
+clippy-output.txt
+audit-output.txt
+
 # Database files (from sqlite memory)
 *.db
 *.db-journal

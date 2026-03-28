@@ -65,10 +65,7 @@ impl ToolRegistry {
                     props
                         .iter()
                         .map(|(k, v)| {
-                            let desc = v
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("");
+                            let desc = v.get("description").and_then(|d| d.as_str()).unwrap_or("");
                             format!("  - {k}: {desc}")
                         })
                         .collect::<Vec<_>>()

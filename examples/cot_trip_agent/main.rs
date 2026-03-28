@@ -17,11 +17,12 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindContext, MagickmindPersistence};
+use mindroid::pipeline::presets::magickmind::{
+    MagickmindClient, MagickmindContext, MagickmindPersistence,
+};
 use mindroid::{
-    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline,
-    PipelineContext, PostProcessor, RelevanceGate, Runtime, SimpleContextBuilder,
-    StreamEvent,
+    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PostProcessor,
+    RelevanceGate, Runtime, SimpleContextBuilder, StreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,9 +73,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut runtime = builder
         .on_message(move |ctx| {
-            let preparer    = Arc::clone(&context_preparer);
-            let magickmind  = Arc::clone(&magickmind);
-            let gate_llm    = gate_llm.clone();
+            let preparer = Arc::clone(&context_preparer);
+            let magickmind = Arc::clone(&magickmind);
+            let gate_llm = gate_llm.clone();
             let respond_llm = Arc::clone(&respond_llm);
 
             async move {
@@ -96,11 +97,14 @@ async fn main() -> anyhow::Result<()> {
                     gate_llm,
                 ) {
                     Ok(g) => g,
-                    Err(e) => { tracing::error!("RelevanceGate init failed: {e}"); return; }
+                    Err(e) => {
+                        tracing::error!("RelevanceGate init failed: {e}");
+                        return;
+                    }
                 };
                 let gate = gate
-                .instructions(
-                    "You handle trip planning — destinations, itineraries, visas, transport, \
+                    .instructions(
+                        "You handle trip planning — destinations, itineraries, visas, transport, \
                      accommodation, activities, and travel preferences (like 'affordable', \
                      'mid-range', 'luxury'). \
                      \n\nIMPORTANT: Look at the conversation context. If another assistant is \
@@ -108,17 +112,19 @@ async fn main() -> anyhow::Result<()> {
                      about budgets, costs, or calculations), do NOT jump in — respond false. \
                      Only respond true if the latest USER message is directed at trip logistics \
                      and no other assistant is actively handling it.",
-                )
-                .with_history(history.clone());
+                    )
+                    .with_history(history.clone());
 
-                let classify_pipeline = Pipeline::new()
-                    .add_stage(gate);
+                let classify_pipeline = Pipeline::new().add_stage(gate);
 
                 let respond_pipeline = Pipeline::new()
                     .add_stage(SimpleContextBuilder::with_history(history.clone()))
                     .add_streaming_stage(match LlmClient::new((*respond_llm).clone()) {
                         Ok(c) => GenericLlmProcessor::new(c),
-                        Err(e) => { tracing::error!("LlmClient init failed: {e}"); return; }
+                        Err(e) => {
+                            tracing::error!("LlmClient init failed: {e}");
+                            return;
+                        }
                     })
                     .add_stage(PostProcessor)
                     .add_stage(MagickmindPersistence::new(magickmind));
@@ -163,10 +169,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let response = full_response.trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send response: {e}");
-                    }
+                if !response.is_empty()
+                    && let Err(e) = ctx.respond(&response).await
+                {
+                    tracing::error!("Failed to send response: {e}");
                 }
             }
         })

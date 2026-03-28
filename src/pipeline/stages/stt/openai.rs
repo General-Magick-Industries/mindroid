@@ -1,15 +1,15 @@
 use async_openai::{
+    Client,
     config::OpenAIConfig,
     types::{
-        audio::{AudioInput, CreateTranscriptionRequestArgs},
         InputSource,
+        audio::{AudioInput, CreateTranscriptionRequestArgs},
     },
-    Client,
 };
 use async_trait::async_trait;
 
-use crate::error::Result;
 use crate::MindroidError;
+use crate::error::Result;
 
 use super::SttProvider;
 

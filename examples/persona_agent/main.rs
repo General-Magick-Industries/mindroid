@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindContext, MagickmindPersistence};
+use mindroid::pipeline::presets::magickmind::{
+    MagickmindClient, MagickmindContext, MagickmindPersistence,
+};
 use mindroid::{
     ContextPreparer, GenericLlmProcessor, LlmMessage, MindroidConfig, Pipeline, PipelineContext,
     PipelineStage, PostProcessor, Result, Runtime,
@@ -176,11 +178,11 @@ async fn main() -> anyhow::Result<()> {
     // Wire up the runtime
     let mut runtime = builder
         .on_message(move |ctx| {
-            let preparer    = Arc::clone(&context_preparer);
-            let gate        = Arc::clone(&gate_pipeline);
-            let magickmind  = Arc::clone(&magickmind);
+            let preparer = Arc::clone(&context_preparer);
+            let gate = Arc::clone(&gate_pipeline);
+            let magickmind = Arc::clone(&magickmind);
             let respond_llm = Arc::clone(&respond_llm);
-            let persona     = Arc::clone(&persona_stage);
+            let persona = Arc::clone(&persona_stage);
 
             async move {
                 tracing::info!(
@@ -217,10 +219,16 @@ async fn main() -> anyhow::Result<()> {
                 // PersonaContextBuilder is wrapped in Arc — Pipeline::add_stage accepts
                 // Arc<T> when T: PipelineStage.
                 let respond_pipeline = Pipeline::new()
-                    .add_stage(PersonaWithHistory { persona: Arc::clone(&persona), history })
+                    .add_stage(PersonaWithHistory {
+                        persona: Arc::clone(&persona),
+                        history,
+                    })
                     .add_streaming_stage(match LlmClient::new((*respond_llm).clone()) {
                         Ok(c) => GenericLlmProcessor::new(c),
-                        Err(e) => { tracing::error!("LlmClient init failed: {e}"); return; }
+                        Err(e) => {
+                            tracing::error!("LlmClient init failed: {e}");
+                            return;
+                        }
                     })
                     .add_stage(PostProcessor)
                     .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
@@ -240,10 +248,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let response = pctx.response.as_deref().unwrap_or("").trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send response: {e}");
-                    }
+                if !response.is_empty()
+                    && let Err(e) = ctx.respond(&response).await
+                {
+                    tracing::error!("Failed to send response: {e}");
                 }
             }
         })

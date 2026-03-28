@@ -51,7 +51,11 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new(content: impl Into<String>, sender_id: impl Into<String>, channel_id: impl Into<String>) -> Self {
+    pub fn new(
+        content: impl Into<String>,
+        sender_id: impl Into<String>,
+        channel_id: impl Into<String>,
+    ) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             content: content.into(),
@@ -78,7 +82,11 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn new(content: impl Into<String>, channel_id: impl Into<String>, sender_id: impl Into<String>) -> Self {
+    pub fn new(
+        content: impl Into<String>,
+        channel_id: impl Into<String>,
+        sender_id: impl Into<String>,
+    ) -> Self {
         Self {
             content: content.into(),
             channel_id: channel_id.into(),
@@ -97,12 +105,27 @@ impl Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Thinking { content: String },
-    Chunk { content: String },
-    ToolCall { name: String, arguments: String },
-    ToolResult { name: String, result: String },
-    Complete { content: String, usage: Option<TokenUsage> },
-    Error { message: String },
+    Thinking {
+        content: String,
+    },
+    Chunk {
+        content: String,
+    },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        name: String,
+        result: String,
+    },
+    Complete {
+        content: String,
+        usage: Option<TokenUsage>,
+    },
+    Error {
+        message: String,
+    },
     Heartbeat,
 }
 
@@ -155,15 +178,24 @@ pub struct LlmMessage {
 
 impl LlmMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into() }
+        Self {
+            role: Role::System,
+            content: content.into(),
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into() }
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into() }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+        }
     }
 }
 

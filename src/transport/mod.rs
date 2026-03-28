@@ -1,8 +1,8 @@
-pub mod stdio;
-#[cfg(feature = "transport-ws")]
-pub mod centrifugo;
 #[cfg(feature = "transport-audio")]
 pub mod audio;
+#[cfg(feature = "transport-ws")]
+pub mod centrifugo;
+pub mod stdio;
 
 use async_trait::async_trait;
 

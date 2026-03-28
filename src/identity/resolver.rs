@@ -74,7 +74,8 @@ impl IdentityResolver {
         // Fast path: check index under read lock
         {
             let index = self.index.read().await;
-            if let Some(canonical_id) = index.get(&(platform.to_string(), platform_id.to_string())) {
+            if let Some(canonical_id) = index.get(&(platform.to_string(), platform_id.to_string()))
+            {
                 return canonical_id.clone();
             }
         }
@@ -209,16 +210,16 @@ impl IdentityResolver {
         // Ensure parent directory exists
         if let Some(parent) = self.registry_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                MindroidError::config(format!(
-                    "Failed to create identity registry directory: {e}"
-                ))
+                MindroidError::config(format!("Failed to create identity registry directory: {e}"))
             })?;
         }
 
         let tmp_path = self.registry_path.with_extension("json.tmp");
-        tokio::fs::write(&tmp_path, json.as_bytes()).await.map_err(|e| {
-            MindroidError::config(format!("Failed to write identity registry tmp file: {e}"))
-        })?;
+        tokio::fs::write(&tmp_path, json.as_bytes())
+            .await
+            .map_err(|e| {
+                MindroidError::config(format!("Failed to write identity registry tmp file: {e}"))
+            })?;
         tokio::fs::rename(&tmp_path, &self.registry_path)
             .await
             .map_err(|e| {

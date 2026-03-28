@@ -162,9 +162,7 @@ pub(crate) fn build_pipeline(
                 .as_deref()
                 .or(config.auth.base_url.as_deref())
                 .ok_or_else(|| {
-                    MindroidError::config(
-                        "pipeline.base_url is required for magickmind pipeline",
-                    )
+                    MindroidError::config("pipeline.base_url is required for magickmind pipeline")
                 })?;
             let api_key = config
                 .pipeline

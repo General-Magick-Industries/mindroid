@@ -125,7 +125,10 @@ impl RelevanceGate {
     ///
     /// Uses `default_model` from the config as the classification model,
     /// falling back to `"smallthinker"`.
-    pub fn from_config(role: &str, llm_config: crate::llm_client::LlmClientConfig) -> crate::Result<Self> {
+    pub fn from_config(
+        role: &str,
+        llm_config: crate::llm_client::LlmClientConfig,
+    ) -> crate::Result<Self> {
         let model = llm_config
             .default_model
             .clone()
@@ -271,7 +274,9 @@ impl RelevanceGate {
         ResponseFormat::JsonSchema {
             json_schema: ResponseFormatJsonSchema {
                 name: "gate_decision".to_string(),
-                description: Some("Whether the message is relevant to the agent's role".to_string()),
+                description: Some(
+                    "Whether the message is relevant to the agent's role".to_string(),
+                ),
                 schema: Some(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -307,10 +312,7 @@ impl PipelineStage for RelevanceGate {
             // "gate passed" (Some) from "gate halted" (None).
             ctx.response = Some(ctx.message.content.clone());
         } else {
-            tracing::info!(
-                "RelevanceGate [{}]: not relevant",
-                self.role,
-            );
+            tracing::info!("RelevanceGate [{}]: not relevant", self.role,);
             ctx.halted = true;
         }
 

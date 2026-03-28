@@ -28,22 +28,20 @@ pub struct MindroidConfig {
 impl MindroidConfig {
     /// Load config from a TOML file path.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
-            MindroidError::Config {
+        let content =
+            std::fs::read_to_string(path.as_ref()).map_err(|e| MindroidError::Config {
                 message: format!("Failed to read config file: {e}"),
                 source: Some(Box::new(e)),
-            }
-        })?;
+            })?;
         Self::from_toml_str(&content)
     }
 
     /// Parse config from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        let mut config: Self =
-            toml::from_str(s).map_err(|e| MindroidError::Config {
-                message: format!("TOML parse error: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        let mut config: Self = toml::from_str(s).map_err(|e| MindroidError::Config {
+            message: format!("TOML parse error: {e}"),
+            source: Some(Box::new(e)),
+        })?;
         config.apply_env_overrides();
         Ok(config)
     }
@@ -86,9 +84,7 @@ impl MindroidConfig {
     /// cargo run --example my_example --features full -- --config ./my-config.toml
     /// ```
     pub fn resolve_from_args() -> Result<Self> {
-        let config_path = std::env::args()
-            .skip_while(|a| a != "--config")
-            .nth(1);
+        let config_path = std::env::args().skip_while(|a| a != "--config").nth(1);
         Self::resolve(config_path.as_deref())
     }
 
@@ -326,14 +322,13 @@ pub struct ShellToolConfig {
 impl ShellToolConfig {
     fn default_allowed_commands() -> Vec<String> {
         [
-            "ls", "cat", "echo", "pwd", "find", "grep", "head", "tail", "wc", "sort",
-            "uniq", "sed", "awk", "curl", "git", "cargo", "rustc", "python3", "node",
-            "npm", "which", "env", "printenv", "date", "uname", "whoami", "id",
-            "mkdir", "touch", "rm", "cp", "mv", "chmod", "chown", "ln", "stat",
-            "ps", "kill", "pkill", "top", "df", "du", "free", "lsof", "ss", "netstat",
-            "ping", "wget", "tar", "gzip", "gunzip", "zip", "unzip", "jq", "tr",
-            "cut", "paste", "diff", "patch", "xargs", "tee", "read", "test", "true",
-            "false", "sh", "bash", "zsh",
+            "ls", "cat", "echo", "pwd", "find", "grep", "head", "tail", "wc", "sort", "uniq",
+            "sed", "awk", "curl", "git", "cargo", "rustc", "python3", "node", "npm", "which",
+            "env", "printenv", "date", "uname", "whoami", "id", "mkdir", "touch", "rm", "cp", "mv",
+            "chmod", "chown", "ln", "stat", "ps", "kill", "pkill", "top", "df", "du", "free",
+            "lsof", "ss", "netstat", "ping", "wget", "tar", "gzip", "gunzip", "zip", "unzip", "jq",
+            "tr", "cut", "paste", "diff", "patch", "xargs", "tee", "read", "test", "true", "false",
+            "sh", "bash", "zsh",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -396,9 +391,10 @@ impl MindroidConfig {
     pub fn llm(&self, name: &str) -> Result<crate::llm_client::LlmClientConfig> {
         use crate::llm_client::{AuthStyle, LlmClientConfig};
 
-        let model_cfg = self.models.get(name).ok_or_else(|| {
-            MindroidError::config(format!("model config '{name}' not found"))
-        })?;
+        let model_cfg = self
+            .models
+            .get(name)
+            .ok_or_else(|| MindroidError::config(format!("model config '{name}' not found")))?;
 
         let provider = self.providers.get(&model_cfg.provider).ok_or_else(|| {
             MindroidError::config(format!(

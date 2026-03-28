@@ -43,7 +43,10 @@ pub enum MindroidError {
 impl MindroidError {
     /// Convenience constructor for config errors without a source chain.
     pub fn config(message: impl Into<String>) -> Self {
-        Self::Config { message: message.into(), source: None }
+        Self::Config {
+            message: message.into(),
+            source: None,
+        }
     }
 }
 

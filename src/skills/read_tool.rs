@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 use crate::error::Result;
@@ -49,11 +49,9 @@ impl Tool for ReadSkillTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let name = args.get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| crate::error::MindroidError::Other(
-                anyhow::anyhow!("Missing required parameter: name")
-            ))?;
+        let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            crate::error::MindroidError::Other(anyhow::anyhow!("Missing required parameter: name"))
+        })?;
 
         let registry = self.registry.read().await;
 
@@ -62,7 +60,12 @@ impl Tool for ReadSkillTool {
                 let escaped_content = escape_skill_content(&skill.prompt_content);
                 let location_attr = skill
                     .location()
-                    .map(|p| format!(" location=\"{}\"", crate::skills::escape_xml_attr(&p.display().to_string())))
+                    .map(|p| {
+                        format!(
+                            " location=\"{}\"",
+                            crate::skills::escape_xml_attr(&p.display().to_string())
+                        )
+                    })
                     .unwrap_or_default();
                 Ok(format!(
                     "<skill name=\"{}\" version=\"{}\" trust=\"{}\"{}>\n{}\n</skill>",
@@ -88,10 +91,8 @@ impl Tool for ReadSkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::SkillRegistry;
     use std::path::PathBuf;
-    use crate::skills::{
-        SkillRegistry,
-    };
 
     fn make_registry_with_skill(name: &str, content: &str) -> Arc<RwLock<SkillRegistry>> {
         let mut registry = SkillRegistry::new(PathBuf::from("/tmp/test-skills"));
@@ -101,7 +102,9 @@ mod tests {
             "---\nname: {}\ndescription: Test skill description\n---\n\n{}",
             name, content
         );
-        registry.register_builtin(&skill_md).expect("register_builtin failed");
+        registry
+            .register_builtin(&skill_md)
+            .expect("register_builtin failed");
         Arc::new(RwLock::new(registry))
     }
 

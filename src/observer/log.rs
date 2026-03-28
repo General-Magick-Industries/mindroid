@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{MindroidError, Message, Observer, StreamEvent};
+use crate::{Message, MindroidError, Observer, StreamEvent};
 
 pub struct LogObserver;
 

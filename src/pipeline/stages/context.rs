@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use crate::{LlmMessage, PipelineContext, PipelineStage, Result};
-use crate::skills::skillset::SkillSet;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
+use crate::skills::skillset::SkillSet;
+use crate::{LlmMessage, PipelineContext, PipelineStage, Result};
 
 /// A simple context builder that creates LLM messages from an optional
 /// system prompt, pre-fetched conversation history, and incoming message content.
@@ -33,19 +33,34 @@ pub struct SimpleContextBuilder {
 
 impl SimpleContextBuilder {
     pub fn new() -> Self {
-        Self { system_prompt: None, history: Arc::new(Vec::new()) }
+        Self {
+            system_prompt: None,
+            history: Arc::new(Vec::new()),
+        }
     }
 
     pub fn with_prompt(prompt: impl Into<String>) -> Self {
-        Self { system_prompt: Some(prompt.into()), history: Arc::new(Vec::new()) }
+        Self {
+            system_prompt: Some(prompt.into()),
+            history: Arc::new(Vec::new()),
+        }
     }
 
     pub fn with_history(history: Arc<Vec<LlmMessage>>) -> Self {
-        Self { system_prompt: None, history }
+        Self {
+            system_prompt: None,
+            history,
+        }
     }
 
-    pub fn with_prompt_and_history(prompt: impl Into<String>, history: Arc<Vec<LlmMessage>>) -> Self {
-        Self { system_prompt: Some(prompt.into()), history }
+    pub fn with_prompt_and_history(
+        prompt: impl Into<String>,
+        history: Arc<Vec<LlmMessage>>,
+    ) -> Self {
+        Self {
+            system_prompt: Some(prompt.into()),
+            history,
+        }
     }
 
     /// Append a skill index to the system prompt.
@@ -83,7 +98,10 @@ impl PipelineStage for SimpleContextBuilder {
         messages.extend(self.history.as_ref().clone());
 
         #[cfg(feature = "transport-audio")]
-        let user_text = ctx.get_ext::<TextInput>().map(|t| t.0.as_str()).unwrap_or(&ctx.message.content);
+        let user_text = ctx
+            .get_ext::<TextInput>()
+            .map(|t| t.0.as_str())
+            .unwrap_or(&ctx.message.content);
         #[cfg(not(feature = "transport-audio"))]
         let user_text = &ctx.message.content;
 
@@ -95,7 +113,12 @@ impl PipelineStage for SimpleContextBuilder {
             messages.len(),
         );
         for (i, msg) in messages.iter().enumerate() {
-            debug!("  llm_messages[{}] role={} len={}", i, msg.role.as_str(), msg.content.len());
+            debug!(
+                "  llm_messages[{}] role={} len={}",
+                i,
+                msg.role.as_str(),
+                msg.content.len()
+            );
         }
 
         ctx.llm_messages = messages;

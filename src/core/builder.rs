@@ -15,7 +15,9 @@ use super::routine::{FnRoutine, Routine, RoutineContext};
 use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
-use crate::persona::{LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider};
+use crate::persona::{
+    LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider,
+};
 
 #[cfg(feature = "identity")]
 use crate::identity::{IdentityResolutionStage, IdentityResolver};
@@ -402,4 +404,4 @@ impl Runtime {
 
 // -- subsystem builders (delegated to factory module) -------------------------
 
-use super::factory::{build_auth, build_transport, build_observers, build_pipeline};
+use super::factory::{build_auth, build_observers, build_pipeline, build_transport};

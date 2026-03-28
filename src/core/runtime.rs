@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
@@ -10,9 +10,9 @@ use crate::pipeline::Pipeline;
 use crate::transport::Transport;
 
 // Re-export from sibling modules so lib.rs needn't change
+pub use super::builder::RuntimeBuilder;
 pub use super::message::{MessageContext, TransportSend, TransportSender};
 pub use super::routine::{Routine, RoutineContext};
-pub use super::builder::RuntimeBuilder;
 
 use super::message::MessageHandler;
 
@@ -97,7 +97,11 @@ impl Runtime {
                             }
                         }
                         Ok(None) => {
-                            tracing::debug!(routine = name, tick = tick_count, "Routine poll returned None, skipping");
+                            tracing::debug!(
+                                routine = name,
+                                tick = tick_count,
+                                "Routine poll returned None, skipping"
+                            );
                         }
                         Err(e) => {
                             tracing::error!(routine = name, tick = tick_count, error = %e, "Routine poll error");
@@ -113,8 +117,8 @@ impl Runtime {
         const MAX_CONCURRENT_HANDLERS: usize = 50;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
 
-        let mut seen_ids: lru::LruCache<String, ()> =
-            lru::LruCache::new(std::num::NonZeroUsize::new(10_000).unwrap());
+        let mut seen_ids = std::collections::HashSet::<String>::new();
+        const MAX_SEEN_IDS: usize = 10_000;
         while let Some(msg) = rx.recv().await {
             tracing::debug!("Received message: {} from {}", msg.id, msg.sender_id);
 
@@ -129,7 +133,10 @@ impl Runtime {
                 tracing::debug!("Skipping duplicate message: {}", msg.id);
                 continue;
             }
-            seen_ids.put(msg.id.clone(), ());
+            if seen_ids.len() >= MAX_SEEN_IDS {
+                seen_ids.clear();
+            }
+            seen_ids.insert(msg.id.clone());
 
             for obs in self.observers.iter() {
                 obs.on_message_received(&msg).await;
@@ -164,10 +171,7 @@ impl Runtime {
     pub async fn shutdown(&mut self) -> Result<()> {
         for (token, handle) in self.routine_handles.drain(..) {
             token.cancel();
-            let timeout = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                handle,
-            );
+            let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), handle);
             match timeout.await {
                 Ok(_) => {}
                 Err(_) => {

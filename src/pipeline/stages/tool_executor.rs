@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -134,8 +134,14 @@ impl PipelineStage for ToolExecutorStage {
         // Operates on local `messages` to avoid borrowing `ctx` through a
         // BoxStream lifetime (which would block the final write to ctx.raw_response).
         let messages = build_messages_with_tools(&ctx.llm_messages, &self.registry);
-        let (mut messages, mut final_content, hit_max) =
-            run_tool_loop(&self.client, &self.registry, self.parser.as_ref(), messages, self.max_iterations).await?;
+        let (mut messages, mut final_content, hit_max) = run_tool_loop(
+            &self.client,
+            &self.registry,
+            self.parser.as_ref(),
+            messages,
+            self.max_iterations,
+        )
+        .await?;
 
         if hit_max {
             messages.push(LlmMessage::user(SUMMARY_PROMPT.to_string()));
@@ -360,7 +366,10 @@ fn repair_json(s: &str) -> String {
     let mut open_braces: i32 = 0;
 
     for ch in result.chars() {
-        if escaped { escaped = false; continue; }
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match ch {
             '\\' if in_string => escaped = true,
             '"' => in_string = !in_string,
@@ -370,8 +379,12 @@ fn repair_json(s: &str) -> String {
         }
     }
 
-    if in_string { result.push('"'); }
-    for _ in 0..open_braces.max(0) { result.push('}'); }
+    if in_string {
+        result.push('"');
+    }
+    for _ in 0..open_braces.max(0) {
+        result.push('}');
+    }
     result
 }
 
@@ -429,7 +442,8 @@ async fn run_tool_loop(
 
         let response_text = collect_llm_text(&mut llm_stream).await?;
 
-        let calls: Vec<(String, serde_json::Value)> = parser.parse(&response_text)
+        let calls: Vec<(String, serde_json::Value)> = parser
+            .parse(&response_text)
             .into_iter()
             .map(|c| (c.name, c.arguments))
             .collect();
@@ -442,7 +456,10 @@ async fn run_tool_loop(
         let mut results_msg = String::new();
         for (name, args) in calls {
             let result = match registry.get(&name) {
-                Some(tool) => tool.execute(args).await.unwrap_or_else(|e| format!("Error: {e}")),
+                Some(tool) => tool
+                    .execute(args)
+                    .await
+                    .unwrap_or_else(|e| format!("Error: {e}")),
                 None => format!("Error: unknown tool '{name}'"),
             };
             results_msg.push_str(&format!(
@@ -452,7 +469,10 @@ async fn run_tool_loop(
         messages.push(LlmMessage::user(results_msg));
 
         if iteration + 1 >= max_iterations {
-            warn!("ToolExecutorStage: reached max iterations ({})", max_iterations);
+            warn!(
+                "ToolExecutorStage: reached max iterations ({})",
+                max_iterations
+            );
             hit_max = true;
             break;
         }
@@ -487,7 +507,10 @@ fn parse_tool_calls(text: &str) -> Vec<(String, serde_json::Value)> {
 
         let (json_str, rest) = if let Some(end) = after_open.find("</tool_call>") {
             // Closing tag present — extract JSON between the tags.
-            (after_open[..end].trim(), &after_open[end + "</tool_call>".len()..])
+            (
+                after_open[..end].trim(),
+                &after_open[end + "</tool_call>".len()..],
+            )
         } else {
             // No closing tag — treat the rest of the text as JSON (LLM omitted it).
             (after_open.trim(), "")
@@ -502,19 +525,23 @@ fn parse_tool_calls(text: &str) -> Vec<(String, serde_json::Value)> {
 
         match parsed {
             Ok(val) => {
-                if let (Some(name), Some(args)) = (
-                    val.get("name").and_then(|n| n.as_str()),
-                    val.get("args"),
-                ) {
+                if let (Some(name), Some(args)) =
+                    (val.get("name").and_then(|n| n.as_str()), val.get("args"))
+                {
                     calls.push((name.to_string(), args.clone()));
                 }
             }
             Err(_) => {
-                debug!("parse_tool_calls: failed to parse JSON: {:?}", truncate_str(json_str, 120));
+                debug!(
+                    "parse_tool_calls: failed to parse JSON: {:?}",
+                    truncate_str(json_str, 120)
+                );
             }
         }
 
-        if rest.is_empty() { break; }
+        if rest.is_empty() {
+            break;
+        }
         haystack = rest;
     }
 
