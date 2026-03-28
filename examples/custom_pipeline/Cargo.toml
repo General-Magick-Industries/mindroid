@@ -1,0 +1,17 @@
+[package]
+name = "mindroid-example-custom-pipeline"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "custom_pipeline"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["llm-client"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }

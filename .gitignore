@@ -1,0 +1,35 @@
+# Build artifacts
+/target
+
+# Environment and secrets
+.env*
+!.env.example
+
+# IDE / editor
+.zed/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# AI tooling
+.claude/
+.omc/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust-specific
+*.pdb
+**/*.rs.bk
+
+# CI artifacts
+clippy-output.txt
+audit-output.txt
+
+# Database files (from sqlite memory)
+*.db
+*.db-journal
+*.db-wal

@@ -1,0 +1,57 @@
+# Budget planning agent configuration
+# Run with: cargo run --example cot_budget_agent --features full -- --config examples/cot_budget_agent.toml
+
+[agent]
+agent_id = "example-agent-id"
+name = "Budget Planner"
+persona = "You are a helpful budget planning assistant."
+model_type = "fast"
+model_ids = ["openrouter/openai/gpt-5.2"]
+compute_power = 1
+
+[transport]
+type = "centrifugo"
+url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[memory]
+type = "magickmind"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[observer]
+type = "log"
+level = "info"
+
+# -- LLM Providers -----------------------------------------------------------
+
+[providers.cortex]
+base_url = "https://dev-magickmind.magickmind.ai"
+api_key = "sk-your-api-key-here"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+[providers.litellm]
+base_url = "https://litellm.globalmagick.com"
+api_key = "sk-your-api-key-here"
+
+# -- Named Models (per-pipeline LLM config) ----------------------------------
+
+[models.gate]
+provider = "litellm"
+model = "gpt-4o-mini"
+
+[models.ack]
+provider = "cortex"
+model = "gpt-4o-mini"
+compute_power = 1
+
+[models.respond]
+provider = "litellm"
+model = "openrouter/openai/gpt-5.2"

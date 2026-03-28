@@ -1,0 +1,43 @@
+# Mindroid Agent Configuration
+# Place this file at ./mindroid.toml or ~/.mindroid/config.toml
+
+[agent]
+agent_id = "your-agent-id-here"
+name = "My Mindroid Agent"
+# mindspace_id = "ms-abc123"       # Required for Magick Mind pipeline
+model_type = "fast"
+model_ids = ["openrouter/google/gemini-3.1-pro-preview"]
+compute_power = 1                  # 0-100
+
+[transport]
+type = "stdio"                      # Options: "stdio", "centrifugo"
+# url = "wss://centrifugo.example.com/connection/websocket"
+# channels = ["personal:agent-001#user-001"]
+
+[pipeline]
+type = "ollama"                     # Options: "ollama", "magickmind"
+# base_url = "https://api.magickmind.io"
+# api_key = "sk-..."               # Or use MINDROID_API_KEY env var
+model = "smallthinker"
+
+[auth]
+type = "static"                     # Options: "static", "apikey"
+token = "dev-token"
+email = "user@example.com"      # For apikey auth
+password = "your-password-here"              # Or use MINDROID_PASSWORD env var
+api_key = "sk-your-api-key-here"
+# base_url = "https://api.magickmind.io"
+
+[memory]
+type = "magickmind"                       # Options: "none", "sqlite", "magickmind"
+# path = "./mindroid.db"           # For sqlite memory
+# base_url = "https://api.magickmind.io"  # For magickmind memory
+
+# [persona]
+# type = "magickmind"
+# persona_id = "your-persona-id"
+# base_url = "https://api.magickmind.com"  # optional, falls back to memory.base_url
+
+[observer]
+type = "log"                        # Options: "none", "log"
+level = "info"

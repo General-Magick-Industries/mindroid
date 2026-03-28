@@ -1,0 +1,62 @@
+# Magickmind Voice Agent configuration
+# Run with: cargo run --example magickmind_voice --features full -- --config examples/magickmind_voice/config.toml
+
+[agent]
+agent_id = "example-agent-id"          # Centrifugo channel / MagickMind agent ID
+name     = "Genseeks"
+compute_power = 1
+
+[transport]
+type = "centrifugo"
+url  = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[memory]
+type = "magickmind"
+
+[observer]
+type  = "log"
+level = "info"
+
+# -- Providers -----------------------------------------------------------------
+
+[providers.deepgram]
+base_url = "https://api.deepgram.com"
+api_key = "your-deepgram-api-key-here"
+
+[providers.litellm]
+base_url = "https://litellm.globalmagick.com"
+api_key = "sk-your-api-key-here"
+
+# -- Models --------------------------------------------------------------------
+
+[models.tts]
+provider = "deepgram"
+model    = "aura-athena-en"        # aura-asteria-en, aura-stella-en, aura-athena-en
+
+[models.respond]
+provider = "litellm"
+model    = "openrouter/openai/gpt-5-mini"
+
+# -- Tools (OS control) --------------------------------------------------------
+
+[tools.shell]
+enabled      = true
+timeout_secs = 30
+# Describe your system setup so the agent picks the right commands immediately.
+# Without this, the agent will probe with `which` to discover available tools.
+# instructions = """
+# Desktop: i3wm on X11.
+# Screen lock: i3lock.
+# Media player: Spotify (playerctl works).
+# Brightness: brightnessctl.
+# """
+
+[tools.open]
+enabled = true
