@@ -33,9 +33,7 @@ pub fn blend_traits(
             string_list_value: None,
         };
 
-        let dyadic_value = dyadic
-            .and_then(|d| d.traits.get(trait_ref))
-            .cloned();
+        let dyadic_value = dyadic.and_then(|d| d.traits.get(trait_ref)).cloned();
 
         let (blended_value, dyadic_source, was_clamped) = match def.lock.as_deref() {
             Some("HARD") => {

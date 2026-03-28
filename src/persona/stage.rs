@@ -5,9 +5,9 @@ use tracing::debug;
 
 use crate::error::Result;
 use crate::models::{LlmMessage, SenderType};
-use crate::pipeline::{PipelineContext, PipelineStage};
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
+use crate::pipeline::{PipelineContext, PipelineStage};
 
 use super::cache::PersonaCache;
 use super::models::{EffectivePersonalityResponse, EffectiveTrait, PersonaSchema};
@@ -35,10 +35,7 @@ impl PersonaContextBuilder {
     /// Fetches the persona schema once at construction time for static fields
     /// (name, role, background_story, tones). The effective personality is
     /// fetched per-request in `process()`.
-    pub async fn new(
-        provider: Arc<dyn PersonaProvider>,
-        persona_id: &str,
-    ) -> Result<Self> {
+    pub async fn new(provider: Arc<dyn PersonaProvider>, persona_id: &str) -> Result<Self> {
         let persona_info = provider.get_persona(persona_id).await?;
         Ok(Self {
             provider,
@@ -56,10 +53,7 @@ impl PersonaContextBuilder {
     }
 
     /// Build a structured system prompt from the persona info and effective traits.
-    fn build_system_prompt(
-        &self,
-        effective: &EffectivePersonalityResponse,
-    ) -> String {
+    fn build_system_prompt(&self, effective: &EffectivePersonalityResponse) -> String {
         let mut parts = Vec::new();
 
         // Identity line
@@ -118,17 +112,25 @@ impl PipelineStage for PersonaContextBuilder {
         }
 
         let user_id = if ctx.message.sender_type == SenderType::User {
-            canonical_id.as_deref().or(Some(ctx.message.sender_id.as_str()))
+            canonical_id
+                .as_deref()
+                .or(Some(ctx.message.sender_id.as_str()))
         } else {
             None
         };
 
         // Check cache first
         let effective = if let Some(cached) = self.cache.get(&self.persona_id, user_id).await {
-            debug!("PersonaContextBuilder: cache hit for persona={} user={:?}", self.persona_id, user_id);
+            debug!(
+                "PersonaContextBuilder: cache hit for persona={} user={:?}",
+                self.persona_id, user_id
+            );
             cached
         } else {
-            debug!("PersonaContextBuilder: cache miss, fetching effective personality for persona={} user={:?}", self.persona_id, user_id);
+            debug!(
+                "PersonaContextBuilder: cache miss, fetching effective personality for persona={} user={:?}",
+                self.persona_id, user_id
+            );
             let resp = self
                 .provider
                 .get_effective_personality(&self.persona_id, user_id)
@@ -145,7 +147,10 @@ impl PipelineStage for PersonaContextBuilder {
         messages.extend(self.history.as_ref().clone());
 
         #[cfg(feature = "transport-audio")]
-        let user_text = ctx.get_ext::<TextInput>().map(|t| t.0.as_str()).unwrap_or(&ctx.message.content);
+        let user_text = ctx
+            .get_ext::<TextInput>()
+            .map(|t| t.0.as_str())
+            .unwrap_or(&ctx.message.content);
         #[cfg(not(feature = "transport-audio"))]
         let user_text = &ctx.message.content;
 

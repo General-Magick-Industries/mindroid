@@ -36,8 +36,6 @@ use mindroid::tools::ToolRegistry;
 use mindroid::tools::reminder::{ReminderRoutine, SetReminderTool, new_reminder_store};
 use mindroid::transport::audio::{AudioTransport, AudioTransportConfig};
 #[cfg(feature = "transport-audio")]
-use rodio;
-
 use mindroid::{
     ChannelType, Message, MessageType, MindroidConfig, Pipeline, Response,
     Result as MindroidResult, Runtime, SenderType, StreamEvent, Transport, TtsProvider,
@@ -374,26 +372,26 @@ async fn main() -> anyhow::Result<()> {
     let mut config = MindroidConfig::resolve(Some(&cli.config))?;
 
     // Apply CLI overrides to config.
-    if let Some(ref model) = cli.model {
-        if let Some(respond) = config.models.get_mut("respond") {
-            respond.model = Some(model.clone());
-        }
+    if let Some(ref model) = cli.model
+        && let Some(respond) = config.models.get_mut("respond")
+    {
+        respond.model = Some(model.clone());
     }
-    if let Some(ref stt_provider) = cli.stt {
-        if let Some(stt) = config.models.get_mut("stt") {
-            stt.provider = stt_provider.clone();
-        }
+    if let Some(ref stt_provider) = cli.stt
+        && let Some(stt) = config.models.get_mut("stt")
+    {
+        stt.provider = stt_provider.clone();
     }
-    if let Some(ref tts_provider) = cli.tts {
-        if let Some(tts) = config.models.get_mut("tts") {
-            tts.provider = tts_provider.clone();
-        }
+    if let Some(ref tts_provider) = cli.tts
+        && let Some(tts) = config.models.get_mut("tts")
+    {
+        tts.provider = tts_provider.clone();
     }
-    if let Some(ref voice) = cli.voice {
-        if let Some(tts) = config.models.get_mut("tts") {
-            tts.options
-                .insert("voice".into(), serde_json::Value::String(voice.clone()));
-        }
+    if let Some(ref voice) = cli.voice
+        && let Some(tts) = config.models.get_mut("tts")
+    {
+        tts.options
+            .insert("voice".into(), serde_json::Value::String(voice.clone()));
     }
 
     let tts = Arc::from(build_tts(&config));
@@ -483,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
         never include timezone codes like UTC+07, just say 'local time' if relevant; \
         translate any raw command output into a natural spoken sentence.";
 
-    let tts: Arc<dyn TtsProvider> = Arc::from(tts);
+    let tts: Arc<dyn TtsProvider> = tts;
 
     let builder = if text_mode {
         let pipeline = Pipeline::new()

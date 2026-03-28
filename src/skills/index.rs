@@ -32,15 +32,24 @@ pub fn build_skill_index(skills: &[LoadedSkill]) -> String {
         let desc = escape_xml_attr(&skill.manifest.description);
         let location_attr = skill
             .location()
-            .map(|p| format!(" location=\"{}\"", escape_xml_attr(&p.display().to_string())))
+            .map(|p| {
+                format!(
+                    " location=\"{}\"",
+                    escape_xml_attr(&p.display().to_string())
+                )
+            })
             .unwrap_or_default();
-        out.push_str(&format!("  <skill name=\"{name}\" description=\"{desc}\"{location_attr} />\n"));
+        out.push_str(&format!(
+            "  <skill name=\"{name}\" description=\"{desc}\"{location_attr} />\n"
+        ));
     }
 
     out.push_str("</available_skills>\n\n");
     out.push_str("To use a skill, call the `read_skill` tool with the skill name.\n");
     out.push_str("Only load skills that are clearly relevant to the current task.\n");
-    out.push_str("Skills may have supporting files (scripts, references) in their location directory.\n");
+    out.push_str(
+        "Skills may have supporting files (scripts, references) in their location directory.\n",
+    );
 
     out
 }
@@ -80,7 +89,10 @@ mod tests {
 
     #[test]
     fn test_single_skill_generates_correct_xml() {
-        let skills = vec![make_skill("m01-ownership", "Ownership/borrow/lifetime issues")];
+        let skills = vec![make_skill(
+            "m01-ownership",
+            "Ownership/borrow/lifetime issues",
+        )];
         let result = build_skill_index(&skills);
         assert!(result.contains("## Available Skills"));
         assert!(result.contains("<available_skills>"));

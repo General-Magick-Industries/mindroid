@@ -14,13 +14,7 @@ impl PipelineStage for PostProcessor {
     }
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        ctx.response = Some(
-            ctx.response
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        );
+        ctx.response = Some(ctx.response.as_deref().unwrap_or("").trim().to_string());
         Ok(())
     }
 }

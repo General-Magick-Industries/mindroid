@@ -7,18 +7,18 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::{LlmMessage, Role, StreamEvent, TokenUsage};
 use async_openai::{
+    Client,
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
         CreateChatCompletionRequestArgs, FinishReason, ResponseFormat,
     },
-    Client,
 };
-use futures::stream::BoxStream;
 use futures::StreamExt;
-use crate::{LlmMessage, Role, StreamEvent, TokenUsage};
+use futures::stream::BoxStream;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -190,10 +190,7 @@ impl LlmClient {
     // ── Non-streaming ────────────────────────────────────────────────────
 
     /// Send a non-streaming chat request. Returns `(content, Option<TokenUsage>)`.
-    pub async fn chat(
-        &self,
-        req: ChatRequest<'_>,
-    ) -> crate::Result<(String, Option<TokenUsage>)> {
+    pub async fn chat(&self, req: ChatRequest<'_>) -> crate::Result<(String, Option<TokenUsage>)> {
         let messages = Self::convert_messages(req.messages);
         let model = self.resolve_model(req.model);
 

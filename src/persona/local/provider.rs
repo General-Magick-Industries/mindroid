@@ -7,8 +7,8 @@ use crate::error::{MindroidError, Result};
 use crate::persona::models::{EffectivePersonalityResponse, PersonaSchema};
 use crate::persona::provider::PersonaProvider;
 
-use super::blender::{blend_traits, DyadicLearnedTraits};
-use super::parser::{parse_persona_file, to_persona_schema, LocalPersonaFrontmatter};
+use super::blender::{DyadicLearnedTraits, blend_traits};
+use super::parser::{LocalPersonaFrontmatter, parse_persona_file, to_persona_schema};
 
 pub struct LocalPersonaProvider {
     persona_id: String,
@@ -76,13 +76,12 @@ impl PersonaProvider for LocalPersonaProvider {
                         dyadic_file.display()
                     ))
                 })?;
-                let parsed: DyadicLearnedTraits =
-                    serde_json::from_str(&raw).map_err(|e| {
-                        MindroidError::config(format!(
-                            "Failed to parse dyadic file '{}': {e}",
-                            dyadic_file.display()
-                        ))
-                    })?;
+                let parsed: DyadicLearnedTraits = serde_json::from_str(&raw).map_err(|e| {
+                    MindroidError::config(format!(
+                        "Failed to parse dyadic file '{}': {e}",
+                        dyadic_file.display()
+                    ))
+                })?;
                 Some(parsed)
             } else {
                 None

@@ -47,7 +47,11 @@ pub fn parse_persona_file(content: &str) -> Result<(LocalPersonaFrontmatter, Str
 }
 
 /// Convert parsed frontmatter + body into a `PersonaSchema`.
-pub fn to_persona_schema(id: &str, frontmatter: &LocalPersonaFrontmatter, body: &str) -> PersonaSchema {
+pub fn to_persona_schema(
+    id: &str,
+    frontmatter: &LocalPersonaFrontmatter,
+    body: &str,
+) -> PersonaSchema {
     PersonaSchema {
         id: id.to_string(),
         artifact_id: None,

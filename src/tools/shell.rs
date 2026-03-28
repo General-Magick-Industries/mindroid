@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::config::ShellToolConfig;
 use crate::error::Result;
@@ -63,7 +63,11 @@ impl ShellTool {
              settings, open programs, manage files, and query system state. \
              NOTE: sudo is not available — use userspace tools directly.{discovery_hint}{instructions_block}"
         );
-        Self { timeout_secs, description, config }
+        Self {
+            timeout_secs,
+            description,
+            config,
+        }
     }
 }
 
@@ -140,8 +144,7 @@ impl Tool for ShellTool {
 
             let output = cmd.output().await;
 
-            match output
-            {
+            match output {
                 Ok(out) => {
                     let stdout = truncate(String::from_utf8_lossy(&out.stdout).into_owned());
                     let stderr = truncate(String::from_utf8_lossy(&out.stderr).into_owned());
@@ -190,9 +193,7 @@ fn blocked_reason(command: &str, allowed_commands: &[String]) -> Option<String> 
         }
         // Extract just the binary name from a possible absolute path (e.g. /usr/bin/sudo -> sudo).
         let binary = word.rsplit('/').next().unwrap_or(word);
-        if !allowed_commands.is_empty()
-            && !allowed_commands.iter().any(|a| a == binary)
-        {
+        if !allowed_commands.is_empty() && !allowed_commands.iter().any(|a| a == binary) {
             return Some(format!(
                 "Command '{binary}' is not in the allowed commands list. \
                  Allowed commands: {allowed}",
@@ -208,8 +209,16 @@ fn blocked_reason(command: &str, allowed_commands: &[String]) -> Option<String> 
 fn safe_env_vars() -> Vec<(String, String)> {
     #[cfg(target_os = "windows")]
     let safe: &[&str] = &[
-        "PATH", "USERPROFILE", "USERNAME", "TEMP", "TMP",
-        "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "COMSPEC", "PATHEXT",
+        "PATH",
+        "USERPROFILE",
+        "USERNAME",
+        "TEMP",
+        "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
     ];
 
     #[cfg(not(target_os = "windows"))]

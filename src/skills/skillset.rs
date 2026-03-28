@@ -70,7 +70,11 @@ impl SkillSet {
     /// (e.g., registered built-in skills).
     pub fn from_registry(registry: SkillRegistry) -> Self {
         let index = build_skill_index(registry.skills());
-        let skill_names = registry.skills().iter().map(|s| s.name().to_string()).collect();
+        let skill_names = registry
+            .skills()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect();
         Self {
             registry: Arc::new(RwLock::new(registry)),
             index,

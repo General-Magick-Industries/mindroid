@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::config::OpenToolConfig;
@@ -18,7 +18,9 @@ pub struct OpenTool {
 
 impl OpenTool {
     pub fn new() -> Self {
-        Self { config: OpenToolConfig::default() }
+        Self {
+            config: OpenToolConfig::default(),
+        }
     }
 
     pub fn with_config(config: OpenToolConfig) -> Self {

@@ -7,14 +7,13 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 use crate::core::routine::{Routine, RoutineContext};
 use crate::error::Result;
 use crate::models::Response;
 use crate::tools::Tool;
-
 
 /// A single scheduled reminder.
 #[derive(Debug, Clone)]
@@ -96,7 +95,9 @@ impl Tool for SetReminderTool {
 
         self.store.write().await.push(reminder);
 
-        Ok(format!("Reminder set: '{message}' in {delay_secs} seconds."))
+        Ok(format!(
+            "Reminder set: '{message}' in {delay_secs} seconds."
+        ))
     }
 }
 

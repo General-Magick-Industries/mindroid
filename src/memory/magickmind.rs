@@ -66,7 +66,12 @@ impl Memory for MagickmindMemory {
             u
         };
         let headers = self.auth_headers().await?;
-        let body = SaveMessageRequest { channel_id, sender_id, content, reply_to_id };
+        let body = SaveMessageRequest {
+            channel_id,
+            sender_id,
+            content,
+            reply_to_id,
+        };
 
         let resp = self
             .http
@@ -75,7 +80,10 @@ impl Memory for MagickmindMemory {
             .json(&body)
             .send()
             .await
-            .map_err(|e| MindroidError::Api { message: e.to_string(), status_code: None })?;
+            .map_err(|e| MindroidError::Api {
+                message: e.to_string(),
+                status_code: None,
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -86,10 +94,10 @@ impl Memory for MagickmindMemory {
             });
         }
 
-        let data: SaveMessageResponse = resp
-            .json()
-            .await
-            .map_err(|e| MindroidError::Api { message: e.to_string(), status_code: None })?;
+        let data: SaveMessageResponse = resp.json().await.map_err(|e| MindroidError::Api {
+            message: e.to_string(),
+            status_code: None,
+        })?;
 
         Ok(Some(data.id))
     }
@@ -115,10 +123,16 @@ impl Memory for MagickmindMemory {
             .http
             .get(url)
             .headers(headers)
-            .query(&[("channel_id", channel_id.as_str()), ("limit", &limit.to_string())])
+            .query(&[
+                ("channel_id", channel_id.as_str()),
+                ("limit", &limit.to_string()),
+            ])
             .send()
             .await
-            .map_err(|e| MindroidError::Api { message: e.to_string(), status_code: None })?;
+            .map_err(|e| MindroidError::Api {
+                message: e.to_string(),
+                status_code: None,
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -129,10 +143,10 @@ impl Memory for MagickmindMemory {
             });
         }
 
-        let data: GetHistoryResponse = resp
-            .json()
-            .await
-            .map_err(|e| MindroidError::Api { message: e.to_string(), status_code: None })?;
+        let data: GetHistoryResponse = resp.json().await.map_err(|e| MindroidError::Api {
+            message: e.to_string(),
+            status_code: None,
+        })?;
 
         Ok(data.messages)
     }
@@ -161,7 +175,10 @@ impl Memory for MagickmindMemory {
             .query(&[("channel_id", channel_id.as_str())])
             .send()
             .await
-            .map_err(|e| MindroidError::Api { message: e.to_string(), status_code: None })?;
+            .map_err(|e| MindroidError::Api {
+                message: e.to_string(),
+                status_code: None,
+            })?;
 
         let status = resp.status();
         if !status.is_success() {

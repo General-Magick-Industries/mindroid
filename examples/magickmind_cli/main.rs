@@ -17,10 +17,12 @@
 use std::sync::Arc;
 
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindContext, MagickmindPersistence};
+use mindroid::pipeline::presets::magickmind::{
+    MagickmindClient, MagickmindContext, MagickmindPersistence,
+};
 use mindroid::{
-    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext,
-    PostProcessor, Runtime, SimpleContextBuilder,
+    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PostProcessor,
+    Runtime, SimpleContextBuilder,
 };
 
 #[tokio::main]
@@ -64,16 +66,18 @@ async fn main() -> anyhow::Result<()> {
 
     let mut runtime = builder
         .on_message(move |ctx| {
-            let preparer    = Arc::clone(&context_preparer);
-            let magickmind  = Arc::clone(&magickmind);
-            let llm_config  = Arc::clone(&llm_config);
+            let preparer = Arc::clone(&context_preparer);
+            let magickmind = Arc::clone(&magickmind);
+            let llm_config = Arc::clone(&llm_config);
 
             async move {
                 // Step 1: fetch conversation context from MagickMind
                 let context = match preparer.prepare(&ctx.message).await {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!("MagickMind context fetch failed, continuing without history: {e}");
+                        tracing::warn!(
+                            "MagickMind context fetch failed, continuing without history: {e}"
+                        );
                         Vec::new()
                     }
                 };
@@ -127,10 +131,10 @@ Guidelines:\n\
                 }
 
                 let response = pctx.response.as_deref().unwrap_or("").trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Send error: {e}");
-                    }
+                if !response.is_empty()
+                    && let Err(e) = ctx.respond(&response).await
+                {
+                    tracing::error!("Send error: {e}");
                 }
             }
         })

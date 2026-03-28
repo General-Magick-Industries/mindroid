@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::error::Result;
 use crate::MindroidError;
+use crate::error::Result;
 
 use super::TtsProvider;
 
@@ -96,11 +96,15 @@ impl DeepgramTts {
             });
         }
 
-        Ok(response.bytes().await.map_err(|e| MindroidError::Pipeline {
-            stage: "DeepgramTts".into(),
-            message: format!("Failed to read audio bytes: {e}"),
-            source: None,
-        })?.to_vec())
+        Ok(response
+            .bytes()
+            .await
+            .map_err(|e| MindroidError::Pipeline {
+                stage: "DeepgramTts".into(),
+                message: format!("Failed to read audio bytes: {e}"),
+                source: None,
+            })?
+            .to_vec())
     }
 }
 
@@ -121,7 +125,8 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
         }
 
         let slice = &remaining[..max_chars];
-        let split_at = slice.rfind(". ")
+        let split_at = slice
+            .rfind(". ")
             .or_else(|| slice.rfind("! "))
             .or_else(|| slice.rfind("? "))
             .map(|i| i + 2)
@@ -144,7 +149,7 @@ fn concat_wav(chunks: Vec<Vec<u8>>) -> Vec<u8> {
         wav.windows(4)
             .position(|w| w == b"data")
             .map(|i| i + 8) // skip "data" (4) + chunk size (4)
-            .unwrap_or(44)  // fall back to standard 44-byte header
+            .unwrap_or(44) // fall back to standard 44-byte header
     }
 
     let first_offset = data_offset(&chunks[0]);

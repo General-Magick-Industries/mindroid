@@ -1,12 +1,12 @@
-#[cfg(feature = "llm-client")]
-mod openai;
 #[cfg(feature = "speech")]
 mod deepgram;
-
 #[cfg(feature = "llm-client")]
-pub use openai::{OpenAiTts, OpenAiTtsConfig};
+mod openai;
+
 #[cfg(feature = "speech")]
 pub use deepgram::{DeepgramTts, DeepgramTtsConfig};
+#[cfg(feature = "llm-client")]
+pub use openai::{OpenAiTts, OpenAiTtsConfig};
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -14,14 +14,14 @@ use std::sync::Arc;
 use tracing::warn;
 
 #[cfg(feature = "transport-audio")]
-use rodio;
-#[cfg(feature = "transport-audio")]
 use futures::StreamExt;
+#[cfg(feature = "transport-audio")]
+use rodio;
 
 use crate::error::Result;
-use crate::{MindroidError, PipelineContext, PipelineStage};
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::AudioOutput;
+use crate::{MindroidError, PipelineContext, PipelineStage};
 
 /// Converts text to synthesized audio bytes.
 #[async_trait]
@@ -43,7 +43,9 @@ pub struct TtsStage {
 
 impl TtsStage {
     pub fn new(provider: impl TtsProvider + 'static) -> Self {
-        Self { provider: Arc::new(provider) }
+        Self {
+            provider: Arc::new(provider),
+        }
     }
 
     pub fn from_arc(provider: Arc<dyn TtsProvider>) -> Self {
@@ -67,13 +69,15 @@ impl PipelineStage for TtsStage {
 
         let clean = strip_markdown(text);
 
-        let audio = self.provider.synthesize(&clean).await.map_err(|e| {
-            MindroidError::Pipeline {
-                stage: "TtsStage".into(),
-                message: format!("TTS synthesis failed: {e}"),
-                source: None,
-            }
-        })?;
+        let audio =
+            self.provider
+                .synthesize(&clean)
+                .await
+                .map_err(|e| MindroidError::Pipeline {
+                    stage: "TtsStage".into(),
+                    message: format!("TTS synthesis failed: {e}"),
+                    source: None,
+                })?;
 
         #[cfg(feature = "transport-audio")]
         {
@@ -286,7 +290,10 @@ impl PipelineStage for AudioOutputStage {
         };
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         self.cmd_tx
-            .send(AudioPlaybackCmd { bytes: audio, done_tx })
+            .send(AudioPlaybackCmd {
+                bytes: audio,
+                done_tx,
+            })
             .map_err(|_| MindroidError::Pipeline {
                 stage: "AudioOutputStage".into(),
                 message: "Audio playback thread is not running".into(),
@@ -322,9 +329,13 @@ fn strip_markdown(text: &str) -> String {
         }
 
         // Headings: # Title → "Title"
-        let line = if let Some(rest) = trimmed.strip_prefix("######").or_else(|| trimmed.strip_prefix("#####"))
-            .or_else(|| trimmed.strip_prefix("####")).or_else(|| trimmed.strip_prefix("###"))
-            .or_else(|| trimmed.strip_prefix("##")).or_else(|| trimmed.strip_prefix('#'))
+        let line = if let Some(rest) = trimmed
+            .strip_prefix("######")
+            .or_else(|| trimmed.strip_prefix("#####"))
+            .or_else(|| trimmed.strip_prefix("####"))
+            .or_else(|| trimmed.strip_prefix("###"))
+            .or_else(|| trimmed.strip_prefix("##"))
+            .or_else(|| trimmed.strip_prefix('#'))
         {
             rest.trim()
         } else {
@@ -341,7 +352,9 @@ fn strip_markdown(text: &str) -> String {
         }
 
         // Bullet / numbered list markers: "- item", "* item", "1. item"
-        let line = if let Some(rest) = line.trim_start().strip_prefix("- ")
+        let line = if let Some(rest) = line
+            .trim_start()
+            .strip_prefix("- ")
             .or_else(|| line.trim_start().strip_prefix("* "))
             .or_else(|| line.trim_start().strip_prefix("+ "))
         {
@@ -415,7 +428,10 @@ fn inline_strip(s: &str) -> String {
             '`' => {
                 i += 1;
                 while i < chars.len() {
-                    if chars[i] == '`' { i += 1; break; }
+                    if chars[i] == '`' {
+                        i += 1;
+                        break;
+                    }
                     result.push(chars[i]);
                     i += 1;
                 }
@@ -433,13 +449,20 @@ fn inline_strip(s: &str) -> String {
                     i += 1;
                     if i < chars.len() && chars[i] == '(' {
                         i += 1;
-                        while i < chars.len() && chars[i] != ')' { i += 1; }
-                        if i < chars.len() { i += 1; }
+                        while i < chars.len() && chars[i] != ')' {
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1;
+                        }
                     }
                 }
                 result.push_str(&link_text);
             }
-            c => { result.push(c); i += 1; }
+            c => {
+                result.push(c);
+                i += 1;
+            }
         }
     }
 

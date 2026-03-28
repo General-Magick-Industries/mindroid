@@ -1,12 +1,12 @@
-mod registry;
-pub mod shell;
 pub mod open;
+mod registry;
 pub mod reminder;
+pub mod shell;
 
-pub use registry::ToolRegistry;
-pub use shell::ShellTool;
 pub use open::OpenTool;
-pub use reminder::{SetReminderTool, ReminderRoutine, ReminderStore, new_reminder_store};
+pub use registry::ToolRegistry;
+pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
+pub use shell::ShellTool;
 
 use async_trait::async_trait;
 
