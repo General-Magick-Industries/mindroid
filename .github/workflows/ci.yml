@@ -20,15 +20,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: Format, Clippy, Build & Test
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build:
+    name: Clippy, Build & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -36,9 +46,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev
-
-      - name: Format check
-        run: cargo fmt --all -- --check
 
       - name: Clippy
         id: clippy
