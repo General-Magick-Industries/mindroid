@@ -1,0 +1,52 @@
+# Persona-driven agent configuration
+# Run with: cargo run --example persona_agent --features full -- --config examples/persona_agent.toml
+
+[agent]
+agent_id = "example-agent-id"
+name = "Vrugbod"
+# The flat persona string is ignored when [persona] is configured.
+# It serves as a fallback if the magickmind persona service is unavailable.
+persona = "You are a helpful AI assistant."
+model_type = "fast"
+model_ids = ["openrouter/google/gemini-3.1-pro-preview"]
+compute_power = 1
+
+[transport]
+type = "centrifugo"
+url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[memory]
+type = "magickmind"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+# -- Persona (magickmind runtime service) -------------------------------------
+# Fetches the effective personality per-request with dyadic per-user adaptation.
+# Replace persona_id with an actual persona from the magickmind persona service.
+
+[persona]
+type = "magickmind"
+persona_id = "example-persona-id"
+# base_url is optional — falls back to memory.base_url or auth.base_url
+
+[observer]
+type = "log"
+level = "info"
+
+# -- LLM Providers -----------------------------------------------------------
+
+[providers.litellm]
+base_url = "https://litellm.globalmagick.com"
+api_key = "sk-your-api-key-here"
+
+# -- Named Models -------------------------------------------------------------
+
+[models.respond]
+provider = "litellm"
+model = "openrouter/google/gemini-3.1-pro-preview"

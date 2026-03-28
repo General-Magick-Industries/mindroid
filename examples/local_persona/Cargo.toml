@@ -1,0 +1,16 @@
+[package]
+name = "mindroid-example-local-persona"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "local_persona"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["persona", "llm-local"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

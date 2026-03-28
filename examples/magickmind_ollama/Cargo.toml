@@ -1,0 +1,16 @@
+[package]
+name = "mindroid-example-magickmind-ollama"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "magickmind_ollama"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["full"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,24 @@
+[agent]
+name = "Guide"
+agent_id = "guide"
+
+[persona]
+type = "local"
+persona_id = "guide"
+data_dir = "examples/local_persona/personas"
+
+[memory]
+type = "none"
+
+[auth]
+type = "static"
+token = "local"
+
+# LLM provider: Ollama running locally
+[providers.ollama]
+base_url = "http://localhost:11434"
+auth_style = "none"
+
+[models.respond]
+provider = "ollama"
+model = "llama3.2"

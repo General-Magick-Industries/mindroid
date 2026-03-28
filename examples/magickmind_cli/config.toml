@@ -1,0 +1,38 @@
+# MagickMind CLI configuration
+# Run with: cargo run --example magickmind_cli --features full -- --config examples/magickmind_cli/config.toml
+
+[agent]
+agent_id = "example-agent-id"      # MagickMind mindspace ID for this agent
+name = "MagickMind Assistance CLI"
+
+[transport]
+type = "centrifugo"
+url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[memory]
+type = "magickmind"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[observer]
+type = "log"
+level = "info"
+
+# -- Ollama provider -----------------------------------------------------------
+# Local Ollama instance. No API key needed.
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+# -- Named model --------------------------------------------------------------
+# `main` is the model used by the CLI pipeline.
+
+[models.main]
+provider = "ollama"
+model = "qwen3-coder"

@@ -1,0 +1,121 @@
+[package]
+name = "mindroid"
+version = "0.0.1-a.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/General-Magick-Industries/mindroid"
+description = "Modular AI agent SDK with trait-based component swappability"
+
+[workspace]
+members = [
+    "examples/minimal",
+    "examples/custom_pipeline",
+    "examples/magickmind",
+    "examples/magickmind_ollama",
+    "examples/persona_agent",
+    "examples/magickmind_voice",
+    "examples/cot_trip_agent",
+    "examples/cot_budget_agent",
+    "examples/magickmind_cli",
+    "examples/voice_agent",
+    "examples/local_persona",
+]
+resolver = "3"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+rodio = { version = "0.17", default-features = false, features = ["wav"] }
+tracing = "0.1"
+mindroid = { path = "." }
+
+[features]
+default = ["llm-local"]
+# Transports
+transport-ws = ["dep:tokio-tungstenite", "dep:base64"]
+transport-audio = ["dep:cpal", "dep:hound", "dep:base64", "dep:voice_activity_detector", "dep:rodio"]
+# LLM
+llm-client = ["dep:async-openai", "dep:reqwest"]
+llm-local = ["llm-client"]
+llm-hosted = ["llm-client", "dep:reqwest"]
+# Speech (STT + TTS providers)
+speech = ["dep:reqwest"]
+# Auth
+apikey = ["dep:reqwest"]
+# Persistence (memory backends)
+persistence = ["dep:reqwest", "dep:rusqlite"]
+# Persona
+persona = ["dep:reqwest"]
+# Identity resolution
+identity = []
+# All features
+full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity"]
+
+[dependencies]
+# Core (always required)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "io-std", "sync", "signal", "fs", "process"] }
+tokio-util = { version = "0.7" }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+sha2 = "0.10"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+async-stream = "0.3"
+lru = "0.12"
+regex = "1"
+
+# Optional: centrifugo transport
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+base64 = { version = "0.22", optional = true }
+
+# Optional: audio transport (mic capture + Silero VAD)
+cpal = { version = "0.15", optional = true }
+hound = { version = "3.5", optional = true }
+voice_activity_detector = { version = "0.2", optional = true }
+# NOTE: pv_cobra (Picovoice Cobra VAD) has all crates.io versions yanked.
+# The `cobra` feature provides the dispatch infrastructure; to enable real
+# Cobra processing, obtain pv_cobra from Picovoice and add it to your own
+# Cargo.toml, then submit a PR enabling the real CobraProcessor impl.
+# Optional: audio playback (TTS output)
+rodio = { version = "0.17", default-features = false, features = ["wav"], optional = true }
+
+# Optional: apikey identity, magickmind memory, magickmind pipeline
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
+
+# Optional: sqlite memory
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+# Home directory resolution (for local persona provider)
+dirs = "6"
+
+# Optional: llm-client
+async-openai = { version = "0.33", features = ["chat-completion", "audio"], optional = true }
+
+[dev-dependencies]
+mockall = "0.13"
+tokio = { version = "1", features = ["test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+dirs = "6"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
