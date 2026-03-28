@@ -1,12 +1,12 @@
 use async_openai::{
+    Client,
     config::OpenAIConfig,
     types::audio::{CreateSpeechRequestArgs, SpeechModel, Voice},
-    Client,
 };
 use async_trait::async_trait;
 
-use crate::error::Result;
 use crate::MindroidError;
+use crate::error::Result;
 
 use super::TtsProvider;
 

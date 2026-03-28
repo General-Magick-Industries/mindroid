@@ -95,7 +95,11 @@ impl ContextPreparer {
             let name = self.providers[i].name();
             match result {
                 Ok(msgs) => {
-                    info!("ContextProvider '{}' returned {} message(s)", name, msgs.len());
+                    info!(
+                        "ContextProvider '{}' returned {} message(s)",
+                        name,
+                        msgs.len()
+                    );
                     messages.extend(msgs);
                 }
                 Err(e) => {

@@ -52,7 +52,10 @@ impl CoordinationGate {
     ///   "don't respond to the immediate reaction, but allow re-engagement after
     ///   the conversation progresses."
     pub fn new(history: Arc<Vec<LlmMessage>>, min_new_messages: usize) -> Self {
-        Self { history, min_new_messages }
+        Self {
+            history,
+            min_new_messages,
+        }
     }
 }
 

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::error::{MindroidError, Result};
 use crate::auth::Auth;
+use crate::error::{MindroidError, Result};
 
 use super::models::{EffectivePersonalityResponse, PersonaSchema};
 use super::provider::PersonaProvider;
@@ -129,11 +129,7 @@ impl MagickmindPersonaClient {
     /// Invalidate the cached effective personality on the server.
     ///
     /// `POST /v1/runtime/invalidate-cache`
-    pub async fn invalidate_cache(
-        &self,
-        persona_id: &str,
-        user_id: Option<&str>,
-    ) -> Result<()> {
+    pub async fn invalidate_cache(&self, persona_id: &str, user_id: Option<&str>) -> Result<()> {
         let url = format!("{}/v1/runtime/invalidate-cache", self.base_url);
         let headers = self.auth_headers().await?;
         let body = InvalidateCacheRequest {

@@ -136,9 +136,10 @@ impl Auth for ApiKeyAuth {
         {
             let state = self.state.read().await;
             if let Some(ref s) = *state
-                && s.expires_at > Instant::now() + Duration::from_secs(10) {
-                    return Ok(s.access_token.clone());
-                }
+                && s.expires_at > Instant::now() + Duration::from_secs(10)
+            {
+                return Ok(s.access_token.clone());
+            }
         }
 
         // Need to login or refresh — take write lock
@@ -146,9 +147,10 @@ impl Auth for ApiKeyAuth {
 
         // Re-check after acquiring write lock (another task may have refreshed)
         if let Some(ref s) = *state
-            && s.expires_at > Instant::now() + Duration::from_secs(10) {
-                return Ok(s.access_token.clone());
-            }
+            && s.expires_at > Instant::now() + Duration::from_secs(10)
+        {
+            return Ok(s.access_token.clone());
+        }
 
         let auth = if let Some(ref s) = *state {
             // Refresh existing session
@@ -165,15 +167,19 @@ impl Auth for ApiKeyAuth {
 
     async fn get_auth_headers(&self) -> Result<Vec<(String, String)>> {
         let token = self.get_token().await?;
-        Ok(vec![("Authorization".to_string(), format!("Bearer {token}"))])
+        Ok(vec![(
+            "Authorization".to_string(),
+            format!("Bearer {token}"),
+        )])
     }
 
     fn is_authenticated(&self) -> bool {
         // Non-async: use try_read to avoid blocking
         if let Ok(state) = self.state.try_read()
-            && let Some(ref s) = *state {
-                return s.expires_at > Instant::now();
-            }
+            && let Some(ref s) = *state
+        {
+            return s.expires_at > Instant::now();
+        }
         false
     }
 

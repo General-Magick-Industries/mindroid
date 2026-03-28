@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::error::Result;
 use crate::MindroidError;
+use crate::error::Result;
 
 use super::SttProvider;
 

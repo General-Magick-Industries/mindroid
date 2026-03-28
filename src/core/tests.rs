@@ -25,10 +25,19 @@ mod model_tests {
     #[test]
     fn stream_event_serde_roundtrip() {
         let events = vec![
-            StreamEvent::Thinking { content: "hmm".into() },
-            StreamEvent::Chunk { content: "hello".into() },
-            StreamEvent::Complete { content: "done".into(), usage: None },
-            StreamEvent::Error { message: "oops".into() },
+            StreamEvent::Thinking {
+                content: "hmm".into(),
+            },
+            StreamEvent::Chunk {
+                content: "hello".into(),
+            },
+            StreamEvent::Complete {
+                content: "done".into(),
+                usage: None,
+            },
+            StreamEvent::Error {
+                message: "oops".into(),
+            },
             StreamEvent::Heartbeat,
         ];
         for event in events {
@@ -121,9 +130,18 @@ mod pipeline_tests {
     #[tokio::test]
     async fn pipeline_stages_run_in_order() {
         let pipeline = Pipeline::new()
-            .add_stage(AppendStage { name: "a".into(), value: "A".into() })
-            .add_stage(AppendStage { name: "b".into(), value: "B".into() })
-            .add_stage(AppendStage { name: "c".into(), value: "C".into() });
+            .add_stage(AppendStage {
+                name: "a".into(),
+                value: "A".into(),
+            })
+            .add_stage(AppendStage {
+                name: "b".into(),
+                value: "B".into(),
+            })
+            .add_stage(AppendStage {
+                name: "c".into(),
+                value: "C".into(),
+            });
 
         let msg = Message::new("test", "user", "ch");
         let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -135,7 +153,9 @@ mod pipeline_tests {
 
     #[async_trait]
     impl PipelineStage for FailStage {
-        fn name(&self) -> &str { "fail" }
+        fn name(&self) -> &str {
+            "fail"
+        }
         async fn process(&self, _ctx: &mut PipelineContext) -> Result<()> {
             Err(crate::error::MindroidError::Pipeline {
                 stage: "fail".into(),
@@ -148,9 +168,15 @@ mod pipeline_tests {
     #[tokio::test]
     async fn pipeline_halts_on_error() {
         let pipeline = Pipeline::new()
-            .add_stage(AppendStage { name: "a".into(), value: "A".into() })
+            .add_stage(AppendStage {
+                name: "a".into(),
+                value: "A".into(),
+            })
             .add_stage(FailStage)
-            .add_stage(AppendStage { name: "c".into(), value: "C".into() });
+            .add_stage(AppendStage {
+                name: "c".into(),
+                value: "C".into(),
+            });
 
         let msg = Message::new("test", "user", "ch");
         let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -166,15 +192,16 @@ mod pipeline_tests {
 
         #[async_trait]
         impl PipelineStage for SetResponse {
-            fn name(&self) -> &str { "set_response" }
+            fn name(&self) -> &str {
+                "set_response"
+            }
             async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
                 ctx.response = Some("hello!".into());
                 Ok(())
             }
         }
 
-        let pipeline = Pipeline::new()
-            .add_stage(SetResponse);
+        let pipeline = Pipeline::new().add_stage(SetResponse);
 
         let msg = Message::new("test", "user", "ch");
         let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -187,7 +214,9 @@ mod pipeline_tests {
 
     #[async_trait]
     impl PipelineStage for HaltStage {
-        fn name(&self) -> &str { "halt" }
+        fn name(&self) -> &str {
+            "halt"
+        }
         async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
             ctx.halted = true;
             Ok(())
@@ -199,7 +228,9 @@ mod pipeline_tests {
 
     #[async_trait]
     impl PipelineStage for HaltWithResponseStage {
-        fn name(&self) -> &str { "halt_with_response" }
+        fn name(&self) -> &str {
+            "halt_with_response"
+        }
         async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
             ctx.response = Some("canned".into());
             ctx.halted = true;
@@ -214,7 +245,9 @@ mod pipeline_tests {
 
     #[async_trait]
     impl PipelineStage for SpyStage {
-        fn name(&self) -> &str { "spy" }
+        fn name(&self) -> &str {
+            "spy"
+        }
         async fn process(&self, _ctx: &mut PipelineContext) -> Result<()> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -223,9 +256,10 @@ mod pipeline_tests {
 
     #[tokio::test]
     async fn pipeline_halts_when_flagged() {
-        let pipeline = Pipeline::new()
-            .add_stage(HaltStage)
-            .add_stage(AppendStage { name: "after".into(), value: "X".into() });
+        let pipeline = Pipeline::new().add_stage(HaltStage).add_stage(AppendStage {
+            name: "after".into(),
+            value: "X".into(),
+        });
 
         let msg = Message::new("test", "user", "ch");
         let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -237,7 +271,10 @@ mod pipeline_tests {
     async fn pipeline_halt_with_response() {
         let pipeline = Pipeline::new()
             .add_stage(HaltWithResponseStage)
-            .add_stage(AppendStage { name: "after".into(), value: "X".into() });
+            .add_stage(AppendStage {
+                name: "after".into(),
+                value: "X".into(),
+            });
 
         let msg = Message::new("test", "user", "ch");
         let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -250,9 +287,14 @@ mod pipeline_tests {
         let spy_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let pipeline = Pipeline::new()
-            .add_stage(AppendStage { name: "first".into(), value: "A".into() })
+            .add_stage(AppendStage {
+                name: "first".into(),
+                value: "A".into(),
+            })
             .add_stage(HaltStage)
-            .add_stage(SpyStage { called: spy_called.clone() });
+            .add_stage(SpyStage {
+                called: spy_called.clone(),
+            });
 
         let msg = Message::new("test", "user", "ch");
         let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -360,7 +402,10 @@ compute_power = 80
         let config = MindroidConfig::from_toml_str(toml_str).unwrap();
         let llm = config.llm("main").unwrap();
 
-        assert_eq!(llm.custom_headers.get("X-Compute-Power"), Some(&"80".to_string()));
+        assert_eq!(
+            llm.custom_headers.get("X-Compute-Power"),
+            Some(&"80".to_string())
+        );
     }
 
     #[test]
@@ -411,7 +456,10 @@ base_url = "http://localhost:11434"
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("nonexistent"), "error should mention the name: {err}");
+        assert!(
+            err.contains("nonexistent"),
+            "error should mention the name: {err}"
+        );
     }
 
     #[test]
@@ -426,7 +474,10 @@ model = "smallthinker"
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("missing"), "error should mention the provider: {err}");
+        assert!(
+            err.contains("missing"),
+            "error should mention the provider: {err}"
+        );
     }
 
     #[test]
@@ -443,7 +494,10 @@ model = "test"
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("base_url"), "error should mention base_url: {err}");
+        assert!(
+            err.contains("base_url"),
+            "error should mention base_url: {err}"
+        );
     }
 
     #[test]
@@ -486,8 +540,14 @@ compute_power = 90
         // Different model and compute power
         assert_eq!(fast.default_model, Some("gpt-4o-mini".into()));
         assert_eq!(smart.default_model, Some("gpt-4".into()));
-        assert_eq!(fast.custom_headers.get("X-Compute-Power"), Some(&"20".to_string()));
-        assert_eq!(smart.custom_headers.get("X-Compute-Power"), Some(&"90".to_string()));
+        assert_eq!(
+            fast.custom_headers.get("X-Compute-Power"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            smart.custom_headers.get("X-Compute-Power"),
+            Some(&"90".to_string())
+        );
     }
 }
 

@@ -29,10 +29,10 @@
 
 use std::sync::Arc;
 
+use mindroid::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use mindroid::{
     GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PostProcessor, Runtime,
 };
-use mindroid::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -94,10 +94,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let response = pctx.response.as_deref().unwrap_or("").trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send response: {e}");
-                    }
+                if !response.is_empty()
+                    && let Err(e) = ctx.respond(&response).await
+                {
+                    tracing::error!("Failed to send response: {e}");
                 }
             }
         })

@@ -49,7 +49,7 @@ impl PersonaCache {
         // Entry is expired: upgrade to write lock and remove it.
         let mut entries = self.entries.write().await;
         // Re-check under write lock in case another task refreshed it.
-        if entries.get(&key).map_or(false, |e| e.expires_at > now) {
+        if entries.get(&key).is_some_and(|e| e.expires_at > now) {
             return Some(entries[&key].response.clone());
         }
         entries.remove(&key);

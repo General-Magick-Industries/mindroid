@@ -5,9 +5,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
-use crate::{
-    ChannelType, Memory, Message, MessageType, MindroidError, Result, SenderType,
-};
+use crate::{ChannelType, Memory, Message, MessageType, MindroidError, Result, SenderType};
 
 pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
@@ -15,7 +13,8 @@ pub struct SqliteMemory {
 
 impl SqliteMemory {
     pub fn new(path: &str) -> Result<Self> {
-        let conn = Connection::open(path).map_err(|e| MindroidError::Other(anyhow::Error::from(e)))?;
+        let conn =
+            Connection::open(path).map_err(|e| MindroidError::Other(anyhow::Error::from(e)))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -76,9 +75,9 @@ impl Memory for SqliteMemory {
         let channel_id = channel_id.to_string();
 
         let rows = tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                MindroidError::Other(anyhow::anyhow!("Mutex poisoned: {}", e))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| MindroidError::Other(anyhow::anyhow!("Mutex poisoned: {}", e)))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, channel_id, sender_id, content, reply_to_id, timestamp \
@@ -107,23 +106,25 @@ impl Memory for SqliteMemory {
 
         let mut messages: Vec<Message> = rows
             .into_iter()
-            .map(|(id, channel_id, sender_id, content, _reply_to_id, timestamp)| {
-                let ts = chrono::DateTime::parse_from_rfc3339(&timestamp)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                Message {
-                    id,
-                    content,
-                    sender_id,
-                    sender_type: SenderType::default(),
-                    channel_id,
-                    channel_type: ChannelType::default(),
-                    message_type: MessageType::default(),
-                    timestamp: ts,
-                    metadata: std::collections::HashMap::new(),
-                    platform: None,
-                }
-            })
+            .map(
+                |(id, channel_id, sender_id, content, _reply_to_id, timestamp)| {
+                    let ts = chrono::DateTime::parse_from_rfc3339(&timestamp)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now());
+                    Message {
+                        id,
+                        content,
+                        sender_id,
+                        sender_type: SenderType::default(),
+                        channel_id,
+                        channel_type: ChannelType::default(),
+                        message_type: MessageType::default(),
+                        timestamp: ts,
+                        metadata: std::collections::HashMap::new(),
+                        platform: None,
+                    }
+                },
+            )
             .collect();
 
         messages.reverse();
@@ -135,9 +136,9 @@ impl Memory for SqliteMemory {
         let channel_id = channel_id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                MindroidError::Other(anyhow::anyhow!("Mutex poisoned: {}", e))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| MindroidError::Other(anyhow::anyhow!("Mutex poisoned: {}", e)))?;
             conn.execute(
                 "DELETE FROM messages WHERE channel_id = ?1",
                 rusqlite::params![channel_id],
@@ -175,8 +176,12 @@ mod tests {
     #[tokio::test]
     async fn clear_history() {
         let mem = SqliteMemory::new(":memory:").unwrap();
-        mem.save_message("chan1", "user1", "msg1", None).await.unwrap();
-        mem.save_message("chan1", "user1", "msg2", None).await.unwrap();
+        mem.save_message("chan1", "user1", "msg1", None)
+            .await
+            .unwrap();
+        mem.save_message("chan1", "user1", "msg2", None)
+            .await
+            .unwrap();
 
         mem.clear_history("chan1").await.unwrap();
 
@@ -187,11 +192,17 @@ mod tests {
     #[tokio::test]
     async fn history_ordering() {
         let mem = SqliteMemory::new(":memory:").unwrap();
-        mem.save_message("chan1", "user1", "first", None).await.unwrap();
+        mem.save_message("chan1", "user1", "first", None)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        mem.save_message("chan1", "user1", "second", None).await.unwrap();
+        mem.save_message("chan1", "user1", "second", None)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        mem.save_message("chan1", "user1", "third", None).await.unwrap();
+        mem.save_message("chan1", "user1", "third", None)
+            .await
+            .unwrap();
 
         let history = mem.get_history("chan1", 10).await.unwrap();
         assert_eq!(history.len(), 3);

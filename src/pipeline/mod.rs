@@ -1,12 +1,12 @@
 pub mod context;
 pub mod coordination;
 pub mod extensions;
-pub mod stages;
 pub mod presets;
+pub mod stages;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
@@ -94,7 +94,6 @@ pub trait StreamingStage: PipelineStage {
     fn stream<'a>(&'a self, ctx: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent>;
 }
 
-
 enum StageEntry {
     Normal(Box<dyn PipelineStage>),
     Streaming(Box<dyn StreamingStage>),
@@ -130,7 +129,7 @@ impl Pipeline {
         self
     }
 
-/// Run the pipeline to completion (non-streaming). Returns the final response.
+    /// Run the pipeline to completion (non-streaming). Returns the final response.
     ///
     /// For the streaming stage, calls its `PipelineStage::process()` fallback
     /// rather than streaming, which should collect the full response into
@@ -143,25 +142,57 @@ impl Pipeline {
             match entry {
                 StageEntry::Normal(stage) => {
                     let name = stage.name();
-                    debug!("Pipeline stage [{}/{}] '{}' starting", i + 1, self.stages.len(), name);
+                    debug!(
+                        "Pipeline stage [{}/{}] '{}' starting",
+                        i + 1,
+                        self.stages.len(),
+                        name
+                    );
                     let start = Instant::now();
                     stage.process(ctx).await?;
                     let elapsed = start.elapsed();
-                    info!("Pipeline stage [{}/{}] '{}' completed in {:.2?}", i + 1, self.stages.len(), name, elapsed);
+                    info!(
+                        "Pipeline stage [{}/{}] '{}' completed in {:.2?}",
+                        i + 1,
+                        self.stages.len(),
+                        name,
+                        elapsed
+                    );
                     if ctx.halted {
-                        info!("Pipeline halted by stage [{}/{}] '{}'", i + 1, self.stages.len(), name);
+                        info!(
+                            "Pipeline halted by stage [{}/{}] '{}'",
+                            i + 1,
+                            self.stages.len(),
+                            name
+                        );
                         break;
                     }
                 }
                 StageEntry::Streaming(stage) => {
                     let name = stage.name();
-                    debug!("Pipeline stage [{}/{}] '{}' (streaming fallback) starting", i + 1, self.stages.len(), name);
+                    debug!(
+                        "Pipeline stage [{}/{}] '{}' (streaming fallback) starting",
+                        i + 1,
+                        self.stages.len(),
+                        name
+                    );
                     let start = Instant::now();
                     stage.process(ctx).await?;
                     let elapsed = start.elapsed();
-                    info!("Pipeline stage [{}/{}] '{}' (streaming fallback) completed in {:.2?}", i + 1, self.stages.len(), name, elapsed);
+                    info!(
+                        "Pipeline stage [{}/{}] '{}' (streaming fallback) completed in {:.2?}",
+                        i + 1,
+                        self.stages.len(),
+                        name,
+                        elapsed
+                    );
                     if ctx.halted {
-                        info!("Pipeline halted by stage [{}/{}] '{}'", i + 1, self.stages.len(), name);
+                        info!(
+                            "Pipeline halted by stage [{}/{}] '{}'",
+                            i + 1,
+                            self.stages.len(),
+                            name
+                        );
                         break;
                     }
                 }
@@ -180,10 +211,7 @@ impl Pipeline {
     /// Post-streaming stages run after the stream completes (their effects
     /// are signaled via a final `Complete` event).
     #[allow(clippy::collapsible_if)]
-    pub fn run_streaming<'a>(
-        &'a self,
-        ctx: &'a mut PipelineContext,
-    ) -> BoxStream<'a, StreamEvent> {
+    pub fn run_streaming<'a>(&'a self, ctx: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent> {
         let stream = async_stream::stream! {
             let pipeline_start = Instant::now();
             let total_stages = self.stages.len();
@@ -281,7 +309,6 @@ impl Pipeline {
 
         Box::pin(stream)
     }
-
 }
 
 impl Default for Pipeline {

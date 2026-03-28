@@ -6,9 +6,9 @@
 //! Run with: `cargo run --example custom_pipeline --features stdio,static-auth`
 
 use async_trait::async_trait;
-use mindroid::{Pipeline, PipelineContext, PipelineStage, Result, Runtime};
 use mindroid::auth::static_id::StaticAuth;
 use mindroid::transport::stdio::StdioTransport;
+use mindroid::{Pipeline, PipelineContext, PipelineStage, Result, Runtime};
 
 /// A custom stage that echoes the message content in uppercase.
 struct UppercaseEcho;
@@ -46,16 +46,12 @@ impl PipelineStage for Wrapper {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let pipeline = Pipeline::new()
-        .add_stage(UppercaseEcho)
-        .add_stage(Wrapper {
-            prefix: ">>> ".into(),
-            suffix: " <<<".into(),
-        });
+    let pipeline = Pipeline::new().add_stage(UppercaseEcho).add_stage(Wrapper {
+        prefix: ">>> ".into(),
+        suffix: " <<<".into(),
+    });
 
     let mut runtime = Runtime::builder()
         .transport(StdioTransport::new())

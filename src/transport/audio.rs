@@ -1,19 +1,19 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample, Stream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use voice_activity_detector::VoiceActivityDetector;
 
+use crate::MindroidError;
 use crate::error::Result;
 use crate::models::{ChannelType, Message, MessageType, Response, SenderType};
 use crate::transport::Transport;
-use crate::MindroidError;
 
 // ─── VAD backend ──────────────────────────────────────────────────────────────
 
@@ -151,10 +151,12 @@ impl Transport for AudioTransport {
         tokio::task::spawn_blocking(move || {
             let result = (|| -> Result<()> {
                 let host = cpal::default_host();
-                let device = host.default_input_device().ok_or_else(|| MindroidError::Transport {
-                    message: "No default audio input device found".into(),
-                    source: None,
-                })?;
+                let device =
+                    host.default_input_device()
+                        .ok_or_else(|| MindroidError::Transport {
+                            message: "No default audio input device found".into(),
+                            source: None,
+                        })?;
 
                 let stream_config = preferred_input_config(&device)?;
                 let sample_rate = stream_config.sample_rate().0;
@@ -221,7 +223,9 @@ impl Transport for AudioTransport {
                                  silence probability 0.0. Add a real pv_cobra dep to enable \
                                  Cobra processing."
                             );
-                            Box::new(CobraProcessor { _access_key: access_key.clone() })
+                            Box::new(CobraProcessor {
+                                _access_key: access_key.clone(),
+                            })
                         };
                         #[cfg(not(feature = "transport-audio"))]
                         let proc: Box<dyn VadProcessor> = {
@@ -318,16 +322,17 @@ impl VadProcessor for CobraProcessor {
 /// Falls back to the device default if 16 kHz is not available.
 fn preferred_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
     if let Ok(mut configs) = device.supported_input_configs()
-        && let Some(range) = configs.find(|c| {
-            c.min_sample_rate().0 <= 16_000 && c.max_sample_rate().0 >= 16_000
-        })
+        && let Some(range) =
+            configs.find(|c| c.min_sample_rate().0 <= 16_000 && c.max_sample_rate().0 >= 16_000)
     {
         return Ok(range.with_sample_rate(cpal::SampleRate(16_000)));
     }
-    device.default_input_config().map_err(|e| MindroidError::Transport {
-        message: format!("No supported input config: {e}"),
-        source: None,
-    })
+    device
+        .default_input_config()
+        .map_err(|e| MindroidError::Transport {
+            message: format!("No supported input config: {e}"),
+            source: None,
+        })
 }
 
 /// Build a cpal input stream.
@@ -508,7 +513,11 @@ fn vad_loop(
                                 let dur = utterance_buf.len() as f32 / sample_rate as f32;
                                 debug!(
                                     "AudioTransport: utterance complete ({dur:.1}s, reason={})",
-                                    if max_reached { "max_duration" } else { "silence" }
+                                    if max_reached {
+                                        "max_duration"
+                                    } else {
+                                        "silence"
+                                    }
                                 );
                                 let wav = encode_wav(&utterance_buf, sample_rate);
                                 let msg = build_message(wav, &agent_id);

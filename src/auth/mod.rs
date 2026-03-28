@@ -1,6 +1,6 @@
-pub mod static_id;
 #[cfg(feature = "apikey")]
 pub mod apikey;
+pub mod static_id;
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -37,7 +37,12 @@ impl<T: Auth> Auth for Arc<T> {
     }
 }
 
-#[cfg(any(feature = "apikey", feature = "persistence", feature = "llm-hosted", feature = "persona"))]
+#[cfg(any(
+    feature = "apikey",
+    feature = "persistence",
+    feature = "llm-hosted",
+    feature = "persona"
+))]
 pub async fn build_auth_header_map(auth: &dyn Auth) -> crate::Result<reqwest::header::HeaderMap> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let headers = auth.get_auth_headers().await?;

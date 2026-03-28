@@ -3,11 +3,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use super::message::TransportSender;
 use crate::config::AgentConfig;
 use crate::error::Result;
 use crate::models::Response;
 use crate::pipeline::Pipeline;
-use super::message::TransportSender;
 
 /// Context passed to a routine's `act()` call each tick.
 pub struct RoutineContext {
@@ -41,8 +41,10 @@ pub trait Routine: Send + Sync + 'static {
     async fn act(&self, ctx: RoutineContext, data: String) -> Result<()>;
 }
 
-pub(crate) type PollFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send>> + Send + Sync>;
-pub(crate) type ActFn = Box<dyn Fn(RoutineContext, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub(crate) type PollFn =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send>> + Send + Sync>;
+pub(crate) type ActFn =
+    Box<dyn Fn(RoutineContext, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub(crate) struct FnRoutine {
     pub(crate) name: String,
@@ -75,8 +77,12 @@ impl FnRoutine {
 
 #[async_trait]
 impl Routine for FnRoutine {
-    fn name(&self) -> &str { &self.name }
-    fn interval(&self) -> std::time::Duration { self.interval }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn interval(&self) -> std::time::Duration {
+        self.interval
+    }
     async fn poll(&self) -> Result<Option<String>> {
         (self.poll_fn)().await
     }

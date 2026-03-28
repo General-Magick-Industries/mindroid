@@ -1,16 +1,14 @@
-use std::collections::HashMap;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::{
-    Auth, LlmMessage, MindroidError, Pipeline, PipelineContext, PipelineStage, Result,
-};
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
+use crate::{Auth, LlmMessage, MindroidError, Pipeline, PipelineContext, PipelineStage, Result};
 
 // ── Magickmind API types ──────────────────────────────────────────────────────
 
@@ -120,7 +118,9 @@ impl MagickmindClient {
         let body = PrepareContextRequest {
             participant_id,
             chat_history: if config.include_chat_history {
-                Some(ChatHistoryParams { limit: config.chat_history_limit })
+                Some(ChatHistoryParams {
+                    limit: config.chat_history_limit,
+                })
             } else {
                 None
             },
@@ -168,11 +168,10 @@ impl MagickmindClient {
             });
         }
 
-        let parsed: PrepareContextResponse =
-            resp.json().await.map_err(|e| MindroidError::Api {
-                message: format!("Failed to parse Magickmind prepare_context response: {e}"),
-                status_code: None,
-            })?;
+        let parsed: PrepareContextResponse = resp.json().await.map_err(|e| MindroidError::Api {
+            message: format!("Failed to parse Magickmind prepare_context response: {e}"),
+            status_code: None,
+        })?;
 
         Ok(convert_context_response(parsed, exclude_sender))
     }
@@ -279,7 +278,11 @@ impl MagickmindContext {
     }
 
     pub fn with_config(client: Arc<MagickmindClient>, config: MagickmindContextConfig) -> Self {
-        Self { client, config, exclude_self_id: None }
+        Self {
+            client,
+            config,
+            exclude_self_id: None,
+        }
     }
 
     /// Identify the agent so its previous messages get the correct `assistant` role.
@@ -319,7 +322,10 @@ impl ContextProvider for MagickmindContext {
     }
 }
 
-fn convert_context_response(resp: PrepareContextResponse, self_id: Option<&str>) -> Vec<LlmMessage> {
+fn convert_context_response(
+    resp: PrepareContextResponse,
+    self_id: Option<&str>,
+) -> Vec<LlmMessage> {
     let mut messages = Vec::new();
 
     // Chat history: split into proper roles so the LLM recognizes its own responses.
@@ -332,7 +338,10 @@ fn convert_context_response(resp: PrepareContextResponse, self_id: Option<&str>)
             continue;
         }
         // Other participants → user role with sender attribution
-        messages.push(LlmMessage::user(format!("[{}]: {}", item.sent_by_user_id, item.content)));
+        messages.push(LlmMessage::user(format!(
+            "[{}]: {}",
+            item.sent_by_user_id, item.content
+        )));
     }
 
     // Knowledge and documents → system context
@@ -344,11 +353,17 @@ fn convert_context_response(resp: PrepareContextResponse, self_id: Option<&str>)
 
     if !resp.corpus.is_empty() {
         let corpus_text: Vec<&str> = resp.corpus.iter().map(|c| c.content.as_str()).collect();
-        context_parts.push(format!("Reference documents:\n{}", corpus_text.join("\n---\n")));
+        context_parts.push(format!(
+            "Reference documents:\n{}",
+            corpus_text.join("\n---\n")
+        ));
     }
 
     if !context_parts.is_empty() {
-        messages.push(LlmMessage::system(format!("Context:\n\n{}", context_parts.join("\n\n"))));
+        messages.push(LlmMessage::system(format!(
+            "Context:\n\n{}",
+            context_parts.join("\n\n")
+        )));
     }
 
     messages
@@ -382,7 +397,12 @@ impl PipelineStage for MagickmindPersistence {
         let content = ctx.response.as_deref().unwrap_or("").to_string();
 
         self.magickmind
-            .save_message(mindspace_id, &ctx.agent_config.agent_id, &content, Some(&ctx.message.id))
+            .save_message(
+                mindspace_id,
+                &ctx.agent_config.agent_id,
+                &content,
+                Some(&ctx.message.id),
+            )
             .await
             .map_err(|e| MindroidError::Pipeline {
                 stage: "MagickmindPersistence".into(),

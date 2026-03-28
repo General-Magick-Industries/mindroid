@@ -1,6 +1,6 @@
-use crate::{Pipeline};
+use crate::Pipeline;
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
-use crate::pipeline::stages::{SimpleContextBuilder, PostProcessor, GenericLlmProcessor};
+use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor, SimpleContextBuilder};
 
 pub fn ollama_pipeline(base_url: &str, model: &str) -> crate::Result<Pipeline> {
     let mut config = LlmClientConfig::new(format!("{base_url}/v1"));

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -14,7 +14,10 @@ use uuid::Uuid;
 use crate::{Auth, Message, MindroidError, Response, Result, Transport};
 
 fn transport_err(msg: impl Into<String>) -> MindroidError {
-    MindroidError::Transport { message: msg.into(), source: None }
+    MindroidError::Transport {
+        message: msg.into(),
+        source: None,
+    }
 }
 
 /// Extract the `sub` claim from a JWT without verifying the signature.
@@ -25,7 +28,9 @@ fn extract_jwt_sub(token: &str) -> Option<String> {
     }
     let payload = parts[1];
     // JWT uses base64url without padding
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     json.get("sub")?.as_str().map(|s| s.to_string())
 }
@@ -36,16 +41,12 @@ struct State {
 }
 
 type WsSink = futures::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
 
 type WsStream = futures::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
 /// Result of a successful Centrifugo handshake.
@@ -80,9 +81,8 @@ impl CentrifugoTransport {
 async fn handshake(ws_url: &str, agent_id: &str, identity: &dyn Auth) -> Result<HandshakeResult> {
     let token = identity.get_token().await?;
 
-    let service_user_id = extract_jwt_sub(&token).ok_or_else(|| {
-        transport_err("Failed to extract sub claim from JWT")
-    })?;
+    let service_user_id = extract_jwt_sub(&token)
+        .ok_or_else(|| transport_err("Failed to extract sub claim from JWT"))?;
 
     let url = if ws_url.contains('?') {
         format!("{}&cf_ws_frame_ping_pong=true", ws_url)
@@ -91,12 +91,12 @@ async fn handshake(ws_url: &str, agent_id: &str, identity: &dyn Auth) -> Result<
     };
 
     debug!("Connecting to Centrifugo at {}", url);
-    let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
-        MindroidError::Transport {
+    let (ws_stream, _) = connect_async(&url)
+        .await
+        .map_err(|e| MindroidError::Transport {
             message: format!("WebSocket connection failed: {e}"),
             source: Some(Box::new(e)),
-        }
-    })?;
+        })?;
 
     let (mut sink, mut stream) = ws_stream.split();
 
@@ -128,8 +128,8 @@ async fn handshake(ws_url: &str, agent_id: &str, identity: &dyn Auth) -> Result<
 
     match &reply {
         WsMessage::Text(text) => {
-            let val: serde_json::Value =
-                serde_json::from_str(text).map_err(|e| transport_err(format!("Invalid connect reply JSON: {e}")))?;
+            let val: serde_json::Value = serde_json::from_str(text)
+                .map_err(|e| transport_err(format!("Invalid connect reply JSON: {e}")))?;
             if val.get("error").is_some() {
                 return Err(transport_err(format!("Centrifugo connect error: {val}")));
             }
@@ -144,7 +144,9 @@ async fn handshake(ws_url: &str, agent_id: &str, identity: &dyn Auth) -> Result<
             debug!("Centrifugo connected: {val} (ttl={ttl:?})");
         }
         other => {
-            return Err(transport_err(format!("Unexpected connect reply frame: {other:?}")));
+            return Err(transport_err(format!(
+                "Unexpected connect reply frame: {other:?}"
+            )));
         }
     }
 
@@ -183,11 +185,18 @@ async fn handshake(ws_url: &str, agent_id: &str, identity: &dyn Auth) -> Result<
             info!("Subscribed to channel: {channel}");
         }
         other => {
-            return Err(transport_err(format!("Unexpected subscribe reply frame: {other:?}")));
+            return Err(transport_err(format!(
+                "Unexpected subscribe reply frame: {other:?}"
+            )));
         }
     }
 
-    Ok(HandshakeResult { sink, stream, channel, ttl })
+    Ok(HandshakeResult {
+        sink,
+        stream,
+        channel,
+        ttl,
+    })
 }
 
 /// Parse a Centrifugo push frame into a `Message`.
@@ -202,7 +211,8 @@ fn parse_push(text: &str) -> Option<Message> {
     // The actual message fields may be nested inside outer.data or outer.payload.
     // magickmind publishes a WsMessage envelope: {"type":"chat_message","payload":{...}}
     // so we try "payload" as well as the legacy "data" key.
-    let inner = outer.get("data")
+    let inner = outer
+        .get("data")
         .or_else(|| outer.get("payload"))
         .unwrap_or(outer);
 
@@ -279,104 +289,109 @@ impl Transport for CentrifugoTransport {
         let state = Arc::clone(&self.state);
 
         tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(1);
-        const MAX_BACKOFF: Duration = Duration::from_secs(30);
-        let mut cmd_id: u32 = 3; // 1=connect, 2=subscribe, 3+ for refresh
+            let mut backoff = Duration::from_secs(1);
+            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+            let mut cmd_id: u32 = 3; // 1=connect, 2=subscribe, 3+ for refresh
 
-        loop {
-            match handshake(&ws_url, &agent_id, identity.as_ref()).await {
-                Ok(HandshakeResult { mut sink, mut stream, ttl, .. }) => {
-                    state.write().await.connected = true;
-                    backoff = Duration::from_secs(1); // reset on success
+            loop {
+                match handshake(&ws_url, &agent_id, identity.as_ref()).await {
+                    Ok(HandshakeResult {
+                        mut sink,
+                        mut stream,
+                        ttl,
+                        ..
+                    }) => {
+                        state.write().await.connected = true;
+                        backoff = Duration::from_secs(1); // reset on success
 
-                    info!("Centrifugo listen loop started");
+                        info!("Centrifugo listen loop started");
 
-                    // Schedule token refresh at 80% of TTL
-                    let refresh_duration = ttl
-                        .map(|t| Duration::from_secs(t * 80 / 100))
-                        .unwrap_or(Duration::from_secs(86400)); // no expiry: sleep forever
-                    let mut refresh_timer = tokio::time::interval(refresh_duration);
-                    refresh_timer.tick().await; // consume the immediate first tick
+                        // Schedule token refresh at 80% of TTL
+                        let refresh_duration = ttl
+                            .map(|t| Duration::from_secs(t * 80 / 100))
+                            .unwrap_or(Duration::from_secs(86400)); // no expiry: sleep forever
+                        let mut refresh_timer = tokio::time::interval(refresh_duration);
+                        refresh_timer.tick().await; // consume the immediate first tick
 
-                    loop {
-                        tokio::select! {
-                            frame = stream.next() => {
-                                match frame {
-                                    Some(Ok(WsMessage::Text(text))) => {
-                                        // Check if this is a refresh reply with a new TTL
-                                        if let Some(new_ttl) = parse_refresh_ttl(&text) {
-                                            let new_duration = Duration::from_secs(new_ttl * 80 / 100);
-                                            refresh_timer = tokio::time::interval(new_duration);
-                                            refresh_timer.tick().await; // consume immediate tick
-                                            debug!("Token refreshed, next refresh in {}s", new_duration.as_secs());
-                                            continue;
-                                        }
-
-                                        if let Some(message) = parse_push(&text) {
-                                            if tx.send(message).await.is_err() {
-                                                warn!("Message receiver dropped, stopping listen loop");
-                                                state.write().await.connected = false;
-                                                return;
+                        loop {
+                            tokio::select! {
+                                frame = stream.next() => {
+                                    match frame {
+                                        Some(Ok(WsMessage::Text(text))) => {
+                                            // Check if this is a refresh reply with a new TTL
+                                            if let Some(new_ttl) = parse_refresh_ttl(&text) {
+                                                let new_duration = Duration::from_secs(new_ttl * 80 / 100);
+                                                refresh_timer = tokio::time::interval(new_duration);
+                                                refresh_timer.tick().await; // consume immediate tick
+                                                debug!("Token refreshed, next refresh in {}s", new_duration.as_secs());
+                                                continue;
                                             }
-                                        } else {
-                                            debug!("Ignoring non-push frame: {text}");
-                                        }
-                                    }
-                                    Some(Ok(WsMessage::Close(_))) => {
-                                        info!("Centrifugo WebSocket closed");
-                                        break;
-                                    }
-                                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
-                                    Some(Ok(other)) => {
-                                        debug!("Ignoring WebSocket frame: {other:?}");
-                                    }
-                                    Some(Err(e)) => {
-                                        error!("WebSocket read error: {e}");
-                                        break;
-                                    }
-                                    None => {
-                                        info!("WebSocket stream ended");
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = refresh_timer.tick() => {
-                                // Time to refresh the token
-                                match identity.get_token().await {
-                                    Ok(new_token) => {
-                                        cmd_id += 1;
-                                        let refresh_cmd = serde_json::json!({
-                                            "id": cmd_id,
-                                            "refresh": {
-                                                "token": new_token
+
+                                            if let Some(message) = parse_push(&text) {
+                                                if tx.send(message).await.is_err() {
+                                                    warn!("Message receiver dropped, stopping listen loop");
+                                                    state.write().await.connected = false;
+                                                    return;
+                                                }
+                                            } else {
+                                                debug!("Ignoring non-push frame: {text}");
                                             }
-                                        });
-                                        if let Err(e) = sink.send(WsMessage::Text(refresh_cmd.to_string())).await {
-                                            error!("Failed to send refresh command: {e}");
+                                        }
+                                        Some(Ok(WsMessage::Close(_))) => {
+                                            info!("Centrifugo WebSocket closed");
                                             break;
                                         }
-                                        debug!("Sent token refresh command (id={cmd_id})");
+                                        Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
+                                        Some(Ok(other)) => {
+                                            debug!("Ignoring WebSocket frame: {other:?}");
+                                        }
+                                        Some(Err(e)) => {
+                                            error!("WebSocket read error: {e}");
+                                            break;
+                                        }
+                                        None => {
+                                            info!("WebSocket stream ended");
+                                            break;
+                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to get new token for refresh: {e}");
-                                        break;
+                                }
+                                _ = refresh_timer.tick() => {
+                                    // Time to refresh the token
+                                    match identity.get_token().await {
+                                        Ok(new_token) => {
+                                            cmd_id += 1;
+                                            let refresh_cmd = serde_json::json!({
+                                                "id": cmd_id,
+                                                "refresh": {
+                                                    "token": new_token
+                                                }
+                                            });
+                                            if let Err(e) = sink.send(WsMessage::Text(refresh_cmd.to_string())).await {
+                                                error!("Failed to send refresh command: {e}");
+                                                break;
+                                            }
+                                            debug!("Sent token refresh command (id={cmd_id})");
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to get new token for refresh: {e}");
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
+
+                        state.write().await.connected = false;
                     }
+                    Err(e) => {
+                        error!("Centrifugo handshake failed: {e}");
+                    }
+                }
 
-                    state.write().await.connected = false;
-                }
-                Err(e) => {
-                    error!("Centrifugo handshake failed: {e}");
-                }
+                warn!("Reconnecting to Centrifugo in {}s", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-
-            warn!("Reconnecting to Centrifugo in {}s", backoff.as_secs());
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        }
         });
 
         Ok(())

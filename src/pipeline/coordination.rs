@@ -1,7 +1,6 @@
-use std::num::NonZeroUsize;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use lru::LruCache;
 use tokio::sync::Mutex;
 
 const MAX_ENGAGEMENTS: usize = 10_000;
@@ -39,7 +38,7 @@ const MAX_ENGAGEMENTS: usize = 10_000;
 /// });
 /// ```
 pub struct EngagementTracker {
-    engagements: Mutex<LruCache<String, Engagement>>,
+    engagements: Mutex<HashMap<String, Engagement>>,
     cooldown: Duration,
 }
 
@@ -51,9 +50,7 @@ struct Engagement {
 impl EngagementTracker {
     pub fn new(cooldown: Duration) -> Self {
         Self {
-            engagements: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MAX_ENGAGEMENTS).unwrap(),
-            )),
+            engagements: Mutex::new(HashMap::new()),
             cooldown,
         }
     }
@@ -68,7 +65,7 @@ impl EngagementTracker {
     /// Returns `false` if:
     /// - There's an active, unexpired engagement with a **different** sender
     pub async fn should_engage(&self, channel_id: &str, sender_id: &str) -> bool {
-        let mut engagements = self.engagements.lock().await;
+        let engagements = self.engagements.lock().await;
 
         match engagements.get(channel_id) {
             Some(engagement) => {
@@ -98,7 +95,11 @@ impl EngagementTracker {
     /// This ensures only successful engagements are tracked.
     pub async fn record(&self, channel_id: &str, sender_id: &str) {
         let mut engagements = self.engagements.lock().await;
-        engagements.put(
+        // Evict expired entries if map is full
+        if engagements.len() >= MAX_ENGAGEMENTS {
+            engagements.retain(|_, e| e.responded_at.elapsed() < self.cooldown);
+        }
+        engagements.insert(
             channel_id.to_string(),
             Engagement {
                 sender_id: sender_id.to_string(),
@@ -113,6 +114,6 @@ impl EngagementTracker {
     /// be open to engaging with new senders.
     pub async fn clear(&self, channel_id: &str) {
         let mut engagements = self.engagements.lock().await;
-        engagements.pop(channel_id);
+        engagements.remove(channel_id);
     }
 }

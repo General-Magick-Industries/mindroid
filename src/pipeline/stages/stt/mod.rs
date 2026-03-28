@@ -1,12 +1,12 @@
-#[cfg(feature = "llm-client")]
-mod openai;
 #[cfg(feature = "speech")]
 mod deepgram;
-
 #[cfg(feature = "llm-client")]
-pub use openai::{OpenAiStt, OpenAiSttConfig};
+mod openai;
+
 #[cfg(feature = "speech")]
 pub use deepgram::{DeepgramStt, DeepgramSttConfig};
+#[cfg(feature = "llm-client")]
+pub use openai::{OpenAiStt, OpenAiSttConfig};
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -14,9 +14,9 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::error::Result;
-use crate::{MindroidError, PipelineContext, PipelineStage};
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::{AudioInput, TextInput};
+use crate::{MindroidError, PipelineContext, PipelineStage};
 
 /// Converts raw audio bytes to a text transcript.
 #[async_trait]
@@ -38,8 +38,13 @@ fn resolve_audio(_ctx: &PipelineContext) -> Result<Vec<u8>> {
 
     #[cfg(feature = "transport-audio")]
     {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        if let Some(b64) = _ctx.message.metadata.get("audio_data").and_then(|v| v.as_str()) {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        if let Some(b64) = _ctx
+            .message
+            .metadata
+            .get("audio_data")
+            .and_then(|v| v.as_str())
+        {
             return STANDARD.decode(b64).map_err(|e| MindroidError::Pipeline {
                 stage: "SttStage".into(),
                 message: format!("Failed to base64-decode audio_data: {e}"),
@@ -69,7 +74,9 @@ pub struct SttStage {
 
 impl SttStage {
     pub fn new(provider: impl SttProvider + 'static) -> Self {
-        Self { provider: Arc::new(provider) }
+        Self {
+            provider: Arc::new(provider),
+        }
     }
 
     pub fn from_arc(provider: Arc<dyn SttProvider>) -> Self {
