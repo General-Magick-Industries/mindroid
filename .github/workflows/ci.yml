@@ -19,10 +19,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: read
-  pull-requests: write
-
 jobs:
   ci:
     name: Format, Clippy, Build & Test

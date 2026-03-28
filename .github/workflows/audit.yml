@@ -8,10 +8,6 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/audit.yml'
 
-permissions:
-  pull-requests: write
-  contents: read
-
 jobs:
   audit:
     name: Cargo Audit
