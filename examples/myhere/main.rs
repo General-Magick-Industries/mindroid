@@ -12,7 +12,7 @@
 //!        → PostProcessor + Persistence [only on fast-brain final answers]
 //!   3. If halted (smart brain needed):
 //!      Smart brain pipeline (BiFrost):
-//!        PersonaWithHistory(MagickMind persona + history)
+//!        SimpleContextBuilder(smart prompt + history)
 //!        → GenericLlmProcessor(smart)  [streaming]
 //!        → PostProcessor + Persistence
 //!
@@ -30,9 +30,8 @@ use mindroid::pipeline::presets::magickmind::{
     MagickmindClient, MagickmindContext, MagickmindPersistence,
 };
 use mindroid::{
-    ContextPreparer, GenericLlmProcessor, LlmMessage, MindroidConfig, PersonaContextBuilder,
-    Pipeline, PipelineContext, PipelineStage, PostProcessor, Result, Runtime,
-    SimpleContextBuilder, StreamEvent,
+    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PipelineStage,
+    PostProcessor, Result, Runtime, SimpleContextBuilder, StreamEvent,
 };
 
 // ── IsFinal extension ────────────────────────────────────────────────────────
@@ -92,45 +91,6 @@ impl PipelineStage for BrainRouterGate {
     }
 }
 
-// ── PersonaWithHistory ───────────────────────────────────────────────────────
-
-/// Runs the shared PersonaContextBuilder then injects per-request history
-/// after the system messages, before the user message.
-struct PersonaWithHistory {
-    persona: Arc<PersonaContextBuilder>,
-    history: Arc<Vec<LlmMessage>>,
-}
-
-#[async_trait]
-impl PipelineStage for PersonaWithHistory {
-    fn name(&self) -> &str {
-        "PersonaWithHistory"
-    }
-
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        self.persona.process(ctx).await?;
-
-        if !self.history.is_empty() {
-            let system_msgs: Vec<_> = ctx.llm_messages.drain(..).collect();
-            let mut new_messages = Vec::with_capacity(system_msgs.len() + self.history.len());
-            let mut rest_start = 0;
-            for (i, msg) in system_msgs.iter().enumerate() {
-                if msg.role == "system".into() {
-                    new_messages.push(msg.clone());
-                    rest_start = i + 1;
-                } else {
-                    break;
-                }
-            }
-            new_messages.extend(self.history.iter().cloned());
-            new_messages.extend(system_msgs[rest_start..].iter().cloned());
-            ctx.llm_messages = new_messages;
-        }
-
-        Ok(())
-    }
-}
-
 // ── Prompts ──────────────────────────────────────────────────────────────────
 
 const FAST_BRAIN_PROMPT_DEFAULT: &str =
@@ -147,7 +107,7 @@ const SMART_BRAIN_PROMPT_DEFAULT: &str =
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("info,mindroid=debug,myhere=debug")
+        .with_env_filter("warn,myhere=info,mindroid::pipeline::context=debug")
         .init();
 
     let config = MindroidConfig::resolve_from_args()?;
@@ -161,6 +121,14 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|m| m.options.get("persona"))
         .and_then(|v| v.as_str())
         .unwrap_or(FAST_BRAIN_PROMPT_DEFAULT)
+        .into();
+
+    let smart_persona: Arc<str> = config
+        .models
+        .get("smart")
+        .and_then(|m| m.options.get("persona"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(SMART_BRAIN_PROMPT_DEFAULT)
         .into();
 
     let builder = Runtime::from_config(config)?;
@@ -186,28 +154,11 @@ async fn main() -> anyhow::Result<()> {
             .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id)),
     );
 
-    // Build persona stage once — fetches persona schema from MagickMind at init.
-    // Falls back to SimpleContextBuilder with the smart persona prompt if not configured.
-    let persona_stage = builder.build_persona_stage().await?;
+    // TODO: persona stage belongs to MyThere (Layer 2), not MyHere.
+    // let persona_stage = builder.build_persona_stage().await?;
 
     let fast_llm = Arc::new(fast_llm);
     let smart_llm = Arc::new(smart_llm);
-    let persona_stage = persona_stage.map(Arc::new);
-
-    // Capture smart_persona fallback only if persona stage is absent
-    let smart_persona_fallback: Option<Arc<str>> = if persona_stage.is_none() {
-        Some(
-            config
-                .models
-                .get("smart")
-                .and_then(|m| m.options.get("persona"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(SMART_BRAIN_PROMPT_DEFAULT)
-                .into(),
-        )
-    } else {
-        None
-    };
 
     let mut runtime = builder
         .on_message(move |ctx| {
@@ -216,8 +167,7 @@ async fn main() -> anyhow::Result<()> {
             let fast_llm = Arc::clone(&fast_llm);
             let smart_llm = Arc::clone(&smart_llm);
             let fast_persona = Arc::clone(&fast_persona);
-            let persona_stage = persona_stage.clone();
-            let smart_persona_fallback = smart_persona_fallback.clone();
+            let smart_persona = Arc::clone(&smart_persona);
 
             async move {
                 // ── 1. Fetch MagickMind context ───────────────────────────────
@@ -229,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
                 let history = Arc::new(context);
+                let persist = !ctx.message.channel_id.is_empty() && ctx.message.channel_id != "stdio";
 
                 // ── 2. Fast brain pipeline ────────────────────────────────────
                 let fast_client = match LlmClient::new((*fast_llm).clone()) {
@@ -236,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => { tracing::error!("Fast brain LLM init failed: {e}"); return; }
                 };
 
-                let fast_pipeline = Pipeline::new()
+                let mut fast_pipeline = Pipeline::new()
                     .add_stage(SimpleContextBuilder::with_prompt_and_history(
                         fast_persona.as_ref(),
                         history.clone(),
@@ -244,19 +195,25 @@ async fn main() -> anyhow::Result<()> {
                     .add_streaming_stage(GenericLlmProcessor::new(fast_client))
                     .add_stage(IsFinalExtractor)
                     .add_stage(BrainRouterGate)
-                    .add_stage(PostProcessor)
-                    .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
+                    .add_stage(PostProcessor);
+                if persist {
+                    fast_pipeline = fast_pipeline.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
+                }
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-                let needs_smart = match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
-                    Ok(_) => pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false),
+                let (needs_smart, fast_response) = match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
+                    Ok(resp) => {
+                        let needs_smart = pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false);
+                        (needs_smart, resp.unwrap_or_default())
+                    }
                     Err(e) => { tracing::error!("Fast brain pipeline failed: {e}"); return; }
                 };
 
                 if !needs_smart {
-                    let response = pctx.response.as_deref().unwrap_or("").trim().to_string();
+                    let response = fast_response.trim().to_string();
                     if !response.is_empty() {
+                        println!("\nMyHere [Fast]: {response}\n");
                         if let Err(e) = ctx.respond(&response).await {
                             tracing::error!("Failed to send fast brain response: {e}");
                         }
@@ -272,23 +229,16 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => { tracing::error!("Smart brain LLM init failed: {e}"); return; }
                 };
 
-                let smart_pipeline = if let Some(ref persona) = persona_stage {
-                    Pipeline::new()
-                        .add_stage(PersonaWithHistory {
-                            persona: Arc::clone(persona),
-                            history,
-                        })
-                        .add_streaming_stage(GenericLlmProcessor::new(smart_client))
-                        .add_stage(PostProcessor)
-                        .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)))
-                } else {
-                    let prompt = smart_persona_fallback.as_deref().unwrap_or(SMART_BRAIN_PROMPT_DEFAULT);
-                    Pipeline::new()
-                        .add_stage(SimpleContextBuilder::with_prompt_and_history(prompt, history))
-                        .add_streaming_stage(GenericLlmProcessor::new(smart_client))
-                        .add_stage(PostProcessor)
-                        .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)))
-                };
+                let mut smart_pipeline = Pipeline::new()
+                    .add_stage(SimpleContextBuilder::with_prompt_and_history(
+                        smart_persona.as_ref(),
+                        history,
+                    ))
+                    .add_streaming_stage(GenericLlmProcessor::new(smart_client))
+                    .add_stage(PostProcessor);
+                if persist {
+                    smart_pipeline = smart_pipeline.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
+                }
 
                 pctx.reset_output();
 
@@ -310,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let response = full_response.trim().to_string();
                 if !response.is_empty() {
+                    println!("\nMyHere [Smart]: {response}\n");
                     if let Err(e) = ctx.respond(&response).await {
                         tracing::error!("Failed to send smart brain response: {e}");
                     }

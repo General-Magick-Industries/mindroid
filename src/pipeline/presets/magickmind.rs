@@ -162,8 +162,9 @@ impl MagickmindClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
             return Err(MindroidError::Api {
-                message: format!("Magickmind prepare_context returned {status}"),
+                message: format!("Magickmind prepare_context returned {status} (HTTP {status}): {body}"),
                 status_code: Some(status.as_u16()),
             });
         }
@@ -305,8 +306,8 @@ impl ContextProvider for MagickmindContext {
 
     async fn fetch(&self, message: &crate::models::Message) -> Result<Vec<LlmMessage>> {
         let mindspace_id = &message.channel_id;
-        if mindspace_id.is_empty() {
-            debug!("MagickmindContext: no channel_id, skipping");
+        if mindspace_id.is_empty() || mindspace_id == "stdio" {
+            debug!("MagickmindContext: no real channel_id, skipping");
             return Ok(Vec::new());
         }
 
