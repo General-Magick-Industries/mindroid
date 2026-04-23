@@ -3,18 +3,19 @@ agent_id = "your-agent-id-here"
 name = "MyHere"
 
 [transport]
-type = "centrifugo"
-url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+type = "stdio"
 
 [auth]
 type = "apikey"
-email = "user@example.com"
+email = "example@example.com"
 password = "your-password-here"
-api_key = ""
-base_url = "https://dev-magickmind.magickmind.ai"
+api_key = "your-api-key-here"
+base_url = "https://dev-bifrost.magickmind.ai"
 
 [memory]
-type = "magickmind"
+type = "sqlite"
+path = "./myhere.db"
+max_memory_items = 0
 
 [persona]
 type = "magickmind"
@@ -27,11 +28,11 @@ type = "log"
 
 [providers.litellm]
 base_url = "https://litellm.globalmagick.com"
-api_key = ""
+api_key = "your-litellm-api-key-here"
 
 [providers.bifrost]
-base_url = "https://dev-magickmind.magickmind.ai"
-api_key = ""
+base_url = "https://dev-bifrost.magickmind.ai"
+api_key = "your-bifrost-api-key-here"
 
 # -- Named Models ------------------------------------------------------------
 

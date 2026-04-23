@@ -3,18 +3,18 @@
 //! The immediate-execution mind with a Fast/Smart brain duality:
 //!
 //!   Per-message flow:
-//!   1. Fetch MagickMind context (chat history + knowledge)
+//!   1. Fetch context from local SQLite DB (chat history)
 //!   2. Fast brain pipeline (litellm):
 //!      SimpleContextBuilder(fast prompt + history)
 //!        → GenericLlmProcessor(fast)   [streaming]
 //!        → IsFinalExtractor            [parse JSON, set IsFinal ext]
 //!        → BrainRouterGate             [halt if escalation needed]
-//!        → PostProcessor + Persistence [only on fast-brain final answers]
+//!        → PostProcessor + SqlitePersistence [only on fast-brain final answers]
 //!   3. If halted (smart brain needed):
 //!      Smart brain pipeline (BiFrost):
 //!        SimpleContextBuilder(smart prompt + history)
 //!        → GenericLlmProcessor(smart)  [streaming]
-//!        → PostProcessor + Persistence
+//!        → PostProcessor + SqlitePersistence
 //!
 //! Run with:
 //!   cargo run -p myhere -- --config examples/myhere/myhere.toml
@@ -26,13 +26,11 @@ use futures::StreamExt;
 use serde::Deserialize;
 
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{
-    MagickmindClient, MagickmindContext, MagickmindPersistence,
-};
+use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
-    ContextPreparer, MindroidConfig, Pipeline, PipelineContext, PipelineStage,
-    PostProcessor, Result, Runtime, ShellTool, SimpleContextBuilder, StreamEvent,
-    ToolExecutorStage, ToolRegistry,
+    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MindroidConfig, Pipeline,
+    PipelineContext, PipelineStage, PostProcessor, Result, Runtime, ShellTool,
+    SimpleContextBuilder, StreamEvent, ToolExecutorStage, ToolRegistry,
 };
 
 // ── IsFinal extension ────────────────────────────────────────────────────────
@@ -92,6 +90,77 @@ impl PipelineStage for BrainRouterGate {
     }
 }
 
+// ── SqliteContextProvider ────────────────────────────────────────────────────
+
+/// Loads recent chat history from SQLite and converts it to LlmMessages.
+/// Messages from `agent_id` are mapped to the `assistant` role; all others to `user`.
+struct SqliteContextProvider {
+    memory: Arc<SqliteMemory>,
+    agent_id: String,
+    limit: usize,
+}
+
+#[async_trait]
+impl ContextProvider for SqliteContextProvider {
+    fn name(&self) -> &str {
+        "SqliteContextProvider"
+    }
+
+    async fn fetch(&self, message: &Message) -> Result<Vec<LlmMessage>> {
+        let history = self
+            .memory
+            .get_history(&message.channel_id, self.limit)
+            .await?;
+
+        let llm_messages = history
+            .into_iter()
+            .map(|msg| {
+                if msg.sender_id == self.agent_id {
+                    LlmMessage::assistant(msg.content)
+                } else {
+                    LlmMessage::user(msg.content)
+                }
+            })
+            .collect();
+
+        Ok(llm_messages)
+    }
+}
+
+// ── SqlitePersistence ────────────────────────────────────────────────────────
+
+/// Saves both the incoming user message and the agent's response to SQLite.
+struct SqlitePersistence {
+    memory: Arc<SqliteMemory>,
+    agent_id: String,
+}
+
+#[async_trait]
+impl PipelineStage for SqlitePersistence {
+    fn name(&self) -> &str {
+        "SqlitePersistence"
+    }
+
+    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        let channel_id = &ctx.message.channel_id;
+        let user_id = &ctx.message.sender_id;
+
+        // Save user message
+        self.memory
+            .save_message(channel_id, user_id, &ctx.message.content, None)
+            .await?;
+
+        // Save agent response
+        if let Some(response) = ctx.response.as_deref().filter(|r| !r.is_empty()) {
+            self.memory
+                .save_message(channel_id, &self.agent_id, response, None)
+                .await?;
+        }
+
+        Ok(())
+    }
+}
+
 // ── Prompts ──────────────────────────────────────────────────────────────────
 
 const FAST_BRAIN_PROMPT_DEFAULT: &str =
@@ -132,49 +201,53 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(SMART_BRAIN_PROMPT_DEFAULT)
         .into();
 
-    let builder = Runtime::from_config(config)?;
-
-    let identity = builder.auth_arc().unwrap();
-    let config = builder.config_ref().unwrap();
-
-    let magickmind_url = config
-        .auth
-        .base_url
+    let db_path = config
+        .memory
+        .path
         .as_deref()
-        .unwrap_or("https://dev-magickmind.magickmind.ai");
+        .unwrap_or("./myhere.db");
 
-    let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
-    if let Some(key) = &config.auth.api_key {
-        magickmind_client = magickmind_client.with_api_key(key);
-    }
-    let magickmind = Arc::new(magickmind_client);
+    let max_memory_items = config
+        .memory
+        .options
+        .get("max_memory_items")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20);
+    // 0 means unlimited; otherwise use the configured value
+    let history_limit = if max_memory_items == 0 { usize::MAX } else { max_memory_items as usize };
+
+    let memory = Arc::new(SqliteMemory::new(db_path)?);
 
     let agent_id = config.agent.agent_id.clone();
-    let context_preparer = Arc::new(
-        ContextPreparer::new()
-            .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id)),
-    );
 
-    // TODO: persona stage belongs to MyThere (Layer 2), not MyHere.
-    // let persona_stage = builder.build_persona_stage().await?;
+    let context_preparer = Arc::new(
+        ContextPreparer::new().add_provider(SqliteContextProvider {
+            memory: Arc::clone(&memory),
+            agent_id: agent_id.clone(),
+            limit: history_limit,
+        }),
+    );
 
     let tool_registry = Arc::new(ToolRegistry::new().register(ShellTool::default()));
 
     let fast_llm = Arc::new(fast_llm);
     let smart_llm = Arc::new(smart_llm);
 
+    let builder = Runtime::from_config(config)?;
+
     let mut runtime = builder
         .on_message(move |ctx| {
             let preparer = Arc::clone(&context_preparer);
-            let magickmind = Arc::clone(&magickmind);
+            let memory = Arc::clone(&memory);
             let fast_llm = Arc::clone(&fast_llm);
             let smart_llm = Arc::clone(&smart_llm);
             let fast_persona = Arc::clone(&fast_persona);
             let smart_persona = Arc::clone(&smart_persona);
             let tool_registry = Arc::clone(&tool_registry);
+            let agent_id = agent_id.clone();
 
             async move {
-                // ── 1. Fetch MagickMind context ───────────────────────────────
+                // ── 1. Fetch local SQLite context ─────────────────────────────
                 let context = match preparer.prepare(&ctx.message).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -183,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
                 let history = Arc::new(context);
-                let persist = !ctx.message.channel_id.is_empty() && ctx.message.channel_id != "stdio";
+                let persist = !ctx.message.channel_id.is_empty();
 
                 // ── 2. Fast brain pipeline ────────────────────────────────────
                 let fast_client = match LlmClient::new((*fast_llm).clone()) {
@@ -201,7 +274,10 @@ async fn main() -> anyhow::Result<()> {
                     .add_stage(BrainRouterGate)
                     .add_stage(PostProcessor);
                 if persist {
-                    fast_pipeline = fast_pipeline.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
+                    fast_pipeline = fast_pipeline.add_stage(SqlitePersistence {
+                        memory: Arc::clone(&memory),
+                        agent_id: agent_id.clone(),
+                    });
                 }
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
@@ -225,7 +301,7 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
 
-                // ── 3. Smart brain pipeline (BiFrost) ─────────────────────────
+                // ── 3. Smart brain pipeline ───────────────────────────────────
                 tracing::info!("Fast brain escalated — running smart brain");
 
                 let smart_client = match LlmClient::new((*smart_llm).clone()) {
@@ -241,7 +317,10 @@ async fn main() -> anyhow::Result<()> {
                     .add_streaming_stage(ToolExecutorStage::new(smart_client, Arc::clone(&tool_registry)))
                     .add_stage(PostProcessor);
                 if persist {
-                    smart_pipeline = smart_pipeline.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
+                    smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
+                        memory: Arc::clone(&memory),
+                        agent_id: agent_id.clone(),
+                    });
                 }
 
                 pctx.reset_output();
