@@ -162,9 +162,8 @@ impl MagickmindClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(MindroidError::Api {
-                message: format!("Magickmind prepare_context returned {status} (HTTP {status}): {body}"),
+                message: format!("Magickmind prepare_context returned {status}"),
                 status_code: Some(status.as_u16()),
             });
         }
