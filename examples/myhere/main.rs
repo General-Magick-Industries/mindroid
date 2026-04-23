@@ -245,9 +245,14 @@ async fn main() -> anyhow::Result<()> {
                 let mut stream = ctx.run_streaming_with_context(&smart_pipeline, &mut pctx);
                 let mut full_response = String::new();
 
+                print!("\nMyHere [Smart]: ");
                 while let Some(event) = stream.next().await {
                     match &event {
-                        StreamEvent::Chunk { content } => full_response.push_str(content),
+                        StreamEvent::Chunk { content } => {
+                            print!("{content}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            full_response.push_str(content);
+                        }
                         StreamEvent::Complete { content, .. } => {
                             if !content.is_empty() { full_response = content.clone(); }
                         }
@@ -257,10 +262,10 @@ async fn main() -> anyhow::Result<()> {
                         _ => {}
                     }
                 }
+                println!();
 
                 let response = full_response.trim().to_string();
                 if !response.is_empty() {
-                    println!("\nMyHere [Smart]: {response}\n");
                     if let Err(e) = ctx.respond(&response).await {
                         tracing::error!("Failed to send smart brain response: {e}");
                     }
