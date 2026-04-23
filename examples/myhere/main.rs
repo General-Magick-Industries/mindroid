@@ -31,7 +31,8 @@ use mindroid::pipeline::presets::magickmind::{
 };
 use mindroid::{
     ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PipelineStage,
-    PostProcessor, Result, Runtime, SimpleContextBuilder, StreamEvent,
+    PostProcessor, Result, Runtime, ShellTool, SimpleContextBuilder, StreamEvent,
+    ToolExecutorStage, ToolRegistry,
 };
 
 // ── IsFinal extension ────────────────────────────────────────────────────────
@@ -157,6 +158,8 @@ async fn main() -> anyhow::Result<()> {
     // TODO: persona stage belongs to MyThere (Layer 2), not MyHere.
     // let persona_stage = builder.build_persona_stage().await?;
 
+    let tool_registry = Arc::new(ToolRegistry::new().register(ShellTool::default()));
+
     let fast_llm = Arc::new(fast_llm);
     let smart_llm = Arc::new(smart_llm);
 
@@ -168,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             let smart_llm = Arc::clone(&smart_llm);
             let fast_persona = Arc::clone(&fast_persona);
             let smart_persona = Arc::clone(&smart_persona);
+            let tool_registry = Arc::clone(&tool_registry);
 
             async move {
                 // ── 1. Fetch MagickMind context ───────────────────────────────
@@ -192,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                         fast_persona.as_ref(),
                         history.clone(),
                     ))
-                    .add_streaming_stage(GenericLlmProcessor::new(fast_client))
+                    .add_streaming_stage(ToolExecutorStage::new(fast_client, Arc::clone(&tool_registry)))
                     .add_stage(IsFinalExtractor)
                     .add_stage(BrainRouterGate)
                     .add_stage(PostProcessor);
@@ -234,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
                         smart_persona.as_ref(),
                         history,
                     ))
-                    .add_streaming_stage(GenericLlmProcessor::new(smart_client))
+                    .add_streaming_stage(ToolExecutorStage::new(smart_client, Arc::clone(&tool_registry)))
                     .add_stage(PostProcessor);
                 if persist {
                     smart_pipeline = smart_pipeline.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));

@@ -45,3 +45,6 @@ persona = "If the question needs deep thinking or reasoning, set is_final to fal
 [models.smart]
 provider = "bifrost"
 model = "openrouter/openai/gpt-4o"
+
+[models.smart.options]
+persona = "You are a deep reasoning assistant. When a task requires a tool, use it immediately without narrating your intent first. Think carefully, but act directly."
