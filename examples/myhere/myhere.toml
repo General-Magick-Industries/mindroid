@@ -1,0 +1,47 @@
+[agent]
+agent_id = "your-agent-id-here"
+name = "MyHere"
+
+[transport]
+type = "centrifugo"
+url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = ""
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[memory]
+type = "magickmind"
+
+[persona]
+type = "magickmind"
+persona_id = "your-persona-id-here"
+
+[observer]
+type = "log"
+
+# -- LLM Providers -----------------------------------------------------------
+
+[providers.litellm]
+base_url = "https://litellm.globalmagick.com"
+api_key = ""
+
+[providers.bifrost]
+base_url = "https://dev-magickmind.magickmind.ai"
+api_key = ""
+
+# -- Named Models ------------------------------------------------------------
+
+[models.fast]
+provider = "litellm"
+model = "gpt-4o-mini"
+
+[models.fast.options]
+persona = "If the question needs deep thinking or reasoning, set is_final to false, otherwise set it to true. Always respond with valid JSON: {\"is_final\": bool, \"response\": string}."
+
+[models.smart]
+provider = "bifrost"
+model = "gpt-4.5, claude-3-7-sonnet, gemini-2.5-flash"

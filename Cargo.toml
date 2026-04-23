@@ -19,6 +19,7 @@ members = [
     "examples/magickmind_cli",
     "examples/voice_agent",
     "examples/local_persona",
+    "examples/myhere",
 ]
 resolver = "3"
 
