@@ -1,25 +1,13 @@
 [agent]
-agent_id = "your-agent-id-here"
 name = "MyHere"
 
 [transport]
 type = "stdio"
 
-[auth]
-type = "apikey"
-email = "example@example.com"
-password = "your-password-here"
-api_key = "your-api-key-here"
-base_url = "https://dev-bifrost.magickmind.ai"
-
 [memory]
 type = "sqlite"
 path = "./myhere.db"
-max_memory_items = 0
-
-[persona]
-type = "magickmind"
-persona_id = "your-persona-id-here" # Might be removed for MyHere (?)
+max_memory_items = 100
 
 [observer]
 type = "log"
@@ -28,11 +16,11 @@ type = "log"
 
 [providers.litellm]
 base_url = "https://litellm.globalmagick.com"
-api_key = "your-litellm-api-key-here"
+api_key = ""
 
 [providers.bifrost]
 base_url = "https://dev-bifrost.magickmind.ai"
-api_key = "your-bifrost-api-key-here"
+api_key = ""
 
 # -- Named Models ------------------------------------------------------------
 

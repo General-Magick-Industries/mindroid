@@ -29,7 +29,7 @@ use mindroid::llm_client::LlmClient;
 use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
     ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MindroidConfig, Pipeline,
-    PipelineContext, PipelineStage, PostProcessor, Result, Runtime, ShellTool,
+    PipelineContext, PipelineStage, PostProcessor, Result, Runtime, ShellTool, OpenTool,
     SimpleContextBuilder, StreamEvent, ToolExecutorStage, ToolRegistry,
 };
 
@@ -177,7 +177,7 @@ const SMART_BRAIN_PROMPT_DEFAULT: &str =
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("warn,myhere=info,mindroid::pipeline::context=debug")
+        .with_env_filter("warn")
         .init();
 
     let config = MindroidConfig::resolve_from_args()?;
@@ -228,7 +228,11 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
 
-    let tool_registry = Arc::new(ToolRegistry::new().register(ShellTool::default()));
+    let tool_registry = Arc::new(
+        ToolRegistry::new()
+            .register(OpenTool::default()),
+            .register(ShellTool::default()),
+    );
 
     let fast_llm = Arc::new(fast_llm);
     let smart_llm = Arc::new(smart_llm);
@@ -345,7 +349,6 @@ async fn main() -> anyhow::Result<()> {
                         _ => {}
                     }
                 }
-                println!();
 
                 let response = full_response.trim().to_string();
                 if !response.is_empty() {
@@ -353,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!("Failed to send smart brain response: {e}");
                     }
                 }
+                println!("\n");
             }
         })
         .build()?;
