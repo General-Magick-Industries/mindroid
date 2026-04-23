@@ -30,7 +30,7 @@ use mindroid::pipeline::presets::magickmind::{
     MagickmindClient, MagickmindContext, MagickmindPersistence,
 };
 use mindroid::{
-    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PipelineStage,
+    ContextPreparer, MindroidConfig, Pipeline, PipelineContext, PipelineStage,
     PostProcessor, Result, Runtime, ShellTool, SimpleContextBuilder, StreamEvent,
     ToolExecutorStage, ToolRegistry,
 };
