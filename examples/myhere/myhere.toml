@@ -18,7 +18,7 @@ type = "magickmind"
 
 [persona]
 type = "magickmind"
-persona_id = "your-persona-id-here"
+persona_id = "your-persona-id-here" # Might be removed for MyHere (?)
 
 [observer]
 type = "log"
@@ -37,11 +37,11 @@ api_key = ""
 
 [models.fast]
 provider = "litellm"
-model = "gpt-4o-mini"
+model = "openrouter/openai/gpt-4o-mini"
 
 [models.fast.options]
 persona = "If the question needs deep thinking or reasoning, set is_final to false, otherwise set it to true. Always respond with valid JSON: {\"is_final\": bool, \"response\": string}."
 
 [models.smart]
 provider = "bifrost"
-model = "gpt-4.5, claude-3-7-sonnet, gemini-2.5-flash"
+model = "openrouter/openai/gpt-4o"
