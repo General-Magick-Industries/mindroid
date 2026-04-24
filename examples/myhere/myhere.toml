@@ -11,7 +11,7 @@ max_memory_items = 100
 
 [observer]
 type = "log"
-level = "debug"
+level = "warn"
 
 # -- LLM Providers -----------------------------------------------------------
 
