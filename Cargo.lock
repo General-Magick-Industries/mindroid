@@ -1547,6 +1547,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mindroid-example-magickmind-persona-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "mindroid",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mindroid-example-magickmind-voice"
 version = "0.0.1"
 dependencies = [
@@ -1554,6 +1568,19 @@ dependencies = [
  "futures",
  "mindroid",
  "rodio",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mindroid-example-mcp-agent"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "mindroid",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

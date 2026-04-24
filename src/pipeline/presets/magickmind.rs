@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::http::AuthenticatedHttpClient;
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
@@ -79,29 +80,19 @@ struct CorpusItem {
 // ── MagickmindClient ──────────────────────────────────────────────────────────
 
 pub struct MagickmindClient {
-    http: reqwest::Client,
-    base_url: String,
-    identity: Arc<dyn Auth>,
-    api_key: Option<String>,
+    client: AuthenticatedHttpClient,
 }
 
 impl MagickmindClient {
     pub fn new(base_url: impl Into<String>, identity: Arc<dyn Auth>) -> Self {
         Self {
-            http: reqwest::Client::new(),
-            base_url: base_url.into(),
-            identity,
-            api_key: None,
+            client: AuthenticatedHttpClient::new(base_url, identity),
         }
     }
 
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = Some(api_key.into());
+        self.client = self.client.with_api_key(api_key);
         self
-    }
-
-    async fn auth_headers(&self) -> Result<reqwest::header::HeaderMap> {
-        crate::auth::build_auth_header_map(self.identity.as_ref()).await
     }
 
     pub async fn prepare_context(
@@ -112,8 +103,7 @@ impl MagickmindClient {
         config: &MagickmindContextConfig,
         exclude_sender: Option<&str>,
     ) -> Result<Vec<LlmMessage>> {
-        let url = format!("{}/v1/mindspaces/{}/context", self.base_url, mindspace_id);
-        let mut headers = self.auth_headers().await?;
+        let path = format!("/v1/mindspaces/{}/context", mindspace_id);
 
         let body = PrepareContextRequest {
             participant_id,
@@ -136,42 +126,24 @@ impl MagickmindClient {
             },
         };
 
-        if let Some(key) = &self.api_key {
-            headers.insert(
-                reqwest::header::HeaderName::from_static("x-api-key"),
-                reqwest::header::HeaderValue::from_str(key).map_err(|e| MindroidError::Auth {
-                    message: format!("Invalid api key header value: {e}"),
-                    source: None,
-                })?,
-            );
-        }
+        debug!("MagickmindClient::prepare_context POST {}{path}", self.client.base_url());
 
-        debug!("MagickmindClient::prepare_context POST {url}");
+        let raw_text = self.client.post_json_text(&path, &body).await?;
 
-        let resp = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| MindroidError::Api {
-                message: format!("Magickmind prepare_context request failed: {e}"),
+        debug!("MagickmindClient::prepare_context raw response: {raw_text}");
+
+        let parsed: PrepareContextResponse =
+            serde_json::from_str(&raw_text).map_err(|e| MindroidError::Api {
+                message: format!("Failed to parse Magickmind prepare_context response: {e}"),
                 status_code: None,
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(MindroidError::Api {
-                message: format!("Magickmind prepare_context returned {status}"),
-                status_code: Some(status.as_u16()),
-            });
-        }
-
-        let parsed: PrepareContextResponse = resp.json().await.map_err(|e| MindroidError::Api {
-            message: format!("Failed to parse Magickmind prepare_context response: {e}"),
-            status_code: None,
-        })?;
+        debug!(
+            "MagickmindClient::prepare_context parsed: chat_history={} items, fetcher={} bytes, corpus={} items",
+            parsed.chat_history.len(),
+            parsed.fetcher.len(),
+            parsed.corpus.len(),
+        );
 
         Ok(convert_context_response(parsed, exclude_sender))
     }
@@ -183,40 +155,16 @@ impl MagickmindClient {
         content: &str,
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let url = format!("{}/v1/mindspaces/{}/messages", self.base_url, mindspace_id);
-        let headers = self.auth_headers().await?;
+        let path = format!("/v1/mindspaces/{}/messages", mindspace_id);
         let body = MagickmindSaveRequest {
             sender_id,
             content,
             reply_to_message_id,
         };
 
-        debug!("MagickmindClient::save_message POST {url}");
+        debug!("MagickmindClient::save_message POST {}{path}", self.client.base_url());
 
-        let resp = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| MindroidError::Api {
-                message: format!("Magickmind save_message request failed: {e}"),
-                status_code: None,
-            })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(MindroidError::Api {
-                message: "Magickmind save_message returned non-success status".to_string(),
-                status_code: Some(status.as_u16()),
-            });
-        }
-
-        let parsed: MagickmindSaveResponse = resp.json().await.map_err(|e| MindroidError::Api {
-            message: format!("Failed to parse Magickmind save_message response: {e}"),
-            status_code: None,
-        })?;
+        let parsed: MagickmindSaveResponse = self.client.post_json(&path, &body).await?;
 
         Ok(parsed.id)
     }
@@ -328,8 +276,8 @@ fn convert_context_response(
 ) -> Vec<LlmMessage> {
     let mut messages = Vec::new();
 
-    // Chat history: split into proper roles so the LLM recognizes its own responses.
-    for item in &resp.chat_history {
+    // Chat history arrives newest-first from the API; reverse to chronological order.
+    for item in resp.chat_history.iter().rev() {
         if let Some(id) = self_id
             && item.sent_by_user_id == id
         {

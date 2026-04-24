@@ -19,6 +19,8 @@ members = [
     "examples/magickmind_cli",
     "examples/voice_agent",
     "examples/local_persona",
+    "examples/mcp_agent",
+    "examples/magickmind_persona_cli",
 ]
 resolver = "3"
 
@@ -44,19 +46,25 @@ transport-audio = ["dep:cpal", "dep:hound", "dep:base64", "dep:voice_activity_de
 # LLM
 llm-client = ["dep:async-openai", "dep:reqwest"]
 llm-local = ["llm-client"]
-llm-hosted = ["llm-client", "dep:reqwest"]
+llm-hosted = ["llm-client", "http-client"]
 # Speech (STT + TTS providers)
 speech = ["dep:reqwest"]
 # Auth
-apikey = ["dep:reqwest"]
+apikey = ["http-client"]
 # Persistence (memory backends)
-persistence = ["dep:reqwest", "dep:rusqlite"]
+persistence = ["http-client", "dep:rusqlite"]
 # Persona
-persona = ["dep:reqwest"]
+persona = ["http-client"]
+# Corpus (RAG document retrieval)
+corpus = ["http-client"]
 # Identity resolution
 identity = []
+# MCP (Model Context Protocol) client
+mcp = ["dep:reqwest"]
+# Internal: shared authenticated HTTP client (auto-enabled by features that need reqwest + Auth)
+http-client = ["dep:reqwest"]
 # All features
-full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity"]
+full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity", "mcp", "corpus"]
 
 [dependencies]
 # Core (always required)

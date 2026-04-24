@@ -6,10 +6,12 @@
 //!
 //! Flow per message:
 //!   1. ContextPreparer       — fetch chat history + knowledge from MagickMind
-//!   2. SimpleContextBuilder  — assemble LLM messages (history + user)
-//!   3. GenericLlmProcessor   — streaming inference via LiteLLM
-//!   4. PostProcessor         — clean up response text
-//!   5. MagickmindPersistence — save response back to MagickMind
+//!   2. CorpusGateStage       — classify whether corpus retrieval is needed
+//!   3. CorpusDistillStage    — query corpus + optional distillation
+//!   4. SimpleContextBuilder  — assemble LLM messages (history + corpus summary + user)
+//!   5. GenericLlmProcessor   — streaming inference via main model
+//!   6. PostProcessor         — clean up response text
+//!   7. MagickmindPersistence — save response back to MagickMind
 //!
 //! Run with:
 //!   cargo run --example magickmind_cli --features full -- --config examples/magickmind_cli/config.toml
@@ -21,8 +23,8 @@ use mindroid::pipeline::presets::magickmind::{
     MagickmindClient, MagickmindContext, MagickmindPersistence,
 };
 use mindroid::{
-    ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PostProcessor,
-    Runtime, SimpleContextBuilder,
+    ContextPreparer, CorpusClient, CorpusDistillStage, CorpusGateStage, GenericLlmProcessor,
+    MindroidConfig, Pipeline, PipelineContext, PostProcessor, Runtime, SimpleContextBuilder,
 };
 
 #[tokio::main]
@@ -33,8 +35,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = MindroidConfig::resolve_from_args()?;
 
-    // Resolve LiteLLM client config from [providers.litellm] + [models.main]
+    // Resolve LLM client configs from [providers] + [models]
     let llm_config = config.llm("main")?;
+    let distill_config = config.llm("distill").ok();
 
     // Auto-build transport (centrifugo), auth (apikey), memory (magickmind), observer from config
     let builder = Runtime::from_config(config)?;
@@ -42,13 +45,22 @@ async fn main() -> anyhow::Result<()> {
     let identity = builder.auth_arc().unwrap();
     let config = builder.config_ref().unwrap();
 
-    let magickmind_url = config
-        .auth
-        .base_url
-        .as_deref()
-        .unwrap_or("https://dev-magickmind.magickmind.ai");
+    // Resolve MagickMind platform URL: prefer [memory] or [persona] provider,
+    // fall back to auth.base_url for legacy configs.
+    let magickmind_url = if let Some(ref provider_name) = config.memory.provider {
+        config
+            .resolve_provider(provider_name, None)?
+            .base_url
+    } else {
+        config
+            .auth
+            .base_url
+            .as_deref()
+            .unwrap_or("https://dev-magickmind.magickmind.ai")
+            .to_string()
+    };
 
-    let mut magickmind_client = MagickmindClient::new(magickmind_url, identity.clone());
+    let mut magickmind_client = MagickmindClient::new(&magickmind_url, identity.clone());
     if let Some(key) = &config.auth.api_key {
         magickmind_client = magickmind_client.with_api_key(key);
     }
@@ -62,6 +74,45 @@ async fn main() -> anyhow::Result<()> {
             .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id)),
     );
 
+    // Corpus client + distillation LLM (if configured)
+    let corpus: Option<(Arc<CorpusClient>, String)> =
+        if let Some(corpus_id) = &config.corpus.corpus_id {
+            let corpus_url = if let Some(ref provider_name) = config.corpus.provider {
+                config
+                    .resolve_provider(provider_name, config.corpus.base_url.as_deref())?
+                    .base_url
+            } else {
+                // Legacy fallback: corpus.base_url → auth.base_url
+                config
+                    .corpus
+                    .base_url
+                    .as_deref()
+                    .or(config.auth.base_url.as_deref())
+                    .unwrap_or("https://dev-magickmind.magickmind.ai")
+                    .to_string()
+            };
+
+            let mut client = CorpusClient::new(&corpus_url, identity.clone());
+            if let Some(key) = config
+                .corpus
+                .api_key
+                .as_ref()
+                .or(config.auth.api_key.as_ref())
+            {
+                client = client.with_api_key(key);
+            }
+
+            tracing::info!("Corpus RAG enabled for corpus_id={corpus_id}");
+            Some((Arc::new(client), corpus_id.clone()))
+        } else {
+            None
+        };
+
+    let distill_llm = distill_config.map(|cfg| {
+        tracing::info!("Corpus distillation enabled via [models.distill]");
+        Arc::new(LlmClient::new(cfg).expect("Failed to create distillation LLM client"))
+    });
+
     let llm_config = Arc::new(llm_config);
 
     let mut runtime = builder
@@ -69,9 +120,11 @@ async fn main() -> anyhow::Result<()> {
             let preparer = Arc::clone(&context_preparer);
             let magickmind = Arc::clone(&magickmind);
             let llm_config = Arc::clone(&llm_config);
+            let corpus = corpus.clone();
+            let distill_llm = distill_llm.clone();
 
             async move {
-                // Step 1: fetch conversation context from MagickMind
+                // Fetch conversation context from MagickMind
                 let context = match preparer.prepare(&ctx.message).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -82,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Step 2: build LLM client for this request
+                // Build LLM client for this request
                 let llm_client = match LlmClient::new((*llm_config).clone()) {
                     Ok(c) => c,
                     Err(e) => {
@@ -91,7 +144,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Step 3: assemble pipeline with system prompt + MagickMind context
                 let system_prompt = "\
 You are the MagickMind Support Agent — a friendly, knowledgeable assistant \
 for the MagickMind platform.\n\n\
@@ -107,7 +159,23 @@ Guidelines:\n\
 - When a question is ambiguous, ask a clarifying question before answering.\n\
 - Reference official MagickMind documentation and endpoints where applicable.";
 
-                let pipeline = Pipeline::new()
+                // Assemble pipeline with optional corpus gate + distill stages
+                let mut pipeline = Pipeline::new();
+
+                if let Some((ref corpus_client, ref corpus_id)) = corpus {
+                    // Add corpus gate (uses distill LLM if available, else always queries)
+                    if let Some(ref llm) = distill_llm {
+                        pipeline = pipeline.add_stage(CorpusGateStage::new(Arc::clone(llm)));
+                    }
+                    // Add corpus retrieval + optional distillation
+                    pipeline = pipeline.add_stage(CorpusDistillStage::new(
+                        Arc::clone(corpus_client),
+                        corpus_id,
+                        distill_llm.as_ref().map(Arc::clone),
+                    ));
+                }
+
+                pipeline = pipeline
                     .add_stage(SimpleContextBuilder::with_prompt_and_history(
                         system_prompt,
                         Arc::new(context),

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::Auth;
-use crate::config::MindroidConfig;
+use crate::config::{MindroidConfig, ResolvedProvider};
 use crate::error::{MindroidError, Result};
 use crate::memory::Memory;
 use crate::observer::Observer;
@@ -43,6 +43,52 @@ pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
 
         other => Err(MindroidError::config(format!(
             "unknown or disabled auth type: '{other}'"
+        ))),
+    }
+}
+
+/// Build an `Arc<dyn Auth>` from a resolved provider's credentials.
+///
+/// Used by components that reference a `[providers.*]` entry and need
+/// their own auth instance (possibly different from the global auth).
+///
+/// Falls back to `fallback_auth` when the provider doesn't specify auth.
+pub(crate) fn build_provider_auth(
+    resolved: &ResolvedProvider,
+    fallback_auth: &Arc<dyn Auth>,
+) -> Result<Arc<dyn Auth>> {
+    match resolved.auth_type.as_deref() {
+        #[cfg(feature = "apikey")]
+        Some("apikey") => {
+            let email = resolved.email.as_deref().unwrap_or("");
+            let password = resolved.password.as_deref().unwrap_or("");
+            Ok(Arc::new(crate::auth::apikey::ApiKeyAuth::new(
+                &resolved.base_url,
+                email,
+                password,
+            )))
+        }
+
+        Some("static") => {
+            let token = resolved
+                .api_key
+                .as_deref()
+                .unwrap_or("dev-token");
+            Ok(Arc::new(crate::auth::static_id::StaticAuth::new(token)))
+        }
+
+        // No explicit auth_type: if api_key present, use static auth;
+        // otherwise fall back to the global auth.
+        None => {
+            if let Some(ref key) = resolved.api_key {
+                Ok(Arc::new(crate::auth::static_id::StaticAuth::new(key)))
+            } else {
+                Ok(fallback_auth.clone())
+            }
+        }
+
+        Some(other) => Err(MindroidError::config(format!(
+            "unknown or disabled provider auth_type: '{other}'"
         ))),
     }
 }
@@ -91,19 +137,33 @@ pub(crate) fn build_memory(
 
         #[cfg(feature = "persistence")]
         "magickmind" => {
-            let base_url = config
-                .memory
-                .base_url
-                .as_deref()
-                .or(config.auth.base_url.as_deref())
-                .ok_or_else(|| {
-                    MindroidError::config(
-                        "memory.base_url (or auth.base_url) is required for magickmind memory",
-                    )
-                })?;
+            let (base_url, effective_auth) =
+                if let Some(ref provider_name) = config.memory.provider {
+                    let resolved = config.resolve_provider(
+                        provider_name,
+                        config.memory.base_url.as_deref(),
+                    )?;
+                    let pauth = build_provider_auth(&resolved, auth)?;
+                    (resolved.base_url, pauth)
+                } else {
+                    // Legacy fallback: memory.base_url → auth.base_url
+                    let url = config
+                        .memory
+                        .base_url
+                        .as_deref()
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "memory.base_url (or auth.base_url) is required for magickmind memory; \
+                                 consider using [memory] provider = \"...\" instead",
+                            )
+                        })?
+                        .to_string();
+                    (url, auth.clone())
+                };
             Ok(Box::new(crate::memory::magickmind::MagickmindMemory::new(
-                base_url,
-                auth.clone(),
+                &base_url,
+                effective_auth,
             )))
         }
 
@@ -156,25 +216,48 @@ pub(crate) fn build_pipeline(
 
         #[cfg(feature = "llm-hosted")]
         "magickmind" => {
-            let base_url = config
-                .pipeline
-                .base_url
-                .as_deref()
-                .or(config.auth.base_url.as_deref())
-                .ok_or_else(|| {
-                    MindroidError::config("pipeline.base_url is required for magickmind pipeline")
-                })?;
-            let api_key = config
-                .pipeline
-                .api_key
-                .as_deref()
-                .or(config.auth.api_key.as_deref())
-                .unwrap_or("");
+            let (base_url, api_key, effective_auth) =
+                if let Some(ref provider_name) = config.pipeline.provider {
+                    let resolved = config.resolve_provider(
+                        provider_name,
+                        config.pipeline.base_url.as_deref(),
+                    )?;
+                    let pauth = build_provider_auth(&resolved, auth)?;
+                    let key = config
+                        .pipeline
+                        .api_key
+                        .clone()
+                        .or(resolved.api_key)
+                        .unwrap_or_default();
+                    (resolved.base_url, key, pauth)
+                } else {
+                    // Legacy fallback: pipeline.base_url → auth.base_url
+                    let url = config
+                        .pipeline
+                        .base_url
+                        .as_deref()
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "pipeline.base_url is required for magickmind pipeline; \
+                                 consider using [pipeline] provider = \"...\" instead",
+                            )
+                        })?
+                        .to_string();
+                    let key = config
+                        .pipeline
+                        .api_key
+                        .as_deref()
+                        .or(config.auth.api_key.as_deref())
+                        .unwrap_or("")
+                        .to_string();
+                    (url, key, auth.clone())
+                };
             Ok(Some(
                 crate::pipeline::presets::magickmind::magickmind_pipeline(
-                    auth.clone(),
-                    base_url,
-                    api_key,
+                    effective_auth,
+                    &base_url,
+                    &api_key,
                     config.agent.compute_power,
                 )?,
             ))
@@ -182,16 +265,27 @@ pub(crate) fn build_pipeline(
 
         #[cfg(feature = "llm-hosted")]
         "magickmind_ollama" => {
-            let magickmind_url = config
-                .pipeline
-                .base_url
-                .as_deref()
-                .or(config.auth.base_url.as_deref())
-                .ok_or_else(|| {
-                    MindroidError::config(
-                        "pipeline.base_url is required for magickmind_ollama pipeline",
-                    )
-                })?;
+            let magickmind_url = if let Some(ref provider_name) = config.pipeline.provider {
+                let resolved = config.resolve_provider(
+                    provider_name,
+                    config.pipeline.base_url.as_deref(),
+                )?;
+                resolved.base_url
+            } else {
+                // Legacy fallback
+                config
+                    .pipeline
+                    .base_url
+                    .as_deref()
+                    .or(config.auth.base_url.as_deref())
+                    .ok_or_else(|| {
+                        MindroidError::config(
+                            "pipeline.base_url is required for magickmind_ollama pipeline; \
+                             consider using [pipeline] provider = \"...\" instead",
+                        )
+                    })?
+                    .to_string()
+            };
             let ollama_url = config
                 .pipeline
                 .options
@@ -202,7 +296,7 @@ pub(crate) fn build_pipeline(
             Ok(Some(
                 crate::pipeline::presets::magickmind::magickmind_ollama_pipeline(
                     auth.clone(),
-                    magickmind_url,
+                    &magickmind_url,
                     ollama_url,
                     model,
                 )?,

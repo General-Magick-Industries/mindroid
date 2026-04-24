@@ -307,6 +307,185 @@ mod pipeline_tests {
 }
 
 #[cfg(test)]
+mod provider_resolution_tests {
+    use crate::config::MindroidConfig;
+
+    #[test]
+    fn resolve_provider_returns_base_url() {
+        let toml_str = r#"
+[providers.magickmind]
+base_url = "https://bifrost.magickmind.ai"
+api_key = "sk-test"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        let resolved = config.resolve_provider("magickmind", None).unwrap();
+
+        assert_eq!(resolved.base_url, "https://bifrost.magickmind.ai");
+        assert_eq!(resolved.api_key, Some("sk-test".into()));
+    }
+
+    #[test]
+    fn resolve_provider_component_overrides_base_url() {
+        let toml_str = r#"
+[providers.magickmind]
+base_url = "https://bifrost.magickmind.ai"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        let resolved = config
+            .resolve_provider("magickmind", Some("https://custom.example.com"))
+            .unwrap();
+
+        assert_eq!(resolved.base_url, "https://custom.example.com");
+    }
+
+    #[test]
+    fn resolve_provider_missing_errors() {
+        let config = MindroidConfig::from_toml_str("").unwrap();
+        let result = config.resolve_provider("nonexistent", None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent"),
+            "error should mention provider name: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_missing_base_url_errors() {
+        let toml_str = r#"
+[providers.empty]
+api_key = "sk-test"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        let result = config.resolve_provider("empty", None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("base_url"),
+            "error should mention base_url: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_with_auth_type_apikey() {
+        let toml_str = r#"
+[providers.magickmind]
+base_url = "https://bifrost.magickmind.ai"
+auth_type = "apikey"
+email = "test@test.com"
+password = "secret"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        let resolved = config.resolve_provider("magickmind", None).unwrap();
+
+        assert_eq!(resolved.auth_type, Some("apikey".into()));
+        assert_eq!(resolved.email, Some("test@test.com".into()));
+        assert_eq!(resolved.password, Some("secret".into()));
+    }
+
+    #[test]
+    fn component_provider_field_parses() {
+        let toml_str = r#"
+[providers.magickmind]
+base_url = "https://bifrost.magickmind.ai"
+
+[persona]
+type = "magickmind"
+provider = "magickmind"
+persona_id = "abc"
+
+[corpus]
+provider = "magickmind"
+corpus_id = "def"
+
+[memory]
+type = "magickmind"
+provider = "magickmind"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        assert_eq!(config.persona.provider, Some("magickmind".into()));
+        assert_eq!(config.corpus.provider, Some("magickmind".into()));
+        assert_eq!(config.memory.provider, Some("magickmind".into()));
+    }
+
+    #[test]
+    fn component_without_provider_still_works() {
+        let toml_str = r#"
+[persona]
+type = "local"
+data_dir = "~/.mindroid/personas"
+
+[memory]
+type = "sqlite"
+path = "./test.db"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        assert!(config.persona.provider.is_none());
+        assert!(config.memory.provider.is_none());
+        assert_eq!(config.persona.persona_type, Some("local".into()));
+        assert_eq!(config.memory.memory_type, Some("sqlite".into()));
+    }
+
+    #[test]
+    fn multiple_components_share_provider() {
+        let toml_str = r#"
+[providers.magickmind]
+base_url = "https://bifrost.magickmind.ai"
+api_key = "sk-shared"
+
+[persona]
+type = "magickmind"
+provider = "magickmind"
+persona_id = "abc"
+
+[corpus]
+provider = "magickmind"
+corpus_id = "def"
+
+[memory]
+type = "magickmind"
+provider = "magickmind"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+
+        let persona_resolved = config.resolve_provider("magickmind", config.persona.base_url.as_deref()).unwrap();
+        let corpus_resolved = config.resolve_provider("magickmind", config.corpus.base_url.as_deref()).unwrap();
+        let memory_resolved = config.resolve_provider("magickmind", config.memory.base_url.as_deref()).unwrap();
+
+        // All share same base_url from provider
+        assert_eq!(persona_resolved.base_url, "https://bifrost.magickmind.ai");
+        assert_eq!(corpus_resolved.base_url, "https://bifrost.magickmind.ai");
+        assert_eq!(memory_resolved.base_url, "https://bifrost.magickmind.ai");
+
+        // All share same api_key from provider
+        assert_eq!(persona_resolved.api_key, Some("sk-shared".into()));
+        assert_eq!(corpus_resolved.api_key, Some("sk-shared".into()));
+        assert_eq!(memory_resolved.api_key, Some("sk-shared".into()));
+    }
+
+    #[test]
+    fn component_base_url_overrides_provider_base_url() {
+        let toml_str = r#"
+[providers.magickmind]
+base_url = "https://bifrost.magickmind.ai"
+
+[corpus]
+provider = "magickmind"
+base_url = "https://corpus-service.example.com"
+corpus_id = "abc"
+"#;
+        let config = MindroidConfig::from_toml_str(toml_str).unwrap();
+        let resolved = config
+            .resolve_provider("magickmind", config.corpus.base_url.as_deref())
+            .unwrap();
+
+        assert_eq!(resolved.base_url, "https://corpus-service.example.com");
+    }
+}
+
+#[cfg(test)]
 #[cfg(feature = "llm-client")]
 mod llm_config_tests {
     use crate::config::MindroidConfig;

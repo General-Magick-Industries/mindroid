@@ -1,0 +1,18 @@
+[package]
+name = "mindroid-example-mcp-agent"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "mcp_agent"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["llm-local", "mcp"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

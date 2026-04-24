@@ -1,0 +1,35 @@
+# MCP Agent Example Configuration
+# Run: CONTEXT7_API_KEY=your-key cargo run -p mindroid-example-mcp-agent -- --config examples/mcp_agent/config.toml
+
+[agent]
+agent_id = "mcp-demo"
+name = "MCP Demo Agent"
+
+[transport]
+type = "stdio"
+
+[pipeline]
+type = "ollama"
+model = "llama3.2"
+
+[auth]
+type = "static"
+token = "dev"
+
+[memory]
+type = "none"
+
+[observer]
+type = "log"
+level = "info"
+
+[tools.shell]
+enabled = true
+
+# -- MCP Servers ---------------------------------------------------------------
+# Each server's tools are auto-discovered and registered with a name prefix.
+
+[[tools.mcp_servers]]
+name = "context7"
+url = "https://mcp.context7.com/mcp"
+api_key_env = "CONTEXT7_API_KEY"   # reads from environment variable

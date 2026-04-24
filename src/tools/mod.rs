@@ -3,10 +3,16 @@ mod registry;
 pub mod reminder;
 pub mod shell;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub use open::OpenTool;
 pub use registry::ToolRegistry;
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
 pub use shell::ShellTool;
+
+#[cfg(feature = "mcp")]
+pub use mcp::{McpClient, McpToolWrapper, load_mcp_tools};
 
 use async_trait::async_trait;
 

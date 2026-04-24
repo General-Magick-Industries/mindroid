@@ -115,4 +115,69 @@ impl ToolRegistry {
         }
         registry
     }
+
+    /// Build a registry from config, including async MCP server loading.
+    ///
+    /// Combines [`from_config`](Self::from_config) and
+    /// [`load_mcp_servers`](Self::load_mcp_servers) into a single call.
+    ///
+    /// ```ignore
+    /// let registry = ToolRegistry::from_config_async(&config.tools).await?;
+    /// ```
+    pub async fn from_config_async(
+        config: &crate::config::ToolsConfig,
+    ) -> crate::error::Result<Self> {
+        let registry = Self::from_config(config);
+        #[cfg(feature = "mcp")]
+        let registry = registry.load_mcp_servers(&config.mcp_servers).await?;
+        Ok(registry)
+    }
+
+    /// Register an already-constructed tool (e.g. from MCP loading).
+    pub fn register_arc(mut self, tool: std::sync::Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    /// Load MCP tools from config and register them.
+    ///
+    /// This is async because it connects to remote MCP servers.
+    /// Call this after `from_config()` to add MCP tools.
+    #[cfg(feature = "mcp")]
+    pub async fn load_mcp_servers(
+        mut self,
+        servers: &[crate::config::McpServerConfig],
+    ) -> crate::error::Result<Self> {
+        for server in servers {
+            if !server.enabled {
+                tracing::debug!(server = %server.name, "MCP server disabled, skipping");
+                continue;
+            }
+
+            let api_key = server.resolve_api_key();
+            match super::mcp::load_mcp_tools(
+                &server.name,
+                &server.url,
+                api_key.as_deref(),
+            )
+            .await
+            {
+                Ok(tools) => {
+                    tracing::info!(
+                        server = %server.name,
+                        tool_count = tools.len(),
+                        "Loaded MCP tools"
+                    );
+                    for tool in tools {
+                        self.tools.push(std::sync::Arc::new(tool));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(server = %server.name, error = %e, "Failed to load MCP server");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(self)
+    }
 }

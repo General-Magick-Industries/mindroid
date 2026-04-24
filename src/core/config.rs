@@ -23,6 +23,8 @@ pub struct MindroidConfig {
     pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
     pub identity: IdentityConfig,
+    #[serde(default)]
+    pub corpus: CorpusConfig,
 }
 
 impl MindroidConfig {
@@ -111,7 +113,63 @@ impl MindroidConfig {
         if let Ok(v) = std::env::var("MINDROID_PERSONA_BASE_URL") {
             self.persona.base_url = Some(v);
         }
+        if let Ok(v) = std::env::var("MINDROID_CORPUS_ID") {
+            self.corpus.corpus_id = Some(v);
+        }
     }
+
+    /// Resolve a named provider, optionally overriding `base_url` from the component.
+    ///
+    /// This is the non-LLM equivalent of [`llm()`](Self::llm). Components like
+    /// `[persona]`, `[corpus]`, `[memory]` reference a `[providers.*]` entry by name;
+    /// this method looks it up and merges any component-level `base_url` override.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The named provider does not exist in `[providers]`
+    /// - Neither the component nor the provider specifies a `base_url`
+    pub fn resolve_provider(
+        &self,
+        provider_name: &str,
+        component_base_url: Option<&str>,
+    ) -> Result<ResolvedProvider> {
+        let provider = self.providers.get(provider_name).ok_or_else(|| {
+            MindroidError::config(format!("provider '{provider_name}' not found"))
+        })?;
+
+        let base_url = component_base_url
+            .map(|s| s.to_string())
+            .or_else(|| provider.base_url.clone())
+            .ok_or_else(|| {
+                MindroidError::config(format!(
+                    "no base_url for provider '{provider_name}' or component override"
+                ))
+            })?;
+
+        Ok(ResolvedProvider {
+            base_url,
+            api_key: provider.api_key.clone(),
+            auth_type: provider.auth_type.clone(),
+            auth_style: provider.auth_style.clone(),
+            email: provider.email.clone(),
+            password: provider.password.clone(),
+        })
+    }
+}
+
+/// A provider resolved from `[providers.*]` with component-level overrides applied.
+///
+/// Returned by [`MindroidConfig::resolve_provider`]. Contains everything needed
+/// to construct an HTTP client or `Auth` implementation for a component.
+#[derive(Debug, Clone)]
+pub struct ResolvedProvider {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub auth_type: Option<String>,
+    pub auth_style: Option<String>,
+    pub email: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +213,8 @@ pub struct TransportConfig {
 pub struct PipelineConfig {
     #[serde(rename = "type")]
     pub pipeline_type: Option<String>,
+    /// Named provider from `[providers.*]` for base_url + auth.
+    pub provider: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
@@ -179,6 +239,8 @@ pub struct AuthConfig {
 pub struct MemoryConfig {
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
+    /// Named provider from `[providers.*]` for base_url + auth.
+    pub provider: Option<String>,
     pub path: Option<String>,
     pub base_url: Option<String>,
     #[serde(default)]
@@ -207,13 +269,39 @@ pub struct PersonaConfig {
     /// Persona provider type. Supported: `"magickmind"`, `"local"`.
     #[serde(rename = "type")]
     pub persona_type: Option<String>,
+    /// Named provider from `[providers.*]` for base_url + auth.
+    pub provider: Option<String>,
     /// The persona ID to fetch.
     pub persona_id: Option<String>,
-    /// Base URL for the magickmind API. Falls back to `memory.base_url` if absent.
+    /// Base URL override. When `provider` is set, overrides the provider's base_url.
+    /// Legacy: falls back to `memory.base_url` / `auth.base_url` if no provider.
     pub base_url: Option<String>,
     /// Directory containing local persona files (for `type = "local"`).
     /// Defaults to `~/.mindroid/personas`.
     pub data_dir: Option<String>,
+}
+
+/// Configuration for the corpus (RAG) subsystem.
+///
+/// ```toml
+/// [corpus]
+/// corpus_id = "abc-123"
+/// base_url = "https://api.magickmind.io"  # optional, falls back to pipeline.base_url
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CorpusConfig {
+    /// The corpus ID to query for document context.
+    pub corpus_id: Option<String>,
+    /// Named provider from `[providers.*]` for base_url + auth.
+    pub provider: Option<String>,
+    /// Base URL override. When `provider` is set, overrides the provider's base_url.
+    /// Legacy: falls back to `auth.base_url` if no provider.
+    pub base_url: Option<String>,
+    /// API key override for corpus queries.
+    /// When `provider` is set, falls back to the provider's api_key.
+    /// Legacy: falls back to `auth.api_key` if no provider.
+    pub api_key: Option<String>,
 }
 
 /// Configuration for cross-platform identity resolution.
@@ -229,12 +317,16 @@ pub struct IdentityConfig {
     pub links: Option<HashMap<String, Vec<String>>>,
 }
 
-/// Shared LLM provider credentials (endpoint + auth).
+/// Shared provider credentials (endpoint + auth).
 ///
-/// Define once in `[providers.<name>]`, reference from multiple `[models.*]` entries.
+/// Define once in `[providers.<name>]`, reference from `[models.*]`, `[persona]`,
+/// `[corpus]`, `[memory]`, or any component that talks to a remote service.
 ///
 /// Auth style is derived automatically: if `api_key` is present → Bearer,
 /// absent → None. Override with `auth_style = "x-api-key"` for cortex-service style.
+///
+/// For providers that require login (email + password → token exchange), set
+/// `auth_type = "apikey"` with `email` and `password`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
@@ -243,6 +335,13 @@ pub struct ProviderConfig {
     /// Explicit auth style override: `"bearer"`, `"x-api-key"`, or `"none"`.
     /// If absent, derived from `api_key` presence.
     pub auth_style: Option<String>,
+    /// Auth type for this provider: `"apikey"` (email+password login),
+    /// `"static"` (fixed token), or absent (derived from other fields).
+    pub auth_type: Option<String>,
+    /// Email for `auth_type = "apikey"` login flow.
+    pub email: Option<String>,
+    /// Password for `auth_type = "apikey"` login flow.
+    pub password: Option<String>,
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 }
@@ -291,6 +390,49 @@ pub struct ModelConfig {
 pub struct ToolsConfig {
     pub shell: ShellToolConfig,
     pub open: OpenToolConfig,
+    /// MCP server connections. Each entry connects to one external MCP server.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// Configuration for a single MCP server connection.
+///
+/// ```toml
+/// [[tools.mcp_servers]]
+/// name = "context7"
+/// url = "https://mcp.context7.com/mcp"
+/// api_key_env = "CONTEXT7_API_KEY"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Unique name used as tool prefix (e.g. "context7" → "context7_query-docs").
+    pub name: String,
+    /// MCP server endpoint URL.
+    pub url: String,
+    /// Inline API key (prefer `api_key_env` to avoid secrets in config files).
+    pub api_key: Option<String>,
+    /// Environment variable name containing the API key.
+    /// Resolved at runtime; takes precedence over `api_key`.
+    pub api_key_env: Option<String>,
+    /// Whether this server is enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl McpServerConfig {
+    /// Resolve the API key: `api_key_env` env var first, then inline `api_key`.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(ref env_name) = self.api_key_env {
+            if let Ok(val) = std::env::var(env_name) {
+                return Some(val);
+            }
+        }
+        self.api_key.clone()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

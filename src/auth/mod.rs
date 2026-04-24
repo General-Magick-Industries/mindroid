@@ -37,23 +37,5 @@ impl<T: Auth> Auth for Arc<T> {
     }
 }
 
-#[cfg(any(
-    feature = "apikey",
-    feature = "persistence",
-    feature = "llm-hosted",
-    feature = "persona"
-))]
-pub async fn build_auth_header_map(auth: &dyn Auth) -> crate::Result<reqwest::header::HeaderMap> {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-    let headers = auth.get_auth_headers().await?;
-    let mut map = HeaderMap::new();
-    for (k, v) in headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(&v),
-        ) {
-            map.insert(name, value);
-        }
-    }
-    Ok(map)
-}
+#[cfg(feature = "http-client")]
+pub use crate::http::build_auth_header_map;

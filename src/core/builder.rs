@@ -340,18 +340,32 @@ impl Runtime {
             match config.persona.persona_type.as_deref() {
                 Some("magickmind") => {
                     if config.persona.persona_id.is_some() {
-                        let base_url = config
-                            .persona
-                            .base_url
-                            .as_deref()
-                            .or(config.memory.base_url.as_deref())
-                            .or(config.auth.base_url.as_deref())
-                            .ok_or_else(|| {
-                                MindroidError::config(
-                                    "persona.base_url, memory.base_url, or auth.base_url is required for magickmind persona",
-                                )
-                            })?;
-                        let client = MagickmindPersonaClient::new(base_url, auth);
+                        let (base_url, effective_auth) =
+                            if let Some(ref provider_name) = config.persona.provider {
+                                let resolved = config.resolve_provider(
+                                    provider_name,
+                                    config.persona.base_url.as_deref(),
+                                )?;
+                                let pauth = build_provider_auth(&resolved, &auth)?;
+                                (resolved.base_url, pauth)
+                            } else {
+                                // Legacy fallback: persona.base_url → memory.base_url → auth.base_url
+                                let url = config
+                                    .persona
+                                    .base_url
+                                    .as_deref()
+                                    .or(config.memory.base_url.as_deref())
+                                    .or(config.auth.base_url.as_deref())
+                                    .ok_or_else(|| {
+                                        MindroidError::config(
+                                            "persona.base_url, memory.base_url, or auth.base_url is required \
+                                             for magickmind persona; consider using [persona] provider = \"...\" instead",
+                                        )
+                                    })?
+                                    .to_string();
+                                (url, auth.clone())
+                            };
+                        let client = MagickmindPersonaClient::new(&base_url, effective_auth);
                         builder.persona_provider =
                             Some(Arc::new(client) as Arc<dyn PersonaProvider>);
                     } else {
@@ -404,4 +418,4 @@ impl Runtime {
 
 // -- subsystem builders (delegated to factory module) -------------------------
 
-use super::factory::{build_auth, build_observers, build_pipeline, build_transport};
+use super::factory::{build_auth, build_observers, build_pipeline, build_provider_auth, build_transport};

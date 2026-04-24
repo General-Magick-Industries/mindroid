@@ -1,5 +1,9 @@
 mod context;
 #[cfg(feature = "llm-client")]
+pub mod corpus_gate;
+#[cfg(all(feature = "corpus", feature = "llm-client"))]
+pub mod corpus_distill;
+#[cfg(feature = "llm-client")]
 pub mod gate;
 #[cfg(feature = "llm-client")]
 mod llm_processor;
@@ -39,3 +43,7 @@ pub use tts::OpenAiTtsConfig;
 #[cfg(feature = "transport-audio")]
 pub use tts::StreamingTtsTransformer;
 pub use tts::{TtsProvider, TtsStage};
+#[cfg(feature = "llm-client")]
+pub use corpus_gate::{CorpusGateDecision, CorpusGateStage};
+#[cfg(all(feature = "corpus", feature = "llm-client"))]
+pub use corpus_distill::CorpusDistillStage;

@@ -1,9 +1,9 @@
-# MagickMind CLI configuration
-# Run with: cargo run --example magickmind_cli --features full -- --config examples/magickmind_cli/config.toml
+# MagickMind Persona CLI configuration
+# Run with: cargo run --example magickmind_persona_cli --features full -- --config examples/magickmind_persona_cli/config.toml
 
 [agent]
 agent_id = "69c3690e4044a36452ef6a60"      # MagickMind mindspace ID for this agent
-name = "MagickMind Assistance CLI"
+name = "MagickMind Persona CLI"
 
 [transport]
 type = "centrifugo"
@@ -23,6 +23,14 @@ base_url = "https://dev-bifrost.magickmind.ai"
 [observer]
 type = "log"
 level = "info"
+
+# -- Persona (magickmind) ------------------------------------------------------
+# Fetches the effective personality from the MagickMind persona service per-request.
+# Supports dyadic (per-user) trait blending.
+
+[persona]
+type = "magickmind"
+persona_id = "69cc9a52a95944be9f86b339"
 
 # -- LiteLLM provider ----------------------------------------------------------
 # Routes through the MagickMind LiteLLM proxy. Uses the same auth api_key.
