@@ -143,6 +143,30 @@ impl ContextProvider for SqliteContextProvider {
     }
 }
 
+// ── Animation helper ────────────────────────────────────────────────────────
+
+/// Spawns an animated loading indicator that cycles through `.`, `..`, `...`
+fn spawn_loading_animation(initial_label: &str) -> tokio::task::JoinHandle<()> {
+    let label = initial_label.to_string();
+    tokio::spawn(async move {
+        let mut stage = 0;
+        loop {
+            let dots = match stage {
+                0 => "|",
+                1 => "/",
+                2 => "—",
+                3 => "\\",
+                _ => "*",
+            };
+            print!("\r{}\x1b[90m{}\x1b[0m\x1b[K", label, dots);
+            let _ = std::io::stdout().flush();
+
+            stage = (stage + 1) % 4;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    })
+}
+
 // ── SqlitePersistence ────────────────────────────────────────────────────────
 
 /// Saves both the incoming user message and the agent's response to SQLite.
@@ -250,6 +274,9 @@ async fn main() -> anyhow::Result<()> {
 
     let builder = Runtime::from_config(config)?;
 
+    println!("MyHere is running! This agent has a Fast brain for quick answers and a Smart brain for complex questions.");
+    println!("\x1b[90mType your messages below:\x1b[0m");
+
     let mut runtime = builder
         .on_message(move |ctx| {
             let preparer = Arc::clone(&context_preparer);
@@ -303,10 +330,9 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-                print!("\nMyHere [Fast]: ");
+                print!("\n\x1b[90mMyHere [Fast]: \x1b[0m");
                 std::io::stdout().flush().ok();
-                print!("\x1b[90m...\x1b[0m");
-                std::io::stdout().flush().ok();
+                let animation = spawn_loading_animation("\x1b[90mMyHere [Fast]: \x1b[0m");
 
                 let (needs_smart, fast_response) =
                     match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
@@ -321,17 +347,19 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
+                animation.abort();
                 let response = fast_response.trim().to_string();
                 if !response.is_empty() {
                     if let Err(e) = ctx.respond(&response).await {
                         tracing::error!("Failed to send fast brain response: {e}");
                     } else {
-                        print!("\x08\x08\x08{response}\n\n");
+                        print!("\rMyHere [Fast]: {response}\n\n");
                         std::io::stdout().flush().ok();
                     }
                 }
 
                 if !needs_smart {
+                    println!("\x1b[90mType your messages below:\x1b[0m");
                     return;
                 }
 
@@ -372,20 +400,20 @@ async fn main() -> anyhow::Result<()> {
 
                 pctx.reset_output();
 
+                print!("\x1b[90mMyHere [Smart]: \x1b[0m");
+                std::io::stdout().flush().ok();
+                let animation = spawn_loading_animation("\x1b[90mMyHere [Smart]: \x1b[0m");
+
                 let mut stream = ctx.run_streaming_with_context(&smart_pipeline, &mut pctx);
                 let mut full_response = String::new();
-
-                print!("MyHere [Smart]: ");
-                std::io::stdout().flush().ok();
-                print!("\x1b[90m...\x1b[0m");
-                std::io::stdout().flush().ok();
 
                 let mut first_chunk = true;
                 while let Some(event) = stream.next().await {
                     match &event {
                         StreamEvent::Chunk { content } => {
                             if first_chunk {
-                                print!("\x08\x08\x08");
+                                animation.abort();
+                                print!("\rMyHere [Smart]: ");
                                 first_chunk = false;
                             }
                             print!("{content}");
@@ -410,7 +438,9 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!("Failed to send smart brain response: {e}");
                     }
                 }
+                
                 println!("\n");
+                println!("\x1b[90mType your messages below:\x1b[0m");
             }
         })
         .build()?;
