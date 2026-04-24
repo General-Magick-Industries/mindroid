@@ -28,8 +28,8 @@ use serde::Deserialize;
 use mindroid::llm_client::LlmClient;
 use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
-    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MindroidConfig, Pipeline,
-    PipelineContext, PipelineStage, PostProcessor, Result, Runtime, ShellTool, OpenTool,
+    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MindroidConfig, OpenTool,
+    Pipeline, PipelineContext, PipelineStage, PostProcessor, Result, Runtime, ShellTool,
     SimpleContextBuilder, StreamEvent, ToolExecutorStage, ToolRegistry,
 };
 
@@ -163,22 +163,18 @@ impl PipelineStage for SqlitePersistence {
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
 
-const FAST_BRAIN_PROMPT_DEFAULT: &str =
-    "If the question needs deep thinking or reasoning, set is_final to false, \
+const FAST_BRAIN_PROMPT_DEFAULT: &str = "If the question needs deep thinking or reasoning, set is_final to false, \
      otherwise set it to true. \
      Always respond with valid JSON: {\"is_final\": bool, \"response\": string}.";
 
-const SMART_BRAIN_PROMPT_DEFAULT: &str =
-    "You are a deep reasoning assistant. Think carefully and thoroughly before responding. \
+const SMART_BRAIN_PROMPT_DEFAULT: &str = "You are a deep reasoning assistant. Think carefully and thoroughly before responding. \
      Provide complete, well-considered answers.";
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("warn").init();
 
     let config = MindroidConfig::resolve_from_args()?;
 
@@ -201,11 +197,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(SMART_BRAIN_PROMPT_DEFAULT)
         .into();
 
-    let db_path = config
-        .memory
-        .path
-        .as_deref()
-        .unwrap_or("./myhere.db");
+    let db_path = config.memory.path.as_deref().unwrap_or("./myhere.db");
 
     let max_memory_items = config
         .memory
@@ -214,23 +206,25 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.as_u64())
         .unwrap_or(20);
     // 0 means unlimited; otherwise use the configured value
-    let history_limit = if max_memory_items == 0 { usize::MAX } else { max_memory_items as usize };
+    let history_limit = if max_memory_items == 0 {
+        usize::MAX
+    } else {
+        max_memory_items as usize
+    };
 
     let memory = Arc::new(SqliteMemory::new(db_path)?);
 
     let agent_id = config.agent.agent_id.clone();
 
-    let context_preparer = Arc::new(
-        ContextPreparer::new().add_provider(SqliteContextProvider {
-            memory: Arc::clone(&memory),
-            agent_id: agent_id.clone(),
-            limit: history_limit,
-        }),
-    );
+    let context_preparer = Arc::new(ContextPreparer::new().add_provider(SqliteContextProvider {
+        memory: Arc::clone(&memory),
+        agent_id: agent_id.clone(),
+        limit: history_limit,
+    }));
 
     let tool_registry = Arc::new(
         ToolRegistry::new()
-            .register(OpenTool::default()),
+            .register(OpenTool::default())
             .register(ShellTool::default()),
     );
 
@@ -265,7 +259,10 @@ async fn main() -> anyhow::Result<()> {
                 // ── 2. Fast brain pipeline ────────────────────────────────────
                 let fast_client = match LlmClient::new((*fast_llm).clone()) {
                     Ok(c) => c,
-                    Err(e) => { tracing::error!("Fast brain LLM init failed: {e}"); return; }
+                    Err(e) => {
+                        tracing::error!("Fast brain LLM init failed: {e}");
+                        return;
+                    }
                 };
 
                 let mut fast_pipeline = Pipeline::new()
@@ -273,7 +270,10 @@ async fn main() -> anyhow::Result<()> {
                         fast_persona.as_ref(),
                         history.clone(),
                     ))
-                    .add_streaming_stage(ToolExecutorStage::new(fast_client, Arc::clone(&tool_registry)))
+                    .add_streaming_stage(ToolExecutorStage::new(
+                        fast_client,
+                        Arc::clone(&tool_registry),
+                    ))
                     .add_stage(IsFinalExtractor)
                     .add_stage(BrainRouterGate)
                     .add_stage(PostProcessor);
@@ -286,13 +286,18 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-                let (needs_smart, fast_response) = match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
-                    Ok(resp) => {
-                        let needs_smart = pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false);
-                        (needs_smart, resp.unwrap_or_default())
-                    }
-                    Err(e) => { tracing::error!("Fast brain pipeline failed: {e}"); return; }
-                };
+                let (needs_smart, fast_response) =
+                    match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
+                        Ok(resp) => {
+                            let needs_smart =
+                                pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false);
+                            (needs_smart, resp.unwrap_or_default())
+                        }
+                        Err(e) => {
+                            tracing::error!("Fast brain pipeline failed: {e}");
+                            return;
+                        }
+                    };
 
                 if !needs_smart {
                     let response = fast_response.trim().to_string();
@@ -310,7 +315,10 @@ async fn main() -> anyhow::Result<()> {
 
                 let smart_client = match LlmClient::new((*smart_llm).clone()) {
                     Ok(c) => c,
-                    Err(e) => { tracing::error!("Smart brain LLM init failed: {e}"); return; }
+                    Err(e) => {
+                        tracing::error!("Smart brain LLM init failed: {e}");
+                        return;
+                    }
                 };
 
                 let mut smart_pipeline = Pipeline::new()
@@ -318,7 +326,10 @@ async fn main() -> anyhow::Result<()> {
                         smart_persona.as_ref(),
                         history,
                     ))
-                    .add_streaming_stage(ToolExecutorStage::new(smart_client, Arc::clone(&tool_registry)))
+                    .add_streaming_stage(ToolExecutorStage::new(
+                        smart_client,
+                        Arc::clone(&tool_registry),
+                    ))
                     .add_stage(PostProcessor);
                 if persist {
                     smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
@@ -341,7 +352,9 @@ async fn main() -> anyhow::Result<()> {
                             full_response.push_str(content);
                         }
                         StreamEvent::Complete { content, .. } => {
-                            if !content.is_empty() { full_response = content.clone(); }
+                            if !content.is_empty() {
+                                full_response = content.clone();
+                            }
                         }
                         StreamEvent::Error { message } => {
                             tracing::error!("Smart brain stream error: {message}");
