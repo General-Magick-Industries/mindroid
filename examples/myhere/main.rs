@@ -19,6 +19,7 @@
 //! Run with:
 //!   cargo run -p myhere -- --config examples/myhere/myhere.toml
 
+use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -63,7 +64,16 @@ impl PipelineStage for IsFinalExtractor {
                 ctx.response = Some(parsed.response);
             }
             Err(_) => {
-                ctx.set_ext(IsFinal(true));
+                let trimmed = raw.trim();
+                if trimmed.eq_ignore_ascii_case("false") {
+                    ctx.set_ext(IsFinal(false));
+                    ctx.response = Some("Let me hand this to my smart brain for a minute.".into());
+                } else if trimmed.eq_ignore_ascii_case("true") {
+                    ctx.set_ext(IsFinal(true));
+                    ctx.response = None;
+                } else {
+                    ctx.set_ext(IsFinal(true));
+                }
             }
         }
         Ok(())
@@ -81,8 +91,8 @@ impl PipelineStage for BrainRouterGate {
     }
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        let is_final = ctx.get_ext::<IsFinal>().map(|f| f.0).unwrap_or(true);
-        if !is_final {
+        let needs_smart = ctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(true);
+        if needs_smart {
             tracing::info!("BrainRouterGate: escalating to smart brain");
             ctx.halted = true;
         }
@@ -107,15 +117,21 @@ impl ContextProvider for SqliteContextProvider {
     }
 
     async fn fetch(&self, message: &Message) -> Result<Vec<LlmMessage>> {
+        let channel_id = if message.channel_id.is_empty() {
+            "stdio".to_string()
+        } else {
+            message.channel_id.clone()
+        };
+
         let history = self
             .memory
-            .get_history(&message.channel_id, self.limit)
+            .get_history(&channel_id, self.limit)
             .await?;
 
         let llm_messages = history
             .into_iter()
             .map(|msg| {
-                if msg.sender_id == self.agent_id {
+                if msg.sender_id == self.agent_id || msg.sender_id.is_empty() {
                     LlmMessage::assistant(msg.content)
                 } else {
                     LlmMessage::user(msg.content)
@@ -142,18 +158,22 @@ impl PipelineStage for SqlitePersistence {
     }
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        let channel_id = &ctx.message.channel_id;
+        let channel_id = if ctx.message.channel_id.is_empty() {
+            "stdio".to_string()
+        } else {
+            ctx.message.channel_id.clone()
+        };
         let user_id = &ctx.message.sender_id;
 
         // Save user message
         self.memory
-            .save_message(channel_id, user_id, &ctx.message.content, None)
+            .save_message(&channel_id, user_id, &ctx.message.content, None)
             .await?;
 
         // Save agent response
         if let Some(response) = ctx.response.as_deref().filter(|r| !r.is_empty()) {
             self.memory
-                .save_message(channel_id, &self.agent_id, response, None)
+                .save_message(&channel_id, &self.agent_id, response, None)
                 .await?;
         }
 
@@ -161,22 +181,15 @@ impl PipelineStage for SqlitePersistence {
     }
 }
 
-// ── Prompts ──────────────────────────────────────────────────────────────────
-
-const FAST_BRAIN_PROMPT_DEFAULT: &str = "If the question needs deep thinking or reasoning, set is_final to false, \
-     otherwise set it to true. \
-     Always respond with valid JSON: {\"is_final\": bool, \"response\": string}.";
-
-const SMART_BRAIN_PROMPT_DEFAULT: &str = "You are a deep reasoning assistant. Think carefully and thoroughly before responding. \
-     Provide complete, well-considered answers.";
-
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter("warn").init();
-
     let config = MindroidConfig::resolve_from_args()?;
+
+    let log_level = config.observer.level.as_deref().unwrap_or("info");
+
+    tracing_subscriber::fmt().with_env_filter(log_level).init();
 
     let fast_llm = config.llm("fast")?;
     let smart_llm = config.llm("smart")?;
@@ -186,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
         .get("fast")
         .and_then(|m| m.options.get("persona"))
         .and_then(|v| v.as_str())
-        .unwrap_or(FAST_BRAIN_PROMPT_DEFAULT)
+        .ok_or_else(|| anyhow::anyhow!("fast model persona is required in config"))?
         .into();
 
     let smart_persona: Arc<str> = config
@@ -194,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
         .get("smart")
         .and_then(|m| m.options.get("persona"))
         .and_then(|v| v.as_str())
-        .unwrap_or(SMART_BRAIN_PROMPT_DEFAULT)
+        .ok_or_else(|| anyhow::anyhow!("smart model persona is required in config"))?
         .into();
 
     let db_path = config.memory.path.as_deref().unwrap_or("./myhere.db");
@@ -214,7 +227,11 @@ async fn main() -> anyhow::Result<()> {
 
     let memory = Arc::new(SqliteMemory::new(db_path)?);
 
-    let agent_id = config.agent.agent_id.clone();
+    let agent_id = if config.agent.agent_id.trim().is_empty() {
+        config.agent.name.clone()
+    } else {
+        config.agent.agent_id.clone()
+    };
 
     let context_preparer = Arc::new(ContextPreparer::new().add_provider(SqliteContextProvider {
         memory: Arc::clone(&memory),
@@ -254,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
                 let history = Arc::new(context);
-                let persist = !ctx.message.channel_id.is_empty();
+                let persist = true;
 
                 // ── 2. Fast brain pipeline ────────────────────────────────────
                 let fast_client = match LlmClient::new((*fast_llm).clone()) {
@@ -286,6 +303,11 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
+                print!("\nMyHere [Fast]: ");
+                std::io::stdout().flush().ok();
+                print!("\x1b[90m...\x1b[0m");
+                std::io::stdout().flush().ok();
+
                 let (needs_smart, fast_response) =
                     match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
                         Ok(resp) => {
@@ -299,14 +321,17 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                if !needs_smart {
-                    let response = fast_response.trim().to_string();
-                    if !response.is_empty() {
-                        println!("\nMyHere [Fast]: {response}\n");
-                        if let Err(e) = ctx.respond(&response).await {
-                            tracing::error!("Failed to send fast brain response: {e}");
-                        }
+                let response = fast_response.trim().to_string();
+                if !response.is_empty() {
+                    if let Err(e) = ctx.respond(&response).await {
+                        tracing::error!("Failed to send fast brain response: {e}");
+                    } else {
+                        print!("\x08\x08\x08{response}\n\n");
+                        std::io::stdout().flush().ok();
                     }
+                }
+
+                if !needs_smart {
                     return;
                 }
 
@@ -321,10 +346,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
+                // Include fast brain's response in context for smart brain
+                let mut smart_history = (*history).clone();
+                if !response.is_empty() {
+                    smart_history.push(LlmMessage::assistant(response.clone()));
+                }
+                let smart_history = Arc::new(smart_history);
+
                 let mut smart_pipeline = Pipeline::new()
                     .add_stage(SimpleContextBuilder::with_prompt_and_history(
                         smart_persona.as_ref(),
-                        history,
+                        smart_history,
                     ))
                     .add_streaming_stage(ToolExecutorStage::new(
                         smart_client,
@@ -343,10 +375,19 @@ async fn main() -> anyhow::Result<()> {
                 let mut stream = ctx.run_streaming_with_context(&smart_pipeline, &mut pctx);
                 let mut full_response = String::new();
 
-                print!("\nMyHere [Smart]: ");
+                print!("MyHere [Smart]: ");
+                std::io::stdout().flush().ok();
+                print!("\x1b[90m...\x1b[0m");
+                std::io::stdout().flush().ok();
+
+                let mut first_chunk = true;
                 while let Some(event) = stream.next().await {
                     match &event {
                         StreamEvent::Chunk { content } => {
+                            if first_chunk {
+                                print!("\x08\x08\x08");
+                                first_chunk = false;
+                            }
                             print!("{content}");
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                             full_response.push_str(content);

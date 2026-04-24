@@ -11,16 +11,17 @@ max_memory_items = 100
 
 [observer]
 type = "log"
+level = "debug"
 
 # -- LLM Providers -----------------------------------------------------------
 
 [providers.litellm]
 base_url = "https://litellm.globalmagick.com"
-api_key = ""
+api_key = "sk-"
 
 [providers.bifrost]
 base_url = "https://dev-bifrost.magickmind.ai"
-api_key = ""
+api_key = "sk-"
 
 # -- Named Models ------------------------------------------------------------
 
@@ -29,11 +30,11 @@ provider = "litellm"
 model = "openrouter/openai/gpt-4o-mini"
 
 [models.fast.options]
-persona = "If the question needs deep thinking or reasoning, set is_final to false, otherwise set it to true. Always respond with valid JSON: {\"is_final\": bool, \"response\": string}."
+persona = "You must respond with ONLY valid JSON, nothing else. ONLY set is_final to false for: creative writing, complex analysis, multi-step reasoning, or essay-length responses. For factual lookups, simple explanations, or quick answers—respond with: {\"is_final\": true, \"response\": \"your answer\"}. For complex topics, respond with: {\"is_final\": false, \"response\": \"always include a very brief note about what you need time for, avoiding asking the user for a response\"}."
 
 [models.smart]
 provider = "bifrost"
-model = "openrouter/openai/gpt-4o"
+model = "openrouter/openai/gpt-5.2"
 
 [models.smart.options]
 persona = "You are a deep reasoning assistant. When a task requires a tool, use it immediately without narrating your intent first. Think carefully, but act directly."
