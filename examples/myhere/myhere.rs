@@ -434,8 +434,8 @@ impl MyHerePipelineBuilder {
                 let (needs_smart, fast_response) =
                     match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
                         Ok(resp) => {
-                            let needs_smart =
-                                pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false);
+                            let is_final = pctx.get_ext::<IsFinal>().map(|f| f.0).unwrap_or(true);
+                            let needs_smart = !is_final;
                             (needs_smart, resp.unwrap_or_default())
                         }
                         Err(e) => {
@@ -447,13 +447,15 @@ impl MyHerePipelineBuilder {
                 animation.abort();
                 let response = fast_response.trim().to_string();
                 if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send fast brain response: {e}");
-                    } else {
+                    let is_stdio = ctx.message.channel_id.is_empty() || ctx.message.channel_id == "stdio";
+                    if is_stdio {
                         print!("\rMyHere [Fast]: {response}\n\n");
                         std::io::stdout().flush().ok();
+                    } else if let Err(e) = ctx.respond(&response).await {
+                        tracing::error!("Failed to send fast brain response: {e}");
                     }
                 }
+
 
                 if !needs_smart {
                     println!("\x1b[90mType your messages below:\x1b[0m");
