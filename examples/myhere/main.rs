@@ -24,7 +24,7 @@ mod myhere;
 use std::sync::Arc;
 
 use mindroid::memory::sqlite::SqliteMemory;
-use mindroid::{ContextPreparer, MindroidConfig, Memory, Runtime};
+use mindroid::{ContextPreparer, MindroidConfig, Runtime};
 
 use myhere::{create_tool_registry, build_myhere_pipeline, SqliteContextProvider};
 
@@ -88,9 +88,6 @@ async fn main() -> anyhow::Result<()> {
     // Example: tool_registry = tool_registry.register(MyCustomTool::default());
 
     let tool_registry = Arc::new(tool_registry);
-
-    let fast_llm = Arc::new(fast_llm);
-    let smart_llm = Arc::new(smart_llm);
 
     let builder = Runtime::from_config(config)?;
 

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mindroid::memory::sqlite::SqliteMemory;
-use mindroid::{ContextPreparer, MindroidConfig, Memory, Pipeline, PipelineContext, PipelineStage, Result, Runtime};
+use mindroid::{ContextPreparer, MindroidConfig, MessageContext, Pipeline, PipelineContext, PipelineStage, Result, Runtime, Response};
 
 use myhere::{create_tool_registry, MyHereStage, SqliteContextProvider};
 
@@ -115,26 +115,23 @@ async fn main() -> anyhow::Result<()> {
 
     let tool_registry = Arc::new(create_tool_registry());
 
-    let fast_llm = Arc::new(fast_llm);
-    let smart_llm = Arc::new(smart_llm);
-
     let builder = Runtime::from_config(config)?;
 
     println!("MyThere is running with MyHere as an internal stage.");
     println!("\x1b[90mType your messages below:\x1b[0m");
 
     // Build MyThere's pipeline with MyHere as a stage
-    let message_handler = |ctx: mindroid::RuntimeContext| {
+    let message_handler = |ctx: MessageContext| {
         let context_preparer = Arc::clone(&context_preparer);
         let memory = Arc::clone(&memory);
-        let fast_llm = Arc::clone(&fast_llm);
-        let smart_llm = Arc::clone(&smart_llm);
+        let fast_llm = fast_llm.clone();
+        let smart_llm = smart_llm.clone();
         let fast_persona = Arc::clone(&fast_persona);
         let smart_persona = Arc::clone(&smart_persona);
         let tool_registry = Arc::clone(&tool_registry);
         let agent_id = agent_id.clone();
 
-        async move {
+        Box::pin(async move {
             let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
             // Build MyThere's pipeline:
@@ -143,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             // 3. Post-process the result
             let pipeline = Pipeline::new()
                 .add_stage(MyThereContextEnricher)
-                .add_stage(Arc::new(MyHereStage::new(
+                .add_stage(MyHereStage::new(
                     context_preparer,
                     memory,
                     fast_llm,
@@ -152,24 +149,25 @@ async fn main() -> anyhow::Result<()> {
                     smart_persona,
                     tool_registry,
                     agent_id,
-                )))
+                ))
                 .add_stage(MyTherePostProcessor);
 
-            if let Err(e) = ctx.run_with_context(&pipeline, &mut pctx).await {
+            if let Err(e) = pipeline.run(&mut pctx).await {
                 tracing::error!("MyThere pipeline failed: {e}");
                 return;
             }
 
             if let Some(response) = pctx.response {
+                let resp = Response::new(response.clone(), ctx.message.channel_id.clone(), "MyThere".to_string());
                 print!("\nMyThere: {response}\n\n");
                 std::io::stdout().flush().ok();
-                if let Err(e) = ctx.respond(&response).await {
+                if let Err(e) = ctx.transport.send(&resp).await {
                     tracing::error!("Failed to send response: {e}");
                 }
             }
 
             println!("\x1b[90mType your messages below:\x1b[0m");
-        }
+        })
     };
 
     let mut runtime = builder.on_message(message_handler).build()?;

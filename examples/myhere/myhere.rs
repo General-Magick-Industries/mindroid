@@ -5,12 +5,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 
-use mindroid::llm_client::LlmClient;
+use mindroid::llm_client::{LlmClient, LlmClientConfig};
 use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
-    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, Pipeline, PipelineContext,
+    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MessageContext, Pipeline, PipelineContext,
     PipelineStage, PostProcessor, Result, ShellTool, SimpleContextBuilder, StreamEvent,
-    ToolExecutorStage, ToolRegistry, OpenTool,
+    ToolExecutorStage, ToolRegistry, OpenTool, Response,
 };
 
 // ── IsFinal extension ────────────────────────────────────────────────────────
@@ -189,10 +189,10 @@ impl PipelineStage for SqlitePersistence {
 /// MyHere dual-brain pipeline packaged as a PipelineStage.
 /// Can be used within MyThere's pipeline to delegate reasoning to MyHere.
 pub struct MyHereStage {
-    context_preparer: Arc<ContextPreparer<SqliteContextProvider>>,
+    context_preparer: Arc<ContextPreparer>,
     memory: Arc<SqliteMemory>,
-    fast_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
-    smart_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+    fast_llm: LlmClientConfig,
+    smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
@@ -201,10 +201,10 @@ pub struct MyHereStage {
 
 impl MyHereStage {
     pub fn new(
-        context_preparer: Arc<ContextPreparer<SqliteContextProvider>>,
+        context_preparer: Arc<ContextPreparer>,
         memory: Arc<SqliteMemory>,
-        fast_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
-        smart_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+        fast_llm: LlmClientConfig,
+        smart_llm: LlmClientConfig,
         fast_persona: Arc<str>,
         smart_persona: Arc<str>,
         tool_registry: Arc<ToolRegistry>,
@@ -241,7 +241,7 @@ impl PipelineStage for MyHereStage {
         let history = Arc::new(additional_context);
 
         // ── Fast brain ────────────────────────────────────────────────────
-        let fast_client = match LlmClient::new((*self.fast_llm).clone()) {
+        let fast_client = match LlmClient::new(self.fast_llm.clone()) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("MyHere fast brain LLM init failed: {e}");
@@ -280,7 +280,7 @@ impl PipelineStage for MyHereStage {
         // ── Smart brain (if needed) ───────────────────────────────────────
         tracing::info!("MyHere: fast brain escalated, running smart brain");
 
-        let smart_client = match LlmClient::new((*self.smart_llm).clone()) {
+        let smart_client = match LlmClient::new(self.smart_llm.clone()) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("MyHere smart brain LLM init failed: {e}");
@@ -331,26 +331,22 @@ pub fn create_tool_registry() -> ToolRegistry {
 /// Builder for MyHere pipeline with extensibility points for custom stages.
 /// Allows downstream pipelines (e.g., MyThere) to inject additional stages.
 pub struct MyHerePipelineBuilder {
-    context_preparer: Arc<ContextPreparer<SqliteContextProvider>>,
+    context_preparer: Arc<ContextPreparer>,
     memory: Arc<SqliteMemory>,
-    fast_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
-    smart_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+    fast_llm: LlmClientConfig,
+    smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
     agent_id: String,
-    /// Custom stages to insert after BrainRouterGate in fast pipeline
-    fast_post_router_stages: Vec<Arc<dyn PipelineStage>>,
-    /// Custom stages to insert after ToolExecutorStage in smart pipeline (before PostProcessor)
-    smart_post_exec_stages: Vec<Arc<dyn PipelineStage>>,
 }
 
 impl MyHerePipelineBuilder {
     pub fn new(
-        context_preparer: Arc<ContextPreparer<SqliteContextProvider>>,
+        context_preparer: Arc<ContextPreparer>,
         memory: Arc<SqliteMemory>,
-        fast_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
-        smart_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+        fast_llm: LlmClientConfig,
+        smart_llm: LlmClientConfig,
         fast_persona: Arc<str>,
         smart_persona: Arc<str>,
         tool_registry: Arc<ToolRegistry>,
@@ -365,24 +361,10 @@ impl MyHerePipelineBuilder {
             smart_persona,
             tool_registry,
             agent_id,
-            fast_post_router_stages: Vec::new(),
-            smart_post_exec_stages: Vec::new(),
         }
     }
 
-    /// Add a custom stage after the BrainRouterGate in the fast brain pipeline.
-    pub fn add_fast_post_router_stage(mut self, stage: Arc<dyn PipelineStage>) -> Self {
-        self.fast_post_router_stages.push(stage);
-        self
-    }
-
-    /// Add a custom stage after ToolExecutorStage in the smart brain pipeline.
-    pub fn add_smart_post_exec_stage(mut self, stage: Arc<dyn PipelineStage>) -> Self {
-        self.smart_post_exec_stages.push(stage);
-        self
-    }
-
-    pub fn build(self) -> impl Fn(mindroid::RuntimeContext) + Send + 'static {
+    pub fn build(self) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
         let context_preparer = self.context_preparer;
         let memory = self.memory;
         let fast_llm = self.fast_llm;
@@ -391,22 +373,18 @@ impl MyHerePipelineBuilder {
         let smart_persona = self.smart_persona;
         let tool_registry = self.tool_registry;
         let agent_id = self.agent_id;
-        let fast_post_router_stages = self.fast_post_router_stages;
-        let smart_post_exec_stages = self.smart_post_exec_stages;
 
         move |ctx| {
             let preparer = Arc::clone(&context_preparer);
             let memory = Arc::clone(&memory);
-            let fast_llm = Arc::clone(&fast_llm);
-            let smart_llm = Arc::clone(&smart_llm);
+            let fast_llm = fast_llm.clone();
+            let smart_llm = smart_llm.clone();
             let fast_persona = Arc::clone(&fast_persona);
             let smart_persona = Arc::clone(&smart_persona);
             let tool_registry = Arc::clone(&tool_registry);
             let agent_id = agent_id.clone();
-            let fast_post_router_stages = fast_post_router_stages.clone();
-            let smart_post_exec_stages = smart_post_exec_stages.clone();
 
-            async move {
+            Box::pin(async move {
                 // ── 1. Fetch local SQLite context ─────────────────────────────
                 let context = match preparer.prepare(&ctx.message).await {
                     Ok(c) => c,
@@ -419,7 +397,7 @@ impl MyHerePipelineBuilder {
                 let persist = true;
 
                 // ── 2. Fast brain pipeline ────────────────────────────────────
-                let fast_client = match LlmClient::new((*fast_llm).clone()) {
+                let fast_client = match LlmClient::new(fast_llm) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!("Fast brain LLM init failed: {e}");
@@ -438,11 +416,6 @@ impl MyHerePipelineBuilder {
                     ))
                     .add_stage(IsFinalExtractor)
                     .add_stage(BrainRouterGate);
-
-                // Add custom fast brain stages
-                for stage in &fast_post_router_stages {
-                    fast_pipeline = fast_pipeline.add_stage(Arc::clone(stage));
-                }
 
                 fast_pipeline = fast_pipeline.add_stage(PostProcessor);
                 if persist {
@@ -490,7 +463,7 @@ impl MyHerePipelineBuilder {
                 // ── 3. Smart brain pipeline ───────────────────────────────────
                 tracing::info!("Fast brain escalated — running smart brain");
 
-                let smart_client = match LlmClient::new((*smart_llm).clone()) {
+                let smart_client = match LlmClient::new(smart_llm) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!("Smart brain LLM init failed: {e}");
@@ -513,14 +486,8 @@ impl MyHerePipelineBuilder {
                     .add_streaming_stage(ToolExecutorStage::new(
                         smart_client,
                         Arc::clone(&tool_registry),
-                    ));
-
-                // Add custom smart brain stages
-                for stage in &smart_post_exec_stages {
-                    smart_pipeline = smart_pipeline.add_stage(Arc::clone(stage));
-                }
-
-                smart_pipeline = smart_pipeline.add_stage(PostProcessor);
+                    ))
+                    .add_stage(PostProcessor);
                 if persist {
                     smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
                         memory: Arc::clone(&memory),
@@ -571,7 +538,7 @@ impl MyHerePipelineBuilder {
 
                 println!("\n");
                 println!("\x1b[90mType your messages below:\x1b[0m");
-            }
+            })
         }
     }
 }
@@ -579,15 +546,15 @@ impl MyHerePipelineBuilder {
 /// Convenience function: builds the MyHere pipeline with no custom stages.
 /// For custom stages, use `MyHerePipelineBuilder` directly.
 pub fn build_myhere_pipeline(
-    context_preparer: Arc<ContextPreparer<SqliteContextProvider>>,
+    context_preparer: Arc<ContextPreparer>,
     memory: Arc<SqliteMemory>,
-    fast_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
-    smart_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+    fast_llm: LlmClientConfig,
+    smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
     agent_id: String,
-) -> impl Fn(mindroid::RuntimeContext) + Send + 'static {
+) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
     MyHerePipelineBuilder::new(
         context_preparer,
         memory,
