@@ -320,14 +320,6 @@ impl PipelineStage for MyHereStage {
 
 // ── MyHere pipeline builder ──────────────────────────────────────────────────
 
-/// Configures and returns the base tool registry with default tools.
-/// Import this to add more tools before building the MyHere pipeline.
-pub fn create_tool_registry() -> ToolRegistry {
-    ToolRegistry::new()
-        .register(OpenTool::default())
-        .register(ShellTool::default())
-}
-
 /// Builder for MyHere pipeline with extensibility points for custom stages.
 /// Allows downstream pipelines (e.g., MyThere) to inject additional stages.
 pub struct MyHerePipelineBuilder {
