@@ -9,8 +9,8 @@ use mindroid::llm_client::{LlmClient, LlmClientConfig};
 use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
     ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MessageContext, Pipeline, PipelineContext,
-    PipelineStage, PostProcessor, Result, ShellTool, SimpleContextBuilder, StreamEvent,
-    ToolExecutorStage, ToolRegistry, OpenTool,
+    PipelineStage, PostProcessor, Result, SimpleContextBuilder, StreamEvent,
+    ToolExecutorStage, ToolRegistry,
 };
 
 // ── IsFinal extension ────────────────────────────────────────────────────────
@@ -320,10 +320,12 @@ impl PipelineStage for MyHereStage {
 
 // ── MyHere pipeline builder ──────────────────────────────────────────────────
 
-/// Creates an empty tool registry.
-/// Downstream pipelines can add tools as needed.
+/// Configures and returns the base tool registry with default tools.
+/// Import this to add more tools before building the MyHere pipeline.
 pub fn create_tool_registry() -> ToolRegistry {
     ToolRegistry::new()
+        .register(OpenTool::default())
+        .register(ShellTool::default())
 }
 
 /// Builder for MyHere pipeline with extensibility points for custom stages.
