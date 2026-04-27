@@ -8,6 +8,10 @@ publish = false
 name = "myhere"
 path = "main.rs"
 
+[[bin]]
+name = "mythere"
+path = "mythere.rs"
+
 [dependencies]
 mindroid = { workspace = true, features = ["full"] }
 tokio = { workspace = true }

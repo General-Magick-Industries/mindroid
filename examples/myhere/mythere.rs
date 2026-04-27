@@ -4,7 +4,7 @@
 //! larger pipeline. MyThere enriches context and orchestrates the flow.
 //!
 //! Run with:
-//!   cargo run --example mythere -- --config examples/myhere/mythere.toml
+//!   cargo run -p myhere --bin mythere -- --config examples/myhere/myhere.toml
 
 mod myhere;
 
@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mindroid::memory::sqlite::SqliteMemory;
-use mindroid::{ContextPreparer, MindroidConfig, MessageContext, Pipeline, PipelineContext, PipelineStage, Result, Runtime, Response};
+use mindroid::{
+    ContextPreparer, MindroidConfig, MessageContext, Pipeline, PipelineContext, PipelineStage,
+    Result, Runtime,
+};
 
 use myhere::{create_tool_registry, MyHereStage, SqliteContextProvider};
 
@@ -29,7 +32,7 @@ impl PipelineStage for MyThereContextEnricher {
         "MyThereContextEnricher"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, _ctx: &mut PipelineContext) -> Result<()> {
         tracing::info!("MyThere: enriching context for MyHere");
         // In a real implementation, enrich the context here.
         // For now, just log it as an example.
@@ -121,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\x1b[90mType your messages below:\x1b[0m");
 
     // Build MyThere's pipeline with MyHere as a stage
-    let message_handler = |ctx: MessageContext| {
+    let message_handler = move |ctx: MessageContext| {
         let context_preparer = Arc::clone(&context_preparer);
         let memory = Arc::clone(&memory);
         let fast_llm = fast_llm.clone();
@@ -158,10 +161,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if let Some(response) = pctx.response {
-                let resp = Response::new(response.clone(), ctx.message.channel_id.clone(), "MyThere".to_string());
                 print!("\nMyThere: {response}\n\n");
                 std::io::stdout().flush().ok();
-                if let Err(e) = ctx.transport.send(&resp).await {
+                if let Err(e) = ctx.respond(&response).await {
                     tracing::error!("Failed to send response: {e}");
                 }
             }
