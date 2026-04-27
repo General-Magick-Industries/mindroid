@@ -13,13 +13,15 @@ use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mindroid::memory::sqlite::SqliteMemory;
+use mindroid::pipeline::presets::magickmind::{
+    MagickmindClient, MagickmindContext, MagickmindPersistence,
+};
 use mindroid::{
     ContextPreparer, MindroidConfig, MessageContext, Pipeline, PipelineContext, PipelineStage,
-    Result, Runtime,
+    Result, Runtime, ShellTool
 };
 
-use myhere::{create_tool_registry, MyHereStage, SqliteContextProvider};
+use myhere::{create_tool_registry, MyHereStage, PersistenceBackend};
 
 // ── MyThere context enrichment stage ─────────────────────────────────────
 
@@ -89,37 +91,38 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("smart model persona is required in config"))?
         .into();
 
-    let db_path = config.memory.path.as_deref().unwrap_or("./mythere.db");
-
-    let max_memory_items = config
-        .memory
-        .options
-        .get("max_memory_items")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20);
-    let history_limit = if max_memory_items == 0 {
-        usize::MAX
-    } else {
-        max_memory_items as usize
-    };
-
-    let memory = Arc::new(SqliteMemory::new(db_path)?);
-
     let agent_id = if config.agent.agent_id.trim().is_empty() {
         config.agent.name.clone()
     } else {
         config.agent.agent_id.clone()
     };
 
-    let context_preparer = Arc::new(ContextPreparer::new().add_provider(SqliteContextProvider {
-        memory: Arc::clone(&memory),
-        agent_id: agent_id.clone(),
-        limit: history_limit,
-    }));
+    let builder = Runtime::from_config(config.clone())?;
+    let builder_auth = builder.auth_arc();
+    let magickmind_url = config
+        .auth
+        .base_url
+        .as_deref()
+        .unwrap_or("https://dev-magickmind.magickmind.ai");
 
-    let tool_registry = Arc::new(create_tool_registry());
+    let mut magickmind_client = MagickmindClient::new(
+        magickmind_url,
+        builder_auth.ok_or_else(|| anyhow::anyhow!("auth not configured"))?,
+    );
+    if let Some(key) = &config.auth.api_key {
+        magickmind_client = magickmind_client.with_api_key(key);
+    }
+    let magickmind = Arc::new(magickmind_client);
 
-    let builder = Runtime::from_config(config)?;
+    let context_preparer = Arc::new(
+        ContextPreparer::new()
+            .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id.clone()))
+    );
+
+    let tool_registry = Arc::new(
+        create_tool_registry()
+            .register(ShellTool::default())
+    );
 
     println!("MyThere is running with MyHere as an internal stage.");
     println!("\x1b[90mType your messages below:\x1b[0m");
@@ -127,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     // Build MyThere's pipeline with MyHere as a stage
     let message_handler = move |ctx: MessageContext| {
         let context_preparer = Arc::clone(&context_preparer);
-        let memory = Arc::clone(&memory);
+        let memory = Arc::clone(&magickmind);
         let fast_llm = fast_llm.clone();
         let smart_llm = smart_llm.clone();
         let fast_persona = Arc::clone(&fast_persona);
@@ -142,11 +145,12 @@ async fn main() -> anyhow::Result<()> {
             // 1. Enrich context (MyThere-specific)
             // 2. Run MyHere's dual-brain logic
             // 3. Post-process the result
+            // 4. Persist response to MagickMind
             let pipeline = Pipeline::new()
                 .add_stage(MyThereContextEnricher)
                 .add_stage(MyHereStage::new(
                     context_preparer,
-                    memory,
+                    PersistenceBackend::magickmind(memory.clone()),
                     fast_llm,
                     smart_llm,
                     fast_persona,
@@ -154,7 +158,8 @@ async fn main() -> anyhow::Result<()> {
                     tool_registry,
                     agent_id,
                 ))
-                .add_stage(MyTherePostProcessor);
+                .add_stage(MyTherePostProcessor)
+                .add_stage(MagickmindPersistence::new(memory));
 
             if let Err(e) = pipeline.run(&mut pctx).await {
                 tracing::error!("MyThere pipeline failed: {e}");

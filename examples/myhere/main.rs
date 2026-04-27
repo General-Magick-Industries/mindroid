@@ -27,7 +27,7 @@ use std::sync::Arc;
 use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{ContextPreparer, MindroidConfig, Runtime};
 
-use myhere::{create_tool_registry, build_myhere_pipeline, SqliteContextProvider};
+use myhere::{create_tool_registry, build_myhere_pipeline, SqliteContextProvider, PersistenceBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let mut runtime = builder
         .on_message(build_myhere_pipeline(
             context_preparer,
-            memory,
+            PersistenceBackend::sqlite(memory),
             fast_llm,
             smart_llm,
             fast_persona,

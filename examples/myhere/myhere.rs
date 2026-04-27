@@ -7,11 +7,31 @@ use serde::Deserialize;
 
 use mindroid::llm_client::{LlmClient, LlmClientConfig};
 use mindroid::memory::sqlite::SqliteMemory;
+use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindPersistence};
 use mindroid::{
-    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MessageContext, Pipeline, PipelineContext,
-    PipelineStage, PostProcessor, Result, SimpleContextBuilder, StreamEvent,
+    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MessageContext, Pipeline,
+    PipelineContext, PipelineStage, PostProcessor, Result, SimpleContextBuilder, StreamEvent,
     ToolExecutorStage, ToolRegistry,
 };
+
+// ── PersistenceBackend enum ──────────────────────────────────────────────────
+
+/// Flexible persistence backend supporting both SQLite and MagickMind.
+#[derive(Clone)]
+pub enum PersistenceBackend {
+    Sqlite(Arc<SqliteMemory>),
+    Magickmind(Arc<MagickmindClient>),
+}
+
+impl PersistenceBackend {
+    pub fn sqlite(memory: Arc<SqliteMemory>) -> Self {
+        Self::Sqlite(memory)
+    }
+
+    pub fn magickmind(client: Arc<MagickmindClient>) -> Self {
+        Self::Magickmind(client)
+    }
+}
 
 // ── IsFinal extension ────────────────────────────────────────────────────────
 
@@ -190,7 +210,7 @@ impl PipelineStage for SqlitePersistence {
 /// Can be used within MyThere's pipeline to delegate reasoning to MyHere.
 pub struct MyHereStage {
     context_preparer: Arc<ContextPreparer>,
-    memory: Arc<SqliteMemory>,
+    persistence: PersistenceBackend,
     fast_llm: LlmClientConfig,
     smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
@@ -202,7 +222,7 @@ pub struct MyHereStage {
 impl MyHereStage {
     pub fn new(
         context_preparer: Arc<ContextPreparer>,
-        memory: Arc<SqliteMemory>,
+        persistence: PersistenceBackend,
         fast_llm: LlmClientConfig,
         smart_llm: LlmClientConfig,
         fast_persona: Arc<str>,
@@ -212,7 +232,7 @@ impl MyHereStage {
     ) -> Self {
         Self {
             context_preparer,
-            memory,
+            persistence,
             fast_llm,
             smart_llm,
             fast_persona,
@@ -266,12 +286,21 @@ impl PipelineStage for MyHereStage {
         // If fast brain final, update outer context and return
         if !needs_smart {
             PostProcessor.process(&mut fast_ctx).await?;
-            SqlitePersistence {
-                memory: Arc::clone(&self.memory),
-                agent_id: self.agent_id.clone(),
+            match &self.persistence {
+                PersistenceBackend::Sqlite(memory) => {
+                    SqlitePersistence {
+                        memory: Arc::clone(memory),
+                        agent_id: self.agent_id.clone(),
+                    }
+                    .process(&mut fast_ctx)
+                    .await?;
+                }
+                PersistenceBackend::Magickmind(magickmind) => {
+                    MagickmindPersistence::new(Arc::clone(magickmind))
+                        .process(&mut fast_ctx)
+                        .await?;
+                }
             }
-            .process(&mut fast_ctx)
-            .await?;
 
             ctx.response = fast_ctx.response;
             return Ok(());
@@ -306,12 +335,21 @@ impl PipelineStage for MyHereStage {
             .await?;
 
         PostProcessor.process(&mut smart_ctx).await?;
-        SqlitePersistence {
-            memory: Arc::clone(&self.memory),
-            agent_id: self.agent_id.clone(),
+        match &self.persistence {
+            PersistenceBackend::Sqlite(memory) => {
+                SqlitePersistence {
+                    memory: Arc::clone(memory),
+                    agent_id: self.agent_id.clone(),
+                }
+                .process(&mut smart_ctx)
+                .await?;
+            }
+            PersistenceBackend::Magickmind(magickmind) => {
+                MagickmindPersistence::new(Arc::clone(magickmind))
+                    .process(&mut smart_ctx)
+                    .await?;
+            }
         }
-        .process(&mut smart_ctx)
-        .await?;
 
         ctx.response = smart_ctx.response;
         Ok(())
@@ -330,7 +368,7 @@ pub fn create_tool_registry() -> ToolRegistry {
 /// Allows downstream pipelines (e.g., MyThere) to inject additional stages.
 pub struct MyHerePipelineBuilder {
     context_preparer: Arc<ContextPreparer>,
-    memory: Arc<SqliteMemory>,
+    persistence: PersistenceBackend,
     fast_llm: LlmClientConfig,
     smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
@@ -342,7 +380,7 @@ pub struct MyHerePipelineBuilder {
 impl MyHerePipelineBuilder {
     pub fn new(
         context_preparer: Arc<ContextPreparer>,
-        memory: Arc<SqliteMemory>,
+        persistence: PersistenceBackend,
         fast_llm: LlmClientConfig,
         smart_llm: LlmClientConfig,
         fast_persona: Arc<str>,
@@ -352,7 +390,7 @@ impl MyHerePipelineBuilder {
     ) -> Self {
         Self {
             context_preparer,
-            memory,
+            persistence,
             fast_llm,
             smart_llm,
             fast_persona,
@@ -364,23 +402,23 @@ impl MyHerePipelineBuilder {
 
     pub fn build(self) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
         let context_preparer = self.context_preparer;
-        let memory = self.memory;
+        let persistence = self.persistence;
         let fast_llm = self.fast_llm;
         let smart_llm = self.smart_llm;
         let fast_persona = self.fast_persona;
         let smart_persona = self.smart_persona;
         let tool_registry = self.tool_registry;
-        let agent_id = self.agent_id;
+        let agent_id = self.agent_id.clone();
 
         move |ctx| {
             let preparer = Arc::clone(&context_preparer);
-            let memory = Arc::clone(&memory);
             let fast_llm = fast_llm.clone();
             let smart_llm = smart_llm.clone();
             let fast_persona = Arc::clone(&fast_persona);
             let smart_persona = Arc::clone(&smart_persona);
             let tool_registry = Arc::clone(&tool_registry);
             let agent_id = agent_id.clone();
+            let persistence = persistence.clone();
 
             Box::pin(async move {
                 // ── 1. Fetch local SQLite context ─────────────────────────────
@@ -417,10 +455,18 @@ impl MyHerePipelineBuilder {
 
                 fast_pipeline = fast_pipeline.add_stage(PostProcessor);
                 if persist {
-                    fast_pipeline = fast_pipeline.add_stage(SqlitePersistence {
-                        memory: Arc::clone(&memory),
-                        agent_id: agent_id.clone(),
-                    });
+                    match &persistence {
+                        PersistenceBackend::Sqlite(memory) => {
+                            fast_pipeline = fast_pipeline.add_stage(SqlitePersistence {
+                                memory: Arc::clone(memory),
+                                agent_id: agent_id.clone(),
+                            });
+                        }
+                        PersistenceBackend::Magickmind(magickmind) => {
+                            fast_pipeline = fast_pipeline
+                                .add_stage(MagickmindPersistence::new(Arc::clone(magickmind)));
+                        }
+                    }
                 }
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
@@ -489,10 +535,18 @@ impl MyHerePipelineBuilder {
                     ))
                     .add_stage(PostProcessor);
                 if persist {
-                    smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
-                        memory: Arc::clone(&memory),
-                        agent_id: agent_id.clone(),
-                    });
+                    match &persistence {
+                        PersistenceBackend::Sqlite(memory) => {
+                            smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
+                                memory: Arc::clone(memory),
+                                agent_id: agent_id.clone(),
+                            });
+                        }
+                        PersistenceBackend::Magickmind(magickmind) => {
+                            smart_pipeline = smart_pipeline
+                                .add_stage(MagickmindPersistence::new(Arc::clone(magickmind)));
+                        }
+                    }
                 }
 
                 pctx.reset_output();
@@ -547,7 +601,7 @@ impl MyHerePipelineBuilder {
 /// For custom stages, use `MyHerePipelineBuilder` directly.
 pub fn build_myhere_pipeline(
     context_preparer: Arc<ContextPreparer>,
-    memory: Arc<SqliteMemory>,
+    persistence: PersistenceBackend,
     fast_llm: LlmClientConfig,
     smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
@@ -557,7 +611,7 @@ pub fn build_myhere_pipeline(
 ) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
     MyHerePipelineBuilder::new(
         context_preparer,
-        memory,
+        persistence,
         fast_llm,
         smart_llm,
         fast_persona,
