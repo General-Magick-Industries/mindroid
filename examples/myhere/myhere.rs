@@ -217,6 +217,7 @@ pub struct MyHereStage {
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
     agent_id: String,
+    persist: bool,
 }
 
 impl MyHereStage {
@@ -239,7 +240,13 @@ impl MyHereStage {
             smart_persona,
             tool_registry,
             agent_id,
+            persist: false,
         }
+    }
+
+    pub fn with_persistence(mut self, persist: bool) -> Self {
+        self.persist = persist;
+        self
     }
 }
 
@@ -286,19 +293,21 @@ impl PipelineStage for MyHereStage {
         // If fast brain final, update outer context and return
         if !needs_smart {
             PostProcessor.process(&mut fast_ctx).await?;
-            match &self.persistence {
-                PersistenceBackend::Sqlite(memory) => {
-                    SqlitePersistence {
-                        memory: Arc::clone(memory),
-                        agent_id: self.agent_id.clone(),
-                    }
-                    .process(&mut fast_ctx)
-                    .await?;
-                }
-                PersistenceBackend::Magickmind(magickmind) => {
-                    MagickmindPersistence::new(Arc::clone(magickmind))
+            if self.persist {
+                match &self.persistence {
+                    PersistenceBackend::Sqlite(memory) => {
+                        SqlitePersistence {
+                            memory: Arc::clone(memory),
+                            agent_id: self.agent_id.clone(),
+                        }
                         .process(&mut fast_ctx)
                         .await?;
+                    }
+                    PersistenceBackend::Magickmind(magickmind) => {
+                        MagickmindPersistence::new(Arc::clone(magickmind))
+                            .process(&mut fast_ctx)
+                            .await?;
+                    }
                 }
             }
 
@@ -335,19 +344,21 @@ impl PipelineStage for MyHereStage {
             .await?;
 
         PostProcessor.process(&mut smart_ctx).await?;
-        match &self.persistence {
-            PersistenceBackend::Sqlite(memory) => {
-                SqlitePersistence {
-                    memory: Arc::clone(memory),
-                    agent_id: self.agent_id.clone(),
-                }
-                .process(&mut smart_ctx)
-                .await?;
-            }
-            PersistenceBackend::Magickmind(magickmind) => {
-                MagickmindPersistence::new(Arc::clone(magickmind))
+        if self.persist {
+            match &self.persistence {
+                PersistenceBackend::Sqlite(memory) => {
+                    SqlitePersistence {
+                        memory: Arc::clone(memory),
+                        agent_id: self.agent_id.clone(),
+                    }
                     .process(&mut smart_ctx)
                     .await?;
+                }
+                PersistenceBackend::Magickmind(magickmind) => {
+                    MagickmindPersistence::new(Arc::clone(magickmind))
+                        .process(&mut smart_ctx)
+                        .await?;
+                }
             }
         }
 
@@ -375,6 +386,7 @@ pub struct MyHerePipelineBuilder {
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
     agent_id: String,
+    persist: bool,
 }
 
 impl MyHerePipelineBuilder {
@@ -397,7 +409,13 @@ impl MyHerePipelineBuilder {
             smart_persona,
             tool_registry,
             agent_id,
+            persist: false,
         }
+    }
+
+    pub fn with_persistence(mut self, persist: bool) -> Self {
+        self.persist = persist;
+        self
     }
 
     pub fn build(self) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
@@ -409,6 +427,7 @@ impl MyHerePipelineBuilder {
         let smart_persona = self.smart_persona;
         let tool_registry = self.tool_registry;
         let agent_id = self.agent_id.clone();
+        let persist = self.persist;
 
         move |ctx| {
             let preparer = Arc::clone(&context_preparer);
@@ -430,7 +449,6 @@ impl MyHerePipelineBuilder {
                     }
                 };
                 let history = Arc::new(context);
-                let persist = true;
 
                 // ── 2. Fast brain pipeline ────────────────────────────────────
                 let fast_client = match LlmClient::new(fast_llm) {
