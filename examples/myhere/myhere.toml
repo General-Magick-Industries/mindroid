@@ -17,7 +17,7 @@ level = "warn"
 
 [providers.litellm]
 base_url = "https://litellm.com"
-api_key = "sk-shPir7xKyEYqLuOxFrS4pQ"
+api_key = "sk-"
 
 [providers.bifrost]
 base_url = "https://bifrost.magickmind.ai"
