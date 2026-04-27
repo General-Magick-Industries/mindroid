@@ -14,6 +14,29 @@ use mindroid::{
     ToolExecutorStage, ToolRegistry,
 };
 
+// ── Config structs ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct MemoryConfig {
+    #[serde(rename = "type")]
+    pub backend_type: String,
+    pub path: Option<String>,
+    pub max_memory_items: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub memory: MemoryConfig,
+}
+
+impl Config {
+    pub fn from_file(path: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        let config = toml::from_str(&content)?;
+        Ok(config)
+    }
+}
+
 // ── PersistenceBackend enum ──────────────────────────────────────────────────
 
 /// Flexible persistence backend supporting both SQLite and MagickMind.
@@ -30,6 +53,17 @@ impl PersistenceBackend {
 
     pub fn magickmind(client: Arc<MagickmindClient>) -> Self {
         Self::Magickmind(client)
+    }
+
+    pub fn from_config(config: &MemoryConfig) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        match config.backend_type.as_str() {
+            "sqlite" => {
+                let path = config.path.as_deref().unwrap_or("./memory.db");
+                let memory = SqliteMemory::new(path)?;
+                Ok(Self::Sqlite(Arc::new(memory)))
+            }
+            t => Err(format!("Unknown memory backend type: {}", t).into()),
+        }
     }
 }
 
