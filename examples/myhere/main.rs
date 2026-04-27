@@ -205,6 +205,195 @@ impl PipelineStage for SqlitePersistence {
     }
 }
 
+// ── MyHere pipeline builder ──────────────────────────────────────────────────
+
+/// Configures and returns the base tool registry with default tools.
+/// Import this to add more tools before building the MyHere pipeline.
+pub fn create_tool_registry() -> ToolRegistry {
+    ToolRegistry::new()
+        .register(OpenTool::default())
+        .register(ShellTool::default())
+}
+
+/// Builds the on_message callback for the MyHere dual-brain pipeline.
+/// Accepts a pre-configured tool registry to allow adding custom tools.
+pub fn build_myhere_pipeline(
+    context_preparer: Arc<ContextPreparer<SqliteContextProvider>>,
+    memory: Arc<SqliteMemory>,
+    fast_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+    smart_llm: Arc<Box<dyn std::any::Any + Send + Sync>>,
+    fast_persona: Arc<str>,
+    smart_persona: Arc<str>,
+    tool_registry: Arc<ToolRegistry>,
+    agent_id: String,
+) -> impl Fn(mindroid::RuntimeContext) + Send + 'static {
+    move |ctx| {
+        let preparer = Arc::clone(&context_preparer);
+        let memory = Arc::clone(&memory);
+        let fast_llm = Arc::clone(&fast_llm);
+        let smart_llm = Arc::clone(&smart_llm);
+        let fast_persona = Arc::clone(&fast_persona);
+        let smart_persona = Arc::clone(&smart_persona);
+        let tool_registry = Arc::clone(&tool_registry);
+        let agent_id = agent_id.clone();
+
+        async move {
+            // ── 1. Fetch local SQLite context ─────────────────────────────
+            let context = match preparer.prepare(&ctx.message).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Context fetch failed, continuing without history: {e}");
+                    Vec::new()
+                }
+            };
+            let history = Arc::new(context);
+            let persist = true;
+
+            // ── 2. Fast brain pipeline ────────────────────────────────────
+            let fast_client = match LlmClient::new((*fast_llm).clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Fast brain LLM init failed: {e}");
+                    return;
+                }
+            };
+
+            let mut fast_pipeline = Pipeline::new()
+                .add_stage(SimpleContextBuilder::with_prompt_and_history(
+                    fast_persona.as_ref(),
+                    history.clone(),
+                ))
+                .add_streaming_stage(ToolExecutorStage::new(
+                    fast_client,
+                    Arc::clone(&tool_registry),
+                ))
+                .add_stage(IsFinalExtractor)
+                .add_stage(BrainRouterGate)
+                .add_stage(PostProcessor);
+            if persist {
+                fast_pipeline = fast_pipeline.add_stage(SqlitePersistence {
+                    memory: Arc::clone(&memory),
+                    agent_id: agent_id.clone(),
+                });
+            }
+
+            let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
+
+            print!("\n\x1b[90mMyHere [Fast]: \x1b[0m");
+            std::io::stdout().flush().ok();
+            let animation = spawn_loading_animation("\x1b[90mMyHere [Fast]: \x1b[0m");
+
+            let (needs_smart, fast_response) =
+                match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
+                    Ok(resp) => {
+                        let needs_smart =
+                            pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false);
+                        (needs_smart, resp.unwrap_or_default())
+                    }
+                    Err(e) => {
+                        tracing::error!("Fast brain pipeline failed: {e}");
+                        return;
+                    }
+                };
+
+            animation.abort();
+            let response = fast_response.trim().to_string();
+            if !response.is_empty() {
+                if let Err(e) = ctx.respond(&response).await {
+                    tracing::error!("Failed to send fast brain response: {e}");
+                } else {
+                    print!("\rMyHere [Fast]: {response}\n\n");
+                    std::io::stdout().flush().ok();
+                }
+            }
+
+            if !needs_smart {
+                println!("\x1b[90mType your messages below:\x1b[0m");
+                return;
+            }
+
+            // ── 3. Smart brain pipeline ───────────────────────────────────
+            tracing::info!("Fast brain escalated — running smart brain");
+
+            let smart_client = match LlmClient::new((*smart_llm).clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Smart brain LLM init failed: {e}");
+                    return;
+                }
+            };
+
+            // Include fast brain's response in context for smart brain
+            let mut smart_history = (*history).clone();
+            if !response.is_empty() {
+                smart_history.push(LlmMessage::assistant(response.clone()));
+            }
+            let smart_history = Arc::new(smart_history);
+
+            let mut smart_pipeline = Pipeline::new()
+                .add_stage(SimpleContextBuilder::with_prompt_and_history(
+                    smart_persona.as_ref(),
+                    smart_history,
+                ))
+                .add_streaming_stage(ToolExecutorStage::new(
+                    smart_client,
+                    Arc::clone(&tool_registry),
+                ))
+                .add_stage(PostProcessor);
+            if persist {
+                smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
+                    memory: Arc::clone(&memory),
+                    agent_id: agent_id.clone(),
+                });
+            }
+
+            pctx.reset_output();
+
+            print!("\x1b[90mMyHere [Smart]: \x1b[0m");
+            std::io::stdout().flush().ok();
+            let animation = spawn_loading_animation("\x1b[90mMyHere [Smart]: \x1b[0m");
+
+            let mut stream = ctx.run_streaming_with_context(&smart_pipeline, &mut pctx);
+            let mut full_response = String::new();
+
+            let mut first_chunk = true;
+            while let Some(event) = stream.next().await {
+                match &event {
+                    StreamEvent::Chunk { content } => {
+                        if first_chunk {
+                            animation.abort();
+                            print!("\rMyHere [Smart]: ");
+                            first_chunk = false;
+                        }
+                        print!("{content}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        full_response.push_str(content);
+                    }
+                    StreamEvent::Complete { content, .. } => {
+                        if !content.is_empty() {
+                            full_response = content.clone();
+                        }
+                    }
+                    StreamEvent::Error { message } => {
+                        tracing::error!("Smart brain stream error: {message}");
+                    }
+                    _ => {}
+                }
+            }
+
+            let response = full_response.trim().to_string();
+            if !response.is_empty() {
+                if let Err(e) = ctx.respond(&response).await {
+                    tracing::error!("Failed to send smart brain response: {e}");
+                }
+            }
+
+            println!("\n");
+            println!("\x1b[90mType your messages below:\x1b[0m");
+        }
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -263,11 +452,11 @@ async fn main() -> anyhow::Result<()> {
         limit: history_limit,
     }));
 
-    let tool_registry = Arc::new(
-        ToolRegistry::new()
-            .register(OpenTool::default())
-            .register(ShellTool::default()),
-    );
+    // Build tool registry — add custom tools before wrapping in Arc
+    let mut tool_registry = create_tool_registry();
+    // Example: tool_registry = tool_registry.register(MyCustomTool::default());
+
+    let tool_registry = Arc::new(tool_registry);
 
     let fast_llm = Arc::new(fast_llm);
     let smart_llm = Arc::new(smart_llm);
@@ -278,171 +467,16 @@ async fn main() -> anyhow::Result<()> {
     println!("\x1b[90mType your messages below:\x1b[0m");
 
     let mut runtime = builder
-        .on_message(move |ctx| {
-            let preparer = Arc::clone(&context_preparer);
-            let memory = Arc::clone(&memory);
-            let fast_llm = Arc::clone(&fast_llm);
-            let smart_llm = Arc::clone(&smart_llm);
-            let fast_persona = Arc::clone(&fast_persona);
-            let smart_persona = Arc::clone(&smart_persona);
-            let tool_registry = Arc::clone(&tool_registry);
-            let agent_id = agent_id.clone();
-
-            async move {
-                // ── 1. Fetch local SQLite context ─────────────────────────────
-                let context = match preparer.prepare(&ctx.message).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("Context fetch failed, continuing without history: {e}");
-                        Vec::new()
-                    }
-                };
-                let history = Arc::new(context);
-                let persist = true;
-
-                // ── 2. Fast brain pipeline ────────────────────────────────────
-                let fast_client = match LlmClient::new((*fast_llm).clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Fast brain LLM init failed: {e}");
-                        return;
-                    }
-                };
-
-                let mut fast_pipeline = Pipeline::new()
-                    .add_stage(SimpleContextBuilder::with_prompt_and_history(
-                        fast_persona.as_ref(),
-                        history.clone(),
-                    ))
-                    .add_streaming_stage(ToolExecutorStage::new(
-                        fast_client,
-                        Arc::clone(&tool_registry),
-                    ))
-                    .add_stage(IsFinalExtractor)
-                    .add_stage(BrainRouterGate)
-                    .add_stage(PostProcessor);
-                if persist {
-                    fast_pipeline = fast_pipeline.add_stage(SqlitePersistence {
-                        memory: Arc::clone(&memory),
-                        agent_id: agent_id.clone(),
-                    });
-                }
-
-                let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
-
-                print!("\n\x1b[90mMyHere [Fast]: \x1b[0m");
-                std::io::stdout().flush().ok();
-                let animation = spawn_loading_animation("\x1b[90mMyHere [Fast]: \x1b[0m");
-
-                let (needs_smart, fast_response) =
-                    match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
-                        Ok(resp) => {
-                            let needs_smart =
-                                pctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(false);
-                            (needs_smart, resp.unwrap_or_default())
-                        }
-                        Err(e) => {
-                            tracing::error!("Fast brain pipeline failed: {e}");
-                            return;
-                        }
-                    };
-
-                animation.abort();
-                let response = fast_response.trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send fast brain response: {e}");
-                    } else {
-                        print!("\rMyHere [Fast]: {response}\n\n");
-                        std::io::stdout().flush().ok();
-                    }
-                }
-
-                if !needs_smart {
-                    println!("\x1b[90mType your messages below:\x1b[0m");
-                    return;
-                }
-
-                // ── 3. Smart brain pipeline ───────────────────────────────────
-                tracing::info!("Fast brain escalated — running smart brain");
-
-                let smart_client = match LlmClient::new((*smart_llm).clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Smart brain LLM init failed: {e}");
-                        return;
-                    }
-                };
-
-                // Include fast brain's response in context for smart brain
-                let mut smart_history = (*history).clone();
-                if !response.is_empty() {
-                    smart_history.push(LlmMessage::assistant(response.clone()));
-                }
-                let smart_history = Arc::new(smart_history);
-
-                let mut smart_pipeline = Pipeline::new()
-                    .add_stage(SimpleContextBuilder::with_prompt_and_history(
-                        smart_persona.as_ref(),
-                        smart_history,
-                    ))
-                    .add_streaming_stage(ToolExecutorStage::new(
-                        smart_client,
-                        Arc::clone(&tool_registry),
-                    ))
-                    .add_stage(PostProcessor);
-                if persist {
-                    smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
-                        memory: Arc::clone(&memory),
-                        agent_id: agent_id.clone(),
-                    });
-                }
-
-                pctx.reset_output();
-
-                print!("\x1b[90mMyHere [Smart]: \x1b[0m");
-                std::io::stdout().flush().ok();
-                let animation = spawn_loading_animation("\x1b[90mMyHere [Smart]: \x1b[0m");
-
-                let mut stream = ctx.run_streaming_with_context(&smart_pipeline, &mut pctx);
-                let mut full_response = String::new();
-
-                let mut first_chunk = true;
-                while let Some(event) = stream.next().await {
-                    match &event {
-                        StreamEvent::Chunk { content } => {
-                            if first_chunk {
-                                animation.abort();
-                                print!("\rMyHere [Smart]: ");
-                                first_chunk = false;
-                            }
-                            print!("{content}");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                            full_response.push_str(content);
-                        }
-                        StreamEvent::Complete { content, .. } => {
-                            if !content.is_empty() {
-                                full_response = content.clone();
-                            }
-                        }
-                        StreamEvent::Error { message } => {
-                            tracing::error!("Smart brain stream error: {message}");
-                        }
-                        _ => {}
-                    }
-                }
-
-                let response = full_response.trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send smart brain response: {e}");
-                    }
-                }
-                
-                println!("\n");
-                println!("\x1b[90mType your messages below:\x1b[0m");
-            }
-        })
+        .on_message(build_myhere_pipeline(
+            context_preparer,
+            memory,
+            fast_llm,
+            smart_llm,
+            fast_persona,
+            smart_persona,
+            tool_registry,
+            agent_id,
+        ))
         .build()?;
 
     runtime.run().await?;
