@@ -19,6 +19,7 @@
 //! Run with:
 //!   cargo run -p myhere -- --config examples/myhere/myhere.toml
 
+#[allow(dead_code)]
 mod myhere;
 
 use std::sync::Arc;
@@ -84,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     // Build tool registry — add custom tools before wrapping in Arc
+    #[allow(unused_mut)]
     let mut tool_registry = create_tool_registry();
     // Example: tool_registry = tool_registry.register(MyCustomTool::default());
 

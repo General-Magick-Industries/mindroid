@@ -10,7 +10,7 @@ use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
     ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MessageContext, Pipeline, PipelineContext,
     PipelineStage, PostProcessor, Result, ShellTool, SimpleContextBuilder, StreamEvent,
-    ToolExecutorStage, ToolRegistry, OpenTool, Response,
+    ToolExecutorStage, ToolRegistry, OpenTool,
 };
 
 // ── IsFinal extension ────────────────────────────────────────────────────────

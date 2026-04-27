@@ -6,6 +6,7 @@
 //! Run with:
 //!   cargo run -p myhere --bin mythere -- --config examples/myhere/myhere.toml
 
+#[allow(dead_code)]
 mod myhere;
 
 use std::io::Write;
