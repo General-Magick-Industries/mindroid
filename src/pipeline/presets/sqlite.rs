@@ -25,11 +25,11 @@ impl SqliteClient {
         }
     }
 
-    pub async fn get_context(
+    pub async fn prepare_context(
         &self,
         channel_id: &str,
-        limit: usize,
         agent_id: &str,
+        limit: usize,
     ) -> Result<Vec<LlmMessage>> {
         let channel_id = self.resolve_channel_id(channel_id);
 
@@ -47,25 +47,17 @@ impl SqliteClient {
             .collect())
     }
 
-    pub async fn save_exchange(
+    pub async fn save_message(
         &self,
         channel_id: &str,
-        user_id: &str,
-        user_msg: &str,
-        agent_id: &str,
-        response: &str,
-        reply_to: Option<&str>,
+        sender_id: &str,
+        content: &str,
+        reply_to_message_id: Option<&str>,
     ) -> Result<()> {
         let channel_id = self.resolve_channel_id(channel_id);
 
-        // Save user message
         self.memory
-            .save_message(channel_id, user_id, user_msg, None)
-            .await?;
-
-        // Save assistant response
-        self.memory
-            .save_message(channel_id, agent_id, response, reply_to)
+            .save_message(channel_id, sender_id, content, reply_to_message_id)
             .await?;
 
         Ok(())
@@ -74,7 +66,6 @@ impl SqliteClient {
 
 // ── SqliteContext ────────────────────────────────────────────────────────────
 
-/// Loads recent chat history from SQLite and converts it to LlmMessages.
 pub struct SqliteContext {
     client: Arc<SqliteClient>,
     agent_id: String,
@@ -82,12 +73,17 @@ pub struct SqliteContext {
 }
 
 impl SqliteContext {
-    pub fn new(client: Arc<SqliteClient>, agent_id: impl Into<String>) -> Self {
+    pub fn new(client: Arc<SqliteClient>) -> Self {
         Self {
             client,
-            agent_id: agent_id.into(),
+            agent_id: String::new(),
             limit: 20,
         }
+    }
+
+    pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = agent_id.into();
+        self
     }
 
     pub fn with_limit(mut self, limit: usize) -> Self {
@@ -104,7 +100,7 @@ impl ContextProvider for SqliteContext {
 
     async fn fetch(&self, message: &Message) -> Result<Vec<LlmMessage>> {
         self.client
-            .get_context(&message.channel_id, self.limit, &self.agent_id)
+            .prepare_context(&message.channel_id, &self.agent_id, self.limit)
             .await
     }
 }
@@ -128,13 +124,24 @@ impl PipelineStage for SqlitePersistence {
     }
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        let channel_id = &ctx.message.channel_id;
+
+        // Save user message
+        self.client
+            .save_message(
+                channel_id,
+                &ctx.message.sender_id,
+                &ctx.message.content,
+                None,
+            )
+            .await?;
+
+        // Save assistant response
         let response = ctx.response.as_deref().unwrap_or("");
 
         self.client
-            .save_exchange(
-                &ctx.message.channel_id,
-                &ctx.message.sender_id,
-                &ctx.message.content,
+            .save_message(
+                channel_id,
                 &ctx.agent_config.agent_id,
                 response,
                 Some(&ctx.message.id),
