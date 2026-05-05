@@ -7,9 +7,9 @@ type = "stdio"
 
 [auth]
 type = "apikey"
-email = "htinlinn.dev.03@gmail.com"
-password = "HtinLinn1234"
-api_key = "sk-u3JZK1sH0Vn105fBNbtuhg"
+email = "@gmail.com"
+password = ""
+api_key = "sk-"
 base_url = "https://dev-bifrost.magickmind.ai"
 
 [memory]
@@ -25,11 +25,11 @@ level = "warn"
 
 [providers.litellm]
 base_url = "https://litellm.globalmagick.com"
-api_key = "sk-u3JZK1sH0Vn105fBNbtuhg"
+api_key = "sk-"
 
 [providers.bifrost]
 base_url = "https://dev-bifrost.magickmind.ai"
-api_key = "sk-u3JZK1sH0Vn105fBNbtuhg"
+api_key = "sk-"
 
 # -- Named Models ------------------------------------------------------------
 
