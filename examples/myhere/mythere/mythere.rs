@@ -7,6 +7,7 @@
 //!   cargo run -p myhere --bin mythere -- --config examples/myhere/myhere.toml
 
 #[allow(dead_code)]
+#[path = "../myhere.rs"]
 mod myhere;
 
 use std::io::Write;
@@ -14,14 +15,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mindroid::pipeline::presets::magickmind::{
-    MagickmindClient, MagickmindContext, MagickmindPersistence,
+    MagickmindClient, MagickmindContext,
 };
+use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::{
     ContextPreparer, MindroidConfig, MessageContext, Pipeline, PipelineContext, PipelineStage,
     Result, Runtime, ShellTool
 };
 
-use myhere::{create_tool_registry, MyHereStage, PersistenceBackend};
+use myhere::{create_tool_registry, add_persistence_stage, MyHereStage, PersistenceBackend, SqliteContextProvider};
 
 // ── MyThere context enrichment stage ─────────────────────────────────────
 
@@ -46,6 +48,31 @@ impl PipelineStage for MyThereContextEnricher {
 // ── MyThere post-processing stage ────────────────────────────────────────
 
 /// Processes MyHere's response before returning to user.
+pub struct MyTherePreProcessor;
+
+#[async_trait]
+impl PipelineStage for MyTherePreProcessor {
+    fn name(&self) -> &str {
+        "MyTherePreProcessor"
+    }
+
+    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        tracing::info!(
+            "MyThere: processing response from User: {:?}",
+            ctx.message.content
+        );
+
+        print!("\nUser: {:?}\n",
+            ctx.message.content);
+        std::io::stdout().flush().ok();
+        // MyHere's response is not final — MyThere can further process it here.
+        Ok(())
+    }
+}
+
+// ── MyThere post-processing stage ────────────────────────────────────────
+
+/// Processes MyHere's response before returning to user.
 pub struct MyTherePostProcessor;
 
 #[async_trait]
@@ -56,9 +83,13 @@ impl PipelineStage for MyTherePostProcessor {
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
         tracing::info!(
-            "MyThere: processing response from MyHere: {:?}",
+            "MyThere: processing response from MyHere: {:?}\n",
             ctx.response.as_deref().unwrap_or("(none)")
         );
+
+        print!("\nMyThere: {:?}\n\n",
+            ctx.response.as_deref().unwrap_or("(none)"));
+        std::io::stdout().flush().ok();
         // MyHere's response is not final — MyThere can further process it here.
         Ok(())
     }
@@ -114,8 +145,29 @@ async fn main() -> anyhow::Result<()> {
     }
     let magickmind = Arc::new(magickmind_client);
 
+    let max_memory_items = config
+        .memory
+        .options
+        .get("max_memory_items")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20);
+    let history_limit = if max_memory_items == 0 {
+        usize::MAX
+    } else {
+        max_memory_items as usize
+    };
+
+    let db_path = config.memory.path.as_deref().unwrap_or("./mythere.db");
+
+    let memory = Arc::new(SqliteMemory::new(db_path)?);
+
     let context_preparer = Arc::new(
         ContextPreparer::new()
+            .add_provider(SqliteContextProvider {
+                memory: Arc::clone(&memory),
+                agent_id: agent_id.clone(),
+                limit: history_limit,
+            })
             .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id.clone()))
     );
 
@@ -124,13 +176,17 @@ async fn main() -> anyhow::Result<()> {
             .register(ShellTool::default())
     );
 
+    let persistence_backend = PersistenceBackend::from_config(
+        &config.memory,
+        Some(magickmind.clone()),
+    )?;
+
     println!("MyThere is running with MyHere as an internal stage.");
-    println!("\x1b[90mType your messages below:\x1b[0m");
 
     // Build MyThere's pipeline with MyHere as a stage
     let message_handler = move |ctx: MessageContext| {
         let context_preparer = Arc::clone(&context_preparer);
-        let memory = Arc::clone(&magickmind);
+        let persistence_backend = persistence_backend.clone();
         let fast_llm = fast_llm.clone();
         let smart_llm = smart_llm.clone();
         let fast_persona = Arc::clone(&fast_persona);
@@ -141,25 +197,26 @@ async fn main() -> anyhow::Result<()> {
         Box::pin(async move {
             let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-            // Build MyThere's pipeline:
-            // 1. Enrich context (MyThere-specific)
-            // 2. Run MyHere's dual-brain logic
-            // 3. Post-process the result
-            // 4. Persist response to MagickMind
             let pipeline = Pipeline::new()
                 .add_stage(MyThereContextEnricher)
+                .add_stage(MyTherePreProcessor)
                 .add_stage(MyHereStage::new(
-                    context_preparer,
-                    PersistenceBackend::magickmind(memory.clone()),
+                    Some(context_preparer),
+                    None,
                     fast_llm,
                     smart_llm,
                     fast_persona,
                     smart_persona,
                     tool_registry,
-                    agent_id,
+                    agent_id.clone(),
                 ))
-                .add_stage(MyTherePostProcessor)
-                .add_stage(MagickmindPersistence::new(memory));
+                .add_stage(MyTherePostProcessor);
+
+            let pipeline = add_persistence_stage(
+                pipeline,
+                Some(persistence_backend),
+                agent_id.as_str(),
+            );
 
             if let Err(e) = pipeline.run(&mut pctx).await {
                 tracing::error!("MyThere pipeline failed: {e}");
@@ -173,8 +230,6 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("Failed to send response: {e}");
                 }
             }
-
-            println!("\x1b[90mType your messages below:\x1b[0m");
         })
     };
 

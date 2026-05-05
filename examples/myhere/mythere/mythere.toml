@@ -1,21 +1,25 @@
 [agent]
-name = "MyHere"
+agent_id = "69e99e5c5f556c7b00898e7c"      # MagickMind mindspace ID for this agent
+name = "MyThere"
 
 [transport]
 type = "stdio"
 
+[auth]
+type = "apikey"
+email = "htinlinn.dev.03@gmail.com"
+password = "HtinLinn1234"
+api_key = "sk-u3JZK1sH0Vn105fBNbtuhg"
+base_url = "https://dev-bifrost.magickmind.ai"
+
 [memory]
 type = "sqlite"
-path = "./myhere.db"
+path = "./mythere.db"
 max_memory_items = 100
 
 [observer]
 type = "log"
 level = "warn"
-
-[auth]
-base_url = "https://dev-magickmind.magickmind.ai"
-api_key = "sk-u3JZK1sH0Vn105fBNbtuhg"
 
 # -- LLM Providers -----------------------------------------------------------
 

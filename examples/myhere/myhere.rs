@@ -1,28 +1,26 @@
-use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
 
+use mindroid::config::MemoryConfig;
 use mindroid::llm_client::{LlmClient, LlmClientConfig};
 use mindroid::memory::sqlite::SqliteMemory;
-use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindPersistence};
+use mindroid::pipeline::presets::magickmind::{
+    MagickmindClient, MagickmindContext, MagickmindPersistence,
+};
+use mindroid::pipeline::presets::sqlite::{
+    SqliteClient, SqliteContext, SqlitePersistence,
+};
 use mindroid::{
-    ContextPreparer, ContextProvider, LlmMessage, Memory, Message, MessageContext, Pipeline,
+    AgentConfig, ContextPreparer, LlmMessage, Message, Pipeline,
     PipelineContext, PipelineStage, PostProcessor, Result, SimpleContextBuilder, StreamEvent,
-    ToolExecutorStage, ToolRegistry,
+    StreamingStage, ToolExecutorStage, ToolRegistry,
 };
 
-// ── Config structs ───────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct MemoryConfig {
-    #[serde(rename = "type")]
-    pub backend_type: String,
-    pub path: Option<String>,
-    pub max_memory_items: Option<usize>,
-}
+// ── Config ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -37,40 +35,91 @@ impl Config {
     }
 }
 
-// ── PersistenceBackend enum ──────────────────────────────────────────────────
+// ── PersistenceBackend ───────────────────────────────────────────────────
 
-/// Flexible persistence backend supporting both SQLite and MagickMind.
 #[derive(Clone)]
 pub enum PersistenceBackend {
-    Sqlite(Arc<SqliteMemory>),
+    Sqlite(Arc<SqliteClient>),
     Magickmind(Arc<MagickmindClient>),
 }
 
 impl PersistenceBackend {
     pub fn sqlite(memory: Arc<SqliteMemory>) -> Self {
-        Self::Sqlite(memory)
+        let client = Arc::new(SqliteClient::new(memory));
+        Self::Sqlite(client)
     }
 
     pub fn magickmind(client: Arc<MagickmindClient>) -> Self {
         Self::Magickmind(client)
     }
 
-    pub fn from_config(config: &MemoryConfig) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        match config.backend_type.as_str() {
+    pub fn from_config(
+        config: &MemoryConfig,
+        magickmind: Option<Arc<MagickmindClient>>,
+    ) -> anyhow::Result<Self> {
+        match config.memory_type.as_deref().unwrap_or("sqlite") {
             "sqlite" => {
                 let path = config.path.as_deref().unwrap_or("./memory.db");
                 let memory = SqliteMemory::new(path)?;
-                Ok(Self::Sqlite(Arc::new(memory)))
+                Ok(Self::sqlite(Arc::new(memory)))
             }
-            t => Err(format!("Unknown memory backend type: {}", t).into()),
+            "magickmind" => {
+                let client = magickmind
+                    .ok_or_else(|| anyhow::anyhow!("MagickMind client required"))?;
+                Ok(Self::Magickmind(client))
+            }
+            t => Err(anyhow::anyhow!("Unknown memory backend type: {}", t)),
         }
     }
 }
 
-// ── IsFinal extension ────────────────────────────────────────────────────────
+// ── Context builder helper ───────────────────────────────────────────────
 
-/// `true`  = fast brain answered sufficiently, skip smart brain.
-/// `false` = question needs deep reasoning, escalate to smart brain.
+pub fn build_context_preparer(
+    persistence: &Option<PersistenceBackend>,
+    agent_id: &str,
+) -> ContextPreparer {
+    let mut preparer = ContextPreparer::new();
+
+    if let Some(p) = persistence {
+        match p {
+            PersistenceBackend::Sqlite(client) => {
+                preparer = preparer.add_provider(
+                    SqliteContext::new(client.clone())
+                        .with_agent_id(agent_id.to_string()),
+                );
+            }
+            PersistenceBackend::Magickmind(client) => {
+                preparer = preparer.add_provider(
+                    MagickmindContext::new(client.clone())
+                        .with_self_id(agent_id.to_string()),
+                );
+            }
+        }
+    }
+
+    preparer
+}
+
+// ── Persistence stage helper ─────────────────────────────────────────────
+
+pub fn add_persistence_stage(
+    pipeline: Pipeline,
+    persistence: Option<PersistenceBackend>,
+) -> Pipeline {
+    match persistence {
+        None => pipeline,
+        Some(PersistenceBackend::Sqlite(client)) => {
+            pipeline.add_stage(SqlitePersistence::new(client))
+        }
+        Some(PersistenceBackend::Magickmind(client)) => {
+            pipeline.add_stage(MagickmindPersistence::new(client))
+        }
+    }
+}
+
+// ── IsFinal logic ────────────────────────────────────────────────────────
+
 pub struct IsFinal(pub bool);
 
 #[derive(Deserialize)]
@@ -78,8 +127,6 @@ pub struct FastBrainOutput {
     pub is_final: bool,
     pub response: String,
 }
-
-// ── IsFinalExtractor ─────────────────────────────────────────────────────────
 
 pub struct IsFinalExtractor;
 
@@ -91,6 +138,7 @@ impl PipelineStage for IsFinalExtractor {
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
         let raw = ctx.response.as_deref().unwrap_or("{}");
+
         match serde_json::from_str::<FastBrainOutput>(raw) {
             Ok(parsed) => {
                 ctx.set_ext(IsFinal(parsed.is_final));
@@ -98,9 +146,11 @@ impl PipelineStage for IsFinalExtractor {
             }
             Err(_) => {
                 let trimmed = raw.trim();
+
                 if trimmed.eq_ignore_ascii_case("false") {
                     ctx.set_ext(IsFinal(false));
-                    ctx.response = Some("Let me hand this to my smart brain for a minute.".into());
+                    ctx.response =
+                        Some("Let me hand this to my smart brain for a minute.".into());
                 } else if trimmed.eq_ignore_ascii_case("true") {
                     ctx.set_ext(IsFinal(true));
                     ctx.response = None;
@@ -109,210 +159,108 @@ impl PipelineStage for IsFinalExtractor {
                 }
             }
         }
-        Ok(())
-    }
-}
-
-// ── BrainRouterGate ──────────────────────────────────────────────────────────
-
-pub struct BrainRouterGate;
-
-#[async_trait]
-impl PipelineStage for BrainRouterGate {
-    fn name(&self) -> &str {
-        "BrainRouterGate"
-    }
-
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        let needs_smart = ctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(true);
-        if needs_smart {
-            tracing::info!("BrainRouterGate: escalating to smart brain");
-            ctx.halted = true;
-        }
-        Ok(())
-    }
-}
-
-// ── SqliteContextProvider ────────────────────────────────────────────────────
-
-/// Loads recent chat history from SQLite and converts it to LlmMessages.
-/// Messages from `agent_id` are mapped to the `assistant` role; all others to `user`.
-pub struct SqliteContextProvider {
-    pub memory: Arc<SqliteMemory>,
-    pub agent_id: String,
-    pub limit: usize,
-}
-
-#[async_trait]
-impl ContextProvider for SqliteContextProvider {
-    fn name(&self) -> &str {
-        "SqliteContextProvider"
-    }
-
-    async fn fetch(&self, message: &Message) -> Result<Vec<LlmMessage>> {
-        let channel_id = if message.channel_id.is_empty() {
-            "stdio".to_string()
-        } else {
-            message.channel_id.clone()
-        };
-
-        let history = self
-            .memory
-            .get_history(&channel_id, self.limit)
-            .await?;
-
-        let llm_messages = history
-            .into_iter()
-            .map(|msg| {
-                if msg.sender_id == self.agent_id || msg.sender_id.is_empty() {
-                    LlmMessage::assistant(msg.content)
-                } else {
-                    LlmMessage::user(msg.content)
-                }
-            })
-            .collect();
-
-        Ok(llm_messages)
-    }
-}
-
-// ── Animation helper ────────────────────────────────────────────────────────
-
-/// Spawns an animated loading indicator that cycles through `.`, `..`, `...`
-pub fn spawn_loading_animation(initial_label: &str) -> tokio::task::JoinHandle<()> {
-    let label = initial_label.to_string();
-    tokio::spawn(async move {
-        let mut stage = 0;
-        loop {
-            let dots = match stage {
-                0 => "|",
-                1 => "/",
-                2 => "—",
-                3 => "\\",
-                _ => "*",
-            };
-            print!("\r{}\x1b[90m{}\x1b[0m\x1b[K", label, dots);
-            let _ = std::io::stdout().flush();
-
-            stage = (stage + 1) % 4;
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-    })
-}
-
-// ── SqlitePersistence ────────────────────────────────────────────────────────
-
-/// Saves both the incoming user message and the agent's response to SQLite.
-pub struct SqlitePersistence {
-    pub memory: Arc<SqliteMemory>,
-    pub agent_id: String,
-}
-
-#[async_trait]
-impl PipelineStage for SqlitePersistence {
-    fn name(&self) -> &str {
-        "SqlitePersistence"
-    }
-
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        let channel_id = if ctx.message.channel_id.is_empty() {
-            "stdio".to_string()
-        } else {
-            ctx.message.channel_id.clone()
-        };
-        let user_id = &ctx.message.sender_id;
-
-        // Save user message
-        self.memory
-            .save_message(&channel_id, user_id, &ctx.message.content, None)
-            .await?;
-
-        // Save agent response
-        if let Some(response) = ctx.response.as_deref().filter(|r| !r.is_empty()) {
-            self.memory
-                .save_message(&channel_id, &self.agent_id, response, None)
-                .await?;
-        }
 
         Ok(())
     }
 }
 
-// ── MyHereStage (MyHere as a reusable stage) ────────────────────────────────
+// ── PrepareHistoryStage ──────────────────────────────────────────────────
 
-/// MyHere dual-brain pipeline packaged as a PipelineStage.
-/// Can be used within MyThere's pipeline to delegate reasoning to MyHere.
-pub struct MyHereStage {
+pub struct PreparedHistory(pub Arc<Vec<LlmMessage>>);
+
+pub struct PrepareHistoryStage {
     context_preparer: Arc<ContextPreparer>,
-    persistence: PersistenceBackend,
+}
+
+impl PrepareHistoryStage {
+    pub fn new(context_preparer: Arc<ContextPreparer>) -> Self {
+        Self { context_preparer }
+    }
+}
+
+#[async_trait]
+impl PipelineStage for PrepareHistoryStage {
+    fn name(&self) -> &str {
+        "PrepareHistoryStage"
+    }
+
+    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        let history = self
+            .context_preparer
+            .prepare(&ctx.message)
+            .await
+            .unwrap_or_default();
+
+        ctx.set_ext(PreparedHistory(Arc::new(history)));
+        Ok(())
+    }
+}
+
+// ── DualBrainStage ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DualBrainEventMode {
+    None,
+    BrainMarkers,
+    SpinnerFriendly,
+}
+pub struct DualBrainStage {
     fast_llm: LlmClientConfig,
     smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
-    agent_id: String,
-    persist: bool,
+    event_mode: DualBrainEventMode,
 }
 
-impl MyHereStage {
+impl DualBrainStage {
     pub fn new(
-        context_preparer: Arc<ContextPreparer>,
-        persistence: PersistenceBackend,
         fast_llm: LlmClientConfig,
         smart_llm: LlmClientConfig,
         fast_persona: Arc<str>,
         smart_persona: Arc<str>,
         tool_registry: Arc<ToolRegistry>,
-        agent_id: String,
     ) -> Self {
         Self {
-            context_preparer,
-            persistence,
             fast_llm,
             smart_llm,
             fast_persona,
             smart_persona,
             tool_registry,
-            agent_id,
-            persist: false,
+            event_mode: DualBrainEventMode::None,
         }
     }
 
-    pub fn with_persistence(mut self, persist: bool) -> Self {
-        self.persist = persist;
+    pub fn with_event_mode(mut self, mode: DualBrainEventMode) -> Self {
+        self.event_mode = mode;
         self
     }
-}
 
-#[async_trait]
-impl PipelineStage for MyHereStage {
-    fn name(&self) -> &str {
-        "MyHereStage"
+    fn history_from_ctx(ctx: &PipelineContext) -> Arc<Vec<LlmMessage>> {
+        ctx.get_ext::<PreparedHistory>()
+            .map(|h| Arc::clone(&h.0))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        // Fetch additional context from SQLite
-        let additional_context = match self.context_preparer.prepare(&ctx.message).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("MyHere: context fetch failed, continuing: {e}");
-                Vec::new()
-            }
-        };
-        let history = Arc::new(additional_context);
+    fn build_smart_history(history: &Arc<Vec<LlmMessage>>, fast_response: &str) -> Arc<Vec<LlmMessage>> {
+        let mut smart_history = (**history).clone();
+        let fast_response = fast_response.trim();
+        if !fast_response.is_empty() {
+            smart_history.push(LlmMessage::assistant(fast_response.to_string()));
+        }
+        Arc::new(smart_history)
+    }
 
-        // ── Fast brain ────────────────────────────────────────────────────
-        let fast_client = match LlmClient::new(self.fast_llm.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("MyHere fast brain LLM init failed: {e}");
-                return Err(e.into());
-            }
-        };
+    async fn run_fast_brain(
+        &self,
+        message: Arc<Message>,
+        agent_config: Arc<AgentConfig>,
+        history: Arc<Vec<LlmMessage>>,
+    ) -> Result<(bool, String)> {
+        let fast_client = LlmClient::new(self.fast_llm.clone())?;
+        let mut fast_ctx = PipelineContext::new(message, agent_config);
 
-        let mut fast_ctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
-
-        SimpleContextBuilder::with_prompt_and_history(self.fast_persona.as_ref(), history.clone())
+        SimpleContextBuilder::with_prompt_and_history(self.fast_persona.as_ref(), history)
             .process(&mut fast_ctx)
             .await?;
 
@@ -323,116 +271,188 @@ impl PipelineStage for MyHereStage {
         IsFinalExtractor.process(&mut fast_ctx).await?;
 
         let needs_smart = fast_ctx.get_ext::<IsFinal>().map(|f| !f.0).unwrap_or(true);
+        Ok((needs_smart, fast_ctx.response.unwrap_or_default()))
+    }
 
-        // If fast brain final, update outer context and return
-        if !needs_smart {
-            PostProcessor.process(&mut fast_ctx).await?;
-            if self.persist {
-                match &self.persistence {
-                    PersistenceBackend::Sqlite(memory) => {
-                        SqlitePersistence {
-                            memory: Arc::clone(memory),
-                            agent_id: self.agent_id.clone(),
-                        }
-                        .process(&mut fast_ctx)
-                        .await?;
-                    }
-                    PersistenceBackend::Magickmind(magickmind) => {
-                        MagickmindPersistence::new(Arc::clone(magickmind))
-                            .process(&mut fast_ctx)
-                            .await?;
-                    }
-                }
-            }
-
-            ctx.response = fast_ctx.response;
-            return Ok(());
-        }
-
-        // ── Smart brain (if needed) ───────────────────────────────────────
-        tracing::info!("MyHere: fast brain escalated, running smart brain");
-
-        let smart_client = match LlmClient::new(self.smart_llm.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("MyHere smart brain LLM init failed: {e}");
-                return Err(e.into());
-            }
-        };
-
-        let fast_response = fast_ctx.response.clone().unwrap_or_default();
-        let mut smart_history = (*history).clone();
-        if !fast_response.is_empty() {
-            smart_history.push(LlmMessage::assistant(fast_response));
-        }
-        let smart_history = Arc::new(smart_history);
-
-        let mut smart_ctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
-
+    async fn init_smart_ctx(
+        &self,
+        message: Arc<Message>,
+        agent_config: Arc<AgentConfig>,
+        smart_history: Arc<Vec<LlmMessage>>,
+    ) -> Result<PipelineContext> {
+        let mut smart_ctx = PipelineContext::new(message, agent_config);
         SimpleContextBuilder::with_prompt_and_history(self.smart_persona.as_ref(), smart_history)
             .process(&mut smart_ctx)
             .await?;
+        Ok(smart_ctx)
+    }
+
+    async fn run_smart_brain_nonstreaming(
+        &self,
+        message: Arc<Message>,
+        agent_config: Arc<AgentConfig>,
+        smart_history: Arc<Vec<LlmMessage>>,
+    ) -> Result<String> {
+        let smart_client = LlmClient::new(self.smart_llm.clone())?;
+        let mut smart_ctx = self.init_smart_ctx(message, agent_config, smart_history).await?;
 
         ToolExecutorStage::new(smart_client, Arc::clone(&self.tool_registry))
             .process(&mut smart_ctx)
             .await?;
 
-        PostProcessor.process(&mut smart_ctx).await?;
-        if self.persist {
-            match &self.persistence {
-                PersistenceBackend::Sqlite(memory) => {
-                    SqlitePersistence {
-                        memory: Arc::clone(memory),
-                        agent_id: self.agent_id.clone(),
-                    }
-                    .process(&mut smart_ctx)
-                    .await?;
-                }
-                PersistenceBackend::Magickmind(magickmind) => {
-                    MagickmindPersistence::new(Arc::clone(magickmind))
-                        .process(&mut smart_ctx)
-                        .await?;
-                }
-            }
+        Ok(smart_ctx.response.unwrap_or_default())
+    }
+}
+
+#[async_trait]
+impl PipelineStage for DualBrainStage {
+    fn name(&self) -> &str {
+        "DualBrainStage"
+    }
+
+    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        let history = Self::history_from_ctx(ctx);
+
+        let (needs_smart, fast_response) = self
+            .run_fast_brain(
+                ctx.message.clone(),
+                ctx.agent_config.clone(),
+                Arc::clone(&history),
+            )
+            .await?;
+
+        if !needs_smart {
+            ctx.response = Some(fast_response);
+            return Ok(());
         }
 
-        ctx.response = smart_ctx.response;
+        let smart_history = Self::build_smart_history(&history, &fast_response);
+        let smart_response = self
+            .run_smart_brain_nonstreaming(ctx.message.clone(), ctx.agent_config.clone(), smart_history)
+            .await?;
+
+        ctx.response = Some(smart_response);
         Ok(())
     }
 }
 
-// ── MyHere pipeline builder ──────────────────────────────────────────────────
+impl StreamingStage for DualBrainStage {
+    fn stream<'a>(&'a self, outer: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent> {
+        Box::pin(async_stream::stream! {
+            let history = Self::history_from_ctx(outer);
+            if self.event_mode != DualBrainEventMode::None {
+                yield StreamEvent::Thinking { content: "MyHere [Fast]".to_string() };
+            }
 
-/// Creates an empty tool registry.
-/// Downstream pipelines can add tools as needed.
-pub fn create_tool_registry() -> ToolRegistry {
-    ToolRegistry::new()
+            // ── Fast brain (non-streaming) ───────────────────────────────
+            let (needs_smart, fast_response) = match self
+                .run_fast_brain(
+                    outer.message.clone(),
+                    outer.agent_config.clone(),
+                    Arc::clone(&history),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    yield StreamEvent::Error { message: e.to_string() };
+                    return;
+                }
+            };
+
+            if !needs_smart {
+                outer.response = Some(fast_response.clone());
+                if self.event_mode == DualBrainEventMode::SpinnerFriendly && !fast_response.is_empty() {
+                    yield StreamEvent::Chunk { content: fast_response.clone() };
+                }
+                yield StreamEvent::Complete {
+                    content: fast_response,
+                    usage: None,
+                };
+                return;
+            }
+
+            let fast_preface = fast_response.trim().to_string();
+            if self.event_mode == DualBrainEventMode::SpinnerFriendly && !fast_preface.is_empty() {
+                yield StreamEvent::Chunk { content: format!("{fast_preface}\n") };
+            }
+
+            // ── Smart brain (streaming) ──────────────────────────────────
+            if self.event_mode != DualBrainEventMode::None {
+                yield StreamEvent::Thinking { content: "MyHere [Smart]".to_string() };
+            }
+            let smart_history = Self::build_smart_history(&history, &fast_preface);
+
+            let smart_client = match LlmClient::new(self.smart_llm.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield StreamEvent::Error { message: e.to_string() };
+                    return;
+                }
+            };
+
+            let mut smart_ctx = match self
+                .init_smart_ctx(outer.message.clone(), outer.agent_config.clone(), smart_history)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    yield StreamEvent::Error { message: e.to_string() };
+                    return;
+                }
+            };
+
+            let tool_stage = ToolExecutorStage::new(smart_client, Arc::clone(&self.tool_registry));
+
+            let collected = {
+                let mut stream = tool_stage.stream(&mut smart_ctx);
+                let mut collected = String::new();
+                while let Some(event) = stream.next().await {
+                    match &event {
+                        StreamEvent::Chunk { content } => collected.push_str(content),
+                        StreamEvent::Complete { content, .. } => {
+                            if !content.is_empty() {
+                                collected = content.clone();
+                            }
+                        }
+                        _ => {}
+                    }
+                    yield event;
+                }
+                collected
+            };
+
+            smart_ctx.response = Some(collected);
+            outer.response = smart_ctx.response;
+        })
+    }
 }
 
-/// Builder for MyHere pipeline with extensibility points for custom stages.
-/// Allows downstream pipelines (e.g., MyThere) to inject additional stages.
-pub struct MyHerePipelineBuilder {
-    context_preparer: Arc<ContextPreparer>,
-    persistence: PersistenceBackend,
+
+// ── MyHereStage (MyHere as a reusable stage) ────────────────────────────────
+
+/// MyHere dual-brain pipeline packaged as a PipelineStage.
+/// Can be used within MyThere's pipeline to delegate reasoning to MyHere.
+
+pub struct MyHereStage {
+    context_preparer: Option<Arc<ContextPreparer>>,
     fast_llm: LlmClientConfig,
     smart_llm: LlmClientConfig,
     fast_persona: Arc<str>,
     smart_persona: Arc<str>,
     tool_registry: Arc<ToolRegistry>,
-    agent_id: String,
-    persist: bool,
+    persistence: Option<PersistenceBackend>,
 }
 
-impl MyHerePipelineBuilder {
+impl MyHereStage {
     pub fn new(
-        context_preparer: Arc<ContextPreparer>,
-        persistence: PersistenceBackend,
+        context_preparer: Option<Arc<ContextPreparer>>,
+        persistence: Option<PersistenceBackend>,
         fast_llm: LlmClientConfig,
         smart_llm: LlmClientConfig,
         fast_persona: Arc<str>,
         smart_persona: Arc<str>,
         tool_registry: Arc<ToolRegistry>,
-        agent_id: String,
     ) -> Self {
         Self {
             context_preparer,
@@ -442,234 +462,44 @@ impl MyHerePipelineBuilder {
             fast_persona,
             smart_persona,
             tool_registry,
-            agent_id,
-            persist: false,
-        }
-    }
-
-    pub fn with_persistence(mut self, persist: bool) -> Self {
-        self.persist = persist;
-        self
-    }
-
-    pub fn build(self) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
-        let context_preparer = self.context_preparer;
-        let persistence = self.persistence;
-        let fast_llm = self.fast_llm;
-        let smart_llm = self.smart_llm;
-        let fast_persona = self.fast_persona;
-        let smart_persona = self.smart_persona;
-        let tool_registry = self.tool_registry;
-        let agent_id = self.agent_id.clone();
-        let persist = self.persist;
-
-        move |ctx| {
-            let preparer = Arc::clone(&context_preparer);
-            let fast_llm = fast_llm.clone();
-            let smart_llm = smart_llm.clone();
-            let fast_persona = Arc::clone(&fast_persona);
-            let smart_persona = Arc::clone(&smart_persona);
-            let tool_registry = Arc::clone(&tool_registry);
-            let agent_id = agent_id.clone();
-            let persistence = persistence.clone();
-
-            Box::pin(async move {
-                // ── 1. Fetch local SQLite context ─────────────────────────────
-                let context = match preparer.prepare(&ctx.message).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("Context fetch failed, continuing without history: {e}");
-                        Vec::new()
-                    }
-                };
-                let history = Arc::new(context);
-
-                // ── 2. Fast brain pipeline ────────────────────────────────────
-                let fast_client = match LlmClient::new(fast_llm) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Fast brain LLM init failed: {e}");
-                        return;
-                    }
-                };
-
-                let mut fast_pipeline = Pipeline::new()
-                    .add_stage(SimpleContextBuilder::with_prompt_and_history(
-                        fast_persona.as_ref(),
-                        history.clone(),
-                    ))
-                    .add_streaming_stage(ToolExecutorStage::new(
-                        fast_client,
-                        Arc::clone(&tool_registry),
-                    ))
-                    .add_stage(IsFinalExtractor)
-                    .add_stage(BrainRouterGate);
-
-                fast_pipeline = fast_pipeline.add_stage(PostProcessor);
-                if persist {
-                    match &persistence {
-                        PersistenceBackend::Sqlite(memory) => {
-                            fast_pipeline = fast_pipeline.add_stage(SqlitePersistence {
-                                memory: Arc::clone(memory),
-                                agent_id: agent_id.clone(),
-                            });
-                        }
-                        PersistenceBackend::Magickmind(magickmind) => {
-                            fast_pipeline = fast_pipeline
-                                .add_stage(MagickmindPersistence::new(Arc::clone(magickmind)));
-                        }
-                    }
-                }
-
-                let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
-
-                print!("\n\x1b[90mMyHere [Fast]: \x1b[0m");
-                std::io::stdout().flush().ok();
-                let animation = spawn_loading_animation("\x1b[90mMyHere [Fast]: \x1b[0m");
-
-                let (needs_smart, fast_response) =
-                    match ctx.run_with_context(&fast_pipeline, &mut pctx).await {
-                        Ok(resp) => {
-                            let is_final = pctx.get_ext::<IsFinal>().map(|f| f.0).unwrap_or(true);
-                            let needs_smart = !is_final;
-                            (needs_smart, resp.unwrap_or_default())
-                        }
-                        Err(e) => {
-                            tracing::error!("Fast brain pipeline failed: {e}");
-                            return;
-                        }
-                    };
-
-                animation.abort();
-                let response = fast_response.trim().to_string();
-                if !response.is_empty() {
-                    let is_stdio = ctx.message.channel_id.is_empty() || ctx.message.channel_id == "stdio";
-                    if is_stdio {
-                        print!("\rMyHere [Fast]: {response}\n\n");
-                        std::io::stdout().flush().ok();
-                    } else if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send fast brain response: {e}");
-                    }
-                }
-
-
-                if !needs_smart {
-                    println!("\x1b[90mType your messages below:\x1b[0m");
-                    return;
-                }
-
-                // ── 3. Smart brain pipeline ───────────────────────────────────
-                tracing::info!("Fast brain escalated — running smart brain");
-
-                let smart_client = match LlmClient::new(smart_llm) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Smart brain LLM init failed: {e}");
-                        return;
-                    }
-                };
-
-                // Include fast brain's response in context for smart brain
-                let mut smart_history = (*history).clone();
-                if !response.is_empty() {
-                    smart_history.push(LlmMessage::assistant(response.clone()));
-                }
-                let smart_history = Arc::new(smart_history);
-
-                let mut smart_pipeline = Pipeline::new()
-                    .add_stage(SimpleContextBuilder::with_prompt_and_history(
-                        smart_persona.as_ref(),
-                        smart_history,
-                    ))
-                    .add_streaming_stage(ToolExecutorStage::new(
-                        smart_client,
-                        Arc::clone(&tool_registry),
-                    ))
-                    .add_stage(PostProcessor);
-                if persist {
-                    match &persistence {
-                        PersistenceBackend::Sqlite(memory) => {
-                            smart_pipeline = smart_pipeline.add_stage(SqlitePersistence {
-                                memory: Arc::clone(memory),
-                                agent_id: agent_id.clone(),
-                            });
-                        }
-                        PersistenceBackend::Magickmind(magickmind) => {
-                            smart_pipeline = smart_pipeline
-                                .add_stage(MagickmindPersistence::new(Arc::clone(magickmind)));
-                        }
-                    }
-                }
-
-                pctx.reset_output();
-
-                print!("\x1b[90mMyHere [Smart]: \x1b[0m");
-                std::io::stdout().flush().ok();
-                let animation = spawn_loading_animation("\x1b[90mMyHere [Smart]: \x1b[0m");
-
-                let mut stream = ctx.run_streaming_with_context(&smart_pipeline, &mut pctx);
-                let mut full_response = String::new();
-
-                let mut first_chunk = true;
-                while let Some(event) = stream.next().await {
-                    match &event {
-                        StreamEvent::Chunk { content } => {
-                            if first_chunk {
-                                animation.abort();
-                                print!("\rMyHere [Smart]: ");
-                                first_chunk = false;
-                            }
-                            print!("{content}");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                            full_response.push_str(content);
-                        }
-                        StreamEvent::Complete { content, .. } => {
-                            if !content.is_empty() {
-                                full_response = content.clone();
-                            }
-                        }
-                        StreamEvent::Error { message } => {
-                            tracing::error!("Smart brain stream error: {message}");
-                        }
-                        _ => {}
-                    }
-                }
-
-                let response = full_response.trim().to_string();
-                if !response.is_empty() {
-                    if let Err(e) = ctx.respond(&response).await {
-                        tracing::error!("Failed to send smart brain response: {e}");
-                    }
-                }
-
-                println!("\n");
-                println!("\x1b[90mType your messages below:\x1b[0m");
-            })
         }
     }
 }
 
-/// Convenience function: builds the MyHere pipeline with no custom stages.
-/// For custom stages, use `MyHerePipelineBuilder` directly.
-pub fn build_myhere_pipeline(
-    context_preparer: Arc<ContextPreparer>,
-    persistence: PersistenceBackend,
-    fast_llm: LlmClientConfig,
-    smart_llm: LlmClientConfig,
-    fast_persona: Arc<str>,
-    smart_persona: Arc<str>,
-    tool_registry: Arc<ToolRegistry>,
-    agent_id: String,
-) -> impl Fn(MessageContext) -> futures::future::BoxFuture<'static, ()> + Send + 'static {
-    MyHerePipelineBuilder::new(
-        context_preparer,
-        persistence,
-        fast_llm,
-        smart_llm,
-        fast_persona,
-        smart_persona,
-        tool_registry,
-        agent_id,
-    )
-    .build()
+#[async_trait]
+impl PipelineStage for MyHereStage {
+    fn name(&self) -> &str {
+        "MyHereStage"
+    }
+
+    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        let mut pipeline = Pipeline::new();
+
+        if let Some(preparer) = &self.context_preparer {
+            pipeline = pipeline.add_stage(PrepareHistoryStage::new(preparer.clone()));
+        }
+
+        pipeline = pipeline
+            .add_stage(DualBrainStage::new(
+                self.fast_llm.clone(),
+                self.smart_llm.clone(),
+                self.fast_persona.clone(),
+                self.smart_persona.clone(),
+                self.tool_registry.clone(),
+            ))
+            .add_stage(PostProcessor);
+
+        let pipeline = add_persistence_stage(pipeline, self.persistence.clone());
+
+        let mut inner = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
+        ctx.response = pipeline.run(&mut inner).await?;
+
+        Ok(())
+    }
+}
+
+// ── Tool registry ────────────────────────────────────────────────────────
+
+pub fn create_tool_registry() -> ToolRegistry {
+    ToolRegistry::new()
 }

@@ -10,7 +10,7 @@ path = "main.rs"
 
 [[bin]]
 name = "mythere"
-path = "mythere.rs"
+path = "mythere/mythere.rs"
 
 [dependencies]
 mindroid = { workspace = true, features = ["full"] }
