@@ -2,7 +2,50 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::memory::Memory;
-use crate::{PipelineContext, PipelineStage, Result};
+use crate::memory::sqlite::SqliteMemory;
+use crate::{PipelineContext, PipelineStage, Result, ContextProvider, LlmMessage, Message};
+
+/// Loads recent chat history from SQLite and converts it to LlmMessages.
+/// Messages from `agent_id` are mapped to the `assistant` role; all others to `user`.
+pub struct SqliteContextProvider {
+    pub memory: Arc<SqliteMemory>,
+    pub agent_id: String,
+    pub limit: usize,
+}
+
+#[async_trait]
+impl ContextProvider for SqliteContextProvider {
+    fn name(&self) -> &str {
+        "SqliteContextProvider"
+    }
+
+    async fn fetch(&self, message: &Message) -> Result<Vec<LlmMessage>> {
+        let channel_id = if message.channel_id.is_empty() {
+            "stdio".to_string()
+        } else {
+            message.channel_id.clone()
+        };
+
+        let history = self
+            .memory
+            .get_history(&channel_id, self.limit)
+            .await?;
+
+        let llm_messages = history
+            .into_iter()
+            .map(|msg| {
+                if msg.sender_id == self.agent_id || msg.sender_id.is_empty() {
+                    LlmMessage::assistant(msg.content)
+                } else {
+                    LlmMessage::user(msg.content)
+                }
+            })
+            .collect();
+
+        Ok(llm_messages)
+    }
+}
+
 
 // ── SqlitePersistence ─────────────────────────────────────────────────────
 
