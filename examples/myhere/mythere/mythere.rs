@@ -18,12 +18,13 @@ use mindroid::pipeline::presets::magickmind::{
     MagickmindClient, MagickmindContext,
 };
 use mindroid::memory::sqlite::SqliteMemory;
+use mindroid::pipeline::presets::sqlite::{SqliteClient, SqliteContext};
 use mindroid::{
     ContextPreparer, MindroidConfig, MessageContext, Pipeline, PipelineContext, PipelineStage,
     Result, Runtime, ShellTool
 };
 
-use myhere::{create_tool_registry, add_persistence_stage, MyHereStage, PersistenceBackend, SqliteContextProvider};
+use myhere::{create_tool_registry, add_persistence_stage, MyHereStage, PersistenceBackend};
 
 // ── MyThere context enrichment stage ─────────────────────────────────────
 
@@ -145,29 +146,31 @@ async fn main() -> anyhow::Result<()> {
     }
     let magickmind = Arc::new(magickmind_client);
 
+    let db_path = config.memory.path.as_deref().unwrap_or("./myhere.db");
+
     let max_memory_items = config
         .memory
         .options
         .get("max_memory_items")
         .and_then(|v| v.as_u64())
         .unwrap_or(20);
+
     let history_limit = if max_memory_items == 0 {
         usize::MAX
     } else {
         max_memory_items as usize
     };
 
-    let db_path = config.memory.path.as_deref().unwrap_or("./mythere.db");
-
     let memory = Arc::new(SqliteMemory::new(db_path)?);
-
+    let client = Arc::new(SqliteClient::new(memory));
+    
     let context_preparer = Arc::new(
         ContextPreparer::new()
-            .add_provider(SqliteContextProvider {
-                memory: Arc::clone(&memory),
-                agent_id: agent_id.clone(),
-                limit: history_limit,
-            })
+            .add_provider(
+                SqliteContext::new(client.clone())
+                .with_agent_id(agent_id.clone())
+                .with_limit(history_limit)
+            )
             .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id.clone()))
     );
 
@@ -192,7 +195,6 @@ async fn main() -> anyhow::Result<()> {
         let fast_persona = Arc::clone(&fast_persona);
         let smart_persona = Arc::clone(&smart_persona);
         let tool_registry = Arc::clone(&tool_registry);
-        let agent_id = agent_id.clone();
 
         Box::pin(async move {
             let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
@@ -207,15 +209,13 @@ async fn main() -> anyhow::Result<()> {
                     smart_llm,
                     fast_persona,
                     smart_persona,
-                    tool_registry,
-                    agent_id.clone(),
+                    tool_registry
                 ))
                 .add_stage(MyTherePostProcessor);
 
             let pipeline = add_persistence_stage(
                 pipeline,
-                Some(persistence_backend),
-                agent_id.as_str(),
+                Some(persistence_backend)
             );
 
             if let Err(e) = pipeline.run(&mut pctx).await {

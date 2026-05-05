@@ -82,7 +82,6 @@ async fn main() -> anyhow::Result<()> {
         max_memory_items as usize
     };
 
-    // ✅ NEW: use SqliteClient (not raw memory everywhere)
     let memory = Arc::new(SqliteMemory::new(db_path)?);
     let client = Arc::new(SqliteClient::new(memory));
 
