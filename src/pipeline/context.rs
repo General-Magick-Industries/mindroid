@@ -90,6 +90,8 @@ impl ContextPreparer {
         let futures: Vec<_> = self.providers.iter().map(|p| p.fetch(message)).collect();
         let results = join_all(futures).await;
 
+        let mut had_error = false;
+
         let mut messages = Vec::new();
         for (i, result) in results.into_iter().enumerate() {
             let name = self.providers[i].name();
@@ -104,9 +106,17 @@ impl ContextPreparer {
                 }
                 Err(e) => {
                     warn!("ContextProvider '{}' failed: {}", name, e);
-                    return Err(e);
+                    had_error = true;
+                    continue;
                 }
             }
+        }
+
+        if messages.is_empty() && had_error {
+            return Err(crate::error::MindroidError::Memory {
+                message: "All context providers failed".into(),
+                source: None,
+            });
         }
 
         info!(
