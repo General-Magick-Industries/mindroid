@@ -30,6 +30,7 @@ api_key = "sk-your-api-key-here"
 
 [memory]
 type = "magickmind"                       # Options: "none", "sqlite", "magickmind"
+# subtype = "sqlite"                   # For sqlite/local memory: "sqlite", "markdown"
 # path = "./mindroid.db"           # For sqlite memory
 # base_url = "https://api.magickmind.io"  # For magickmind memory
 

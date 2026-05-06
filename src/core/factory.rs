@@ -109,8 +109,28 @@ pub(crate) fn build_memory(
 
         #[cfg(feature = "persistence")]
         "sqlite" => {
-            let path = config.memory.path.as_deref().unwrap_or("./mindroid.db");
-            Ok(Box::new(crate::memory::sqlite::SqliteMemory::new(path)?))
+            let sub_m_type = config
+                .memory
+                .options
+                .get("subtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sqlite");
+
+            match sub_m_type {
+                "markdown" => {
+                    let path = config.memory.path.as_deref().unwrap_or("./mindroid");
+                    Ok(Box::new(crate::memory::markdown::MarkdownMemory::new(path)?))
+                }
+
+                "sqlite" => {
+                    let path = config.memory.path.as_deref().unwrap_or("./mindroid.db");
+                    Ok(Box::new(crate::memory::sqlite::SqliteMemory::new(path)?))
+                }
+
+                other => Err(MindroidError::config(format!(
+                    "unknown or disabled sqlite memory sub_type: '{other}'"
+                ))),
+            }
         }
 
         other => Err(MindroidError::config(format!(

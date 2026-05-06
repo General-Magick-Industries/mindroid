@@ -1,7 +1,7 @@
 #[cfg(feature = "persistence")]
 pub mod magickmind;
-#[cfg(feature = "persistence")]
 pub mod sqlite;
+pub mod markdown;
 
 use async_trait::async_trait;
 
