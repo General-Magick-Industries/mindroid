@@ -22,7 +22,7 @@ use mindroid::pipeline::presets::magickmind::{
 };
 use mindroid::{
     ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PostProcessor,
-    RelevanceGate, Runtime, SimpleContextBuilder, StreamEvent,
+    PrepareOutcome, RelevanceGate, Runtime, SimpleContextBuilder, StreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,15 +80,26 @@ async fn main() -> anyhow::Result<()> {
 
             async move {
                 // Fetch context once from MagickMind
-                let context = match preparer.prepare(&ctx.message).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Context preparation failed: {e}");
+                let history = match preparer.prepare(&ctx.message).await {
+                    PrepareOutcome::Complete(msgs) => Arc::new(msgs),
+                    PrepareOutcome::Degraded { messages, warnings } => {
+                        for w in &warnings {
+                            tracing::warn!("Context provider '{}' failed: {}", w.provider, w.error);
+                        }
+                        Arc::new(messages)
+                    }
+                    PrepareOutcome::Failed(warnings) => {
+                        for w in &warnings {
+                            tracing::error!(
+                                "Context provider '{}' failed: {}",
+                                w.provider,
+                                w.error
+                            );
+                        }
+                        tracing::error!("All context providers failed — aborting");
                         return;
                     }
                 };
-
-                let history = Arc::new(context);
 
                 // Build pipelines with history injected at construction time
                 let gate = match RelevanceGate::from_config(
