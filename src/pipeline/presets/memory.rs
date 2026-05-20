@@ -211,7 +211,12 @@ impl PipelineStage for MemoryPersistence {
 
         // Save user message
         self.client
-            .save_message(channel_id, &ctx.message.sender_id, &ctx.message.content, None)
+            .save_message(
+                channel_id,
+                &ctx.message.sender_id,
+                &ctx.message.content,
+                None,
+            )
             .await
             .map_err(|e| MindroidError::Pipeline {
                 stage: "MemoryPersistence".into(),
@@ -259,11 +264,6 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             platform: None,
         }
-    }
-
-    fn test_client() -> Arc<MemoryClient> {
-        let mem = Arc::new(SqliteMemory::new(":memory:").unwrap());
-        Arc::new(MemoryClient::new(mem))
     }
 
     #[tokio::test]
@@ -327,7 +327,9 @@ mod tests {
             .unwrap();
 
         let client = Arc::new(MemoryClient::new(mem));
-        let ctx = MemoryContext::new(client).with_agent_id("bot-1").with_limit(10);
+        let ctx = MemoryContext::new(client)
+            .with_agent_id("bot-1")
+            .with_limit(10);
 
         let message = test_message("chan1", "user-1", "test");
         let result = ctx.fetch(&message).await.unwrap();
@@ -348,7 +350,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut pctx = PipelineContext::new(message, agent_config);
+        let mut pctx = PipelineContext::new(message.into(), agent_config.into());
         // No response set — ctx.response is None
 
         persistence.process(&mut pctx).await.unwrap();
@@ -372,7 +374,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut pctx = PipelineContext::new(message, agent_config);
+        let mut pctx = PipelineContext::new(message.into(), agent_config.into());
         pctx.response = Some("4".to_string());
 
         persistence.process(&mut pctx).await.unwrap();
