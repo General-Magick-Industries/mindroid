@@ -3,10 +3,6 @@ name: Security Audit
 on:
   pull_request:
     branches: [main, develop]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/audit.yml'
 
 jobs:
   audit:
