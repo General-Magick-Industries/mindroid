@@ -27,7 +27,7 @@ use mindroid::pipeline::presets::magickmind::{
 };
 use mindroid::{
     ContextPreparer, GenericLlmProcessor, LlmMessage, MindroidConfig, Pipeline, PipelineContext,
-    PipelineStage, PostProcessor, Result, Runtime,
+    PipelineStage, PostProcessor, PrepareOutcome, Result, Runtime,
 };
 
 // ---------------------------------------------------------------------------
@@ -205,15 +205,26 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("@mentioned — proceeding");
 
                 // Step 2: Fetch context from MagickMind (only after mention check passes)
-                let context = match preparer.prepare(&ctx.message).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Context preparation failed: {e}");
+                let history = match preparer.prepare(&ctx.message).await {
+                    PrepareOutcome::Complete(msgs) => Arc::new(msgs),
+                    PrepareOutcome::Degraded { messages, warnings } => {
+                        for w in &warnings {
+                            tracing::warn!("Context provider '{}' failed: {}", w.provider, w.error);
+                        }
+                        Arc::new(messages)
+                    }
+                    PrepareOutcome::Failed(warnings) => {
+                        for w in &warnings {
+                            tracing::error!(
+                                "Context provider '{}' failed: {}",
+                                w.provider,
+                                w.error
+                            );
+                        }
+                        tracing::error!("All context providers failed — aborting");
                         return;
                     }
                 };
-
-                let history = Arc::new(context);
 
                 // Step 3: Build the respond pipeline per-request with history injected.
                 // PersonaContextBuilder is wrapped in Arc — Pipeline::add_stage accepts

@@ -13,7 +13,9 @@ pub use crate::models::{LlmMessage, Message, Response, Role, StreamEvent};
 pub use crate::auth::Auth;
 pub use crate::memory::{Memory, NoMemory};
 pub use crate::observer::{NoObserver, Observer};
-pub use crate::pipeline::context::{ContextPreparer, ContextProvider};
+pub use crate::pipeline::context::{
+    ContextPreparer, ContextProvider, PrepareOutcome, ProviderWarning,
+};
 pub use crate::pipeline::{Pipeline, PipelineContext, PipelineStage, StreamingStage};
 pub use crate::tools::{Tool, ToolRegistry};
 pub use crate::transport::Transport;

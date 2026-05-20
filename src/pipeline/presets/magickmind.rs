@@ -258,7 +258,7 @@ impl Default for MagickmindContextConfig {
 /// let preparer = ContextPreparer::new()
 ///     .add_provider(MagickmindContext::new(magickmind.clone()));
 ///
-/// let context = preparer.prepare(&message).await?;
+/// let context = preparer.prepare(&message).await.into_messages();
 /// ```
 pub struct MagickmindContext {
     client: Arc<MagickmindClient>,

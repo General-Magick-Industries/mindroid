@@ -72,15 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
             async move {
                 // Step 1: fetch conversation context from MagickMind
-                let context = match preparer.prepare(&ctx.message).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            "MagickMind context fetch failed, continuing without history: {e}"
-                        );
-                        Vec::new()
-                    }
-                };
+                let context = preparer.prepare(&ctx.message).await.into_messages();
 
                 // Step 2: build LLM client for this request
                 let llm_client = match LlmClient::new((*llm_config).clone()) {
