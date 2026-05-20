@@ -16,6 +16,7 @@
 # AI tooling
 .claude/
 .omc/
+AGENTS.md
 
 # OS
 .DS_Store
@@ -24,6 +25,7 @@ Thumbs.db
 # Rust-specific
 *.pdb
 **/*.rs.bk
+rust-toolchain.toml
 
 # CI artifacts
 clippy-output.txt

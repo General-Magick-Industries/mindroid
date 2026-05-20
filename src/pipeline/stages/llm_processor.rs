@@ -16,10 +16,8 @@ pub async fn collect_stream(
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::Chunk { content } => collected.push_str(&content),
-            StreamEvent::Complete { content, .. } => {
-                if !content.is_empty() {
-                    collected = content;
-                }
+            StreamEvent::Complete { content, .. } if !content.is_empty() => {
+                collected = content;
             }
             StreamEvent::Error { message } => {
                 return (collected, Some(message));
