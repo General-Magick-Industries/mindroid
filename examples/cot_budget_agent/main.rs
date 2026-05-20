@@ -156,10 +156,8 @@ async fn main() -> anyhow::Result<()> {
                         StreamEvent::Chunk { content } => {
                             full_response.push_str(content);
                         }
-                        StreamEvent::Complete { content, .. } => {
-                            if !content.is_empty() {
-                                full_response = content.clone();
-                            }
+                        StreamEvent::Complete { content, .. } if !content.is_empty() => {
+                            full_response = content.clone();
                         }
                         StreamEvent::Error { message } => {
                             tracing::error!("Stream error: {message}");

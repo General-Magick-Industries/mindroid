@@ -538,27 +538,27 @@ async fn main() -> anyhow::Result<()> {
                             }
                             response_text.push_str(&content);
                         }
-                        StreamEvent::ToolCall { name, arguments } => {
-                            if !quiet {
-                                if printed_prefix {
-                                    println!();
-                                    printed_prefix = false;
-                                }
-                                println!("       \x1b[2;33m[tool: {name}]\x1b[0m \x1b[2m{arguments}\x1b[0m");
+                        StreamEvent::ToolCall { name, arguments } if !quiet => {
+                            if printed_prefix {
+                                println!();
+                                printed_prefix = false;
                             }
+                            println!(
+                                "       \x1b[2;33m[tool: {name}]\x1b[0m \x1b[2m{arguments}\x1b[0m"
+                            );
                         }
-                        StreamEvent::ToolResult { name, result } => {
-                            if !quiet {
-                                let preview: String = result
-                                    .lines()
-                                    .next()
-                                    .unwrap_or("")
-                                    .trim()
-                                    .chars()
-                                    .take(80)
-                                    .collect();
-                                println!("       \x1b[2;32m[result: {name}]\x1b[0m \x1b[2m{preview}\x1b[0m");
-                            }
+                        StreamEvent::ToolResult { name, result } if !quiet => {
+                            let preview: String = result
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .chars()
+                                .take(80)
+                                .collect();
+                            println!(
+                                "       \x1b[2;32m[result: {name}]\x1b[0m \x1b[2m{preview}\x1b[0m"
+                            );
                         }
                         StreamEvent::Error { message } => {
                             if printed_prefix {

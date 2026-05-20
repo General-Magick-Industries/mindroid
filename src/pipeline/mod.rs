@@ -260,10 +260,10 @@ impl Pipeline {
                                     collected.push_str(content);
                                     chunk_count += 1;
                                 }
-                                StreamEvent::Complete { content, .. } => {
-                                    if !content.is_empty() {
-                                        collected = content.clone();
-                                    }
+                                StreamEvent::Complete { content, .. }
+                                    if !content.is_empty() =>
+                                {
+                                    collected = content.clone();
                                 }
                                 StreamEvent::Error { message } => {
                                     warn!("Pipeline stage '{}' stream error: {}", name, message);
