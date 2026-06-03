@@ -6,6 +6,7 @@ pub mod message;
 pub mod models;
 pub mod routine;
 pub mod runtime;
+pub mod session;
 
 #[cfg(test)]
 mod tests;

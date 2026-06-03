@@ -15,6 +15,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
+use crate::core::session::SessionHandle;
 use crate::error::Result;
 use crate::models::{LlmMessage, Message, StreamEvent};
 
@@ -31,6 +32,11 @@ pub struct PipelineContext {
     /// When set to `true`, the pipeline stops executing further stages.
     pub halted: bool,
 
+    /// Optional handle to the originating connection for server-style
+    /// transports (e.g. a bidirectional voice stream). `None` for one-shot
+    /// transports. Connection-scoped: preserved across [`PipelineContext::reset_output`].
+    pub session: Option<Arc<SessionHandle>>,
+
     /// Typed extension map for feature-specific pipeline state.
     ///
     /// Use [`PipelineContext::set_ext`], [`PipelineContext::get_ext`], and
@@ -46,6 +52,7 @@ impl PipelineContext {
             llm_messages: Vec::new(),
             response: None,
             halted: false,
+            session: None,
             extensions: HashMap::new(),
         }
     }

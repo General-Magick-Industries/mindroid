@@ -46,6 +46,7 @@ pub use config::{
     AgentConfig, MindroidConfig, ModelConfig, OpenToolConfig, ProviderConfig, ShellToolConfig,
     ToolsConfig,
 };
+pub use core::session::SessionHandle;
 pub use error::{MindroidError, Result};
 pub use memory::{Memory, NoMemory};
 pub use models::{
