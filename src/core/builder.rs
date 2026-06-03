@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use crate::auth::Auth;
 use crate::config::MindroidConfig;
-use crate::error::{MindroidError, Result};
+use crate::error::Result;
+// Only referenced from the persona-gated config block below.
+#[cfg(feature = "persona")]
+use crate::error::MindroidError;
 use crate::memory::Memory;
 use crate::observer::Observer;
 use crate::pipeline::Pipeline;

@@ -1,3 +1,6 @@
+// `PathBuf`/`expand_tilde` are only used by the persona/identity config paths
+// (and their tests); gate them so default-feature builds stay warning-free.
+#[cfg(any(feature = "persona", feature = "identity", test))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,6 +13,7 @@ use crate::pipeline::Pipeline;
 use crate::transport::Transport;
 
 /// Expand a leading `~/` to the user's home directory.
+#[cfg(any(feature = "persona", feature = "identity", test))]
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if path.starts_with("~/") {
         dirs::home_dir()
