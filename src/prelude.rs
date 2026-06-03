@@ -44,3 +44,6 @@ pub use crate::tools::DelegationTool;
 pub use crate::pipeline::presets::vision::vision_pipeline;
 #[cfg(all(feature = "speech", feature = "llm-client"))]
 pub use crate::pipeline::presets::voice::voice_pipeline;
+
+// Omni (always available — only CpalAudio is feature-gated)
+pub use crate::omni::{AudioSink, AudioSource, OmniEvent, OmniProvider, OmniSession};
