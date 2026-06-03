@@ -26,3 +26,10 @@ pub use crate::runtime::{
     MessageContext, Routine, RoutineContext, Runtime, RuntimeBuilder, TransportSend,
     TransportSender,
 };
+
+// Session coordination
+pub use crate::core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
+pub use crate::core::strategy::RunStrategy;
+
+// Pipeline combinators
+pub use crate::pipeline::combinators::{BranchStage, RetryStage, RouteFn, RouterStage};

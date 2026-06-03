@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::auth::Auth;
 use crate::config::MindroidConfig;
+use crate::core::strategy::RunStrategy;
 use crate::error::{MindroidError, Result};
 use crate::memory::Memory;
 use crate::observer::Observer;
@@ -66,6 +67,7 @@ pub struct RuntimeBuilder {
     pub(crate) transport_sender: Option<TransportSender>,
     pub(crate) channel_buffer: usize,
     pub(crate) routines: Vec<Box<dyn Routine>>,
+    pub(crate) strategy: RunStrategy,
     #[cfg(feature = "persona")]
     pub(crate) persona_provider: Option<Arc<dyn PersonaProvider>>,
     #[cfg(feature = "identity")]
@@ -85,6 +87,7 @@ impl RuntimeBuilder {
             transport_sender: None,
             channel_buffer: 256,
             routines: Vec::new(),
+            strategy: RunStrategy::default(),
             #[cfg(feature = "persona")]
             persona_provider: None,
             #[cfg(feature = "identity")]
@@ -156,6 +159,13 @@ impl RuntimeBuilder {
 
     pub fn channel_buffer(mut self, size: usize) -> Self {
         self.channel_buffer = size;
+        self
+    }
+
+    /// Set the run strategy for handling overlapping pipeline runs.
+    /// Default: `Concurrent` (all messages processed in parallel).
+    pub fn strategy(mut self, strategy: RunStrategy) -> Self {
+        self.strategy = strategy;
         self
     }
 
@@ -278,6 +288,8 @@ impl RuntimeBuilder {
 
         let transport_sender = self.transport_sender.unwrap_or_else(TransportSender::noop);
 
+        let coordinator = Arc::new(crate::core::coordinator::PerKey::new(self.strategy));
+
         Ok(Runtime {
             transport,
             pipeline: Arc::new(pipeline),
@@ -288,6 +300,7 @@ impl RuntimeBuilder {
             channel_buffer: self.channel_buffer,
             routines: self.routines,
             routine_handles: Vec::new(),
+            coordinator,
         })
     }
 }

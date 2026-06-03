@@ -3,6 +3,7 @@ use futures::stream::BoxStream;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
 use crate::core::context::Context;
@@ -19,12 +20,22 @@ pub struct MessageContext {
     pub(crate) pipeline: Arc<Pipeline>,
     pub(crate) transport: Arc<TransportSender>,
     pub(crate) observers: Arc<Vec<Box<dyn Observer>>>,
+    pub(crate) cancel: Option<CancellationToken>,
 }
 
 impl MessageContext {
+    /// Create a [`Context`] with the coordinator's cancellation token wired in.
+    fn make_context(&self) -> Context {
+        let ctx = Context::new(self.message.clone(), self.agent_config.clone());
+        match &self.cancel {
+            Some(token) => ctx.with_cancel(token.child_token()),
+            None => ctx,
+        }
+    }
+
     /// Run the pipeline on this message and return the result.
     pub async fn process(&self) -> Result<Option<String>> {
-        let mut ctx = Context::new(self.message.clone(), self.agent_config.clone());
+        let mut ctx = self.make_context();
         self.pipeline.run(&mut ctx).await
     }
 
@@ -33,9 +44,13 @@ impl MessageContext {
         let agent_config = self.agent_config.clone();
         let message = self.message.clone();
         let pipeline = self.pipeline.clone();
+        let cancel = self.cancel.clone();
 
         let stream = async_stream::stream! {
             let mut ctx = Context::new(message, agent_config);
+            if let Some(token) = cancel {
+                ctx = ctx.with_cancel(token.child_token());
+            }
             let mut inner = pipeline.run_streaming(&mut ctx);
             use futures::StreamExt;
             while let Some(event) = inner.next().await {
@@ -48,7 +63,7 @@ impl MessageContext {
 
     /// Run any pipeline on this message and return the result.
     pub async fn run_pipeline(&self, pipeline: &Pipeline) -> Result<Option<String>> {
-        let mut ctx = Context::new(self.message.clone(), self.agent_config.clone());
+        let mut ctx = self.make_context();
         pipeline.run(&mut ctx).await
     }
 
@@ -59,9 +74,13 @@ impl MessageContext {
     ) -> BoxStream<'a, StreamEvent> {
         let agent_config = self.agent_config.clone();
         let message = self.message.clone();
+        let cancel = self.cancel.clone();
 
         let stream = async_stream::stream! {
             let mut ctx = Context::new(message, agent_config);
+            if let Some(token) = cancel {
+                ctx = ctx.with_cancel(token.child_token());
+            }
             let mut inner = pipeline.run_streaming(&mut ctx);
             use futures::StreamExt;
             while let Some(event) = inner.next().await {
@@ -96,7 +115,7 @@ impl MessageContext {
     /// Use this when you need access to fields beyond `final_response`,
     /// such as `audio_output` produced by [`TtsStage`].
     pub async fn process_context(&self) -> Result<Context> {
-        let mut ctx = Context::new(self.message.clone(), self.agent_config.clone());
+        let mut ctx = self.make_context();
         self.pipeline.run(&mut ctx).await?;
         Ok(ctx)
     }

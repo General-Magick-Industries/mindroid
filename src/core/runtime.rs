@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
@@ -28,6 +28,7 @@ pub struct Runtime {
     pub(crate) channel_buffer: usize,
     pub(crate) routines: Vec<Box<dyn Routine>>,
     pub(crate) routine_handles: Vec<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    pub(crate) coordinator: Arc<crate::core::coordinator::PerKey<String>>,
 }
 
 impl Runtime {
@@ -114,9 +115,6 @@ impl Runtime {
         }
 
         // Process messages
-        const MAX_CONCURRENT_HANDLERS: usize = 50;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
-
         let mut seen_ids = std::collections::HashSet::<String>::new();
         const MAX_SEEN_IDS: usize = 10_000;
         while let Some(msg) = rx.recv().await {
@@ -142,24 +140,27 @@ impl Runtime {
                 obs.on_message_received(&msg).await;
             }
 
+            // Acquire a coordinator permit (strategy-aware)
+            let permit = match self.coordinator.acquire(&msg.sender_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Skipping message {}: {}", msg.id, e);
+                    continue;
+                }
+            };
+
             let ctx = MessageContext {
                 message: Arc::new(msg),
                 agent_config: self.agent_config.clone(),
                 pipeline: self.pipeline.clone(),
                 transport: self.transport_sender.clone(),
                 observers: self.observers.clone(),
+                cancel: Some(permit.token().clone()),
             };
 
             let handler_fut = (self.handler)(ctx);
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::error!("Handler semaphore closed, dropping message");
-                    continue;
-                }
-            };
             tokio::spawn(async move {
-                let _permit = permit; // dropped when handler completes
+                let _permit = permit; // drop guard signals completion for Sequential
                 handler_fut.await;
             });
         }
@@ -179,6 +180,10 @@ impl Runtime {
                 }
             }
         }
+
+        // Close coordinator before transport disconnect
+        self.coordinator.close_all();
+
         tracing::info!("Shutting down...");
         for obs in self.observers.iter() {
             obs.on_shutdown().await;
