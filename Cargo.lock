@@ -405,6 +405,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinator_demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "mindroid",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

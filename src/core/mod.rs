@@ -2,6 +2,7 @@ pub mod builder;
 pub mod config;
 pub mod content;
 pub mod context;
+pub mod coordinator;
 pub mod error;
 pub mod events;
 pub mod extension_map;

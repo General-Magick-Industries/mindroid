@@ -1,3 +1,4 @@
+pub mod combinators;
 pub mod context;
 pub mod coordination;
 pub mod extensions;

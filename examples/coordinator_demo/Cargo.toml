@@ -1,0 +1,17 @@
+[package]
+name = "coordinator_demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "coordinator_demo"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
