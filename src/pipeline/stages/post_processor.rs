@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
-use crate::{PipelineContext, PipelineStage, Result};
+use crate::core::context::Context;
+use crate::{PipelineStage, Result};
 
 /// Trims whitespace from the LLM response and writes it back to `ctx.response`.
 ///
@@ -13,7 +14,7 @@ impl PipelineStage for PostProcessor {
         "PostProcessor"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         ctx.response = Some(ctx.response.as_deref().unwrap_or("").trim().to_string());
         Ok(())
     }

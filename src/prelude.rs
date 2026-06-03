@@ -16,6 +16,7 @@ pub use crate::observer::{NoObserver, Observer};
 pub use crate::pipeline::context::{
     ContextPreparer, ContextProvider, PrepareOutcome, ProviderWarning,
 };
+pub use crate::core::context::Context;
 pub use crate::pipeline::{Pipeline, PipelineContext, PipelineStage, StreamingStage};
 pub use crate::tools::{Tool, ToolRegistry};
 pub use crate::transport::Transport;

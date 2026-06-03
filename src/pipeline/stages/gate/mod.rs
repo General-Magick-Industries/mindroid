@@ -4,7 +4,8 @@ mod relevance;
 
 use async_trait::async_trait;
 
-use crate::{PipelineContext, Result};
+use crate::core::context::Context;
+use crate::Result;
 
 /// A boolean classifier that decides whether the pipeline should proceed.
 ///
@@ -12,7 +13,7 @@ use crate::{PipelineContext, Result};
 #[async_trait]
 pub trait Gate: Send + Sync {
     /// Return `true` to pass, `false` to halt.
-    async fn classify(&self, ctx: &PipelineContext) -> Result<bool>;
+    async fn classify(&self, ctx: &Context) -> Result<bool>;
 }
 
 pub use combinators::{AndGate, OrGate};

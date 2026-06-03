@@ -52,8 +52,9 @@ use std::sync::Arc;
 use async_openai::types::chat::{ResponseFormat, ResponseFormatJsonSchema};
 use serde::Deserialize;
 
+use crate::core::context::Context;
 use crate::llm_client::{AuthStyle, ChatRequest, LlmClient, LlmClientConfig};
-use crate::{LlmMessage, MindroidError, PipelineContext, PipelineStage, Result, Role};
+use crate::{LlmMessage, MindroidError, PipelineStage, Result, Role};
 
 use super::Gate;
 
@@ -193,13 +194,13 @@ impl RelevanceGate {
     ///
     /// Returns `true` if relevant (gate passes), `false` if not relevant (gate would halt).
     /// On LLM / parse failure: returns `Err` when strict, `Ok(true)` otherwise.
-    pub async fn run_classification(&self, ctx: &PipelineContext) -> crate::Result<bool> {
+    pub async fn run_classification(&self, ctx: &Context) -> crate::Result<bool> {
         let messages = self.build_prompt(&ctx.message.content);
 
         tracing::debug!(
             "RelevanceGate [{}]: prompt system={:?}",
             self.role,
-            messages.first().map(|m| &m.content),
+            messages.first().map(|m| m.text()),
         );
 
         let result = self
@@ -299,7 +300,7 @@ impl PipelineStage for RelevanceGate {
         "RelevanceGate"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let relevant = self.run_classification(ctx).await?;
 
         if relevant {
@@ -322,7 +323,7 @@ impl PipelineStage for RelevanceGate {
 
 #[async_trait]
 impl Gate for RelevanceGate {
-    async fn classify(&self, ctx: &PipelineContext) -> Result<bool> {
+    async fn classify(&self, ctx: &Context) -> Result<bool> {
         self.run_classification(ctx).await
     }
 }

@@ -8,7 +8,8 @@ use tracing::debug;
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
-use crate::{Auth, LlmMessage, MindroidError, Pipeline, PipelineContext, PipelineStage, Result};
+use crate::core::context::Context;
+use crate::{Auth, LlmMessage, MindroidError, Pipeline, PipelineStage, Result};
 
 // ── Magickmind API types ──────────────────────────────────────────────────────
 
@@ -387,7 +388,7 @@ impl PipelineStage for MagickmindPersistence {
         "MagickmindPersistence"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let mindspace_id = &ctx.message.channel_id;
         if mindspace_id.is_empty() {
             debug!("MagickmindPersistence: no mindspace_id in message, skipping save");

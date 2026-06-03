@@ -7,82 +7,23 @@ pub mod stages;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::config::AgentConfig;
+use crate::core::context::Context;
+use crate::core::events::PipelineEvent;
 use crate::error::Result;
-use crate::models::{LlmMessage, Message, StreamEvent};
+use crate::models::StreamEvent;
 
-/// Context passed through pipeline stages, accumulating data at each step.
-pub struct PipelineContext {
-    /// The incoming message being processed.
-    pub message: Arc<Message>,
-    /// Agent configuration.
-    pub agent_config: Arc<AgentConfig>,
-    /// LLM conversation messages, built by ContextBuilder stage.
-    pub llm_messages: Vec<LlmMessage>,
-    /// Response text produced by the pipeline (set by Processor and PostProcessor stages).
-    pub response: Option<String>,
-    /// When set to `true`, the pipeline stops executing further stages.
-    pub halted: bool,
-
-    /// Typed extension map for feature-specific pipeline state.
-    ///
-    /// Use [`PipelineContext::set_ext`], [`PipelineContext::get_ext`], and
-    /// [`PipelineContext::take_ext`] to store and retrieve values keyed by type.
-    pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-}
-
-impl PipelineContext {
-    pub fn new(message: Arc<Message>, agent_config: Arc<AgentConfig>) -> Self {
-        Self {
-            message,
-            agent_config,
-            llm_messages: Vec::new(),
-            response: None,
-            halted: false,
-            extensions: HashMap::new(),
-        }
-    }
-
-    /// Clear output fields for reuse across pipeline runs.
-    /// Preserves message and agent_config.
-    /// Clears llm_messages so each pipeline builds its own prompt.
-    pub fn reset_output(&mut self) {
-        self.llm_messages.clear();
-        self.response = None;
-        self.halted = false;
-        self.extensions.clear();
-    }
-
-    /// Store a typed value in the extension map.
-    pub fn set_ext<T: Send + Sync + 'static>(&mut self, value: T) {
-        self.extensions.insert(TypeId::of::<T>(), Box::new(value));
-    }
-
-    /// Retrieve a shared reference to a typed value from the extension map.
-    pub fn get_ext<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.extensions.get(&TypeId::of::<T>())?.downcast_ref()
-    }
-
-    /// Remove and return a typed value from the extension map.
-    pub fn take_ext<T: Send + Sync + 'static>(&mut self) -> Option<T> {
-        self.extensions
-            .remove(&TypeId::of::<T>())
-            .and_then(|b| b.downcast().ok().map(|b| *b))
-    }
-}
+/// Backward-compatible alias for [`crate::core::context::Context`].
+pub type PipelineContext = crate::core::context::Context;
 
 /// A single stage in the processing pipeline.
 #[async_trait]
 pub trait PipelineStage: Send + Sync {
     fn name(&self) -> &str;
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()>;
+    async fn process(&self, ctx: &mut Context) -> Result<()>;
 }
 
 /// A pipeline stage that supports streaming output (e.g., LLM token streaming).
@@ -91,7 +32,7 @@ pub trait PipelineStage: Send + Sync {
 /// Implementors must also implement `PipelineStage::process()` as the
 /// non-streaming fallback (collect all chunks and set `ctx.raw_response`).
 pub trait StreamingStage: PipelineStage {
-    fn stream<'a>(&'a self, ctx: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent>;
+    fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent>;
 }
 
 enum StageEntry {
@@ -134,9 +75,12 @@ impl Pipeline {
     /// For the streaming stage, calls its `PipelineStage::process()` fallback
     /// rather than streaming, which should collect the full response into
     /// `ctx.response`.
-    pub async fn run(&self, ctx: &mut PipelineContext) -> Result<Option<String>> {
+    pub async fn run(&self, ctx: &mut Context) -> Result<Option<String>> {
         let pipeline_start = Instant::now();
         info!("Pipeline::run starting ({} stages)", self.stages.len());
+        ctx.emit_event(PipelineEvent::PipelineStarted {
+            stage_count: self.stages.len(),
+        });
 
         for (i, entry) in self.stages.iter().enumerate() {
             match entry {
@@ -148,6 +92,10 @@ impl Pipeline {
                         self.stages.len(),
                         name
                     );
+                    ctx.emit_event(PipelineEvent::StageStarted {
+                        stage_name: name.to_string(),
+                        stage_index: i,
+                    });
                     let start = Instant::now();
                     stage.process(ctx).await?;
                     let elapsed = start.elapsed();
@@ -158,6 +106,11 @@ impl Pipeline {
                         name,
                         elapsed
                     );
+                    ctx.emit_event(PipelineEvent::StageCompleted {
+                        stage_name: name.to_string(),
+                        stage_index: i,
+                        elapsed,
+                    });
                     if ctx.halted {
                         info!(
                             "Pipeline halted by stage [{}/{}] '{}'",
@@ -165,6 +118,18 @@ impl Pipeline {
                             self.stages.len(),
                             name
                         );
+                        break;
+                    }
+                    if ctx.cancel.is_cancelled() {
+                        info!(
+                            "Pipeline cancelled after stage [{}/{}] '{}'",
+                            i + 1,
+                            self.stages.len(),
+                            name
+                        );
+                        ctx.emit_event(PipelineEvent::Cancelled {
+                            stage_name: name.to_string(),
+                        });
                         break;
                     }
                 }
@@ -176,6 +141,10 @@ impl Pipeline {
                         self.stages.len(),
                         name
                     );
+                    ctx.emit_event(PipelineEvent::StageStarted {
+                        stage_name: name.to_string(),
+                        stage_index: i,
+                    });
                     let start = Instant::now();
                     stage.process(ctx).await?;
                     let elapsed = start.elapsed();
@@ -186,6 +155,11 @@ impl Pipeline {
                         name,
                         elapsed
                     );
+                    ctx.emit_event(PipelineEvent::StageCompleted {
+                        stage_name: name.to_string(),
+                        stage_index: i,
+                        elapsed,
+                    });
                     if ctx.halted {
                         info!(
                             "Pipeline halted by stage [{}/{}] '{}'",
@@ -195,12 +169,25 @@ impl Pipeline {
                         );
                         break;
                     }
+                    if ctx.cancel.is_cancelled() {
+                        info!(
+                            "Pipeline cancelled after stage [{}/{}] '{}'",
+                            i + 1,
+                            self.stages.len(),
+                            name
+                        );
+                        ctx.emit_event(PipelineEvent::Cancelled {
+                            stage_name: name.to_string(),
+                        });
+                        break;
+                    }
                 }
             }
         }
 
         let total = pipeline_start.elapsed();
         info!("Pipeline::run completed in {:.2?}", total);
+        ctx.emit_event(PipelineEvent::PipelineCompleted { elapsed: total });
 
         Ok(ctx.response.take())
     }
@@ -211,11 +198,14 @@ impl Pipeline {
     /// Post-streaming stages run after the stream completes (their effects
     /// are signaled via a final `Complete` event).
     #[allow(clippy::collapsible_if)]
-    pub fn run_streaming<'a>(&'a self, ctx: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent> {
+    pub fn run_streaming<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         let stream = async_stream::stream! {
             let pipeline_start = Instant::now();
             let total_stages = self.stages.len();
             info!("Pipeline::run_streaming starting ({total_stages} stages)");
+            ctx.emit_event(PipelineEvent::PipelineStarted {
+                stage_count: total_stages,
+            });
 
             let split = self.streaming_idx.unwrap_or(total_stages);
 
@@ -224,15 +214,36 @@ impl Pipeline {
                 if let StageEntry::Normal(stage) = entry {
                     let name = stage.name();
                     debug!("Pipeline stage [{}/{}] '{}' starting", i + 1, total_stages, name);
+                    ctx.emit_event(PipelineEvent::StageStarted {
+                        stage_name: name.to_string(),
+                        stage_index: i,
+                    });
                     let start = Instant::now();
                     if let Err(e) = stage.process(ctx).await {
                         warn!("Pipeline stage '{}' failed: {}", name, e);
+                        ctx.emit_event(PipelineEvent::StageError {
+                            stage_name: name.to_string(),
+                            error: e.to_string(),
+                        });
                         yield StreamEvent::Error { message: e.to_string() };
                         return;
                     }
-                    info!("Pipeline stage [{}/{}] '{}' completed in {:.2?}", i + 1, total_stages, name, start.elapsed());
+                    let elapsed = start.elapsed();
+                    info!("Pipeline stage [{}/{}] '{}' completed in {:.2?}", i + 1, total_stages, name, elapsed);
+                    ctx.emit_event(PipelineEvent::StageCompleted {
+                        stage_name: name.to_string(),
+                        stage_index: i,
+                        elapsed,
+                    });
                     if ctx.halted {
                         info!("Pipeline halted by stage [{}/{}] '{}'", i + 1, total_stages, name);
+                        return;
+                    }
+                    if ctx.cancel.is_cancelled() {
+                        info!("Pipeline cancelled after stage [{}/{}] '{}'", i + 1, total_stages, name);
+                        ctx.emit_event(PipelineEvent::Cancelled {
+                            stage_name: name.to_string(),
+                        });
                         return;
                     }
                 }
@@ -249,9 +260,21 @@ impl Pipeline {
                 if let StageEntry::Streaming(stage) = &self.stages[idx] {
                     let name = stage.name();
                     debug!("Pipeline stage [{}/{}] '{}' (streaming) starting", idx + 1, total_stages, name);
+                    // Capture events sender before the mutable borrow for streaming
+                    let events_tx = ctx.events_sender().cloned();
+                    let emit = |event: PipelineEvent| {
+                        if let Some(ref tx) = events_tx {
+                            let _ = tx.send(event);
+                        }
+                    };
+                    emit(PipelineEvent::StageStarted {
+                        stage_name: name.to_string(),
+                        stage_index: idx,
+                    });
                     let stream_start = Instant::now();
                     let mut collected = String::new();
                     let mut chunk_count: u32 = 0;
+                    let cancel = ctx.cancel.clone();
                     {
                         let mut event_stream: BoxStream<'_, StreamEvent> = stage.stream(ctx);
                         while let Some(event) = event_stream.next().await {
@@ -271,12 +294,25 @@ impl Pipeline {
                                 _ => {}
                             }
                             yield event;
+                            if cancel.is_cancelled() {
+                                info!("Pipeline streaming cancelled during stage '{}'", name);
+                                emit(PipelineEvent::Cancelled {
+                                    stage_name: name.to_string(),
+                                });
+                                break;
+                            }
                         }
                     }
+                    let stream_elapsed = stream_start.elapsed();
                     info!(
                         "Pipeline stage [{}/{}] '{}' (streaming) completed in {:.2?} ({} chunks, {} bytes)",
-                        idx + 1, total_stages, name, stream_start.elapsed(), chunk_count, collected.len()
+                        idx + 1, total_stages, name, stream_elapsed, chunk_count, collected.len()
                     );
+                    emit(PipelineEvent::StageCompleted {
+                        stage_name: name.to_string(),
+                        stage_index: idx,
+                        elapsed: stream_elapsed,
+                    });
                     if ctx.response.is_none() {
                         ctx.response = Some(collected);
                     }
@@ -290,20 +326,44 @@ impl Pipeline {
                     let stage_num = post_start + i + 1;
                     let name = stage.name();
                     debug!("Pipeline stage [{}/{}] '{}' starting", stage_num, total_stages, name);
+                    ctx.emit_event(PipelineEvent::StageStarted {
+                        stage_name: name.to_string(),
+                        stage_index: post_start + i,
+                    });
                     let start = Instant::now();
                     if let Err(e) = stage.process(ctx).await {
                         warn!("Pipeline stage '{}' failed: {}", name, e);
+                        ctx.emit_event(PipelineEvent::StageError {
+                            stage_name: name.to_string(),
+                            error: e.to_string(),
+                        });
                         yield StreamEvent::Error { message: e.to_string() };
                         return;
                     }
-                    info!("Pipeline stage [{}/{}] '{}' completed in {:.2?}", stage_num, total_stages, name, start.elapsed());
+                    let elapsed = start.elapsed();
+                    info!("Pipeline stage [{}/{}] '{}' completed in {:.2?}", stage_num, total_stages, name, elapsed);
+                    ctx.emit_event(PipelineEvent::StageCompleted {
+                        stage_name: name.to_string(),
+                        stage_index: post_start + i,
+                        elapsed,
+                    });
                     if ctx.halted {
                         info!("Pipeline halted by stage [{}/{}] '{}'", stage_num, total_stages, name);
+                        return;
+                    }
+                    if ctx.cancel.is_cancelled() {
+                        info!("Pipeline cancelled after stage [{}/{}] '{}'", stage_num, total_stages, name);
+                        ctx.emit_event(PipelineEvent::Cancelled {
+                            stage_name: name.to_string(),
+                        });
                         return;
                     }
                 }
             }
 
+            ctx.emit_event(PipelineEvent::PipelineCompleted {
+                elapsed: pipeline_start.elapsed(),
+            });
             info!("Pipeline::run_streaming completed in {:.2?}", pipeline_start.elapsed());
         };
 
@@ -323,5 +383,78 @@ impl fmt::Debug for Pipeline {
             .field("stages", &format!("{} stages", self.stages.len()))
             .field("streaming_idx", &self.streaming_idx)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::config::AgentConfig;
+    use crate::models::Message;
+
+    /// A stage that records whether it was called.
+    struct RecorderStage {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl PipelineStage for RecorderStage {
+        fn name(&self) -> &str { "recorder" }
+        async fn process(&self, _ctx: &mut Context) -> crate::error::Result<()> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A stage that cancels the context.
+    struct CancelStage;
+
+    #[async_trait]
+    impl PipelineStage for CancelStage {
+        fn name(&self) -> &str { "cancel" }
+        async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
+            ctx.cancel.cancel();
+            Ok(())
+        }
+    }
+
+    fn make_test_context() -> Context {
+        let msg = Arc::new(Message::new("test", "user1", "ch1"));
+        let config = Arc::new(AgentConfig::default());
+        Context::new(msg, config)
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_cancellation() {
+        let second_called = Arc::new(AtomicBool::new(false));
+        let pipeline = Pipeline::new()
+            .add_stage(CancelStage)
+            .add_stage(RecorderStage { called: second_called.clone() });
+
+        let mut ctx = make_test_context();
+        let _ = pipeline.run(&mut ctx).await;
+
+        // Second stage should NOT have been called
+        assert!(!second_called.load(Ordering::SeqCst), "Second stage should not run after cancellation");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_streaming_cancellation() {
+        use futures::StreamExt;
+
+        let second_called = Arc::new(AtomicBool::new(false));
+        let pipeline = Pipeline::new()
+            .add_stage(CancelStage)
+            .add_stage(RecorderStage { called: second_called.clone() });
+
+        let mut ctx = make_test_context();
+        // Consume the stream fully
+        let mut stream = pipeline.run_streaming(&mut ctx);
+        while stream.next().await.is_some() {}
+
+        // Second stage should NOT have been called
+        assert!(!second_called.load(Ordering::SeqCst), "Second stage should not run after cancellation in streaming mode");
     }
 }

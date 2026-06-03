@@ -7,14 +7,17 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::core::content::{ContentPart, ContentSource};
 use crate::{LlmMessage, Role, StreamEvent, TokenUsage};
 use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, FinishReason, ResponseFormat,
+        ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequestArgs,
+        FinishReason, ImageUrl, ResponseFormat,
     },
 };
 use futures::StreamExt;
@@ -88,6 +91,65 @@ pub struct ChatRequest<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Multimodal helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true if content contains any non-text parts that need multimodal formatting.
+fn has_multimodal_content(content: &[ContentPart]) -> bool {
+    content.iter().any(|p| !p.is_text())
+}
+
+/// Convert `ContentPart`s to OpenAI user message content parts for multimodal messages.
+/// Text-only messages should use the fast text path instead.
+fn content_parts_to_openai(
+    content: &[ContentPart],
+) -> Vec<ChatCompletionRequestUserMessageContentPart> {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(ChatCompletionRequestUserMessageContentPart::Text(
+                ChatCompletionRequestMessageContentPartText { text: text.clone() },
+            )),
+            ContentPart::Image { source, mime_type } => {
+                let url = match source {
+                    ContentSource::Uri { uri } => uri.clone(),
+                    ContentSource::Inline { data } => {
+                        #[cfg(feature = "transport-ws")]
+                        {
+                            use base64::Engine;
+                            let encoded =
+                                base64::engine::general_purpose::STANDARD.encode(data);
+                            format!("data:{};base64,{}", mime_type, encoded)
+                        }
+                        #[cfg(not(feature = "transport-ws"))]
+                        {
+                            let _ = (data, mime_type);
+                            tracing::warn!(
+                                "Skipping inline image in OpenAI conversion: base64 encoding \
+                                 requires the `transport-ws` feature"
+                            );
+                            return None;
+                        }
+                    }
+                };
+                Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                    ChatCompletionRequestMessageContentPartImage {
+                        image_url: ImageUrl { url, detail: None },
+                    },
+                ))
+            }
+            other => {
+                tracing::warn!(
+                    "Skipping unsupported content type in OpenAI conversion: {:?}",
+                    other
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // LlmClient
 // ---------------------------------------------------------------------------
 
@@ -154,27 +216,42 @@ impl LlmClient {
     fn convert_messages(messages: &[LlmMessage]) -> Vec<ChatCompletionRequestMessage> {
         messages
             .iter()
-            .filter_map(|msg| match msg.role {
-                Role::System => ChatCompletionRequestSystemMessageArgs::default()
-                    .content(msg.content.as_str())
-                    .build()
-                    .ok()
-                    .map(Into::into),
-                Role::User | Role::Unknown => ChatCompletionRequestUserMessageArgs::default()
-                    .content(msg.content.as_str())
-                    .build()
-                    .ok()
-                    .map(Into::into),
-                Role::Assistant => ChatCompletionRequestAssistantMessageArgs::default()
-                    .content(msg.content.as_str())
-                    .build()
-                    .ok()
-                    .map(Into::into),
-                Role::Tool => ChatCompletionRequestUserMessageArgs::default()
-                    .content(msg.content.as_str())
-                    .build()
-                    .ok()
-                    .map(Into::into),
+            .filter_map(|msg| {
+                let text = msg.text();
+                match msg.role {
+                    Role::System => ChatCompletionRequestSystemMessageArgs::default()
+                        .content(text.as_str())
+                        .build()
+                        .ok()
+                        .map(Into::into),
+                    Role::User | Role::Unknown => {
+                        if has_multimodal_content(&msg.content) {
+                            // Multimodal: use array content format
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(content_parts_to_openai(&msg.content))
+                                .build()
+                                .ok()
+                                .map(Into::into)
+                        } else {
+                            // Text-only: fast path
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(text.as_str())
+                                .build()
+                                .ok()
+                                .map(Into::into)
+                        }
+                    }
+                    Role::Assistant => ChatCompletionRequestAssistantMessageArgs::default()
+                        .content(text.as_str())
+                        .build()
+                        .ok()
+                        .map(Into::into),
+                    Role::Tool => ChatCompletionRequestUserMessageArgs::default()
+                        .content(text.as_str())
+                        .build()
+                        .ok()
+                        .map(Into::into),
+                }
             })
             .collect()
     }
@@ -410,5 +487,30 @@ mod tests {
         let mut config = LlmClientConfig::new("http://localhost:11434/v1");
         config.auth_style = AuthStyle::None;
         let _client = LlmClient::new(config).unwrap();
+    }
+
+    #[test]
+    fn text_only_uses_fast_path() {
+        let msg = LlmMessage::user("hello world");
+        assert!(!has_multimodal_content(&msg.content));
+    }
+
+    #[test]
+    fn image_uri_detected_as_multimodal() {
+        let msg = LlmMessage {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("Look at this:"),
+                ContentPart::Image {
+                    source: ContentSource::Uri {
+                        uri: "https://example.com/cat.jpg".into(),
+                    },
+                    mime_type: "image/jpeg".into(),
+                },
+            ],
+        };
+        assert!(has_multimodal_content(&msg.content));
+        let parts = content_parts_to_openai(&msg.content);
+        assert_eq!(parts.len(), 2);
     }
 }

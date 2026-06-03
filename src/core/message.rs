@@ -8,7 +8,8 @@ use crate::config::AgentConfig;
 use crate::error::Result;
 use crate::models::{Message, Response, StreamEvent};
 use crate::observer::Observer;
-use crate::pipeline::{Pipeline, PipelineContext};
+use crate::core::context::Context;
+use crate::pipeline::Pipeline;
 
 /// Context available to message handlers. Provides access to the pipeline,
 /// transport, and memory for processing a single message.
@@ -23,7 +24,7 @@ pub struct MessageContext {
 impl MessageContext {
     /// Run the pipeline on this message and return the result.
     pub async fn process(&self) -> Result<Option<String>> {
-        let mut ctx = PipelineContext::new(self.message.clone(), self.agent_config.clone());
+        let mut ctx = Context::new(self.message.clone(), self.agent_config.clone());
         self.pipeline.run(&mut ctx).await
     }
 
@@ -34,7 +35,7 @@ impl MessageContext {
         let pipeline = self.pipeline.clone();
 
         let stream = async_stream::stream! {
-            let mut ctx = PipelineContext::new(message, agent_config);
+            let mut ctx = Context::new(message, agent_config);
             let mut inner = pipeline.run_streaming(&mut ctx);
             use futures::StreamExt;
             while let Some(event) = inner.next().await {
@@ -47,7 +48,7 @@ impl MessageContext {
 
     /// Run any pipeline on this message and return the result.
     pub async fn run_pipeline(&self, pipeline: &Pipeline) -> Result<Option<String>> {
-        let mut ctx = PipelineContext::new(self.message.clone(), self.agent_config.clone());
+        let mut ctx = Context::new(self.message.clone(), self.agent_config.clone());
         pipeline.run(&mut ctx).await
     }
 
@@ -60,7 +61,7 @@ impl MessageContext {
         let message = self.message.clone();
 
         let stream = async_stream::stream! {
-            let mut ctx = PipelineContext::new(message, agent_config);
+            let mut ctx = Context::new(message, agent_config);
             let mut inner = pipeline.run_streaming(&mut ctx);
             use futures::StreamExt;
             while let Some(event) = inner.next().await {
@@ -90,12 +91,12 @@ impl MessageContext {
         Ok(result)
     }
 
-    /// Run the pipeline and return the full [`PipelineContext`].
+    /// Run the pipeline and return the full [`Context`].
     ///
     /// Use this when you need access to fields beyond `final_response`,
     /// such as `audio_output` produced by [`TtsStage`].
-    pub async fn process_context(&self) -> Result<PipelineContext> {
-        let mut ctx = PipelineContext::new(self.message.clone(), self.agent_config.clone());
+    pub async fn process_context(&self) -> Result<Context> {
+        let mut ctx = Context::new(self.message.clone(), self.agent_config.clone());
         self.pipeline.run(&mut ctx).await?;
         Ok(ctx)
     }
@@ -110,22 +111,22 @@ impl MessageContext {
         Ok(content)
     }
 
-    /// Run a pipeline with a developer-provided PipelineContext.
+    /// Run a pipeline with a developer-provided [`Context`].
     /// Allows sharing context (llm_messages, extensions) across pipeline runs.
     pub async fn run_with_context(
         &self,
         pipeline: &Pipeline,
-        pctx: &mut PipelineContext,
+        pctx: &mut Context,
     ) -> Result<Option<String>> {
         pipeline.run(pctx).await
     }
 
-    /// Run a pipeline with streaming using a developer-provided PipelineContext.
+    /// Run a pipeline with streaming using a developer-provided [`Context`].
     /// Allows sharing context (llm_messages, extensions) across pipeline runs.
     pub fn run_streaming_with_context<'a>(
         &'a self,
         pipeline: &'a Pipeline,
-        pctx: &'a mut PipelineContext,
+        pctx: &'a mut Context,
     ) -> BoxStream<'a, StreamEvent> {
         pipeline.run_streaming(pctx)
     }

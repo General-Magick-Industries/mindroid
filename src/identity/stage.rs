@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::core::context::Context;
 use crate::error::Result;
 use crate::models::SenderType;
-use crate::pipeline::{PipelineContext, PipelineStage};
+use crate::pipeline::PipelineStage;
 
 use super::resolver::IdentityResolver;
 
@@ -26,7 +27,7 @@ impl PipelineStage for IdentityResolutionStage {
         "IdentityResolution"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         if ctx.message.sender_type != SenderType::User {
             return Ok(());
         }

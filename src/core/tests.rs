@@ -107,7 +107,8 @@ mod pipeline_tests {
     use crate::config::AgentConfig;
     use crate::error::Result;
     use crate::models::Message;
-    use crate::pipeline::{Pipeline, PipelineContext, PipelineStage};
+    use crate::core::context::Context;
+    use crate::pipeline::{Pipeline, PipelineStage};
     use async_trait::async_trait;
 
     struct AppendStage {
@@ -120,7 +121,7 @@ mod pipeline_tests {
         fn name(&self) -> &str {
             &self.name
         }
-        async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
             let current = ctx.response.take().unwrap_or_default();
             ctx.response = Some(format!("{current}{}", self.value));
             Ok(())
@@ -144,7 +145,7 @@ mod pipeline_tests {
             });
 
         let msg = Message::new("test", "user", "ch");
-        let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
         let result = pipeline.run(&mut ctx).await.unwrap();
         assert_eq!(result, Some("ABC".to_string()));
     }
@@ -156,7 +157,7 @@ mod pipeline_tests {
         fn name(&self) -> &str {
             "fail"
         }
-        async fn process(&self, _ctx: &mut PipelineContext) -> Result<()> {
+        async fn process(&self, _ctx: &mut Context) -> Result<()> {
             Err(crate::error::MindroidError::Pipeline {
                 stage: "fail".into(),
                 message: "intentional".into(),
@@ -179,7 +180,7 @@ mod pipeline_tests {
             });
 
         let msg = Message::new("test", "user", "ch");
-        let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
         let result = pipeline.run(&mut ctx).await;
         assert!(result.is_err());
         // Stage C should not have run, so response should be "A"
@@ -195,7 +196,7 @@ mod pipeline_tests {
             fn name(&self) -> &str {
                 "set_response"
             }
-            async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
                 ctx.response = Some("hello!".into());
                 Ok(())
             }
@@ -204,7 +205,7 @@ mod pipeline_tests {
         let pipeline = Pipeline::new().add_stage(SetResponse);
 
         let msg = Message::new("test", "user", "ch");
-        let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
         let result = pipeline.run(&mut ctx).await.unwrap();
         assert_eq!(result, Some("hello!".to_string()));
     }
@@ -217,7 +218,7 @@ mod pipeline_tests {
         fn name(&self) -> &str {
             "halt"
         }
-        async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
             ctx.halted = true;
             Ok(())
         }
@@ -231,7 +232,7 @@ mod pipeline_tests {
         fn name(&self) -> &str {
             "halt_with_response"
         }
-        async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
             ctx.response = Some("canned".into());
             ctx.halted = true;
             Ok(())
@@ -248,7 +249,7 @@ mod pipeline_tests {
         fn name(&self) -> &str {
             "spy"
         }
-        async fn process(&self, _ctx: &mut PipelineContext) -> Result<()> {
+        async fn process(&self, _ctx: &mut Context) -> Result<()> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -262,7 +263,7 @@ mod pipeline_tests {
         });
 
         let msg = Message::new("test", "user", "ch");
-        let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
         let result = pipeline.run(&mut ctx).await.unwrap();
         assert_eq!(result, None);
     }
@@ -277,7 +278,7 @@ mod pipeline_tests {
             });
 
         let msg = Message::new("test", "user", "ch");
-        let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
         let result = pipeline.run(&mut ctx).await.unwrap();
         assert_eq!(result, Some("canned".to_string()));
     }
@@ -297,7 +298,7 @@ mod pipeline_tests {
             });
 
         let msg = Message::new("test", "user", "ch");
-        let mut ctx = PipelineContext::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
         let result = pipeline.run(&mut ctx).await.unwrap();
         // Halted with no explicit response, but response was set by first stage
         assert_eq!(result, Some("A".to_string()));
