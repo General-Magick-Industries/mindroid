@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
@@ -228,6 +230,76 @@ impl PipelineStage for RetryStage {
         }
 
         Err(last_err.unwrap())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ApprovalStage — wait for an external T to appear in the session scope
+// ---------------------------------------------------------------------------
+
+/// Waits for an external approval signal of type `T` to appear in the
+/// session-scoped extension map.
+///
+/// The stage subscribes to the session scope's change stream and blocks
+/// until **any** value of type `T` is written to the session. It returns
+/// `Ok(())` on receipt, or an error if the pipeline is cancelled or the
+/// configurable timeout elapses first.
+///
+/// The caller is responsible for defining what `T` means (e.g. a
+/// `UserApproval` newtype). `ApprovalStage` is generic and places no
+/// constraints on the semantics of `T` beyond `Clone + Send + Sync`.
+///
+/// # Example
+/// ```rust,ignore
+/// #[derive(Clone)]
+/// struct UserApproval;
+///
+/// let stage = ApprovalStage::<UserApproval>::new("await-approval")
+///     .timeout(Duration::from_secs(300));
+/// ```
+pub struct ApprovalStage<T: Clone + Send + Sync + 'static> {
+    name: String,
+    timeout: Duration,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Clone + Send + Sync + 'static> ApprovalStage<T> {
+    /// Create a new `ApprovalStage` with a default timeout of 5 minutes.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            timeout: Duration::from_secs(300),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Override the wait timeout (default: 5 minutes).
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+#[async_trait]
+impl<T: Clone + Send + Sync + 'static> PipelineStage for ApprovalStage<T> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
+        // Clone the cancel token BEFORE creating the stream, which borrows ctx.
+        let cancel = ctx.cancel.clone();
+        let Some(mut stream) = ctx.watch_session::<T>() else {
+            return Err(MindroidError::pipeline(
+                "no session scope for approval",
+            ));
+        };
+        let timeout = self.timeout;
+        tokio::select! {
+            Some(_val) = StreamExt::next(&mut stream) => Ok(()),
+            _ = cancel.cancelled() => Err(MindroidError::pipeline("approval cancelled")),
+            _ = tokio::time::sleep(timeout) => Err(MindroidError::pipeline("approval timed out")),
+        }
     }
 }
 
@@ -608,5 +680,70 @@ mod tests {
         // After retry succeeds, the stale response should have been cleared by reset_output
         // (the FailNTimesStage doesn't set response, so it stays None after reset)
         assert!(ctx.response.is_none());
+    }
+
+    // ── ApprovalStage tests ────────────────────────────────────────────────────
+
+    use crate::core::extension_map::SharedExtensionMap;
+    use super::ApprovalStage;
+
+    /// Simple approval signal type — user-defined, just needs Clone+Send+Sync.
+    #[derive(Clone)]
+    struct Approved;
+
+    fn make_session_context() -> (Context, SharedExtensionMap) {
+        let session = SharedExtensionMap::new();
+        let ctx = make_test_context().with_session(session.clone());
+        (ctx, session)
+    }
+
+    #[tokio::test]
+    async fn test_approval_received() {
+        let (mut ctx, session) = make_session_context();
+        let stage = ApprovalStage::<Approved>::new("approval")
+            .timeout(Duration::from_secs(5));
+
+        // Spawn a task that writes the approval signal after 50ms
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session.set(Approved);
+        });
+
+        let result = stage.process(&mut ctx).await;
+        assert!(result.is_ok(), "expected Ok on approval received, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_approval_timeout() {
+        let (mut ctx, _session) = make_session_context();
+        // No one writes Approved — should time out quickly
+        let stage = ApprovalStage::<Approved>::new("approval")
+            .timeout(Duration::from_millis(10));
+
+        let result = stage.process(&mut ctx).await;
+        assert!(result.is_err(), "expected Err on timeout");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timed out"),
+            "error message should contain 'timed out', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approval_cancelled() {
+        let (mut ctx, _session) = make_session_context();
+        let stage = ApprovalStage::<Approved>::new("approval")
+            .timeout(Duration::from_secs(60));
+
+        // Cancel the pipeline immediately before running
+        ctx.cancel.cancel();
+
+        let result = stage.process(&mut ctx).await;
+        assert!(result.is_err(), "expected Err on cancellation");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cancelled"),
+            "error message should contain 'cancelled', got: {msg}"
+        );
     }
 }
