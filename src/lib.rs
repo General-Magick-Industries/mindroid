@@ -65,6 +65,10 @@ pub use pipeline::context::{ContextPreparer, ContextProvider, PrepareOutcome, Pr
 pub use pipeline::coordination::EngagementTracker;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::extensions::{AudioInput, AudioOutput, TextInput};
+#[cfg(feature = "llm-client")]
+pub use pipeline::presets::vision::vision_pipeline;
+#[cfg(all(feature = "speech", feature = "llm-client"))]
+pub use pipeline::presets::voice::voice_pipeline;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::stages::AudioOutputStage;
 #[cfg(feature = "transport-audio")]
@@ -77,10 +81,6 @@ pub use pipeline::stages::{DeepgramStt, DeepgramSttConfig, DeepgramTts, Deepgram
 pub use pipeline::stages::{
     GenericLlmProcessor, OpenAiStt, OpenAiSttConfig, OpenAiTts, OpenAiTtsConfig, collect_stream,
 };
-#[cfg(all(feature = "speech", feature = "llm-client"))]
-pub use pipeline::presets::voice::voice_pipeline;
-#[cfg(feature = "llm-client")]
-pub use pipeline::presets::vision::vision_pipeline;
 pub use pipeline::stages::{PostProcessor, SimpleContextBuilder};
 pub use pipeline::stages::{SttProvider, SttStage, TtsProvider, TtsStage};
 pub use pipeline::{Pipeline, PipelineContext, PipelineStage, StreamingStage};

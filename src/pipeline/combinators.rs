@@ -290,9 +290,7 @@ impl<T: Clone + Send + Sync + 'static> PipelineStage for ApprovalStage<T> {
         // Clone the cancel token BEFORE creating the stream, which borrows ctx.
         let cancel = ctx.cancel.clone();
         let Some(mut stream) = ctx.watch_session::<T>() else {
-            return Err(MindroidError::pipeline(
-                "no session scope for approval",
-            ));
+            return Err(MindroidError::pipeline("no session scope for approval"));
         };
         let timeout = self.timeout;
         tokio::select! {
@@ -684,8 +682,8 @@ mod tests {
 
     // ── ApprovalStage tests ────────────────────────────────────────────────────
 
-    use crate::core::extension_map::SharedExtensionMap;
     use super::ApprovalStage;
+    use crate::core::extension_map::SharedExtensionMap;
 
     /// Simple approval signal type — user-defined, just needs Clone+Send+Sync.
     #[derive(Clone)]
@@ -700,8 +698,7 @@ mod tests {
     #[tokio::test]
     async fn test_approval_received() {
         let (mut ctx, session) = make_session_context();
-        let stage = ApprovalStage::<Approved>::new("approval")
-            .timeout(Duration::from_secs(5));
+        let stage = ApprovalStage::<Approved>::new("approval").timeout(Duration::from_secs(5));
 
         // Spawn a task that writes the approval signal after 50ms
         tokio::spawn(async move {
@@ -710,15 +707,17 @@ mod tests {
         });
 
         let result = stage.process(&mut ctx).await;
-        assert!(result.is_ok(), "expected Ok on approval received, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok on approval received, got: {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn test_approval_timeout() {
         let (mut ctx, _session) = make_session_context();
         // No one writes Approved — should time out quickly
-        let stage = ApprovalStage::<Approved>::new("approval")
-            .timeout(Duration::from_millis(10));
+        let stage = ApprovalStage::<Approved>::new("approval").timeout(Duration::from_millis(10));
 
         let result = stage.process(&mut ctx).await;
         assert!(result.is_err(), "expected Err on timeout");
@@ -732,8 +731,7 @@ mod tests {
     #[tokio::test]
     async fn test_approval_cancelled() {
         let (mut ctx, _session) = make_session_context();
-        let stage = ApprovalStage::<Approved>::new("approval")
-            .timeout(Duration::from_secs(60));
+        let stage = ApprovalStage::<Approved>::new("approval").timeout(Duration::from_secs(60));
 
         // Cancel the pipeline immediately before running
         ctx.cancel.cancel();
