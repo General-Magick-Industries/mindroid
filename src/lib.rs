@@ -17,8 +17,8 @@ pub mod tools;
 #[cfg(feature = "llm-client")]
 pub use pipeline::stages::{ParsedToolCall, ToolCallParser, ToolExecutorStage, XmlToolCallParser};
 pub use tools::{
-    OpenTool, ReminderRoutine, ReminderStore, SetReminderTool, ShellTool, Tool, ToolRegistry,
-    new_reminder_store,
+    DelegationTool, OpenTool, ReminderRoutine, ReminderStore, SetReminderTool, ShellTool, Tool,
+    ToolRegistry, new_reminder_store,
 };
 
 // Core trait modules (always available)
@@ -60,11 +60,15 @@ pub use models::{
 pub use observer::{NoObserver, Observer};
 #[cfg(feature = "persona")]
 pub use persona::{MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider};
-pub use pipeline::combinators::{BranchStage, RetryStage, RouteFn, RouterStage};
+pub use pipeline::combinators::{ApprovalStage, BranchStage, RetryStage, RouteFn, RouterStage};
 pub use pipeline::context::{ContextPreparer, ContextProvider, PrepareOutcome, ProviderWarning};
 pub use pipeline::coordination::EngagementTracker;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::extensions::{AudioInput, AudioOutput, TextInput};
+#[cfg(feature = "llm-client")]
+pub use pipeline::presets::vision::vision_pipeline;
+#[cfg(all(feature = "speech", feature = "llm-client"))]
+pub use pipeline::presets::voice::voice_pipeline;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::stages::AudioOutputStage;
 #[cfg(feature = "transport-audio")]
