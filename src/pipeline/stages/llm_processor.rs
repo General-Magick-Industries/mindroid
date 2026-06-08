@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
+use crate::core::context::Context;
 use crate::llm_client::{ChatRequest, LlmClient};
-use crate::{MindroidError, PipelineContext, PipelineStage, Result, StreamEvent, StreamingStage};
+use crate::{MindroidError, PipelineStage, Result, StreamEvent, StreamingStage};
 
 /// Collect a stream of [`StreamEvent`]s into a `(content, Option<error_message>)` tuple.
 ///
@@ -68,7 +69,7 @@ impl PipelineStage for GenericLlmProcessor {
         "GenericLlmProcessor"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let (collected, error) = collect_stream(self.client.stream_chat(ChatRequest {
             messages: &ctx.llm_messages,
             model: None,
@@ -93,7 +94,7 @@ impl PipelineStage for GenericLlmProcessor {
 }
 
 impl StreamingStage for GenericLlmProcessor {
-    fn stream<'a>(&'a self, ctx: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent> {
+    fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         self.client.stream_chat(ChatRequest {
             messages: &ctx.llm_messages,
             model: None,

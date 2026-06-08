@@ -4,10 +4,11 @@ use futures::stream::BoxStream;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::llm_client::{ChatRequest, LlmClient};
 use crate::models::{LlmMessage, StreamEvent};
-use crate::pipeline::{PipelineContext, PipelineStage, StreamingStage};
+use crate::pipeline::{PipelineStage, StreamingStage};
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
@@ -129,7 +130,7 @@ impl PipelineStage for ToolExecutorStage {
         "ToolExecutorStage"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         // Non-streaming fallback: delegates to run_tool_loop (no yielded events).
         // Operates on local `messages` to avoid borrowing `ctx` through a
         // BoxStream lifetime (which would block the final write to ctx.raw_response).
@@ -162,7 +163,7 @@ impl PipelineStage for ToolExecutorStage {
 }
 
 impl StreamingStage for ToolExecutorStage {
-    fn stream<'a>(&'a self, ctx: &'a mut PipelineContext) -> BoxStream<'a, StreamEvent> {
+    fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         Box::pin(async_stream::stream! {
             // Clone messages so we can extend them with tool rounds.
             // The original ctx.llm_messages stays untouched.
@@ -487,8 +488,8 @@ fn build_messages_with_tools(source: &[LlmMessage], registry: &ToolRegistry) -> 
     let tool_prompt = registry.system_prompt();
     if !tool_prompt.is_empty() {
         if let Some(sys) = messages.iter_mut().find(|m| m.role == crate::Role::System) {
-            sys.content.push_str("\n\n");
-            sys.content.push_str(&tool_prompt);
+            sys.append_text("\n\n");
+            sys.append_text(&tool_prompt);
         } else {
             messages.insert(0, LlmMessage::system(tool_prompt));
         }

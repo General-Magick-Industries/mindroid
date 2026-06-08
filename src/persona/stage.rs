@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::core::context::Context;
 use crate::error::Result;
 use crate::models::{LlmMessage, SenderType};
+use crate::pipeline::PipelineStage;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
-use crate::pipeline::{PipelineContext, PipelineStage};
 
 use super::cache::PersonaCache;
 use super::models::{EffectivePersonalityResponse, EffectiveTrait, PersonaSchema};
@@ -96,7 +97,7 @@ impl PipelineStage for PersonaContextBuilder {
         "PersonaContextBuilder"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         // Determine user_id for dyadic blending (only for user-sent messages)
         // Prefer canonical user ID from identity resolution if available
         let canonical_id: Option<String>;

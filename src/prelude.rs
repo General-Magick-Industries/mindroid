@@ -11,6 +11,7 @@ pub use crate::models::{LlmMessage, Message, Response, Role, StreamEvent};
 
 // Core traits
 pub use crate::auth::Auth;
+pub use crate::core::context::Context;
 pub use crate::memory::{Memory, NoMemory};
 pub use crate::observer::{NoObserver, Observer};
 pub use crate::pipeline::context::{

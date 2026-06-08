@@ -76,6 +76,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
 regex = "1"
+dashmap = "6"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Optional: centrifugo transport
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }

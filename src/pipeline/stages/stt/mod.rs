@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use tracing::warn;
 
+use crate::core::context::Context;
 use crate::error::Result;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::{AudioInput, TextInput};
-use crate::{MindroidError, PipelineContext, PipelineStage};
+use crate::{MindroidError, PipelineStage};
 
 /// Converts raw audio bytes to a text transcript.
 #[async_trait]
@@ -30,7 +31,7 @@ pub trait SttProvider: Send + Sync {
 /// When the `audio` feature is enabled, also checks
 /// `ctx.message.metadata["audio_data"]` for a base64-encoded WAV written by
 /// `AudioTransport`.
-fn resolve_audio(_ctx: &PipelineContext) -> Result<Vec<u8>> {
+fn resolve_audio(_ctx: &Context) -> Result<Vec<u8>> {
     #[cfg(feature = "transport-audio")]
     if let Some(audio) = _ctx.get_ext::<AudioInput>() {
         return Ok(audio.0.clone());
@@ -90,7 +91,7 @@ impl PipelineStage for SttStage {
         "SttStage"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let audio = resolve_audio(ctx)?;
         let transcript = self.provider.transcribe(&audio).await?;
 

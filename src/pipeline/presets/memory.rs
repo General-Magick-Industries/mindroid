@@ -33,10 +33,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::debug;
 
+use crate::core::context::Context;
 use crate::memory::Memory;
-use crate::{
-    ContextProvider, LlmMessage, Message, MindroidError, PipelineContext, PipelineStage, Result,
-};
+use crate::{ContextProvider, LlmMessage, Message, MindroidError, PipelineStage, Result};
 
 // ── MemoryClient ────────────────────────────────────────────────────────────
 
@@ -206,7 +205,7 @@ impl PipelineStage for MemoryPersistence {
         "MemoryPersistence"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let channel_id = &ctx.message.channel_id;
 
         // Save user message
@@ -316,7 +315,7 @@ mod tests {
         let result = client.prepare_context("", "bot-1", 10).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content, "stdio message");
+        assert_eq!(result[0].text(), "stdio message");
     }
 
     #[tokio::test]
@@ -350,7 +349,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut pctx = PipelineContext::new(message.into(), agent_config.into());
+        let mut pctx = Context::new(message.into(), agent_config.into());
         // No response set — ctx.response is None
 
         persistence.process(&mut pctx).await.unwrap();
@@ -374,7 +373,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut pctx = PipelineContext::new(message.into(), agent_config.into());
+        let mut pctx = Context::new(message.into(), agent_config.into());
         pctx.response = Some("4".to_string());
 
         persistence.process(&mut pctx).await.unwrap();

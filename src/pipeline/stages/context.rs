@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::core::context::Context;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
 use crate::skills::skillset::SkillSet;
-use crate::{LlmMessage, PipelineContext, PipelineStage, Result};
+use crate::{LlmMessage, PipelineStage, Result};
 
 /// A simple context builder that creates LLM messages from an optional
 /// system prompt, pre-fetched conversation history, and incoming message content.
@@ -88,7 +89,7 @@ impl PipelineStage for SimpleContextBuilder {
         "SimpleContextBuilder"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let mut messages = Vec::new();
 
         if let Some(ref prompt) = self.system_prompt {
@@ -117,7 +118,7 @@ impl PipelineStage for SimpleContextBuilder {
                 "  llm_messages[{}] role={} len={}",
                 i,
                 msg.role.as_str(),
-                msg.content.len()
+                msg.text().len()
             );
         }
 
