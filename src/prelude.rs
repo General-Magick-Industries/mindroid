@@ -32,4 +32,15 @@ pub use crate::core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator
 pub use crate::core::strategy::RunStrategy;
 
 // Pipeline combinators
-pub use crate::pipeline::combinators::{BranchStage, RetryStage, RouteFn, RouterStage};
+pub use crate::pipeline::combinators::{
+    ApprovalStage, BranchStage, RetryStage, RouteFn, RouterStage,
+};
+
+// Tools
+pub use crate::tools::DelegationTool;
+
+// Pipeline presets
+#[cfg(feature = "llm-client")]
+pub use crate::pipeline::presets::vision::vision_pipeline;
+#[cfg(all(feature = "speech", feature = "llm-client"))]
+pub use crate::pipeline::presets::voice::voice_pipeline;

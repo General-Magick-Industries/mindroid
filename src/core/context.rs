@@ -2,6 +2,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use futures::Stream;
+
 use crate::config::AgentConfig;
 use crate::core::events::PipelineEvent;
 use crate::core::extension_map::{ExtensionMap, SharedExtensionMap};
@@ -184,6 +186,30 @@ impl Context {
         self.halted = false;
         self.run.clear();
     }
+
+    // -- Watch accessors --
+
+    /// Subscribe to changes of type `T` in the session scope.
+    ///
+    /// Returns `None` if no session scope is attached. The returned stream
+    /// yields a cloned `T` each time that type is set on the session map.
+    /// Values set before this call are not replayed.
+    pub fn watch_session<T: Clone + Send + Sync + 'static>(
+        &self,
+    ) -> Option<impl Stream<Item = T> + '_> {
+        self.session.as_ref().map(|s| s.watch::<T>())
+    }
+
+    /// Subscribe to changes of type `T` in the global scope.
+    ///
+    /// Returns `None` if no global scope is attached. The returned stream
+    /// yields a cloned `T` each time that type is set on the global map.
+    /// Values set before this call are not replayed.
+    pub fn watch_global<T: Clone + Send + Sync + 'static>(
+        &self,
+    ) -> Option<impl Stream<Item = T> + '_> {
+        self.global.as_ref().map(|s| s.watch::<T>())
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +271,38 @@ mod tests {
 
         // Session scope survives
         assert_eq!(ctx.get::<u32>(), Some(100u32));
+    }
+
+    #[tokio::test]
+    async fn test_watch_session_receives_update() {
+        use futures::StreamExt;
+
+        let session = SharedExtensionMap::new();
+        let ctx = make_test_context().with_session(session.clone());
+
+        // Subscribe before the value is set
+        let mut stream = ctx.watch_session::<u32>().expect("session scope present");
+
+        // Set value from a separate task
+        let handle = tokio::spawn(async move {
+            session.set(99u32);
+        });
+        handle.await.expect("setter task panicked");
+
+        // The stream should yield the new value
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("timed out waiting for stream item")
+            .expect("stream ended unexpectedly");
+
+        assert_eq!(received, 99u32);
+    }
+
+    #[test]
+    fn test_watch_session_none_without_session() {
+        // Context with no session scope attached
+        let ctx = make_test_context();
+        let stream = ctx.watch_session::<u32>();
+        assert!(stream.is_none());
     }
 }

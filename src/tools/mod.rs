@@ -1,8 +1,10 @@
+pub mod delegation;
 pub mod open;
 mod registry;
 pub mod reminder;
 pub mod shell;
 
+pub use delegation::DelegationTool;
 pub use open::OpenTool;
 pub use registry::ToolRegistry;
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
