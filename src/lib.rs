@@ -1,4 +1,5 @@
 pub mod core;
+pub mod omni;
 pub mod prelude;
 
 // Re-export core submodules at crate root for convenience
