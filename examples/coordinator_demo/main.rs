@@ -9,12 +9,12 @@
 
 use async_trait::async_trait;
 use mindroid::Pipeline;
+use mindroid::Runtime;
 use mindroid::core::context::Context;
 use mindroid::core::strategy::RunStrategy;
 use mindroid::error::Result;
 use mindroid::pipeline::PipelineStage;
 use mindroid::transport::stdio::StdioTransport;
-use mindroid::Runtime;
 use std::time::Duration;
 
 /// A slow stage that simulates work (2 seconds).
@@ -28,10 +28,16 @@ impl PipelineStage for SlowStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        tracing::info!("SlowStage: starting work for message: {:?}", ctx.message.content);
+        tracing::info!(
+            "SlowStage: starting work for message: {:?}",
+            ctx.message.content
+        );
         for i in 0..20 {
             if ctx.cancel.is_cancelled() {
-                tracing::warn!("SlowStage: CANCELLED at step {}/20 — a newer message took over", i);
+                tracing::warn!(
+                    "SlowStage: CANCELLED at step {}/20 — a newer message took over",
+                    i
+                );
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -44,9 +50,7 @@ impl PipelineStage for SlowStage {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     tracing::info!("=== Coordinator Demo: LatestWins Strategy ===");
     tracing::info!("Type a message and press Enter. While the slow pipeline runs,");
