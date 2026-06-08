@@ -79,7 +79,9 @@ async fn lifecycle_audio_tool_turn_complete() {
         .expect("build should succeed");
 
     // Drive the event sequence
-    tx.send(OmniEvent::AudioChunk(make_chunk(42))).await.unwrap();
+    tx.send(OmniEvent::AudioChunk(make_chunk(42)))
+        .await
+        .unwrap();
     tx.send(OmniEvent::ToolCall {
         id: "call-1".to_string(),
         name: "echo".to_string(),
@@ -215,7 +217,10 @@ async fn server_mode_no_audio_processes_events() {
     tx.send(OmniEvent::TurnComplete).await.unwrap();
     drop(tx);
 
-    session.run().await.expect("server-mode run() should succeed");
+    session
+        .run()
+        .await
+        .expect("server-mode run() should succeed");
 
     let results = received_tool_results.lock().unwrap();
     assert_eq!(results.len(), 1, "one tool result expected");
@@ -288,7 +293,10 @@ async fn interrupted_event_stops_sink() {
     tx.send(OmniEvent::Interrupted).await.unwrap();
     drop(tx);
 
-    session.run().await.expect("run() should succeed after interrupt");
+    session
+        .run()
+        .await
+        .expect("run() should succeed after interrupt");
 
     let calls = sink_calls.lock().unwrap().clone();
     assert!(

@@ -14,8 +14,15 @@ pub struct AudioChunk {
 #[derive(Debug, Clone)]
 pub enum OmniEvent {
     AudioChunk(AudioChunk),
-    Transcript { text: String, is_final: bool },
-    ToolCall { id: String, name: String, args: Value },
+    Transcript {
+        text: String,
+        is_final: bool,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args: Value,
+    },
     Interrupted,
     TurnComplete,
     /// `MindroidError` is not `Clone`, so we wrap it in `Arc`.

@@ -118,9 +118,18 @@ mod tests {
         let config = OmniConfig::default();
         provider.connect(&config).await.unwrap();
 
-        provider.send_audio(make_chunk(vec![1, 2, 3])).await.unwrap();
-        provider.send_audio(make_chunk(vec![4, 5, 6])).await.unwrap();
-        provider.send_audio(make_chunk(vec![7, 8, 9])).await.unwrap();
+        provider
+            .send_audio(make_chunk(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        provider
+            .send_audio(make_chunk(vec![4, 5, 6]))
+            .await
+            .unwrap();
+        provider
+            .send_audio(make_chunk(vec![7, 8, 9]))
+            .await
+            .unwrap();
 
         let chunks = provider.recorded_chunks.lock().unwrap();
         assert_eq!(chunks.len(), 3);
