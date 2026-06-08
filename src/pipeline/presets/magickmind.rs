@@ -5,10 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::core::context::Context;
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
-use crate::core::context::Context;
 use crate::{Auth, LlmMessage, MindroidError, Pipeline, PipelineStage, Result};
 
 // ── Magickmind API types ──────────────────────────────────────────────────────

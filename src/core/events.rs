@@ -53,11 +53,11 @@ mod duration_millis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentConfig;
+    use crate::core::context::Context;
+    use crate::models::Message;
     use std::sync::Arc;
     use tokio::sync::mpsc;
-    use crate::config::AgentConfig;
-    use crate::models::Message;
-    use crate::core::context::Context;
 
     fn make_test_context() -> Context {
         let msg = Arc::new(Message::new("test", "user1", "channel1"));
@@ -73,7 +73,10 @@ mod tests {
         ctx.emit_event(PipelineEvent::PipelineStarted { stage_count: 3 });
 
         let event = rx.recv().await.unwrap();
-        assert!(matches!(event, PipelineEvent::PipelineStarted { stage_count: 3 }));
+        assert!(matches!(
+            event,
+            PipelineEvent::PipelineStarted { stage_count: 3 }
+        ));
     }
 
     #[test]
@@ -99,15 +102,25 @@ mod tests {
     fn test_serde_roundtrip() {
         let events = vec![
             PipelineEvent::PipelineStarted { stage_count: 3 },
-            PipelineEvent::StageStarted { stage_name: "ctx_builder".into(), stage_index: 0 },
+            PipelineEvent::StageStarted {
+                stage_name: "ctx_builder".into(),
+                stage_index: 0,
+            },
             PipelineEvent::StageCompleted {
                 stage_name: "ctx_builder".into(),
                 stage_index: 0,
                 elapsed: Duration::from_millis(42),
             },
-            PipelineEvent::StageError { stage_name: "llm".into(), error: "timeout".into() },
-            PipelineEvent::Cancelled { stage_name: "post".into() },
-            PipelineEvent::PipelineCompleted { elapsed: Duration::from_millis(100) },
+            PipelineEvent::StageError {
+                stage_name: "llm".into(),
+                error: "timeout".into(),
+            },
+            PipelineEvent::Cancelled {
+                stage_name: "post".into(),
+            },
+            PipelineEvent::PipelineCompleted {
+                elapsed: Duration::from_millis(100),
+            },
         ];
 
         for event in &events {

@@ -389,10 +389,10 @@ impl fmt::Debug for Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::config::AgentConfig;
     use crate::models::Message;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A stage that records whether it was called.
     struct RecorderStage {
@@ -401,7 +401,9 @@ mod tests {
 
     #[async_trait]
     impl PipelineStage for RecorderStage {
-        fn name(&self) -> &str { "recorder" }
+        fn name(&self) -> &str {
+            "recorder"
+        }
         async fn process(&self, _ctx: &mut Context) -> crate::error::Result<()> {
             self.called.store(true, Ordering::SeqCst);
             Ok(())
@@ -413,7 +415,9 @@ mod tests {
 
     #[async_trait]
     impl PipelineStage for CancelStage {
-        fn name(&self) -> &str { "cancel" }
+        fn name(&self) -> &str {
+            "cancel"
+        }
         async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
             ctx.cancel.cancel();
             Ok(())
@@ -431,13 +435,18 @@ mod tests {
         let second_called = Arc::new(AtomicBool::new(false));
         let pipeline = Pipeline::new()
             .add_stage(CancelStage)
-            .add_stage(RecorderStage { called: second_called.clone() });
+            .add_stage(RecorderStage {
+                called: second_called.clone(),
+            });
 
         let mut ctx = make_test_context();
         let _ = pipeline.run(&mut ctx).await;
 
         // Second stage should NOT have been called
-        assert!(!second_called.load(Ordering::SeqCst), "Second stage should not run after cancellation");
+        assert!(
+            !second_called.load(Ordering::SeqCst),
+            "Second stage should not run after cancellation"
+        );
     }
 
     #[tokio::test]
@@ -447,7 +456,9 @@ mod tests {
         let second_called = Arc::new(AtomicBool::new(false));
         let pipeline = Pipeline::new()
             .add_stage(CancelStage)
-            .add_stage(RecorderStage { called: second_called.clone() });
+            .add_stage(RecorderStage {
+                called: second_called.clone(),
+            });
 
         let mut ctx = make_test_context();
         // Consume the stream fully
@@ -455,6 +466,9 @@ mod tests {
         while stream.next().await.is_some() {}
 
         // Second stage should NOT have been called
-        assert!(!second_called.load(Ordering::SeqCst), "Second stage should not run after cancellation in streaming mode");
+        assert!(
+            !second_called.load(Ordering::SeqCst),
+            "Second stage should not run after cancellation in streaming mode"
+        );
     }
 }

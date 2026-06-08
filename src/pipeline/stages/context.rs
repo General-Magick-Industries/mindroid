@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::core::context::Context;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
 use crate::skills::skillset::SkillSet;
-use crate::core::context::Context;
 use crate::{LlmMessage, PipelineStage, Result};
 
 /// A simple context builder that creates LLM messages from an optional

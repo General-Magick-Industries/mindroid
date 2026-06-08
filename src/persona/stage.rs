@@ -6,9 +6,9 @@ use tracing::debug;
 use crate::core::context::Context;
 use crate::error::Result;
 use crate::models::{LlmMessage, SenderType};
+use crate::pipeline::PipelineStage;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
-use crate::pipeline::PipelineStage;
 
 use super::cache::PersonaCache;
 use super::models::{EffectivePersonalityResponse, EffectiveTrait, PersonaSchema};

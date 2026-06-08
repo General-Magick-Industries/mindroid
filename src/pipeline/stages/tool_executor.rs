@@ -4,10 +4,10 @@ use futures::stream::BoxStream;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::llm_client::{ChatRequest, LlmClient};
 use crate::models::{LlmMessage, StreamEvent};
-use crate::core::context::Context;
 use crate::pipeline::{PipelineStage, StreamingStage};
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.

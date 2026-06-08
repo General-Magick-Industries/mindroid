@@ -111,13 +111,11 @@ impl SharedExtensionMap {
     pub fn watch<T: Clone + Send + Sync + 'static>(&self) -> impl Stream<Item = T> + '_ {
         let rx = self.notify.subscribe();
         let map = self.map.clone();
-        BroadcastStream::new(rx).filter_map(move |result| {
-            match result {
-                Ok(StateEvent::Changed { type_id, .. }) if type_id == TypeId::of::<T>() => map
-                    .get(&type_id)
-                    .and_then(|entry| entry.value().downcast_ref::<T>().cloned()),
-                _ => None,
-            }
+        BroadcastStream::new(rx).filter_map(move |result| match result {
+            Ok(StateEvent::Changed { type_id, .. }) if type_id == TypeId::of::<T>() => map
+                .get(&type_id)
+                .and_then(|entry| entry.value().downcast_ref::<T>().cloned()),
+            _ => None,
         })
     }
 }
@@ -198,12 +196,9 @@ mod tests {
         });
 
         // The stream should yield the value
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.next(),
-        )
-        .await
-        .expect("timed out waiting for stream item");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for stream item");
 
         assert_eq!(received, Some(7u32));
     }

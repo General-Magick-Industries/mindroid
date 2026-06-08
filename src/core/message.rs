@@ -5,10 +5,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::AgentConfig;
+use crate::core::context::Context;
 use crate::error::Result;
 use crate::models::{Message, Response, StreamEvent};
 use crate::observer::Observer;
-use crate::core::context::Context;
 use crate::pipeline::Pipeline;
 
 /// Context available to message handlers. Provides access to the pipeline,

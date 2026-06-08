@@ -16,8 +16,8 @@ use async_openai::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequestArgs,
-        FinishReason, ImageUrl, ResponseFormat,
+        ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequestArgs, FinishReason,
+        ImageUrl, ResponseFormat,
     },
 };
 use futures::StreamExt;
@@ -117,8 +117,7 @@ fn content_parts_to_openai(
                         #[cfg(feature = "transport-ws")]
                         {
                             use base64::Engine;
-                            let encoded =
-                                base64::engine::general_purpose::STANDARD.encode(data);
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
                             format!("data:{};base64,{}", mime_type, encoded)
                         }
                         #[cfg(not(feature = "transport-ws"))]

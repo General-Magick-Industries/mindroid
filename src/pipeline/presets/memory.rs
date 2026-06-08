@@ -33,11 +33,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::memory::Memory;
 use crate::core::context::Context;
-use crate::{
-    ContextProvider, LlmMessage, Message, MindroidError, PipelineStage, Result,
-};
+use crate::memory::Memory;
+use crate::{ContextProvider, LlmMessage, Message, MindroidError, PipelineStage, Result};
 
 // ── MemoryClient ────────────────────────────────────────────────────────────
 

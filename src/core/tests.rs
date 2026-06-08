@@ -105,9 +105,9 @@ mod pipeline_tests {
     use std::sync::Arc;
 
     use crate::config::AgentConfig;
+    use crate::core::context::Context;
     use crate::error::Result;
     use crate::models::Message;
-    use crate::core::context::Context;
     use crate::pipeline::{Pipeline, PipelineStage};
     use async_trait::async_trait;
 

@@ -4,8 +4,8 @@ mod relevance;
 
 use async_trait::async_trait;
 
-use crate::core::context::Context;
 use crate::Result;
+use crate::core::context::Context;
 
 /// A boolean classifier that decides whether the pipeline should proceed.
 ///
