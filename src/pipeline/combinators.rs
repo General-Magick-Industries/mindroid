@@ -304,20 +304,21 @@ mod tests {
         let fail_called = Arc::new(AtomicBool::new(false));
 
         let branch = BranchStage::new("branch", PassGate)
-            .on_pass(
-                Pipeline::new()
-                    .add_stage(RecorderStage { called: pass_called.clone() }),
-            )
-            .on_fail(
-                Pipeline::new()
-                    .add_stage(RecorderStage { called: fail_called.clone() }),
-            );
+            .on_pass(Pipeline::new().add_stage(RecorderStage {
+                called: pass_called.clone(),
+            }))
+            .on_fail(Pipeline::new().add_stage(RecorderStage {
+                called: fail_called.clone(),
+            }));
 
         let mut ctx = make_test_context();
         branch.process(&mut ctx).await.unwrap();
 
         assert!(pass_called.load(Ordering::SeqCst), "pass branch must run");
-        assert!(!fail_called.load(Ordering::SeqCst), "fail branch must not run");
+        assert!(
+            !fail_called.load(Ordering::SeqCst),
+            "fail branch must not run"
+        );
     }
 
     #[tokio::test]
@@ -326,19 +327,20 @@ mod tests {
         let fail_called = Arc::new(AtomicBool::new(false));
 
         let branch = BranchStage::new("branch", HaltGate)
-            .on_pass(
-                Pipeline::new()
-                    .add_stage(RecorderStage { called: pass_called.clone() }),
-            )
-            .on_fail(
-                Pipeline::new()
-                    .add_stage(RecorderStage { called: fail_called.clone() }),
-            );
+            .on_pass(Pipeline::new().add_stage(RecorderStage {
+                called: pass_called.clone(),
+            }))
+            .on_fail(Pipeline::new().add_stage(RecorderStage {
+                called: fail_called.clone(),
+            }));
 
         let mut ctx = make_test_context();
         branch.process(&mut ctx).await.unwrap();
 
-        assert!(!pass_called.load(Ordering::SeqCst), "pass branch must not run");
+        assert!(
+            !pass_called.load(Ordering::SeqCst),
+            "pass branch must not run"
+        );
         assert!(fail_called.load(Ordering::SeqCst), "fail branch must run");
         // halted must be reset after BranchStage consumed it
         assert!(!ctx.halted, "halted must be cleared after branch");
@@ -352,17 +354,25 @@ mod tests {
         let mut ctx = make_test_context();
         let result = branch.process(&mut ctx).await;
 
-        assert!(result.is_ok(), "branch without fail pipeline must return Ok");
-        assert!(!ctx.halted, "halted must be cleared even when no fail pipeline");
+        assert!(
+            result.is_ok(),
+            "branch without fail pipeline must return Ok"
+        );
+        assert!(
+            !ctx.halted,
+            "halted must be cleared even when no fail pipeline"
+        );
     }
 
     #[tokio::test]
     async fn test_branch_cancellation() {
         let pass_called = Arc::new(AtomicBool::new(false));
 
-        let branch = BranchStage::new("branch", PassGate).on_pass(
-            Pipeline::new().add_stage(RecorderStage { called: pass_called.clone() }),
-        );
+        let branch = BranchStage::new("branch", PassGate).on_pass(Pipeline::new().add_stage(
+            RecorderStage {
+                called: pass_called.clone(),
+            },
+        ));
 
         let mut ctx = make_test_context();
         // Cancel before running
@@ -388,16 +398,18 @@ mod tests {
         let outer_pass_called = Arc::new(AtomicBool::new(false));
 
         let inner_branch = BranchStage::new("inner-branch", PassGate).on_pass(
-            Pipeline::new()
-                .add_stage(RecorderStage { called: inner_pass_called.clone() }),
+            Pipeline::new().add_stage(RecorderStage {
+                called: inner_pass_called.clone(),
+            }),
         );
 
-        let outer_branch = BranchStage::new("outer-branch", PassGate)
-            .on_pass(
-                Pipeline::new()
-                    .add_stage(inner_branch)
-                    .add_stage(RecorderStage { called: outer_pass_called.clone() }),
-            );
+        let outer_branch = BranchStage::new("outer-branch", PassGate).on_pass(
+            Pipeline::new()
+                .add_stage(inner_branch)
+                .add_stage(RecorderStage {
+                    called: outer_pass_called.clone(),
+                }),
+        );
 
         let mut ctx = make_test_context();
         outer_branch.process(&mut ctx).await.unwrap();
@@ -497,9 +509,9 @@ mod tests {
 
     // ── RetryStage helpers & tests ─────────────────────────────────────────────
 
+    use super::RetryStage;
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
-    use super::RetryStage;
 
     /// Stage that fails N times, then succeeds.
     struct FailNTimesStage {
@@ -535,8 +547,13 @@ mod tests {
     #[tokio::test]
     async fn test_retry_succeeds_first_try() {
         let called = Arc::new(AtomicBool::new(false));
-        let retry = RetryStage::new(RecorderStage { called: called.clone() }, 3)
-            .delay(Duration::from_millis(1));
+        let retry = RetryStage::new(
+            RecorderStage {
+                called: called.clone(),
+            },
+            3,
+        )
+        .delay(Duration::from_millis(1));
 
         let mut ctx = make_test_context();
         retry.process(&mut ctx).await.unwrap();

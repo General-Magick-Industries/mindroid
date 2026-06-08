@@ -48,6 +48,7 @@ pub use config::{
 };
 pub use core::content::{ContentPart, ContentSource};
 pub use core::context::Context;
+pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
 pub use core::events::PipelineEvent;
 pub use core::strategy::RunStrategy;
 pub use error::{MindroidError, Result};
@@ -57,9 +58,9 @@ pub use models::{
     TokenUsage,
 };
 pub use observer::{NoObserver, Observer};
-pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
 #[cfg(feature = "persona")]
 pub use persona::{MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider};
+pub use pipeline::combinators::{BranchStage, RetryStage, RouteFn, RouterStage};
 pub use pipeline::context::{ContextPreparer, ContextProvider, PrepareOutcome, ProviderWarning};
 pub use pipeline::coordination::EngagementTracker;
 #[cfg(feature = "transport-audio")]
@@ -76,7 +77,6 @@ pub use pipeline::stages::{DeepgramStt, DeepgramSttConfig, DeepgramTts, Deepgram
 pub use pipeline::stages::{
     GenericLlmProcessor, OpenAiStt, OpenAiSttConfig, OpenAiTts, OpenAiTtsConfig, collect_stream,
 };
-pub use pipeline::combinators::{BranchStage, RetryStage, RouteFn, RouterStage};
 pub use pipeline::stages::{PostProcessor, SimpleContextBuilder};
 pub use pipeline::stages::{SttProvider, SttStage, TtsProvider, TtsStage};
 pub use pipeline::{Pipeline, PipelineContext, PipelineStage, StreamingStage};

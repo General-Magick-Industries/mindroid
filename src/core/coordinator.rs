@@ -6,10 +6,10 @@
 //! - [`RunStrategy::LatestWins`] — a new run cancels the currently-active one.
 //! - [`RunStrategy::Sequential`] — runs are queued and executed one at a time.
 
+use dashmap::DashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -104,7 +104,10 @@ impl SessionCoordinator {
         match self.strategy {
             RunStrategy::Concurrent => {
                 let cancel = CancellationToken::new();
-                Ok(CoordinatorPermit { cancel, _completion: None })
+                Ok(CoordinatorPermit {
+                    cancel,
+                    _completion: None,
+                })
             }
 
             RunStrategy::LatestWins => {
@@ -116,7 +119,10 @@ impl SessionCoordinator {
                 }
                 *guard = Some(cancel.clone());
                 drop(guard);
-                Ok(CoordinatorPermit { cancel, _completion: None })
+                Ok(CoordinatorPermit {
+                    cancel,
+                    _completion: None,
+                })
             }
 
             RunStrategy::Sequential => {
@@ -195,7 +201,8 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> PerKey<K> {
     ///
     /// Creates a new [`SessionCoordinator`] on first access for this key.
     pub async fn acquire(&self, key: &K) -> Result<CoordinatorPermit> {
-        let coordinator = self.coordinators
+        let coordinator = self
+            .coordinators
             .entry(key.clone())
             .or_insert_with(|| Arc::new(SessionCoordinator::new(self.strategy)))
             .value()
@@ -469,6 +476,9 @@ mod tests {
         // Existing coordinators are closed, but new key creates new coordinator
         // Let's test that existing key fails:
         let result2 = pk.acquire(&"a".to_string()).await;
-        assert!(result2.is_err(), "acquire on closed coordinator should fail");
+        assert!(
+            result2.is_err(),
+            "acquire on closed coordinator should fail"
+        );
     }
 }
