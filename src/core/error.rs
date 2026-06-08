@@ -48,6 +48,15 @@ impl MindroidError {
             source: None,
         }
     }
+
+    /// Convenience constructor for pipeline errors without a source chain.
+    pub fn pipeline(message: impl Into<String>) -> Self {
+        Self::Pipeline {
+            stage: "coordinator".into(),
+            message: message.into(),
+            source: None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, MindroidError>;
