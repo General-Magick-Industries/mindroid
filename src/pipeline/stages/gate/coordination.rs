@@ -7,7 +7,8 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::{LlmMessage, PipelineContext, PipelineStage, Result, Role};
+use crate::core::context::Context;
+use crate::{LlmMessage, PipelineStage, Result, Role};
 
 /// A deterministic gate that prevents agents from re-engaging in conversations
 /// where they've already responded and no significant new input has arrived.
@@ -65,7 +66,7 @@ impl PipelineStage for CoordinationGate {
         "CoordinationGate"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let agent_id = &ctx.agent_config.agent_id;
 
         // Find the index of the last assistant-role message (agent's own response).

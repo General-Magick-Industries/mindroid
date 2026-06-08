@@ -18,10 +18,11 @@ use futures::StreamExt;
 #[cfg(feature = "transport-audio")]
 use rodio;
 
+use crate::core::context::Context;
 use crate::error::Result;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::AudioOutput;
-use crate::{MindroidError, PipelineContext, PipelineStage};
+use crate::{MindroidError, PipelineStage};
 
 /// Converts text to synthesized audio bytes.
 #[async_trait]
@@ -59,7 +60,7 @@ impl PipelineStage for TtsStage {
         "TtsStage"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let text = ctx.response.as_deref().unwrap_or("");
 
         if text.trim().is_empty() {
@@ -280,7 +281,7 @@ impl PipelineStage for AudioOutputStage {
         "AudioOutputStage"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         let audio = match ctx.take_ext::<AudioOutput>() {
             Some(a) => a.0,
             None => {

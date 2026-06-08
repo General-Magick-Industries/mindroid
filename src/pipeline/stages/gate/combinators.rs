@@ -4,7 +4,8 @@
 
 use async_trait::async_trait;
 
-use crate::{PipelineContext, PipelineStage, Result};
+use crate::core::context::Context;
+use crate::{PipelineStage, Result};
 
 use super::Gate;
 
@@ -27,7 +28,7 @@ impl PipelineStage for OrGate {
         "OrGate"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         for gate in &self.gates {
             let passed = gate.classify(ctx).await.unwrap_or_else(|e| {
                 tracing::warn!("OrGate: gate returned error ({e}), treating as pass (fail-open)");
@@ -63,7 +64,7 @@ impl PipelineStage for AndGate {
         "AndGate"
     }
 
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
         for gate in &self.gates {
             let passed = gate.classify(ctx).await.unwrap_or_else(|e| {
                 tracing::warn!("AndGate: gate returned error ({e}), treating as pass (fail-open)");
