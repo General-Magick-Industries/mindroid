@@ -290,7 +290,10 @@ impl CpalAudioSink {
             }
         });
 
-        Ok(Self { cmd_tx, sample_rate })
+        Ok(Self {
+            cmd_tx,
+            sample_rate,
+        })
     }
 }
 
@@ -386,9 +389,8 @@ fn preferred_input_config_at(
     sample_rate: u32,
 ) -> Result<cpal::SupportedStreamConfig, MindroidError> {
     if let Ok(mut configs) = device.supported_input_configs()
-        && let Some(range) = configs.find(|c| {
-            c.min_sample_rate().0 <= sample_rate && c.max_sample_rate().0 >= sample_rate
-        })
+        && let Some(range) = configs
+            .find(|c| c.min_sample_rate().0 <= sample_rate && c.max_sample_rate().0 >= sample_rate)
     {
         return Ok(range.with_sample_rate(cpal::SampleRate(sample_rate)));
     }

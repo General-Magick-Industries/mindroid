@@ -54,7 +54,8 @@ impl OmniSession {
         // Requires VadInference (spawn_blocking for Silero)
         // For MVP: rely on provider-driven events only.
         // Placeholder: match on config to document intent without blocking.
-        let _has_local_turn_detection = matches!(&self.config.turn_detection, TurnDetection::Local(_));
+        let _has_local_turn_detection =
+            matches!(&self.config.turn_detection, TurnDetection::Local(_));
         let _has_local_barge_in = matches!(&self.config.barge_in, BargeInMode::LocalVad);
 
         // 5. The select! loop
@@ -358,7 +359,10 @@ mod tests {
         }
 
         fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>> {
-            let rx = self.event_rx.take().expect("events() called more than once");
+            let rx = self
+                .event_rx
+                .take()
+                .expect("events() called more than once");
             Box::pin(ReceiverStream::new(rx))
         }
 
@@ -667,7 +671,10 @@ mod tests {
         assert_eq!(results.len(), 1, "one tool result should be sent");
         assert_eq!(results[0].0, "call-1");
         // EchoTool returns args.to_string() wrapped in a Value::String
-        assert_eq!(results[0].1, Value::String(r#"{"msg":"hello"}"#.to_string()));
+        assert_eq!(
+            results[0].1,
+            Value::String(r#"{"msg":"hello"}"#.to_string())
+        );
     }
 
     /// AudioChunk followed by Interrupted → sink.stop() is called, state → Listening.
@@ -684,7 +691,9 @@ mod tests {
             .build()
             .unwrap();
 
-        tx.send(OmniEvent::AudioChunk(make_chunk(42))).await.unwrap();
+        tx.send(OmniEvent::AudioChunk(make_chunk(42)))
+            .await
+            .unwrap();
         tx.send(OmniEvent::Interrupted).await.unwrap();
         drop(tx);
 
@@ -752,7 +761,10 @@ mod tests {
             cancel.cancel();
         });
 
-        session.run().await.expect("run() should succeed after cancellation");
+        session
+            .run()
+            .await
+            .expect("run() should succeed after cancellation");
 
         let calls = sink_calls.lock().unwrap().clone();
         assert!(
@@ -789,7 +801,10 @@ mod tests {
         tx.send(OmniEvent::TurnComplete).await.unwrap();
         drop(tx);
 
-        session.run().await.expect("server mode run() should succeed");
+        session
+            .run()
+            .await
+            .expect("server mode run() should succeed");
 
         let results = recorded_results.lock().unwrap();
         assert_eq!(results.len(), 1);

@@ -294,10 +294,7 @@ impl Default for MockAudioSink {
 impl AudioSink for MockAudioSink {
     async fn play(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
         let label = chunk.data.first().copied().unwrap_or(0);
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("play:{label}"));
+        self.calls.lock().unwrap().push(format!("play:{label}"));
         Ok(())
     }
 
@@ -366,7 +363,9 @@ mod tests {
         let (mut p, _tx) = MockOmniProvider::new();
         p.connect(&OmniConfig::default()).await.unwrap();
 
-        p.send_tool_result("call-1", json!({"temp": 21})).await.unwrap();
+        p.send_tool_result("call-1", json!({"temp": 21}))
+            .await
+            .unwrap();
         p.send_tool_result("call-2", json!("ok")).await.unwrap();
 
         let results = p.received_tool_results.lock().unwrap();
