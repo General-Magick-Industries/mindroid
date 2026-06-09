@@ -1,6 +1,7 @@
 pub mod core;
 pub mod omni;
 pub mod prelude;
+pub mod voice;
 
 // Re-export core submodules at crate root for convenience
 pub use core::config;
