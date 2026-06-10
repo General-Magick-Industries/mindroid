@@ -2,12 +2,24 @@ use crate::core::config::AgentConfig;
 use crate::core::error::MindroidError;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
-use crate::omni::types::{BargeInMode, OmniConfig, OmniEvent, SessionState, TurnDetection};
+use crate::omni::types::{
+    AudioChunk, BargeInMode, OmniConfig, OmniEvent, SessionState, TurnDetection,
+};
 use crate::tools::Tool;
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+// Local-VAD imports — only compiled when the Silero ONNX feature is present.
+#[cfg(feature = "transport-audio")]
+use {
+    crate::omni::vad::VadInference,
+    crate::voice::frontend::{AudioFrontend, FrontendEvent},
+    crate::voice::types::VadConfig,
+    std::time::Instant,
+};
 
 /// An omnimodal session that connects an [`OmniProvider`] with optional audio
 /// I/O and tools, managing session lifecycle state.
@@ -49,21 +61,105 @@ impl OmniSession {
         // 3. Optional audio source stream
         let mut audio_stream = self.audio_source.as_ref().map(|s| s.stream());
 
-        // 4. Optional local VAD
-        // TODO: local VAD barge-in + turn detection integration
-        // Requires VadInference (spawn_blocking for Silero)
-        // For MVP: rely on provider-driven events only.
-        // Placeholder: match on config to document intent without blocking.
-        let _has_local_turn_detection =
+        // 4. Determine whether local VAD paths are active.
+        let has_local_turn_detection =
             matches!(&self.config.turn_detection, TurnDetection::Local(_));
-        let _has_local_barge_in = matches!(&self.config.barge_in, BargeInMode::LocalVad);
+        let has_local_barge_in = matches!(&self.config.barge_in, BargeInMode::LocalVad);
+        let use_local_vad = has_local_turn_detection || has_local_barge_in;
 
-        // 5. The select! loop
+        // 5. Set up the VAD inference offload.
+        //
+        //    The channel types are always declared so the select! arm compiles
+        //    regardless of features.  The channels are populated only when the
+        //    `transport-audio` feature (and hence `VadInference`) is available.
+        //
+        //    `vad_out_rx`: receives `(f32_samples, probability)` back from the
+        //    blocking worker.
+        //    `vad_in_tx`: sends raw `AudioChunk`s to the worker.
+        let mut vad_out_rx: Option<mpsc::Receiver<(Vec<f32>, f32)>> = None;
+        let mut vad_in_tx: Option<mpsc::Sender<AudioChunk>> = None;
+
+        #[cfg(feature = "transport-audio")]
+        if use_local_vad {
+            let sample_rate = self
+                .audio_source
+                .as_ref()
+                .map(|s| s.sample_rate())
+                .unwrap_or(16_000);
+
+            // 32 ms frame — Silero's preferred stride.
+            let chunk_size = (sample_rate as u64 * 32 / 1_000) as usize;
+
+            let (in_tx, in_rx) = mpsc::channel::<AudioChunk>(8);
+            let (out_tx, out_rx) = mpsc::channel::<(Vec<f32>, f32)>(8);
+
+            match VadInference::new(sample_rate, chunk_size) {
+                Ok(mut vad) => {
+                    // Hand the inference to a blocking thread; it owns `in_rx` and
+                    // `out_tx` for its lifetime.
+                    tokio::task::spawn_blocking(move || {
+                        let mut in_rx = in_rx;
+                        while let Some(chunk) = in_rx.blocking_recv() {
+                            // Raw bytes → i16 (little-endian, as produced by CPAL).
+                            let i16_samples: Vec<i16> = chunk
+                                .data
+                                .chunks_exact(2)
+                                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                                .collect();
+                            // f32 copy for AudioFrontend::process.
+                            let f32_samples: Vec<f32> = i16_samples
+                                .iter()
+                                .map(|&s| s as f32 / i16::MAX as f32)
+                                .collect();
+                            let probability = vad.predict(&i16_samples);
+                            // If the async side is gone, the send silently fails.
+                            let _ = out_tx.blocking_send((f32_samples, probability));
+                        }
+                    });
+                    vad_in_tx = Some(in_tx);
+                    vad_out_rx = Some(out_rx);
+                }
+                Err(_) => {
+                    // VadInference construction failed — fall back to provider-only.
+                }
+            }
+        }
+
+        // 6. Build AudioFrontend when local VAD channels are live.
+        //    Declared always so the select! body can refer to it unconditionally;
+        //    actual construction is feature-gated.
+        #[cfg(feature = "transport-audio")]
+        let mut audio_frontend: Option<AudioFrontend> = if vad_in_tx.is_some() {
+            let sample_rate = self
+                .audio_source
+                .as_ref()
+                .map(|s| s.sample_rate())
+                .unwrap_or(16_000);
+            let vad_config = match &self.config.turn_detection {
+                TurnDetection::Local(cfg) => cfg.clone(),
+                _ => VadConfig::default(),
+            };
+            Some(
+                AudioFrontend::builder(vad_config, 32)
+                    .sample_rate_hz(sample_rate)
+                    .barge_in_mode(self.config.barge_in.clone())
+                    .turn_detection(self.config.turn_detection.clone())
+                    .build(),
+            )
+        } else {
+            None
+        };
+
+        // 7. The select! loop.
+        //
+        //    The VAD results arm is always present syntactically (tokio::select!
+        //    does not support #[cfg] on arms).  When `vad_out_rx` is None the
+        //    arm resolves to `std::future::pending()` and never fires.
         loop {
             tokio::select! {
                 biased;
 
-                // Highest priority: cancellation
+                // Highest priority: cancellation.
                 _ = self.cancel.cancelled() => {
                     self.state = SessionState::Closed;
                     if let Some(ref sink) = self.audio_sink {
@@ -73,7 +169,60 @@ impl OmniSession {
                     break;
                 }
 
-                // Audio input forwarding
+                // VAD inference results.  When `vad_out_rx` is None this arm
+                // immediately resolves to `pending()` and is never selected.
+                vad_result = async {
+                    match vad_out_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<(Vec<f32>, f32)>>().await,
+                    }
+                } => {
+                    // All processing in here is feature-gated because `AudioFrontend`
+                    // and `FrontendEvent` only exist with `transport-audio`.
+                    #[cfg(feature = "transport-audio")]
+                    {
+                        if let Some((f32_samples, probability)) = vad_result {
+                            if let Some(ref mut fe) = audio_frontend {
+                                let agent_speaking = self.state == SessionState::Speaking;
+                                let now = Instant::now();
+                                let events =
+                                    fe.process(&f32_samples, probability, agent_speaking, now);
+                                for event in events {
+                                    match event {
+                                        FrontendEvent::BargeIn { .. } => {
+                                            // Local barge-in: stop the sink immediately and
+                                            // return to Listening.  Provider-side history
+                                            // truncation is deferred (not in scope here).
+                                            if let Some(ref sink) = self.audio_sink {
+                                                sink.stop().await?;
+                                            }
+                                            self.state = SessionState::Listening;
+                                        }
+                                        FrontendEvent::UtteranceComplete { .. } => {
+                                            // Local turn detection: tell the provider that
+                                            // the user's turn is complete so it can start
+                                            // generating a response.
+                                            self.provider.end_audio_stream().await?;
+                                        }
+                                        FrontendEvent::SpeechStarted => {
+                                            // Speech onset — no session-level action needed;
+                                            // the frontend tracks state internally.
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Worker exited — disable the channel so we always pend.
+                            vad_out_rx = None;
+                        }
+                    }
+                    // When the feature is absent the arm type-checks as `Option<…>`
+                    // but the body is compiled away; nothing happens.
+                    #[cfg(not(feature = "transport-audio"))]
+                    let _ = vad_result;
+                }
+
+                // Audio input forwarding.
                 chunk = async {
                     match audio_stream.as_mut() {
                         Some(s) => s.next().await,
@@ -81,19 +230,31 @@ impl OmniSession {
                     }
                 } => {
                     if let Some(chunk) = chunk {
-                        self.provider.send_audio(chunk).await?;
-                        // TODO: local VAD barge-in + turn detection
-                        // Requires VadInference (spawn_blocking for Silero)
-                        // For MVP: rely on provider events
+                        // Always forward to provider.
+                        self.provider.send_audio(chunk.clone()).await?;
+
+                        // When local VAD is active, also send a copy to the inference
+                        // worker.  `try_send` — skip the frame if the inbox is full
+                        // rather than blocking the audio loop.
+                        if let Some(ref tx) = vad_in_tx {
+                            let _ = tx.try_send(chunk);
+                        }
                     } else {
-                        // Audio stream ended — signal end of speech to provider and
-                        // clear the stream so we fall back to pending() from here on.
+                        // Audio stream ended.
                         audio_stream = None;
-                        self.provider.end_audio_stream().await?;
+                        if !has_local_turn_detection {
+                            // Provider-side turn detection: signal end immediately.
+                            self.provider.end_audio_stream().await?;
+                        } else {
+                            // Local turn detection: close the sender so the VAD
+                            // worker drains and terminates; end_audio_stream will be
+                            // called from the UtteranceComplete event once VAD fires.
+                            vad_in_tx = None;
+                        }
                     }
                 }
 
-                // Provider event handling
+                // Provider event handling.
                 event = provider_events.next() => {
                     match event {
                         Some(OmniEvent::AudioChunk(chunk)) => {
@@ -110,7 +271,7 @@ impl OmniSession {
                                 Err(e) => serde_json::json!({"error": e.to_string()}),
                             };
                             self.provider.send_tool_result(&id, result_value).await?;
-                            // Return to Listening after tool call is dispatched
+                            // Return to Listening after tool call is dispatched.
                             self.state = SessionState::Listening;
                         }
                         Some(OmniEvent::Interrupted) => {
@@ -137,11 +298,11 @@ impl OmniSession {
                             return Err(err);
                         }
                         Some(OmniEvent::Transcript { .. }) => {
-                            // Transcript events — log/ignore for now
-                            // TODO: expose transcripts via a callback/channel
+                            // Transcript events — log/ignore for now.
+                            // TODO: expose transcripts via a callback/channel.
                         }
                         None => {
-                            // Provider stream exhausted — clean exit
+                            // Provider stream exhausted — clean exit.
                             self.state = SessionState::Closed;
                             break;
                         }
@@ -160,6 +321,169 @@ impl OmniSession {
             .find(|t| t.name() == name)
             .ok_or_else(|| MindroidError::pipeline(format!("tool not found: {name}")))?;
         tool.execute(args).await
+    }
+
+    /// Test-only entry point that injects a pre-populated VAD results channel,
+    /// bypassing the `VadInference` worker.  Used to verify that the run loop
+    /// correctly handles `FrontendEvent::BargeIn` and `FrontendEvent::UtteranceComplete`
+    /// without requiring the `transport-audio` Silero feature at test time.
+    ///
+    /// The `vad_rx` channel should send `(f32_samples, probability)` pairs and
+    /// then be closed (dropped) to allow `run()` to complete naturally.
+    #[cfg(all(test, feature = "transport-audio"))]
+    pub(crate) async fn run_with_vad_rx(
+        &mut self,
+        vad_rx: mpsc::Receiver<(Vec<f32>, f32)>,
+    ) -> Result<(), MindroidError> {
+        use crate::voice::frontend::AudioFrontend;
+        use crate::voice::types::VadConfig;
+
+        self.state = SessionState::Connecting;
+        self.provider.connect(&self.config).await?;
+        self.state = SessionState::Listening;
+
+        let mut provider_events = self.provider.events();
+        let mut audio_stream = self.audio_source.as_ref().map(|s| s.stream());
+
+        let has_local_turn_detection =
+            matches!(&self.config.turn_detection, TurnDetection::Local(_));
+        let has_local_barge_in = matches!(&self.config.barge_in, BargeInMode::LocalVad);
+
+        let mut vad_out_rx: Option<mpsc::Receiver<(Vec<f32>, f32)>> = Some(vad_rx);
+
+        // Build an AudioFrontend for the injected VAD path.
+        let sample_rate = self
+            .audio_source
+            .as_ref()
+            .map(|s| s.sample_rate())
+            .unwrap_or(16_000);
+        let vad_config = match &self.config.turn_detection {
+            TurnDetection::Local(cfg) => cfg.clone(),
+            _ => VadConfig::default(),
+        };
+        let mut audio_frontend: Option<AudioFrontend> =
+            if has_local_turn_detection || has_local_barge_in {
+                Some(
+                    AudioFrontend::builder(vad_config, 32)
+                        .sample_rate_hz(sample_rate)
+                        .barge_in_mode(self.config.barge_in.clone())
+                        .turn_detection(self.config.turn_detection.clone())
+                        .build(),
+                )
+            } else {
+                None
+            };
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = self.cancel.cancelled() => {
+                    self.state = SessionState::Closed;
+                    if let Some(ref sink) = self.audio_sink {
+                        let _ = sink.stop().await;
+                    }
+                    let _ = self.provider.disconnect().await;
+                    break;
+                }
+
+                vad_result = async {
+                    match vad_out_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<(Vec<f32>, f32)>>().await,
+                    }
+                } => {
+                    if let Some((f32_samples, probability)) = vad_result {
+                        if let Some(ref mut fe) = audio_frontend {
+                            let agent_speaking = self.state == SessionState::Speaking;
+                            let now = std::time::Instant::now();
+                            let events =
+                                fe.process(&f32_samples, probability, agent_speaking, now);
+                            for event in events {
+                                match event {
+                                    FrontendEvent::BargeIn { .. } => {
+                                        if let Some(ref sink) = self.audio_sink {
+                                            sink.stop().await?;
+                                        }
+                                        self.state = SessionState::Listening;
+                                    }
+                                    FrontendEvent::UtteranceComplete { .. } => {
+                                        self.provider.end_audio_stream().await?;
+                                    }
+                                    FrontendEvent::SpeechStarted => {}
+                                }
+                            }
+                        }
+                    } else {
+                        vad_out_rx = None;
+                    }
+                }
+
+                chunk = async {
+                    match audio_stream.as_mut() {
+                        Some(s) => s.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(chunk) = chunk {
+                        self.provider.send_audio(chunk).await?;
+                    } else {
+                        audio_stream = None;
+                        if !has_local_turn_detection {
+                            self.provider.end_audio_stream().await?;
+                        }
+                    }
+                }
+
+                event = provider_events.next() => {
+                    match event {
+                        Some(OmniEvent::AudioChunk(chunk)) => {
+                            self.state = SessionState::Speaking;
+                            if let Some(ref sink) = self.audio_sink {
+                                sink.play(chunk).await?;
+                            }
+                        }
+                        Some(OmniEvent::ToolCall { id, name, args }) => {
+                            self.state = SessionState::ToolCall;
+                            let result = self.execute_tool(&name, args).await;
+                            let result_value = match result {
+                                Ok(r) => Value::String(r),
+                                Err(e) => serde_json::json!({"error": e.to_string()}),
+                            };
+                            self.provider.send_tool_result(&id, result_value).await?;
+                            self.state = SessionState::Listening;
+                        }
+                        Some(OmniEvent::Interrupted) => {
+                            if let Some(ref sink) = self.audio_sink {
+                                sink.stop().await?;
+                            }
+                            self.state = SessionState::Listening;
+                        }
+                        Some(OmniEvent::TurnComplete) => {
+                            if let Some(ref sink) = self.audio_sink {
+                                sink.flush().await?;
+                            }
+                            self.state = SessionState::Listening;
+                        }
+                        Some(OmniEvent::Error(e)) => {
+                            self.state = SessionState::Closed;
+                            if let Some(ref sink) = self.audio_sink {
+                                let _ = sink.stop().await;
+                            }
+                            let err = Arc::try_unwrap(e)
+                                .unwrap_or_else(|arc| MindroidError::pipeline(arc.to_string()));
+                            return Err(err);
+                        }
+                        Some(OmniEvent::Transcript { .. }) => {}
+                        None => {
+                            self.state = SessionState::Closed;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -844,5 +1168,186 @@ mod tests {
             "sink.stop() should be called before returning Err; calls = {calls:?}"
         );
         assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    // ── Local-VAD integration tests (transport-audio feature required) ────────
+    //
+    // These tests bypass the Silero ONNX worker by using `run_with_vad_rx`,
+    // which accepts a pre-populated channel of (f32_samples, probability) pairs
+    // that the AudioFrontend processes directly in the run loop.
+
+    /// When `BargeInMode::LocalVad` is configured and the AudioFrontend fires a
+    /// `BargeIn` event (sustained speech while agent is speaking), the session
+    /// must call `sink.stop()` and return to `Listening`.
+    ///
+    /// We drive the frontend to a barge-in by:
+    /// 1. Sending an AudioChunk provider event so `state == Speaking`.
+    /// 2. Injecting 10 consecutive high-probability speech frames into `vad_rx`
+    ///    (the InterruptionGate threshold inside AudioFrontend).
+    /// 3. Then dropping the provider event sender to end the session.
+    #[cfg(feature = "transport-audio")]
+    #[tokio::test]
+    async fn test_local_barge_in_stops_sink() {
+        let (provider, tx) = RecordingProvider::new();
+        let sink = RecordingSink::new();
+        let sink_calls = Arc::clone(&sink.calls);
+
+        // Configure local barge-in.
+        let mut session = OmniSession::builder()
+            .provider(provider)
+            .audio_sink(sink)
+            .barge_in(BargeInMode::LocalVad)
+            .turn_detection(TurnDetection::Server) // server-side turn, local barge-in only
+            .build()
+            .unwrap();
+
+        // Channel that feeds synthetic VAD results to the run loop.
+        let (vad_tx, vad_rx) = mpsc::channel::<(Vec<f32>, f32)>(32);
+
+        // Step 1: make the session think the agent is speaking by sending an
+        //         AudioChunk event from the provider.
+        tx.send(OmniEvent::AudioChunk(make_chunk(1))).await.unwrap();
+
+        // Spawn the session so it starts processing.
+        let session_task = tokio::spawn(async move {
+            session
+                .run_with_vad_rx(vad_rx)
+                .await
+                .expect("run should succeed");
+            session
+        });
+
+        // Give the loop a moment to process the AudioChunk (state → Speaking).
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Step 2: inject 10 high-probability speech frames while agent is speaking.
+        // AudioFrontend's InterruptionGate fires BargeIn on the 10th consecutive
+        // speech frame.  Each frame is 512 samples @ 16 kHz (32 ms).
+        let frame = vec![0.1f32; 512];
+        for _ in 0..10 {
+            vad_tx.send((frame.clone(), 0.9)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        // Step 3: close VAD channel and provider event stream so the loop exits.
+        drop(vad_tx);
+        drop(tx);
+
+        let _ = session_task.await.unwrap();
+
+        let calls = sink_calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"stop".to_string()),
+            "sink.stop() should be called on local BargeIn; calls = {calls:?}"
+        );
+    }
+
+    /// When `TurnDetection::Local` is configured and the AudioFrontend fires
+    /// `UtteranceComplete`, the session must call `provider.end_audio_stream()`.
+    ///
+    /// We drive the frontend to UtteranceComplete by:
+    /// 1. Injecting enough speech frames to exceed min_speech (≥ 10 frames × 512
+    ///    samples = 5120 > 4800 minimum).
+    /// 2. Then injecting 38 silence frames to satisfy the silence threshold.
+    #[cfg(feature = "transport-audio")]
+    #[tokio::test]
+    async fn test_local_turn_complete_calls_end_audio_stream() {
+        use crate::voice::types::VadConfig;
+        use std::time::Duration;
+
+        // VadConfig tuned to match the test parameters (silence=38×32ms, pad=10×32ms).
+        let vad_cfg = VadConfig {
+            speech_threshold: 0.5,
+            speech_end_threshold: 0.3,
+            silence_duration: Duration::from_millis(38 * 32),
+            speech_pad: Duration::from_millis(10 * 32),
+            min_speech: Duration::from_millis(300),
+            max_utterance: Duration::from_secs(30),
+        };
+
+        let (_provider, tx) = RecordingProvider::new();
+        let recorded_eos = Arc::new(Mutex::new(0u32));
+
+        // Wrap RecordingProvider to count end_audio_stream calls.
+        struct CountingProvider {
+            inner: RecordingProvider,
+            count: Arc<Mutex<u32>>,
+        }
+
+        #[async_trait]
+        impl OmniProvider for CountingProvider {
+            async fn connect(&mut self, cfg: &OmniConfig) -> Result<(), MindroidError> {
+                self.inner.connect(cfg).await
+            }
+            async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
+                self.inner.send_audio(chunk).await
+            }
+            async fn send_text(&self, t: &str) -> Result<(), MindroidError> {
+                self.inner.send_text(t).await
+            }
+            async fn send_tool_result(&self, id: &str, r: Value) -> Result<(), MindroidError> {
+                self.inner.send_tool_result(id, r).await
+            }
+            async fn end_audio_stream(&self) -> Result<(), MindroidError> {
+                *self.count.lock().unwrap() += 1;
+                Ok(())
+            }
+            fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>> {
+                self.inner.events()
+            }
+            async fn disconnect(&mut self) -> Result<(), MindroidError> {
+                self.inner.disconnect().await
+            }
+        }
+
+        let (inner_provider, tx2) = RecordingProvider::new();
+        let eos_count = Arc::clone(&recorded_eos);
+        let counting = CountingProvider {
+            inner: inner_provider,
+            count: Arc::clone(&eos_count),
+        };
+
+        let mut session = OmniSession::builder()
+            .provider(counting)
+            .barge_in(BargeInMode::Disabled)
+            .turn_detection(TurnDetection::Local(vad_cfg))
+            .build()
+            .unwrap();
+
+        let (vad_tx, vad_rx) = mpsc::channel::<(Vec<f32>, f32)>(64);
+
+        let session_task = tokio::spawn(async move {
+            session
+                .run_with_vad_rx(vad_rx)
+                .await
+                .expect("run should succeed");
+        });
+
+        // Feed 12 speech frames (12 × 512 = 6144 samples > 4800 min) then 38
+        // silence frames to trigger UtteranceComplete in the frontend.
+        let speech_frame = vec![0.1f32; 512];
+        let silence_frame = vec![0.0f32; 512];
+
+        for _ in 0..12 {
+            vad_tx.send((speech_frame.clone(), 0.8)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..38 {
+            vad_tx.send((silence_frame.clone(), 0.1)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        // Close channels to let the loop exit.
+        drop(vad_tx);
+        drop(tx);
+        drop(tx2);
+
+        session_task.await.unwrap();
+
+        assert!(
+            *eos_count.lock().unwrap() >= 1,
+            "end_audio_stream should be called at least once on local UtteranceComplete"
+        );
     }
 }
