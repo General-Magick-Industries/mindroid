@@ -14,6 +14,7 @@ use crate::MindroidError;
 use crate::error::Result;
 use crate::models::{ChannelType, Message, MessageType, Response, SenderType};
 use crate::transport::Transport;
+use crate::voice::types::VadConfig;
 
 // ─── VAD backend ──────────────────────────────────────────────────────────────
 
@@ -30,26 +31,29 @@ pub enum VadBackend {
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 /// Configuration for [`AudioTransport`].
+///
+/// VAD tuning lives in `vad: VadConfig`. Transport-specific knobs (backend
+/// selection) remain as top-level fields. Construct with
+/// [`AudioTransportConfig::default()`] or override individual `vad` sub-fields:
+///
+/// ```rust,ignore
+/// AudioTransportConfig {
+///     vad: VadConfig {
+///         silence_duration: Duration::from_millis(800),
+///         ..AudioTransportConfig::default().vad
+///     },
+///     ..AudioTransportConfig::default()
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct AudioTransportConfig {
-    /// Probability threshold to START speech detection. Range 0.0–1.0. Default: `0.5`.
-    pub speech_threshold: f32,
-    /// Probability threshold to END speech (hysteresis). Range 0.0–1.0. Default: `0.3`.
-    /// The silence counter only increments when probability drops below this value,
-    /// preventing premature cutoff on brief dips mid-sentence.
-    pub speech_end_threshold: f32,
-    /// Consecutive silence required to end an utterance (ms). Default: `1200`.
-    pub silence_duration_ms: u64,
-    /// Minimum utterance length to forward (ms). Shorter segments are
-    /// discarded as noise. Default: `300`.
-    pub min_speech_duration_ms: u64,
-    /// Maximum utterance length before a forced send (ms). Default: `30_000`.
-    pub max_utterance_duration_ms: u64,
-    /// Hold-time after speech starts before silence detection is allowed (ms).
-    /// During this window, even low-probability frames do not increment the silence
-    /// counter. Prevents noise bursts at utterance start from triggering early cutoff.
-    /// Default: `300`.
-    pub speech_pad_ms: u64,
+    /// All VAD tuning parameters (thresholds, durations, limits).
+    ///
+    /// Note: the default silence window for this transport is **1200 ms** —
+    /// deliberately different from `VadConfig::default()` (500 ms) because the
+    /// transport is optimised for conversational microphone input where a longer
+    /// pause is needed to reliably detect end-of-turn.
+    pub vad: VadConfig,
     /// Which VAD backend to use. Default: [`VadBackend::Silero`].
     pub vad_backend: VadBackend,
 }
@@ -57,12 +61,17 @@ pub struct AudioTransportConfig {
 impl Default for AudioTransportConfig {
     fn default() -> Self {
         Self {
-            speech_threshold: 0.5,
-            speech_end_threshold: 0.3,
-            silence_duration_ms: 1200,
-            min_speech_duration_ms: 300,
-            max_utterance_duration_ms: 30_000,
-            speech_pad_ms: 300,
+            // Transport-specific VAD defaults — silence is 1200 ms (NOT the
+            // VadConfig::default() 500 ms) because microphone input requires a
+            // longer inter-turn gap to avoid premature cutoff.
+            vad: VadConfig {
+                speech_threshold: 0.5,
+                speech_end_threshold: 0.3,
+                silence_duration: Duration::from_millis(1200),
+                speech_pad: Duration::from_millis(300),
+                min_speech: Duration::from_millis(300),
+                max_utterance: Duration::from_secs(30),
+            },
             vad_backend: VadBackend::Silero,
         }
     }
@@ -432,18 +441,30 @@ where
 
 // ─── VAD loop ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, PartialEq)]
-enum VadState {
-    Idle,
-    Speaking,
-}
-
-/// Core VAD state machine.
+/// Core VAD loop driven by [`crate::voice::AudioFrontend`].
 ///
-/// Hysteresis: speech starts when `prob >= speech_threshold` (0.5) and only
-/// ends when `prob < speech_end_threshold` (0.3) for `silence_duration_ms`.
-/// A `speech_pad_ms` hold window after utterance start makes the silence
-/// counter immune to brief low-probability frames at the beginning of speech.
+/// The externally-computed probability (from the [`VadProcessor`] backend) is
+/// fed into [`AudioFrontend::process`] along with the raw f32 frame.
+/// [`FrontendEvent::UtteranceComplete`] carries the accumulated samples; we
+/// WAV-encode them and forward exactly as before.
+///
+/// The local-mic transport has no agent-playback path, so `agent_speaking` is
+/// always `false` — the barge-in gate inside the frontend stays inert.
+/// A monotonic `Instant::now()` is supplied at each call site (no clock
+/// knowledge required inside the pure `voice/` core).
+///
+/// Frame-count arithmetic (at 16 kHz / 512-sample chunk):
+///   silence : 1200 ms × 16000 / 1000 = 19200 samples → div_ceil(512) = 38 frames
+///   pad     :  300 ms × 16000 / 1000 =  4800 samples → div_ceil(512) = 10 frames (≈ 300 ms)
+///   min     :  300 ms × 16000 / 1000 =  4800 samples (threshold on buffer length)
+///   max     :   30 s  × 16000       = 480000 samples (hard cap)
+///
+/// ## 8 kHz compatibility
+///
+/// The real `sample_rate` is passed to the builder via `.sample_rate_hz(..)`, so
+/// `AudioFrontend` derives `min_utterance_samples` / `max_utterance_samples`
+/// correctly at both 16 kHz and 8 kHz — preserving behavioral parity with the
+/// former hand-rolled loop.
 #[allow(clippy::too_many_arguments)]
 fn vad_loop(
     frame_rx: std::sync::mpsc::Receiver<Vec<f32>>,
@@ -455,24 +476,25 @@ fn vad_loop(
     processor: &mut dyn VadProcessor,
     shutdown: Arc<AtomicBool>,
 ) {
-    let silence_frames_threshold = {
-        let samples_needed = (config.silence_duration_ms as usize * sample_rate as usize) / 1000;
-        samples_needed.div_ceil(chunk_size)
-    };
-    let min_utterance_samples =
-        (config.min_speech_duration_ms as usize * sample_rate as usize) / 1000;
-    let max_utterance_samples =
-        (config.max_utterance_duration_ms as usize * sample_rate as usize) / 1000;
-    // Number of frames at utterance start during which silence is ignored.
-    let pad_frames = {
-        let pad_samples = (config.speech_pad_ms as usize * sample_rate as usize) / 1000;
-        pad_samples.div_ceil(chunk_size)
+    use crate::voice::encode_wav;
+    use crate::voice::{
+        AudioFrontend, FrontendEvent,
+        types::{BargeInMode, TurnDetection},
     };
 
-    let mut state = VadState::Idle;
-    let mut utterance_buf: Vec<f32> = Vec::new();
-    let mut silence_frames: usize = 0;
-    let mut pad_remaining: usize = 0;
+    // chunk_duration_ms is the same for both supported rates:
+    //   16000 Hz / 512 samples = 32 ms
+    //    8000 Hz / 256 samples = 32 ms
+    let chunk_duration_ms = (chunk_size as u64 * 1_000) / sample_rate as u64;
+
+    let mut frontend = AudioFrontend::builder(config.vad.clone(), chunk_duration_ms)
+        // Pass the real rate so Duration→sample thresholds are correct at 8 kHz too.
+        .sample_rate_hz(sample_rate)
+        // Local-mic transport has no agent playback; barge-in gate is inert.
+        .barge_in_mode(BargeInMode::Disabled)
+        // Silence-based auto-completion mirrors the old hand-rolled logic.
+        .turn_detection(TurnDetection::Local(config.vad.clone()))
+        .build();
 
     loop {
         match frame_rx.recv_timeout(Duration::from_millis(50)) {
@@ -481,61 +503,32 @@ fn vad_loop(
                 // (guaranteed by the accumulator in build_input_stream).
                 let prob = processor.process(&frame);
 
-                match state {
-                    VadState::Idle => {
-                        if prob >= config.speech_threshold {
-                            state = VadState::Speaking;
-                            silence_frames = 0;
-                            pad_remaining = pad_frames;
-                            utterance_buf.extend_from_slice(&frame);
+                // Monotonic clock at the call site — pure voice/ core does not
+                // call Instant::now() itself.
+                let now = std::time::Instant::now();
+
+                // Local-mic transport has no agent playback, so agent_speaking
+                // is always false; the barge-in gate remains inert.
+                let events = frontend.process(&frame, prob, false, now);
+
+                for event in events {
+                    match event {
+                        FrontendEvent::SpeechStarted => {
                             debug!("AudioTransport: speech started (prob={prob:.3})");
                         }
-                    }
-                    VadState::Speaking => {
-                        utterance_buf.extend_from_slice(&frame);
-
-                        if pad_remaining > 0 {
-                            // Immunity window — don't count silence yet.
-                            pad_remaining -= 1;
-                        } else if prob >= config.speech_end_threshold {
-                            // Still clearly speaking (above end threshold).
-                            silence_frames = 0;
-                        } else {
-                            // Below end threshold — start accumulating silence.
-                            silence_frames += 1;
-                        }
-
-                        let silence_ended = silence_frames >= silence_frames_threshold;
-                        let max_reached = utterance_buf.len() >= max_utterance_samples;
-
-                        if silence_ended || max_reached {
-                            if utterance_buf.len() >= min_utterance_samples {
-                                let dur = utterance_buf.len() as f32 / sample_rate as f32;
-                                debug!(
-                                    "AudioTransport: utterance complete ({dur:.1}s, reason={})",
-                                    if max_reached {
-                                        "max_duration"
-                                    } else {
-                                        "silence"
-                                    }
-                                );
-                                let wav = encode_wav(&utterance_buf, sample_rate);
-                                let msg = build_message(wav, &agent_id);
-                                if msg_tx.blocking_send(msg).is_err() {
-                                    info!("AudioTransport: channel closed, exiting");
-                                    return;
-                                }
-                            } else {
-                                debug!(
-                                    "AudioTransport: utterance too short ({} samples), discarding",
-                                    utterance_buf.len()
-                                );
+                        FrontendEvent::UtteranceComplete { samples, .. } => {
+                            let dur = samples.len() as f32 / sample_rate as f32;
+                            debug!("AudioTransport: utterance complete ({dur:.1}s)");
+                            let wav = encode_wav(&samples, sample_rate);
+                            let msg = build_message(wav, &agent_id);
+                            if msg_tx.blocking_send(msg).is_err() {
+                                info!("AudioTransport: channel closed, exiting");
+                                return;
                             }
-                            utterance_buf.clear();
-                            silence_frames = 0;
-                            pad_remaining = 0;
-                            state = VadState::Idle;
                         }
+                        // BargeIn is not reachable (mode = Disabled), but
+                        // handle exhaustively for forward-compatibility.
+                        FrontendEvent::BargeIn { .. } => {}
                     }
                 }
             }
@@ -551,43 +544,6 @@ fn vad_loop(
             }
         }
     }
-}
-
-// ─── WAV encoding ─────────────────────────────────────────────────────────────
-
-/// Encode f32 PCM samples into a WAV byte buffer (16-bit, mono).
-fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut buf = Vec::<u8>::new();
-    {
-        let cursor = std::io::Cursor::new(&mut buf);
-        let mut writer = match hound::WavWriter::new(cursor, spec) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("AudioTransport: WAV writer init failed: {e}");
-                return Vec::new();
-            }
-        };
-        for &s in samples {
-            let s16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            if writer.write_sample(s16).is_err() {
-                break;
-            }
-        }
-        // finalize() writes the correct RIFF/data header sizes, then drops
-        // the writer and releases the mutable borrow on `buf`.
-        if let Err(e) = writer.finalize() {
-            error!("AudioTransport: WAV finalize failed: {e}");
-            return Vec::new();
-        }
-    }
-    buf
 }
 
 // ─── Message construction ─────────────────────────────────────────────────────
@@ -609,5 +565,47 @@ fn build_message(wav_bytes: Vec<u8>, agent_id: &str) -> Message {
         timestamp: chrono::Utc::now(),
         metadata,
         platform: Some("microphone".into()),
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parity test: the migrated `AudioTransportConfig::default()` must produce
+    /// byte-identical derived frame thresholds to the pre-migration flat fields.
+    ///
+    /// Arithmetic at 16 kHz / 512-sample chunk:
+    ///   silence : 1200 ms × 16000 Hz / 1000 = 19200 samples → div_ceil(512) = 38 frames
+    ///   pad     :  300 ms × 16000 Hz / 1000 =  4800 samples → div_ceil(512) = 10 frames
+    ///   min     :  300 ms × 16000 Hz / 1000 =  4800 samples  (buffer-length threshold)
+    ///   max     :   30  s × 16000 Hz        = 480000 samples (hard cap)
+    #[test]
+    fn audio_transport_config_default_parity() {
+        const SAMPLE_RATE: usize = 16_000;
+        const CHUNK_SIZE: usize = 512;
+
+        let cfg = AudioTransportConfig::default();
+        let vad = &cfg.vad;
+
+        // Silence frame count (same arithmetic as vad_loop).
+        let silence_samples = (vad.silence_duration.as_millis() as usize * SAMPLE_RATE) / 1000;
+        let silence_frames = silence_samples.div_ceil(CHUNK_SIZE);
+        assert_eq!(silence_frames, 38, "silence_frames mismatch");
+
+        // Pad frame count.
+        let pad_samples = (vad.speech_pad.as_millis() as usize * SAMPLE_RATE) / 1000;
+        let pad_frames = pad_samples.div_ceil(CHUNK_SIZE);
+        assert_eq!(pad_frames, 10, "pad_frames mismatch");
+
+        // Minimum utterance samples.
+        let min_samples = (vad.min_speech.as_millis() as usize * SAMPLE_RATE) / 1000;
+        assert_eq!(min_samples, 4800, "min_utterance_samples mismatch");
+
+        // Maximum utterance samples.
+        let max_samples = (vad.max_utterance.as_millis() as usize * SAMPLE_RATE) / 1000;
+        assert_eq!(max_samples, 480_000, "max_utterance_samples mismatch");
     }
 }
