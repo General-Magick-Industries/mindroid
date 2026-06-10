@@ -116,7 +116,10 @@ mod tests {
         guard.notify_tts_chunk(t0);
         // Simulate 200 ms elapsing.
         let now = t0 + Duration::from_millis(200);
-        assert!(guard.is_suppressed(now), "should be suppressed within window");
+        assert!(
+            guard.is_suppressed(now),
+            "should be suppressed within window"
+        );
     }
 
     #[test]
@@ -127,7 +130,10 @@ mod tests {
 
         guard.notify_tts_chunk(t0);
         let now = t0 + Duration::from_millis(300);
-        assert!(!guard.is_suppressed(now), "should allow after window expires");
+        assert!(
+            !guard.is_suppressed(now),
+            "should allow after window expires"
+        );
     }
 
     #[test]
@@ -142,7 +148,10 @@ mod tests {
 
         // Even immediately after the chunk, not suppressed.
         let now = t0 + Duration::from_millis(10);
-        assert!(!guard.is_suppressed(now), "should not suppress when agent idle");
+        assert!(
+            !guard.is_suppressed(now),
+            "should not suppress when agent idle"
+        );
     }
 
     #[test]
@@ -157,7 +166,10 @@ mod tests {
 
         guard.notify_agent_stopped();
         // After stop, no longer suppressed even though window hasn't elapsed.
-        assert!(!guard.is_suppressed(now), "notify_agent_stopped should clear suppression");
+        assert!(
+            !guard.is_suppressed(now),
+            "notify_agent_stopped should clear suppression"
+        );
     }
 
     #[test]
@@ -168,7 +180,10 @@ mod tests {
 
         guard.set_agent_speaking(true);
         let now = t0 + Duration::from_millis(10);
-        assert!(!guard.is_suppressed(now), "no tts chunk means no suppression");
+        assert!(
+            !guard.is_suppressed(now),
+            "no tts chunk means no suppression"
+        );
     }
 
     #[test]
@@ -179,6 +194,9 @@ mod tests {
 
         guard.notify_tts_chunk(t0);
         let now = t0 + Duration::from_millis(250);
-        assert!(!guard.is_suppressed(now), "at exactly window boundary should not suppress");
+        assert!(
+            !guard.is_suppressed(now),
+            "at exactly window boundary should not suppress"
+        );
     }
 }

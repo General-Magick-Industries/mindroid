@@ -159,45 +159,36 @@ impl AudioFrontendBuilder {
         // Derive frame-count thresholds from config (integer division, matching
         // run_vad's `samples / chunk_size` pattern via chunk_duration_ms).
         let sample_rate_hz: usize = self.sample_rate_hz as usize;
-        let chunk_samples =
-            (sample_rate_hz as u64 * self.chunk_duration_ms / 1_000) as usize;
+        let chunk_samples = (sample_rate_hz as u64 * self.chunk_duration_ms / 1_000) as usize;
         let chunk_duration_ms = self.chunk_duration_ms;
 
         let silence_frames_threshold = {
-            let samples = self.config.silence_duration.as_millis() as usize
-                * sample_rate_hz
-                / 1_000;
+            let samples =
+                self.config.silence_duration.as_millis() as usize * sample_rate_hz / 1_000;
             samples.div_ceil(chunk_samples)
         };
         let pad_frames = {
-            let samples = self.config.speech_pad.as_millis() as usize
-                * sample_rate_hz
-                / 1_000;
+            let samples = self.config.speech_pad.as_millis() as usize * sample_rate_hz / 1_000;
             samples.div_ceil(chunk_samples)
         };
-        let min_utterance_samples = self.config.min_speech.as_millis() as usize
-            * sample_rate_hz
-            / 1_000;
-        let max_utterance_samples = self.config.max_utterance.as_millis() as usize
-            * sample_rate_hz
-            / 1_000;
+        let min_utterance_samples =
+            self.config.min_speech.as_millis() as usize * sample_rate_hz / 1_000;
+        let max_utterance_samples =
+            self.config.max_utterance.as_millis() as usize * sample_rate_hz / 1_000;
 
         // Resolve TurnDetector: explicit override > TurnDetection::Local > default.
-        let turn_detector: Box<dyn TurnDetector + Send> =
-            if let Some(td) = self.turn_detector {
-                td
-            } else {
-                match &self.turn_detection {
-                    TurnDetection::Local(_) => {
-                        Box::new(SilenceTimerTurnDetector::new())
-                    }
-                    // Manual / Server: we still store a SilenceTimerTurnDetector
-                    // but the auto_complete flag prevents it from ending turns.
-                    TurnDetection::Manual | TurnDetection::Server => {
-                        Box::new(SilenceTimerTurnDetector::new())
-                    }
+        let turn_detector: Box<dyn TurnDetector + Send> = if let Some(td) = self.turn_detector {
+            td
+        } else {
+            match &self.turn_detection {
+                TurnDetection::Local(_) => Box::new(SilenceTimerTurnDetector::new()),
+                // Manual / Server: we still store a SilenceTimerTurnDetector
+                // but the auto_complete flag prevents it from ending turns.
+                TurnDetection::Manual | TurnDetection::Server => {
+                    Box::new(SilenceTimerTurnDetector::new())
                 }
-            };
+            }
+        };
 
         // Whether silence-based auto-completion is active.
         let auto_complete = matches!(self.turn_detection, TurnDetection::Local(_));
@@ -407,7 +398,7 @@ impl AudioFrontend {
 
         if self.injected_turn_start && !self.speaking {
             self.injected_turn_start = false;
-            let turn = self.counter.next();
+            let turn = self.counter.next_id();
             self.current_turn = Some(turn);
             self.speaking = true;
             self.silence_frames = 0;
@@ -421,7 +412,7 @@ impl AudioFrontend {
         if self.injected_barge_in {
             self.injected_barge_in = false;
             let turn = self.current_turn.unwrap_or_else(|| {
-                let t = self.counter.next();
+                let t = self.counter.next_id();
                 self.current_turn = Some(t);
                 t
             });
@@ -436,7 +427,7 @@ impl AudioFrontend {
 
         if matches!(vad_decision, VadDecision::SpeechStarted) && !self.speaking {
             self.speaking = true;
-            let turn = self.counter.next();
+            let turn = self.counter.next_id();
             self.current_turn = Some(turn);
             self.silence_frames = 0;
             self.pad_remaining = self.pad_frames;
@@ -445,10 +436,11 @@ impl AudioFrontend {
 
             // Onset frame is the first barge-in frame (counter = 1 after this call).
             let echo_suppressed = self.echo_guard.is_suppressed(now);
-            let gate_agent_speaking =
-                self.user_speaking_override.unwrap_or(agent_speaking);
+            let gate_agent_speaking = self.user_speaking_override.unwrap_or(agent_speaking);
             if !matches!(self.barge_in_mode, BargeInMode::Disabled) {
-                let decision = self.gate.observe(true, gate_agent_speaking, echo_suppressed);
+                let decision = self
+                    .gate
+                    .observe(true, gate_agent_speaking, echo_suppressed);
                 if let Some(ev) = self.maybe_barge_in(decision, turn) {
                     events.push(ev);
                 }
@@ -477,11 +469,13 @@ impl AudioFrontend {
             let gate_agent_speaking = self.user_speaking_override.unwrap_or(agent_speaking);
 
             if !matches!(self.barge_in_mode, BargeInMode::Disabled) {
-                let decision = self.gate.observe(is_speech, gate_agent_speaking, echo_suppressed);
-                if let Some(turn) = self.current_turn {
-                    if let Some(ev) = self.maybe_barge_in(decision, turn) {
-                        events.push(ev);
-                    }
+                let decision = self
+                    .gate
+                    .observe(is_speech, gate_agent_speaking, echo_suppressed);
+                if let Some(turn) = self.current_turn
+                    && let Some(ev) = self.maybe_barge_in(decision, turn)
+                {
+                    events.push(ev);
                 }
             }
 
@@ -498,7 +492,7 @@ impl AudioFrontend {
                 max_reached
             };
 
-            if (silence_ended || max_reached) && self.auto_complete || max_reached && !self.auto_complete {
+            if max_reached || (silence_ended && self.auto_complete) {
                 if let Some(turn) = self.current_turn.take() {
                     let samples = std::mem::take(&mut self.utterance_buf);
                     if samples.len() >= self.min_utterance_samples {
@@ -523,7 +517,7 @@ impl AudioFrontend {
                 // Check turn_complete from TurnDetector separately (handles
                 // silence_ended via TurnDecision::Complete path).
                 let _ = turn_complete; // suppress unused warning — already
-                                      // merged into the combined condition above.
+                // merged into the combined condition above.
             }
         }
 
@@ -683,7 +677,10 @@ mod tests {
             all_events.extend(evs);
         }
 
-        assert!(!has_barge_in(&all_events), "barge-in should be suppressed by echo guard");
+        assert!(
+            !has_barge_in(&all_events),
+            "barge-in should be suppressed by echo guard"
+        );
     }
 
     // ── Test 2: sustained barge-in fires after suppression window ────────────
@@ -701,7 +698,10 @@ mod tests {
         // Start speech at t=300 ms (well outside 250 ms suppression window).
         let (events, _) = feed_speech(&mut fe, 10, true, base, 300);
 
-        assert!(has_barge_in(&events), "barge-in should fire outside echo window");
+        assert!(
+            has_barge_in(&events),
+            "barge-in should fire outside echo window"
+        );
     }
 
     // ── Test 3: short noise (9 frames then non-speech) → no BargeIn ──────────
@@ -723,7 +723,10 @@ mod tests {
         t += CHUNK_MS;
         let _ = t;
 
-        assert!(!has_barge_in(&all), "9 frames + non-speech should not fire barge-in");
+        assert!(
+            !has_barge_in(&all),
+            "9 frames + non-speech should not fire barge-in"
+        );
     }
 
     // ── Test 4: reset on agent stop ───────────────────────────────────────────
@@ -746,7 +749,10 @@ mod tests {
 
         // Should not have fired any barge-in at any point.
         let all: Vec<_> = events1.into_iter().chain(events2).collect();
-        assert!(!has_barge_in(&all), "after agent stopped, no barge-in should fire");
+        assert!(
+            !has_barge_in(&all),
+            "after agent stopped, no barge-in should fire"
+        );
     }
 
     // ── Test 5: silence turn-end produces UtteranceComplete ──────────────────
@@ -839,7 +845,10 @@ mod tests {
 
         let (events, _) = feed_speech(&mut fe, 15, true, base, 0);
 
-        assert!(!has_barge_in(&events), "BargeIn should never fire when mode is Disabled");
+        assert!(
+            !has_barge_in(&events),
+            "BargeIn should never fire when mode is Disabled"
+        );
     }
 
     // ── Test: inject_barge_in emits BargeIn immediately ──────────────────────
@@ -857,7 +866,10 @@ mod tests {
         let now = base + Duration::from_millis(CHUNK_MS);
         let evs = fe.process(&speech_frame(), 0.8, false, now);
 
-        assert!(has_barge_in(&evs), "injected barge-in should produce BargeIn event");
+        assert!(
+            has_barge_in(&evs),
+            "injected barge-in should produce BargeIn event"
+        );
     }
 
     // ── Test: inject_turn_start starts a turn without VAD ────────────────────
@@ -871,7 +883,10 @@ mod tests {
         fe.inject_turn_start();
         let evs = fe.process(&silence_frame(), 0.0, false, base);
 
-        assert!(has_speech_started(&evs), "injected turn start should emit SpeechStarted");
+        assert!(
+            has_speech_started(&evs),
+            "injected turn start should emit SpeechStarted"
+        );
         assert!(fe.speaking);
     }
 

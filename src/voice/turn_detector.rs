@@ -69,9 +69,9 @@ impl TurnDetector for SilenceTimerTurnDetector {
     fn observe(&mut self, vad: VadDecision, _now: Instant) -> TurnDecision {
         match vad {
             VadDecision::SpeechEnded => TurnDecision::Complete,
-            VadDecision::SpeechStarted
-            | VadDecision::SpeechContinues
-            | VadDecision::Silence => TurnDecision::Pending,
+            VadDecision::SpeechStarted | VadDecision::SpeechContinues | VadDecision::Silence => {
+                TurnDecision::Pending
+            }
         }
     }
 }
@@ -89,19 +89,31 @@ mod tests {
     #[test]
     fn speech_started_and_continues_are_pending() {
         let mut td = SilenceTimerTurnDetector::new();
-        assert_eq!(td.observe(VadDecision::SpeechStarted, now()), TurnDecision::Pending);
-        assert_eq!(td.observe(VadDecision::SpeechContinues, now()), TurnDecision::Pending);
+        assert_eq!(
+            td.observe(VadDecision::SpeechStarted, now()),
+            TurnDecision::Pending
+        );
+        assert_eq!(
+            td.observe(VadDecision::SpeechContinues, now()),
+            TurnDecision::Pending
+        );
     }
 
     #[test]
     fn speech_ended_is_complete() {
         let mut td = SilenceTimerTurnDetector::new();
-        assert_eq!(td.observe(VadDecision::SpeechEnded, now()), TurnDecision::Complete);
+        assert_eq!(
+            td.observe(VadDecision::SpeechEnded, now()),
+            TurnDecision::Complete
+        );
     }
 
     #[test]
     fn silence_in_idle_is_pending() {
         let mut td = SilenceTimerTurnDetector::new();
-        assert_eq!(td.observe(VadDecision::Silence, now()), TurnDecision::Pending);
+        assert_eq!(
+            td.observe(VadDecision::Silence, now()),
+            TurnDecision::Pending
+        );
     }
 }

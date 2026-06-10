@@ -64,7 +64,10 @@ mod tests {
     fn encode_wav_empty_samples() {
         let wav = encode_wav(&[], 16_000);
         // An empty WAV is valid — hound writes a correct zero-length file.
-        assert!(!wav.is_empty(), "hound writes a valid header even for 0 samples");
+        assert!(
+            !wav.is_empty(),
+            "hound writes a valid header even for 0 samples"
+        );
         assert_eq!(&wav[0..4], b"RIFF");
     }
 

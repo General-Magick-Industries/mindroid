@@ -2,7 +2,9 @@ use crate::core::config::AgentConfig;
 use crate::core::error::MindroidError;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
-use crate::omni::types::{AudioChunk, BargeInMode, OmniConfig, OmniEvent, SessionState, TurnDetection};
+use crate::omni::types::{
+    AudioChunk, BargeInMode, OmniConfig, OmniEvent, SessionState, TurnDetection,
+};
 use crate::tools::Tool;
 use futures::StreamExt;
 use serde_json::Value;
@@ -359,17 +361,18 @@ impl OmniSession {
             TurnDetection::Local(cfg) => cfg.clone(),
             _ => VadConfig::default(),
         };
-        let mut audio_frontend: Option<AudioFrontend> = if has_local_turn_detection || has_local_barge_in {
-            Some(
-                AudioFrontend::builder(vad_config, 32)
-                    .sample_rate_hz(sample_rate)
-                    .barge_in_mode(self.config.barge_in.clone())
-                    .turn_detection(self.config.turn_detection.clone())
-                    .build(),
-            )
-        } else {
-            None
-        };
+        let mut audio_frontend: Option<AudioFrontend> =
+            if has_local_turn_detection || has_local_barge_in {
+                Some(
+                    AudioFrontend::builder(vad_config, 32)
+                        .sample_rate_hz(sample_rate)
+                        .barge_in_mode(self.config.barge_in.clone())
+                        .turn_detection(self.config.turn_detection.clone())
+                        .build(),
+                )
+            } else {
+                None
+            };
 
         loop {
             tokio::select! {
@@ -1207,7 +1210,10 @@ mod tests {
 
         // Spawn the session so it starts processing.
         let session_task = tokio::spawn(async move {
-            session.run_with_vad_rx(vad_rx).await.expect("run should succeed");
+            session
+                .run_with_vad_rx(vad_rx)
+                .await
+                .expect("run should succeed");
             session
         });
 

@@ -174,9 +174,7 @@ mod tests {
     /// Drive `n` consecutive speech frames (agent speaking, no echo suppression)
     /// and collect the decisions.
     fn drive_speech(gate: &mut InterruptionGate, n: usize) -> Vec<InterruptionDecision> {
-        (0..n)
-            .map(|_| gate.observe(true, true, false))
-            .collect()
+        (0..n).map(|_| gate.observe(true, true, false)).collect()
     }
 
     // ── test: short burst then silence never fires ────────────────────────────
@@ -192,14 +190,21 @@ mod tests {
         // The gate starts at 0; we feed 9 frames which takes it to 9 (< 10).
         let decisions = drive_speech(&mut gate, 9);
         for d in &decisions {
-            assert_eq!(*d, InterruptionDecision::NoOp, "expected NoOp before threshold");
+            assert_eq!(
+                *d,
+                InterruptionDecision::NoOp,
+                "expected NoOp before threshold"
+            );
         }
         assert_eq!(gate.speech_frames, 9);
 
         // Non-speech frame resets the counter.
         let d = gate.observe(false, true, false);
         assert_eq!(d, InterruptionDecision::NoOp);
-        assert_eq!(gate.speech_frames, 0, "counter must reset on non-speech frame");
+        assert_eq!(
+            gate.speech_frames, 0,
+            "counter must reset on non-speech frame"
+        );
     }
 
     // ── test: 10 consecutive speech frames → Interrupt ────────────────────────
@@ -256,7 +261,10 @@ mod tests {
         // Agent stops speaking → counter resets.
         let d = gate.observe(true, false, false);
         assert_eq!(d, InterruptionDecision::NoOp);
-        assert_eq!(gate.speech_frames, 0, "counter must reset when agent not speaking");
+        assert_eq!(
+            gate.speech_frames, 0,
+            "counter must reset when agent not speaking"
+        );
 
         // Agent resumes; only 9 more frames (not yet at threshold).
         for _ in 0..9 {
@@ -283,7 +291,10 @@ mod tests {
         for d in &decisions {
             assert_eq!(*d, InterruptionDecision::NoOp);
         }
-        assert_eq!(gate.observe(true, true, false), InterruptionDecision::Interrupt);
+        assert_eq!(
+            gate.observe(true, true, false),
+            InterruptionDecision::Interrupt
+        );
     }
 
     // ── test: custom threshold ────────────────────────────────────────────────
@@ -294,7 +305,10 @@ mod tests {
 
         assert_eq!(gate.observe(true, true, false), InterruptionDecision::NoOp);
         assert_eq!(gate.observe(true, true, false), InterruptionDecision::NoOp);
-        assert_eq!(gate.observe(true, true, false), InterruptionDecision::Interrupt);
+        assert_eq!(
+            gate.observe(true, true, false),
+            InterruptionDecision::Interrupt
+        );
     }
 
     // ── test: SustainedFramesScorer ───────────────────────────────────────────

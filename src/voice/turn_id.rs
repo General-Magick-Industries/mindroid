@@ -39,8 +39,8 @@ impl fmt::Display for TurnId {
 /// ```
 /// # use mindroid::voice::turn_id::{TurnId, TurnCounter};
 /// let mut counter = TurnCounter::default();
-/// assert_eq!(counter.next(), TurnId(1));
-/// assert_eq!(counter.next(), TurnId(2));
+/// assert_eq!(counter.next_id(), TurnId(1));
+/// assert_eq!(counter.next_id(), TurnId(2));
 /// ```
 #[derive(Debug, Default)]
 pub struct TurnCounter {
@@ -55,7 +55,7 @@ impl TurnCounter {
 
     /// Allocate the next [`TurnId`].  Always strictly greater than the
     /// previously returned value.
-    pub fn next(&mut self) -> TurnId {
+    pub fn next_id(&mut self) -> TurnId {
         self.last += 1;
         TurnId(self.last)
     }
@@ -75,7 +75,7 @@ impl TurnId {
     /// ```no_run
     /// # use mindroid::voice::turn_id::{TurnId, TurnCounter};
     /// let mut counter = TurnCounter::new();
-    /// let turn = counter.next();
+    /// let turn = counter.next_id();
     /// let span = tracing::info_span!("process_turn", turn_id = tracing::field::Empty);
     /// let _guard = span.enter();
     /// turn.record_on_current_span();
@@ -96,16 +96,21 @@ mod tests {
     #[test]
     fn counter_starts_at_one() {
         let mut c = TurnCounter::new();
-        assert_eq!(c.next(), TurnId(1));
+        assert_eq!(c.next_id(), TurnId(1));
     }
 
     #[test]
     fn counter_is_monotonically_increasing() {
         let mut c = TurnCounter::new();
-        let ids: Vec<TurnId> = (0..5).map(|_| c.next()).collect();
+        let ids: Vec<TurnId> = (0..5).map(|_| c.next_id()).collect();
         // Each successive element must be strictly greater than the previous.
         for window in ids.windows(2) {
-            assert!(window[1] > window[0], "{:?} not > {:?}", window[1], window[0]);
+            assert!(
+                window[1] > window[0],
+                "{:?} not > {:?}",
+                window[1],
+                window[0]
+            );
         }
     }
 
@@ -113,8 +118,8 @@ mod tests {
     fn counter_default_matches_new() {
         let mut a = TurnCounter::new();
         let mut b = TurnCounter::default();
-        assert_eq!(a.next(), b.next());
-        assert_eq!(a.next(), b.next());
+        assert_eq!(a.next_id(), b.next_id());
+        assert_eq!(a.next_id(), b.next_id());
     }
 
     #[test]

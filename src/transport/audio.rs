@@ -476,8 +476,11 @@ fn vad_loop(
     processor: &mut dyn VadProcessor,
     shutdown: Arc<AtomicBool>,
 ) {
-    use crate::voice::{AudioFrontend, FrontendEvent, types::{BargeInMode, TurnDetection}};
     use crate::voice::encode_wav;
+    use crate::voice::{
+        AudioFrontend, FrontendEvent,
+        types::{BargeInMode, TurnDetection},
+    };
 
     // chunk_duration_ms is the same for both supported rates:
     //   16000 Hz / 512 samples = 32 ms
@@ -588,8 +591,7 @@ mod tests {
         let vad = &cfg.vad;
 
         // Silence frame count (same arithmetic as vad_loop).
-        let silence_samples =
-            (vad.silence_duration.as_millis() as usize * SAMPLE_RATE) / 1000;
+        let silence_samples = (vad.silence_duration.as_millis() as usize * SAMPLE_RATE) / 1000;
         let silence_frames = silence_samples.div_ceil(CHUNK_SIZE);
         assert_eq!(silence_frames, 38, "silence_frames mismatch");
 
