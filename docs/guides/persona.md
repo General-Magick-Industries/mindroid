@@ -212,6 +212,45 @@ Communication tones: empathetic, calm, encouraging
 
 ---
 
+## Bifrost-backed Prompt (delegated formatting)
+
+`PersonaContextBuilder` (above) fetches structured trait data and formats the
+system prompt **in-process** in Rust. An alternative is to let **Bifrost** own
+prompt construction: `BifrostPersonaStage` calls Bifrost's prepare endpoint and
+uses the returned string verbatim.
+
+```
+POST {base_url}/v1/persona/{persona_id}/prepare
+body:   { "user_id": "<optional>" }
+returns: { "system_prompt": "..." }
+```
+
+Bifrost fans out to the persona and runtime services over gRPC, runs its own
+`buildSystemPrompt` / `formatEffectiveTrait` (numeric trait *banding* —
+e.g. "very high", "moderate" — and structured trait-ref parsing), then returns
+a finished prompt. Use this when Bifrost is the single source of truth for
+prompt rendering and you do not want to duplicate formatting logic in Rust.
+
+| | `magickmind` (SDK formats) | `bifrost` (Bifrost formats) |
+|---|---|---|
+| Trait banding / custom phrasing | no — raw `- warmth: 0.8` | yes — Bifrost's `formatEffectiveTrait` |
+| Network hops per request | 2 (persona + runtime) | 1 (Bifrost fans out via gRPC) |
+| Formatting location | Rust (`format_trait`) | Go (single source of truth) |
+
+### Configuration
+
+```toml
+[persona]
+type = "bifrost"
+persona_id = "your-persona-id"
+base_url = "https://dev-bifrost.magickmind.ai"  # falls back to memory/auth base_url
+```
+
+`RuntimeBuilder::build_bifrost_persona_stage()` returns the configured stage
+(no startup network call — Bifrost computes everything per-request). The
+`persona_agent` example auto-selects it when `type = "bifrost"`; see
+`examples/persona_agent/bifrost.toml`.
+
 ## Caching
 
 `PersonaContextBuilder` holds an in-memory TTL cache keyed by `"{persona_id}:{user_id}"`.
