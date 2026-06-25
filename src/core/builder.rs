@@ -17,7 +17,8 @@ use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
 use crate::persona::{
-    LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider,
+    BifrostPersonaStage, LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder,
+    PersonaProvider,
 };
 
 #[cfg(feature = "identity")]
@@ -70,6 +71,10 @@ pub struct RuntimeBuilder {
     pub(crate) strategy: RunStrategy,
     #[cfg(feature = "persona")]
     pub(crate) persona_provider: Option<Arc<dyn PersonaProvider>>,
+    /// Bifrost-backed persona: `(base_url, persona_id)`. Set when
+    /// `persona.type = "bifrost"`. Built into a `BifrostPersonaStage` on demand.
+    #[cfg(feature = "persona")]
+    pub(crate) bifrost_persona: Option<(String, String)>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -90,6 +95,8 @@ impl RuntimeBuilder {
             strategy: RunStrategy::default(),
             #[cfg(feature = "persona")]
             persona_provider: None,
+            #[cfg(feature = "persona")]
+            bifrost_persona: None,
             #[cfg(feature = "identity")]
             identity_resolver: None,
         }
@@ -194,6 +201,18 @@ impl RuntimeBuilder {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Build a `BifrostPersonaStage` from the configured Bifrost persona.
+    ///
+    /// Returns `None` unless `persona.type = "bifrost"` was configured (and
+    /// auth has been resolved). Unlike [`build_persona_stage`](Self::build_persona_stage),
+    /// this performs no network call — Bifrost computes the prompt per-request.
+    #[cfg(feature = "persona")]
+    pub fn build_bifrost_persona_stage(&self) -> Option<BifrostPersonaStage> {
+        let (base_url, persona_id) = self.bifrost_persona.as_ref()?;
+        let auth = self.auth.clone()?;
+        Some(BifrostPersonaStage::new(base_url, persona_id, auth))
     }
 
     /// Build an `IdentityResolutionStage` from the configured resolver.
@@ -372,6 +391,26 @@ impl Runtime {
                             "persona.persona_id is required when persona.type = \"magickmind\"",
                         ));
                     }
+                }
+                Some("bifrost") => {
+                    let persona_id = config.persona.persona_id.clone().ok_or_else(|| {
+                        MindroidError::config(
+                            "persona.persona_id is required when persona.type = \"bifrost\"",
+                        )
+                    })?;
+                    let base_url = config
+                        .persona
+                        .base_url
+                        .as_deref()
+                        .or(config.memory.base_url.as_deref())
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "persona.base_url, memory.base_url, or auth.base_url is required for bifrost persona",
+                            )
+                        })?
+                        .to_string();
+                    builder.bifrost_persona = Some((base_url, persona_id));
                 }
                 Some("local") => {
                     if let Some(persona_id) = config.persona.persona_id.as_deref() {

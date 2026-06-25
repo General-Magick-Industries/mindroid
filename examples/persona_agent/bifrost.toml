@@ -1,0 +1,58 @@
+# Persona-driven agent — Bifrost-backed persona prompt.
+#
+# Identical to dazael.toml except [persona] delegates prompt construction to
+# Bifrost's POST /v1/persona/{id}/prepare endpoint, which runs its own
+# buildSystemPrompt / formatEffectiveTrait (trait banding) and returns a
+# finished system_prompt string. mindroid uses that string verbatim.
+#
+# Run with:
+#   cargo run --example persona_agent --features full -- --config examples/persona_agent/bifrost.toml
+
+[agent]
+agent_id = "example-agent-id"
+name = "Dazael – Sword-mage"
+# Fallback flat persona if the persona service is unavailable.
+persona = "You are a helpful AI assistant."
+model_type = "fast"
+model_ids = ["openrouter/google/gemini-3.1-pro-preview"]
+compute_power = 1
+
+[transport]
+type = "centrifugo"
+url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+[memory]
+type = "magickmind"
+base_url = "https://dev-magickmind.magickmind.ai"
+
+# -- Persona (Bifrost prepare endpoint) ---------------------------------------
+# Bifrost owns prompt formatting. Point base_url at your Bifrost deployment.
+# If omitted, base_url falls back to memory.base_url, then auth.base_url.
+
+[persona]
+type = "bifrost"
+persona_id = "example-persona-id"
+base_url = "https://dev-bifrost.magickmind.ai"
+
+[observer]
+type = "log"
+level = "info"
+
+# -- LLM Providers -----------------------------------------------------------
+
+[providers.litellm]
+base_url = "https://litellm.globalmagick.com"
+api_key = "sk-your-api-key-here"
+
+# -- Named Models -------------------------------------------------------------
+
+[models.respond]
+provider = "litellm"
+model = "openrouter/google/gemini-3.1-pro-preview"

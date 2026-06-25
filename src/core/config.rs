@@ -198,13 +198,16 @@ pub struct ObserverConfig {
 /// Configuration for the persona subsystem.
 ///
 /// When `type = "magickmind"`, the runtime will fetch the effective personality
-/// from the magickmind runtime service per-request.
+/// from the magickmind runtime service per-request and format the prompt in-process.
+/// When `type = "bifrost"`, the runtime delegates prompt construction to Bifrost's
+/// `POST /v1/persona/{id}/prepare` endpoint and uses the returned `system_prompt`
+/// verbatim (Bifrost owns trait banding / formatting).
 /// When `type = "local"`, the persona is loaded from a local `persona.md` file.
 /// When `type = "markdown"`, the system prompt is loaded from a local file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersonaConfig {
-    /// Persona provider type. Supported: `"magickmind"`, `"local"`.
+    /// Persona provider type. Supported: `"magickmind"`, `"bifrost"`, `"local"`.
     #[serde(rename = "type")]
     pub persona_type: Option<String>,
     /// The persona ID to fetch.
