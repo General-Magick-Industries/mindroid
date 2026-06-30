@@ -217,6 +217,9 @@ pub struct PersonaConfig {
     /// Directory containing local persona files (for `type = "local"`).
     /// Defaults to `~/.mindroid/personas`.
     pub data_dir: Option<String>,
+    /// Cache TTL (seconds) for Bifrost-prepared system prompts (`type = "bifrost"`).
+    /// Defaults to 600 (10 minutes). `0` disables caching.
+    pub cache_ttl_secs: Option<u64>,
 }
 
 /// Configuration for cross-platform identity resolution.

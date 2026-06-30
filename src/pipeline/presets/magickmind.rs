@@ -26,7 +26,7 @@ struct MagickmindSaveResponse {
     id: Option<String>,
 }
 
-// ── Context Prepare API types (POST /v1/mindspaces/:id/context) ─────────────
+// ── Context Prepare API types (POST /v1/magickspaces/:id/context) ─────────────
 
 #[derive(Serialize)]
 struct PrepareContextRequest<'a> {
@@ -113,7 +113,7 @@ impl MagickmindClient {
         config: &MagickmindContextConfig,
         exclude_sender: Option<&str>,
     ) -> Result<Vec<LlmMessage>> {
-        let url = format!("{}/v1/mindspaces/{}/context", self.base_url, mindspace_id);
+        let url = format!("{}/v1/magickspaces/{}/context", self.base_url, mindspace_id);
         let mut headers = self.auth_headers().await?;
 
         let body = PrepareContextRequest {
@@ -184,7 +184,7 @@ impl MagickmindClient {
         content: &str,
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let url = format!("{}/v1/mindspaces/{}/messages", self.base_url, mindspace_id);
+        let url = format!("{}/v1/magickspaces/{}/messages", self.base_url, mindspace_id);
         let headers = self.auth_headers().await?;
         let body = MagickmindSaveRequest {
             sender_id,
@@ -250,7 +250,7 @@ impl Default for MagickmindContextConfig {
 
 /// Fetches context from Magickmind's context preparation endpoint.
 ///
-/// Calls `POST /v1/mindspaces/{channel_id}/context` using the message's
+/// Calls `POST /v1/magickspaces/{channel_id}/context` using the message's
 /// `channel_id` as the mindspace ID and `sender_id` as the participant.
 ///
 /// ```ignore

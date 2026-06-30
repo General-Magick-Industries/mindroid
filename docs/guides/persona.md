@@ -242,14 +242,43 @@ prompt rendering and you do not want to duplicate formatting logic in Rust.
 ```toml
 [persona]
 type = "bifrost"
-persona_id = "your-persona-id"
+persona_id = "your-persona-id"                  # default persona (see below)
 base_url = "https://dev-bifrost.magickmind.ai"  # falls back to memory/auth base_url
+cache_ttl_secs = 600                            # optional; prepared-prompt cache TTL (default 600 = 10 min, 0 disables)
 ```
 
 `RuntimeBuilder::build_bifrost_persona_stage()` returns the configured stage
 (no startup network call — Bifrost computes everything per-request). The
 `persona_agent` example auto-selects it when `type = "bifrost"`; see
 `examples/persona_agent/bifrost.toml`.
+
+### Per-message persona selection (`PersonaId`)
+
+The configured `persona_id` is a **default**. To serve many personas from one
+stage (e.g. a server whose mobile clients each send their own persona id), the
+application sets a `PersonaId` extension on the inbound message context; the
+stage uses it instead of the default. This mirrors how `IdentityResolutionStage`
+sets `CanonicalUserId` — *the SDK owns the slot, the application owns the value.*
+
+```rust
+use mindroid::PersonaId;
+
+// In an upstream, application-owned step (e.g. extracting it from message metadata):
+ctx.set_ext(PersonaId(persona_id_from_mobile));
+```
+
+If no `PersonaId` extension is present, the stage falls back to the configured
+`persona_id`. Source policy (where the id comes from) is the application's job;
+the resolve-and-cache mechanism is the SDK's.
+
+### Prepared-prompt caching
+
+`BifrostPersonaStage` caches each prepared `system_prompt` keyed by
+`(persona_id, user_id)` so voice/chat turns don't call Bifrost on every message
+(the `prepare` response carries no TTL, so the cache lifetime is the SDK's
+choice). The default is 10 minutes; override per stage with
+`.with_ttl(Duration)` or via `cache_ttl_secs` in config. A TTL of `0` disables
+caching.
 
 ## Caching
 

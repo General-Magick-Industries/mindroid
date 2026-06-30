@@ -71,10 +71,10 @@ pub struct RuntimeBuilder {
     pub(crate) strategy: RunStrategy,
     #[cfg(feature = "persona")]
     pub(crate) persona_provider: Option<Arc<dyn PersonaProvider>>,
-    /// Bifrost-backed persona: `(base_url, persona_id)`. Set when
+    /// Bifrost-backed persona: `(base_url, persona_id, cache_ttl_secs)`. Set when
     /// `persona.type = "bifrost"`. Built into a `BifrostPersonaStage` on demand.
     #[cfg(feature = "persona")]
-    pub(crate) bifrost_persona: Option<(String, String)>,
+    pub(crate) bifrost_persona: Option<(String, String, Option<u64>)>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -210,9 +210,13 @@ impl RuntimeBuilder {
     /// this performs no network call — Bifrost computes the prompt per-request.
     #[cfg(feature = "persona")]
     pub fn build_bifrost_persona_stage(&self) -> Option<BifrostPersonaStage> {
-        let (base_url, persona_id) = self.bifrost_persona.as_ref()?;
+        let (base_url, persona_id, ttl_secs) = self.bifrost_persona.as_ref()?;
         let auth = self.auth.clone()?;
-        Some(BifrostPersonaStage::new(base_url, persona_id, auth))
+        let mut stage = BifrostPersonaStage::new(base_url, persona_id, auth);
+        if let Some(secs) = ttl_secs {
+            stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
+        }
+        Some(stage)
     }
 
     /// Build an `IdentityResolutionStage` from the configured resolver.
@@ -410,7 +414,8 @@ impl Runtime {
                             )
                         })?
                         .to_string();
-                    builder.bifrost_persona = Some((base_url, persona_id));
+                    builder.bifrost_persona =
+                        Some((base_url, persona_id, config.persona.cache_ttl_secs));
                 }
                 Some("local") => {
                     if let Some(persona_id) = config.persona.persona_id.as_deref() {
