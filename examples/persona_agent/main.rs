@@ -159,6 +159,11 @@ async fn main() -> anyhow::Result<()> {
     // Gate pipeline: cheap @mention check (no API calls)
     let gate_pipeline = Arc::new(Pipeline::new().add_stage(mention_gate));
 
+    // Local test toggle: set MINDROID_DISABLE_GATE=1 to answer every message on
+    // the channel (no @mention required) — e.g. plain messages from a website
+    // magickspace. Unset, the shipped @mention behaviour is preserved.
+    let gate_enabled = std::env::var("MINDROID_DISABLE_GATE").is_err();
+
     // Build the persona stage once. Two modes are supported via [persona] config:
     //   type = "magickmind" → PersonaContextBuilder formats the prompt in-process
     //   type = "bifrost"    → BifrostPersonaStage delegates formatting to Bifrost's
@@ -195,18 +200,23 @@ async fn main() -> anyhow::Result<()> {
                     ctx.message.content
                 );
 
-                // Step 1: Check @mention first (cheap, no API calls)
+                // Step 1: Check @mention first (cheap, no API calls).
+                // Skipped when MINDROID_DISABLE_GATE is set (local mindroid test).
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-                if let Err(e) = ctx.run_with_context(&gate, &mut pctx).await {
-                    tracing::error!("Mention gate failed: {e}");
-                    return;
+                if gate_enabled {
+                    if let Err(e) = ctx.run_with_context(&gate, &mut pctx).await {
+                        tracing::error!("Mention gate failed: {e}");
+                        return;
+                    }
+                    if pctx.halted {
+                        tracing::info!("Not @mentioned — staying silent");
+                        return;
+                    }
+                    tracing::info!("@mentioned — proceeding");
+                } else {
+                    tracing::info!("Mention gate disabled — responding to all messages");
                 }
-                if pctx.halted {
-                    tracing::info!("Not @mentioned — staying silent");
-                    return;
-                }
-                tracing::info!("@mentioned — proceeding");
 
                 // Step 2: Fetch context from MagickMind (only after mention check passes)
                 let history = match preparer.prepare(&ctx.message).await {

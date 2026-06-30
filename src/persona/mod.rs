@@ -6,7 +6,7 @@ pub mod models;
 mod provider;
 mod stage;
 
-pub use bifrost::BifrostPersonaStage;
+pub use bifrost::{BifrostPersonaStage, PersonaId};
 pub use client::MagickmindPersonaClient;
 pub use local::LocalPersonaProvider;
 pub use models::{

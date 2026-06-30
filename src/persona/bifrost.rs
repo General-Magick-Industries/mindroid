@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -25,14 +27,50 @@ use crate::pipeline::extensions::TextInput;
 /// Use this when Bifrost is the single source of truth for prompt rendering.
 ///
 /// `POST {base_url}/v1/persona/{persona_id}/prepare`
+///
+/// ## Persona selection (constant vs. per-message)
+///
+/// The configured `persona_id` is a **default**. If an inbound message carries a
+/// [`PersonaId`] extension in the pipeline [`Context`], that id is used instead —
+/// letting a single stage serve many personas (e.g. a server whose mobile clients
+/// each send their own persona id). The application sets the extension; the SDK
+/// only reads it.
+///
+/// ## Caching
+///
+/// Prepared prompts are cached per `(persona_id, user_id)` for [`with_ttl`] (default
+/// 10 minutes) so voice/chat turns don't hit Bifrost on every message.
+///
+/// [`with_ttl`]: BifrostPersonaStage::with_ttl
 pub struct BifrostPersonaStage {
     http: reqwest::Client,
     base_url: String,
+    /// Default persona id, used when no [`PersonaId`] extension is in context.
     persona_id: String,
     identity: Arc<dyn Auth>,
     /// Pre-fetched conversation history injected at construction time.
     history: Arc<Vec<LlmMessage>>,
+    /// How long a prepared prompt stays valid in [`Self::cache`].
+    ttl: Duration,
+    /// Cache of prepared system prompts keyed by `(persona_id, user_id)`.
+    cache: Mutex<HashMap<(String, Option<String>), CacheEntry>>,
 }
+
+/// A cached prepared prompt plus the instant it was fetched.
+struct CacheEntry {
+    prompt: String,
+    fetched_at: Instant,
+}
+
+/// Per-message persona selector stored in the pipeline [`Context`].
+///
+/// When present, [`BifrostPersonaStage`] uses this persona id instead of its
+/// configured default — enabling one stage to serve many personas. The
+/// application is responsible for setting it (e.g. extracting it from inbound
+/// message metadata); the SDK only reads it. Mirrors `CanonicalUserId` from the
+/// identity module.
+#[derive(Debug, Clone)]
+pub struct PersonaId(pub String);
 
 impl BifrostPersonaStage {
     /// Create a new `BifrostPersonaStage`.
@@ -46,8 +84,13 @@ impl BifrostPersonaStage {
             persona_id: persona_id.to_string(),
             identity,
             history: Arc::new(Vec::new()),
+            ttl: Duration::from_secs(Self::DEFAULT_TTL_SECS),
+            cache: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Default prepared-prompt cache TTL in seconds (10 minutes).
+    pub const DEFAULT_TTL_SECS: u64 = 600;
 
     /// Provide conversation history for inclusion in the LLM prompt.
     pub fn with_history(mut self, history: Arc<Vec<LlmMessage>>) -> Self {
@@ -55,8 +98,47 @@ impl BifrostPersonaStage {
         self
     }
 
+    /// Override the prepared-prompt cache TTL (default 10 minutes).
+    ///
+    /// A TTL of zero disables caching (every message re-fetches from Bifrost).
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Resolve the system prompt for `persona_id`/`user_id`, serving a fresh
+    /// cache entry when available and otherwise fetching from Bifrost.
+    async fn resolve_prompt(&self, persona_id: &str, user_id: Option<&str>) -> Result<String> {
+        let key = (persona_id.to_string(), user_id.map(str::to_string));
+
+        // Fast path: fresh cache hit. Never hold the lock across the await below.
+        {
+            let cache = self.cache.lock().expect("persona cache mutex poisoned");
+            if let Some(entry) = cache.get(&key)
+                && entry.fetched_at.elapsed() < self.ttl
+            {
+                debug!("BifrostPersonaStage: cache hit for {key:?}");
+                return Ok(entry.prompt.clone());
+            }
+        }
+
+        // Miss or stale: fetch from Bifrost, then populate the cache.
+        let prompt = self.prepare(persona_id, user_id).await?;
+        {
+            let mut cache = self.cache.lock().expect("persona cache mutex poisoned");
+            cache.insert(
+                key,
+                CacheEntry {
+                    prompt: prompt.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+        Ok(prompt)
+    }
+
     /// Call Bifrost's prepare endpoint and return the finished system prompt.
-    async fn prepare(&self, user_id: Option<&str>) -> Result<String> {
+    async fn prepare(&self, persona_id: &str, user_id: Option<&str>) -> Result<String> {
         let url = {
             let mut u = reqwest::Url::parse(&self.base_url).map_err(|e| MindroidError::Api {
                 message: format!("invalid base_url: {e}"),
@@ -67,7 +149,7 @@ impl BifrostPersonaStage {
                     message: "base_url cannot be a base URL".to_string(),
                     status_code: None,
                 })?
-                .extend(&["v1", "persona", &self.persona_id, "prepare"]);
+                .extend(&["v1", "persona", persona_id, "prepare"]);
             u
         };
         let headers = crate::auth::build_auth_header_map(self.identity.as_ref()).await?;
@@ -89,7 +171,7 @@ impl BifrostPersonaStage {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(MindroidError::Api {
-                message: format!("Failed to prepare persona {}: {text}", self.persona_id),
+                message: format!("Failed to prepare persona {persona_id}: {text}"),
                 status_code: Some(status.as_u16()),
             });
         }
@@ -132,11 +214,15 @@ impl PipelineStage for BifrostPersonaStage {
             None
         };
 
-        debug!(
-            "BifrostPersonaStage: preparing persona={} user={:?}",
-            self.persona_id, user_id
-        );
-        let system_prompt = self.prepare(user_id).await?;
+        // Resolve persona id: prefer a per-message `PersonaId` extension (set by
+        // the application), else fall back to the configured default.
+        let persona_id = ctx
+            .get_ext::<PersonaId>()
+            .map(|p| p.0.clone())
+            .unwrap_or_else(|| self.persona_id.clone());
+
+        debug!("BifrostPersonaStage: preparing persona={persona_id} user={user_id:?}");
+        let system_prompt = self.resolve_prompt(&persona_id, user_id).await?;
 
         // Assemble LLM messages: system prompt first, then history, then user message.
         let mut messages = vec![LlmMessage::system(&system_prompt)];
@@ -207,5 +293,26 @@ mod tests {
         let resp: PreparePersonaResponse =
             serde_json::from_str(r#"{"system_prompt":"You are Aria."}"#).unwrap();
         assert_eq!(resp.system_prompt, "You are Aria.");
+    }
+
+    #[test]
+    fn default_ttl_is_ten_minutes() {
+        let stage = BifrostPersonaStage::new(
+            "https://x",
+            "p1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        );
+        assert_eq!(stage.ttl, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn with_ttl_overrides_default() {
+        let stage = BifrostPersonaStage::new(
+            "https://x",
+            "p1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        )
+        .with_ttl(Duration::from_secs(30));
+        assert_eq!(stage.ttl, Duration::from_secs(30));
     }
 }

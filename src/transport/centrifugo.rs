@@ -241,8 +241,8 @@ fn parse_push(text: &str) -> Option<Message> {
         .to_string();
 
     let channel_id = outer
-        .get("mindspace_id")
-        .or_else(|| inner.get("mindspace_id"))
+        .get("magickspace_id")
+        .or_else(|| inner.get("magickspace_id"))
         .or_else(|| inner.get("channel_id"))
         .and_then(|v| v.as_str())
         .unwrap_or(&channel)
@@ -318,23 +318,33 @@ impl Transport for CentrifugoTransport {
                                 frame = stream.next() => {
                                     match frame {
                                         Some(Ok(WsMessage::Text(text))) => {
-                                            // Check if this is a refresh reply with a new TTL
-                                            if let Some(new_ttl) = parse_refresh_ttl(&text) {
-                                                let new_duration = Duration::from_secs(new_ttl * 80 / 100);
-                                                refresh_timer = tokio::time::interval(new_duration);
-                                                refresh_timer.tick().await; // consume immediate tick
-                                                debug!("Token refreshed, next refresh in {}s", new_duration.as_secs());
-                                                continue;
-                                            }
-
-                                            if let Some(message) = parse_push(&text) {
-                                                if tx.send(message).await.is_err() {
-                                                    warn!("Message receiver dropped, stopping listen loop");
-                                                    state.write().await.connected = false;
-                                                    return;
+                                            // Centrifugo batches replies/pushes as
+                                            // newline-delimited JSON in one frame, so
+                                            // parse each line independently.
+                                            for line in text.split('\n') {
+                                                let line = line.trim();
+                                                if line.is_empty() {
+                                                    continue;
                                                 }
-                                            } else {
-                                                debug!("Ignoring non-push frame: {text}");
+
+                                                // Check if this is a refresh reply with a new TTL
+                                                if let Some(new_ttl) = parse_refresh_ttl(line) {
+                                                    let new_duration = Duration::from_secs(new_ttl * 80 / 100);
+                                                    refresh_timer = tokio::time::interval(new_duration);
+                                                    refresh_timer.tick().await; // consume immediate tick
+                                                    debug!("Token refreshed, next refresh in {}s", new_duration.as_secs());
+                                                    continue;
+                                                }
+
+                                                if let Some(message) = parse_push(line) {
+                                                    if tx.send(message).await.is_err() {
+                                                        warn!("Message receiver dropped, stopping listen loop");
+                                                        state.write().await.connected = false;
+                                                        return;
+                                                    }
+                                                } else {
+                                                    debug!("Ignoring non-push frame: {line}");
+                                                }
                                             }
                                         }
                                         Some(Ok(WsMessage::Close(_))) => {
