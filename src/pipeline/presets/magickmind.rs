@@ -184,7 +184,10 @@ impl MagickmindClient {
         content: &str,
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let url = format!("{}/v1/magickspaces/{}/messages", self.base_url, mindspace_id);
+        let url = format!(
+            "{}/v1/magickspaces/{}/messages",
+            self.base_url, mindspace_id
+        );
         let headers = self.auth_headers().await?;
         let body = MagickmindSaveRequest {
             sender_id,
