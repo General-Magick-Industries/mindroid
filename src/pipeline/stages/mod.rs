@@ -16,6 +16,10 @@ pub use gate::{AndGate, CoordinationGate, Gate, OrGate, RelevanceGate};
 pub use llm_processor::{GenericLlmProcessor, collect_stream};
 pub use post_processor::PostProcessor;
 #[cfg(feature = "speech")]
+pub use stt::CartesiaStt;
+#[cfg(feature = "speech")]
+pub use stt::CartesiaSttConfig;
+#[cfg(feature = "speech")]
 pub use stt::DeepgramStt;
 #[cfg(feature = "speech")]
 pub use stt::DeepgramSttConfig;
@@ -28,10 +32,18 @@ pub use stt::{SttProvider, SttStage};
 pub use tool_executor::{ParsedToolCall, ToolCallParser, ToolExecutorStage, XmlToolCallParser};
 #[cfg(feature = "transport-audio")]
 pub use tts::AudioOutputStage;
+#[cfg(all(feature = "speech", feature = "transport-ws"))]
+pub use tts::CartesiaStreamingTts;
+#[cfg(feature = "speech")]
+pub use tts::CartesiaTts;
+#[cfg(feature = "speech")]
+pub use tts::CartesiaTtsConfig;
 #[cfg(feature = "speech")]
 pub use tts::DeepgramTts;
 #[cfg(feature = "speech")]
 pub use tts::DeepgramTtsConfig;
+#[cfg(feature = "speech")]
+pub use tts::GenerationConfig as CartesiaGenerationConfig;
 #[cfg(feature = "llm-client")]
 pub use tts::OpenAiTts;
 #[cfg(feature = "llm-client")]

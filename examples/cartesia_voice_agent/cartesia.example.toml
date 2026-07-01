@@ -1,0 +1,34 @@
+# Cartesia voice agent — copy this to `cartesia.toml` and fill in your keys.
+#
+#   cp examples/cartesia_voice_agent/cartesia.example.toml \
+#      examples/cartesia_voice_agent/cartesia.toml
+#
+# `cartesia.toml` is git-ignored (it holds secrets); this template is safe to commit.
+
+# Bifrost persona. The agent calls POST /v1/persona/{persona_id}/prepare and uses
+# the returned system prompt. Auth is an email/password login against base_url.
+[bifrost]
+base_url = "https://dev-bifrost.magickmind.ai"
+email = "you@example.com"
+password = "your-password"
+persona_id = "your-persona-id"
+
+# LLM brain — any OpenAI-compatible endpoint. Here LiteLLM fronting OpenRouter.
+[llm]
+base_url = "https://litellm.globalmagick.com"
+api_key = "sk-..."
+model = "openrouter/anthropic/claude-sonnet-4.5"
+
+# Cartesia speech — Ink (STT) + Sonic (TTS). Get a key at https://cartesia.ai.
+[cartesia]
+api_key = "sk_car_..."
+# Sonic voice id — pick your own from the Cartesia voice library.
+voice_id = "f786b574-daa5-4673-aa0c-cbe3e8534c02"
+model_id = "sonic-3.5"
+language = "en"
+sample_rate = 44100
+
+# Optional: a Tavily key enables real web search for the agent's web_search tool.
+# Leave empty to fall back to the keyless (but limited) DuckDuckGo Instant Answer API.
+[web_search]
+tavily_api_key = ""

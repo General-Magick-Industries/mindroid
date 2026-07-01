@@ -72,15 +72,20 @@ pub use pipeline::extensions::{AudioInput, AudioOutput, TextInput};
 #[cfg(feature = "llm-client")]
 pub use pipeline::presets::vision::vision_pipeline;
 #[cfg(all(feature = "speech", feature = "llm-client"))]
-pub use pipeline::presets::voice::voice_pipeline;
+pub use pipeline::presets::voice::{cartesia_voice_pipeline, voice_pipeline};
 #[cfg(feature = "transport-audio")]
 pub use pipeline::stages::AudioOutputStage;
+#[cfg(all(feature = "speech", feature = "transport-ws"))]
+pub use pipeline::stages::CartesiaStreamingTts;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::stages::StreamingTtsTransformer;
 #[cfg(feature = "llm-client")]
 pub use pipeline::stages::gate::{AndGate, CoordinationGate, Gate, OrGate, RelevanceGate};
 #[cfg(feature = "speech")]
-pub use pipeline::stages::{DeepgramStt, DeepgramSttConfig, DeepgramTts, DeepgramTtsConfig};
+pub use pipeline::stages::{
+    CartesiaGenerationConfig, CartesiaStt, CartesiaSttConfig, CartesiaTts, CartesiaTtsConfig,
+    DeepgramStt, DeepgramSttConfig, DeepgramTts, DeepgramTtsConfig,
+};
 #[cfg(feature = "llm-client")]
 pub use pipeline::stages::{
     GenericLlmProcessor, OpenAiStt, OpenAiSttConfig, OpenAiTts, OpenAiTtsConfig, collect_stream,

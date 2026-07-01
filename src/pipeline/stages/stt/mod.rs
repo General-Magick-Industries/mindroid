@@ -1,8 +1,12 @@
 #[cfg(feature = "speech")]
+mod cartesia;
+#[cfg(feature = "speech")]
 mod deepgram;
 #[cfg(feature = "llm-client")]
 mod openai;
 
+#[cfg(feature = "speech")]
+pub use cartesia::{CartesiaStt, CartesiaSttConfig};
 #[cfg(feature = "speech")]
 pub use deepgram::{DeepgramStt, DeepgramSttConfig};
 #[cfg(feature = "llm-client")]

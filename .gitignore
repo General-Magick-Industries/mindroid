@@ -4,6 +4,8 @@
 # Environment and secrets
 .env*
 !.env.example
+# Local example config with real keys (copy of the *.example.toml)
+examples/cartesia_voice_agent/cartesia.toml
 
 # IDE / editor
 .zed/

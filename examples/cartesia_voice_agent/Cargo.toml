@@ -1,0 +1,24 @@
+[package]
+name = "mindroid-example-cartesia-voice-agent"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "cartesia_voice_agent"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["speech", "llm-client", "persona", "apikey", "transport-audio", "transport-ws"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+rodio = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

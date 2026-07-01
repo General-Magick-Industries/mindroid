@@ -1,8 +1,16 @@
 #[cfg(feature = "speech")]
+mod cartesia;
+#[cfg(all(feature = "speech", feature = "transport-ws"))]
+mod cartesia_streaming;
+#[cfg(feature = "speech")]
 mod deepgram;
 #[cfg(feature = "llm-client")]
 mod openai;
 
+#[cfg(feature = "speech")]
+pub use cartesia::{CartesiaTts, CartesiaTtsConfig, GenerationConfig};
+#[cfg(all(feature = "speech", feature = "transport-ws"))]
+pub use cartesia_streaming::CartesiaStreamingTts;
 #[cfg(feature = "speech")]
 pub use deepgram::{DeepgramTts, DeepgramTtsConfig};
 #[cfg(feature = "llm-client")]

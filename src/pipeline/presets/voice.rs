@@ -43,3 +43,40 @@ pub fn voice_pipeline(
         .add_streaming_stage(GenericLlmProcessor::new(llm))
         .add_stage(TtsStage::new(tts)))
 }
+
+/// Builds a voice pipeline backed by Cartesia for both ears and voice:
+/// Cartesia Ink (STT) → LLM → Cartesia Sonic (TTS).
+///
+/// This is a thin convenience wrapper over [`voice_pipeline`] that constructs
+/// [`CartesiaStt`](crate::CartesiaStt) and [`CartesiaTts`](crate::CartesiaTts)
+/// from their configs. Set the voice tone on [`CartesiaTtsConfig`] before
+/// calling (voice id, speed, volume, or the tone presets).
+///
+/// # Example
+///
+/// ```ignore
+/// use mindroid::llm_client::{LlmClient, LlmClientConfig};
+/// use mindroid::pipeline::presets::voice::cartesia_voice_pipeline;
+/// use mindroid::{CartesiaSttConfig, CartesiaTtsConfig};
+///
+/// let stt = CartesiaSttConfig::new(api_key.clone());
+/// let tts = CartesiaTtsConfig::new(api_key, voice_id).lively();
+///
+/// let mut cfg = LlmClientConfig::new("http://localhost:13305/api/v1");
+/// cfg.default_model = Some("Qwen3-0.6B-GGUF".to_string());
+/// let client = LlmClient::new(cfg)?;
+///
+/// let pipeline = cartesia_voice_pipeline(stt, client, tts)?;
+/// ```
+#[cfg(feature = "speech")]
+pub fn cartesia_voice_pipeline(
+    stt: crate::CartesiaSttConfig,
+    llm: LlmClient,
+    tts: crate::CartesiaTtsConfig,
+) -> crate::Result<Pipeline> {
+    voice_pipeline(
+        crate::CartesiaStt::new(stt),
+        llm,
+        crate::CartesiaTts::new(tts),
+    )
+}
