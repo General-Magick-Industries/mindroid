@@ -1,47 +1,78 @@
 name: CI
 
+# No workflow-level `paths:` filter on purpose. The jobs below are required by
+# branch protection, and a required check MUST report on every PR — otherwise a
+# PR that touches none of the filtered paths (e.g. docs-only) skips the workflow
+# entirely and GitHub deadlocks at "Expected — Waiting for status to be reported".
+# Instead, jobs always run (and report their status), but skip the heavy Rust
+# steps when no Rust/manifest files changed (see the `changes` job). Job names are
+# unchanged so the existing required contexts keep reporting.
 on:
   pull_request:
     branches: [main, develop]
-    paths:
-      - "**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - "**/*.rs"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".github/workflows/ci.yml"
+
   fmt:
     name: Format
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: Format check
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo fmt --all -- --check
+      - name: No Rust changes — skipping
+        if: needs.changes.outputs.rust != 'true'
+        run: echo "No Rust/manifest changes; format check skipped."
 
   build:
     name: Clippy, Build & Test
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
+        if: needs.changes.outputs.rust == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev
 
       - name: Clippy
         id: clippy
+        if: needs.changes.outputs.rust == 'true'
         continue-on-error: true
         env:
           CARGO_TERM_COLOR: never
@@ -54,7 +85,7 @@ jobs:
           echo "$OUTPUT"
 
       - name: Comment clippy results on PR
-        if: github.event_name == 'pull_request' && steps.clippy.outputs.exit_code != '0'
+        if: needs.changes.outputs.rust == 'true' && github.event_name == 'pull_request' && steps.clippy.outputs.exit_code != '0'
         uses: actions/github-script@v7
         with:
           script: |
@@ -100,11 +131,17 @@ jobs:
             }
 
       - name: Build
+        if: needs.changes.outputs.rust == 'true'
         run: cargo build --all-features
 
       - name: Test
+        if: needs.changes.outputs.rust == 'true'
         run: cargo test --all-features --lib
 
       - name: Fail if clippy warnings
-        if: steps.clippy.outputs.exit_code != '0'
+        if: needs.changes.outputs.rust == 'true' && steps.clippy.outputs.exit_code != '0'
         run: exit 1
+
+      - name: No Rust changes — skipping
+        if: needs.changes.outputs.rust != 'true'
+        run: echo "No Rust/manifest changes; clippy/build/test skipped."
