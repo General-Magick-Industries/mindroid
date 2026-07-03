@@ -16,7 +16,8 @@
 # AI tooling
 .claude/
 .omc/
-AGENTS.md
+# AGENTS.md is intentionally committed — it is the shared, cross-tool source of
+# truth for agent + contributor guidance (see docs/adr/). CLAUDE.md imports it.
 
 # OS
 .DS_Store
