@@ -165,23 +165,24 @@ async fn main() -> anyhow::Result<()> {
     let gate_enabled = std::env::var("MINDROID_DISABLE_GATE").is_err();
 
     // Build the persona stage once. Two modes are supported via [persona] config:
-    //   type = "magickmind" → PersonaContextBuilder formats the prompt in-process
-    //   type = "bifrost"    → BifrostPersonaStage delegates formatting to Bifrost's
-    //                         /v1/persona/{id}/prepare endpoint (trait banding, etc.)
+    //   type = "magickmind"          → PersonaContextBuilder formats the prompt in-process
+    //   type = "magickmind-prepared" → MagickmindPersonaStage delegates formatting to the
+    //                                  MagickMind server's /v1/persona/{id}/prepare endpoint (trait banding, etc.)
     // Both implement PipelineStage, so we hold whichever is configured as a
     // trait object. The respond pipeline is built per-request so per-request
     // history can be injected via the PersonaWithHistory wrapper.
-    let persona_stage: Arc<dyn PipelineStage> =
-        if let Some(bifrost) = builder.build_bifrost_persona_stage() {
-            tracing::info!("Using Bifrost-backed persona stage (type = \"bifrost\")");
-            Arc::new(bifrost)
-        } else {
-            let persona_client = builder.build_persona_stage().await?.expect(
-                "persona_agent requires [persona] config with type = \"magickmind\" or \"bifrost\"",
+    let persona_stage: Arc<dyn PipelineStage> = if let Some(prepared) =
+        builder.build_magickmind_persona_stage()
+    {
+        tracing::info!("Using MagickMind-prepared persona stage (type = \"magickmind-prepared\")");
+        Arc::new(prepared)
+    } else {
+        let persona_client = builder.build_persona_stage().await?.expect(
+                "persona_agent requires [persona] config with type = \"magickmind\" or \"magickmind-prepared\"",
             );
-            tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
-            Arc::new(persona_client)
-        };
+        tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
+        Arc::new(persona_client)
+    };
     let respond_llm = Arc::new(respond_llm);
 
     // Wire up the runtime
@@ -305,7 +306,7 @@ impl PipelineStage for PersonaWithHistory {
     }
 
     async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        // The wrapped persona stage (magickmind or bifrost) was built with an
+        // The wrapped persona stage (magickmind or magickmind-prepared) was built with an
         // empty history Arc. Run it to populate the system prompt + user message,
         // then splice this request's history in between.
         self.persona.process(ctx).await?;

@@ -212,12 +212,12 @@ Communication tones: empathetic, calm, encouraging
 
 ---
 
-## Bifrost-backed Prompt (delegated formatting)
+## MagickMind-prepared Prompt (delegated formatting)
 
 `PersonaContextBuilder` (above) fetches structured trait data and formats the
-system prompt **in-process** in Rust. An alternative is to let **Bifrost** own
-prompt construction: `BifrostPersonaStage` calls Bifrost's prepare endpoint and
-uses the returned string verbatim.
+system prompt **in-process** in Rust. An alternative is to let the **MagickMind
+server** own prompt construction: `MagickmindPersonaStage` calls the server's
+prepare endpoint and uses the returned string verbatim.
 
 ```
 POST {base_url}/v1/persona/{persona_id}/prepare
@@ -225,32 +225,32 @@ body:   { "user_id": "<optional>" }
 returns: { "system_prompt": "..." }
 ```
 
-Bifrost fans out to the persona and runtime services over gRPC, runs its own
+The server fans out to the persona and runtime services over gRPC, runs its own
 `buildSystemPrompt` / `formatEffectiveTrait` (numeric trait *banding* —
 e.g. "very high", "moderate" — and structured trait-ref parsing), then returns
-a finished prompt. Use this when Bifrost is the single source of truth for
-prompt rendering and you do not want to duplicate formatting logic in Rust.
+a finished prompt. Use this when the MagickMind server is the single source of
+truth for prompt rendering and you do not want to duplicate formatting logic in Rust.
 
-| | `magickmind` (SDK formats) | `bifrost` (Bifrost formats) |
+| | `magickmind` (SDK formats) | `magickmind-prepared` (server formats) |
 |---|---|---|
-| Trait banding / custom phrasing | no — raw `- warmth: 0.8` | yes — Bifrost's `formatEffectiveTrait` |
-| Network hops per request | 2 (persona + runtime) | 1 (Bifrost fans out via gRPC) |
-| Formatting location | Rust (`format_trait`) | Go (single source of truth) |
+| Trait banding / custom phrasing | no — raw `- warmth: 0.8` | yes — server's `formatEffectiveTrait` |
+| Network hops per request | 2 (persona + runtime) | 1 (server fans out via gRPC) |
+| Formatting location | Rust (`format_trait`) | Server (single source of truth) |
 
 ### Configuration
 
 ```toml
 [persona]
-type = "bifrost"
-persona_id = "your-persona-id"                  # default persona (see below)
-base_url = "https://dev-bifrost.magickmind.ai"  # falls back to memory/auth base_url
-cache_ttl_secs = 600                            # optional; prepared-prompt cache TTL (default 600 = 10 min, 0 disables)
+type = "magickmind-prepared"
+persona_id = "your-persona-id"                     # default persona (see below)
+base_url = "https://dev-magickmind.magickmind.ai"  # falls back to memory/auth base_url
+cache_ttl_secs = 600                               # optional; prepared-prompt cache TTL (default 600 = 10 min, 0 disables)
 ```
 
-`RuntimeBuilder::build_bifrost_persona_stage()` returns the configured stage
-(no startup network call — Bifrost computes everything per-request). The
-`persona_agent` example auto-selects it when `type = "bifrost"`; see
-`examples/persona_agent/bifrost.toml`.
+`RuntimeBuilder::build_magickmind_persona_stage()` returns the configured stage
+(no startup network call — the server computes everything per-request). The
+`persona_agent` example auto-selects it when `type = "magickmind-prepared"`; see
+`examples/persona_agent/magickmind-prepared.toml`.
 
 ### Per-message persona selection (`PersonaId`)
 
@@ -273,8 +273,8 @@ the resolve-and-cache mechanism is the SDK's.
 
 ### Prepared-prompt caching
 
-`BifrostPersonaStage` caches each prepared `system_prompt` keyed by
-`(persona_id, user_id)` so voice/chat turns don't call Bifrost on every message
+`MagickmindPersonaStage` caches each prepared `system_prompt` keyed by
+`(persona_id, user_id)` so voice/chat turns don't call the server on every message
 (the `prepare` response carries no TTL, so the cache lifetime is the SDK's
 choice). The default is 10 minutes; override per stage with
 `.with_ttl(Duration)` or via `cache_ttl_secs` in config. A TTL of `0` disables
