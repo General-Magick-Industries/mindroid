@@ -17,7 +17,7 @@ use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
 use crate::persona::{
-    BifrostPersonaStage, LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder,
+    LocalPersonaProvider, MagickmindPersonaClient, MagickmindPersonaStage, PersonaContextBuilder,
     PersonaProvider,
 };
 
@@ -71,10 +71,10 @@ pub struct RuntimeBuilder {
     pub(crate) strategy: RunStrategy,
     #[cfg(feature = "persona")]
     pub(crate) persona_provider: Option<Arc<dyn PersonaProvider>>,
-    /// Bifrost-backed persona: `(base_url, persona_id, cache_ttl_secs)`. Set when
-    /// `persona.type = "bifrost"`. Built into a `BifrostPersonaStage` on demand.
+    /// MagickMind-prepared persona: `(base_url, persona_id, cache_ttl_secs)`. Set when
+    /// `persona.type = "magickmind-prepared"`. Built into a `MagickmindPersonaStage` on demand.
     #[cfg(feature = "persona")]
-    pub(crate) bifrost_persona: Option<(String, String, Option<u64>)>,
+    pub(crate) magickmind_persona: Option<(String, String, Option<u64>)>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -96,7 +96,7 @@ impl RuntimeBuilder {
             #[cfg(feature = "persona")]
             persona_provider: None,
             #[cfg(feature = "persona")]
-            bifrost_persona: None,
+            magickmind_persona: None,
             #[cfg(feature = "identity")]
             identity_resolver: None,
         }
@@ -203,16 +203,16 @@ impl RuntimeBuilder {
         }
     }
 
-    /// Build a `BifrostPersonaStage` from the configured Bifrost persona.
+    /// Build a `MagickmindPersonaStage` from the configured MagickMind-prepared persona.
     ///
-    /// Returns `None` unless `persona.type = "bifrost"` was configured (and
+    /// Returns `None` unless `persona.type = "magickmind-prepared"` was configured (and
     /// auth has been resolved). Unlike [`build_persona_stage`](Self::build_persona_stage),
-    /// this performs no network call — Bifrost computes the prompt per-request.
+    /// this performs no network call — the server computes the prompt per-request.
     #[cfg(feature = "persona")]
-    pub fn build_bifrost_persona_stage(&self) -> Option<BifrostPersonaStage> {
-        let (base_url, persona_id, ttl_secs) = self.bifrost_persona.as_ref()?;
+    pub fn build_magickmind_persona_stage(&self) -> Option<MagickmindPersonaStage> {
+        let (base_url, persona_id, ttl_secs) = self.magickmind_persona.as_ref()?;
         let auth = self.auth.clone()?;
-        let mut stage = BifrostPersonaStage::new(base_url, persona_id, auth);
+        let mut stage = MagickmindPersonaStage::new(base_url, persona_id, auth);
         if let Some(secs) = ttl_secs {
             stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
         }
@@ -396,10 +396,10 @@ impl Runtime {
                         ));
                     }
                 }
-                Some("bifrost") => {
+                Some("magickmind-prepared") => {
                     let persona_id = config.persona.persona_id.clone().ok_or_else(|| {
                         MindroidError::config(
-                            "persona.persona_id is required when persona.type = \"bifrost\"",
+                            "persona.persona_id is required when persona.type = \"magickmind-prepared\"",
                         )
                     })?;
                     let base_url = config
@@ -410,11 +410,11 @@ impl Runtime {
                         .or(config.auth.base_url.as_deref())
                         .ok_or_else(|| {
                             MindroidError::config(
-                                "persona.base_url, memory.base_url, or auth.base_url is required for bifrost persona",
+                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind-prepared persona",
                             )
                         })?
                         .to_string();
-                    builder.bifrost_persona =
+                    builder.magickmind_persona =
                         Some((base_url, persona_id, config.persona.cache_ttl_secs));
                 }
                 Some("local") => {

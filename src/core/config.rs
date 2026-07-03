@@ -199,15 +199,15 @@ pub struct ObserverConfig {
 ///
 /// When `type = "magickmind"`, the runtime will fetch the effective personality
 /// from the magickmind runtime service per-request and format the prompt in-process.
-/// When `type = "bifrost"`, the runtime delegates prompt construction to Bifrost's
-/// `POST /v1/persona/{id}/prepare` endpoint and uses the returned `system_prompt`
-/// verbatim (Bifrost owns trait banding / formatting).
+/// When `type = "magickmind-prepared"`, the runtime delegates prompt construction to the
+/// MagickMind server's `POST /v1/persona/{id}/prepare` endpoint and uses the returned
+/// `system_prompt` verbatim (the server owns trait banding / formatting).
 /// When `type = "local"`, the persona is loaded from a local `persona.md` file.
 /// When `type = "markdown"`, the system prompt is loaded from a local file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersonaConfig {
-    /// Persona provider type. Supported: `"magickmind"`, `"bifrost"`, `"local"`.
+    /// Persona provider type. Supported: `"magickmind"`, `"magickmind-prepared"`, `"local"`.
     #[serde(rename = "type")]
     pub persona_type: Option<String>,
     /// The persona ID to fetch.
@@ -217,7 +217,7 @@ pub struct PersonaConfig {
     /// Directory containing local persona files (for `type = "local"`).
     /// Defaults to `~/.mindroid/personas`.
     pub data_dir: Option<String>,
-    /// Cache TTL (seconds) for Bifrost-prepared system prompts (`type = "bifrost"`).
+    /// Cache TTL (seconds) for server-prepared system prompts (`type = "magickmind-prepared"`).
     /// Defaults to 600 (10 minutes). `0` disables caching.
     pub cache_ttl_secs: Option<u64>,
 }

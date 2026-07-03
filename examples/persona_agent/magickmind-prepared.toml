@@ -1,12 +1,12 @@
-# Persona-driven agent — Bifrost-backed persona prompt.
+# Persona-driven agent — MagickMind-prepared persona prompt.
 #
 # Identical to dazael.toml except [persona] delegates prompt construction to
-# Bifrost's POST /v1/persona/{id}/prepare endpoint, which runs its own
+# the MagickMind server's POST /v1/persona/{id}/prepare endpoint, which runs its own
 # buildSystemPrompt / formatEffectiveTrait (trait banding) and returns a
 # finished system_prompt string. mindroid uses that string verbatim.
 #
 # Run with:
-#   cargo run --example persona_agent --features full -- --config examples/persona_agent/bifrost.toml
+#   cargo run --example persona_agent --features full -- --config examples/persona_agent/magickmind-prepared.toml
 
 [agent]
 agent_id = "example-agent-id"
@@ -32,14 +32,14 @@ base_url = "https://dev-magickmind.magickmind.ai"
 type = "magickmind"
 base_url = "https://dev-magickmind.magickmind.ai"
 
-# -- Persona (Bifrost prepare endpoint) ---------------------------------------
-# Bifrost owns prompt formatting. Point base_url at your Bifrost deployment.
+# -- Persona (MagickMind prepare endpoint) ------------------------------------
+# The MagickMind server owns prompt formatting. Point base_url at your MagickMind deployment.
 # If omitted, base_url falls back to memory.base_url, then auth.base_url.
 
 [persona]
-type = "bifrost"
+type = "magickmind-prepared"
 persona_id = "example-persona-id"
-base_url = "https://dev-bifrost.magickmind.ai"
+base_url = "https://dev-magickmind.magickmind.ai"
 
 [observer]
 type = "log"

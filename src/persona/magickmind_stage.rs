@@ -14,17 +14,17 @@ use crate::pipeline::PipelineStage;
 #[cfg(feature = "transport-audio")]
 use crate::pipeline::extensions::TextInput;
 
-/// A pipeline stage that delegates persona prompt construction to Bifrost's
+/// A pipeline stage that delegates persona prompt construction to MagickMind's
 /// `PreparePersona` endpoint and uses the returned system prompt verbatim.
 ///
 /// Unlike [`PersonaContextBuilder`](super::PersonaContextBuilder), which fetches
 /// structured persona + effective-personality data and formats the prompt
-/// in-process, this stage offloads *all* formatting to Bifrost. Bifrost fans out
+/// in-process, this stage offloads *all* formatting to MagickMind. MagickMind fans out
 /// to the persona and runtime services over gRPC, runs its own
 /// `buildSystemPrompt` / `formatEffectiveTrait` (trait banding, structured
 /// trait-ref parsing), and returns a finished `system_prompt` string.
 ///
-/// Use this when Bifrost is the single source of truth for prompt rendering.
+/// Use this when MagickMind is the single source of truth for prompt rendering.
 ///
 /// `POST {base_url}/v1/persona/{persona_id}/prepare`
 ///
@@ -39,10 +39,10 @@ use crate::pipeline::extensions::TextInput;
 /// ## Caching
 ///
 /// Prepared prompts are cached per `(persona_id, user_id)` for [`with_ttl`] (default
-/// 10 minutes) so voice/chat turns don't hit Bifrost on every message.
+/// 10 minutes) so voice/chat turns don't hit MagickMind on every message.
 ///
-/// [`with_ttl`]: BifrostPersonaStage::with_ttl
-pub struct BifrostPersonaStage {
+/// [`with_ttl`]: MagickmindPersonaStage::with_ttl
+pub struct MagickmindPersonaStage {
     http: reqwest::Client,
     base_url: String,
     /// Default persona id, used when no [`PersonaId`] extension is in context.
@@ -64,7 +64,7 @@ struct CacheEntry {
 
 /// Per-message persona selector stored in the pipeline [`Context`].
 ///
-/// When present, [`BifrostPersonaStage`] uses this persona id instead of its
+/// When present, [`MagickmindPersonaStage`] uses this persona id instead of its
 /// configured default — enabling one stage to serve many personas. The
 /// application is responsible for setting it (e.g. extracting it from inbound
 /// message metadata); the SDK only reads it. Mirrors `CanonicalUserId` from the
@@ -72,10 +72,10 @@ struct CacheEntry {
 #[derive(Debug, Clone)]
 pub struct PersonaId(pub String);
 
-impl BifrostPersonaStage {
-    /// Create a new `BifrostPersonaStage`.
+impl MagickmindPersonaStage {
+    /// Create a new `MagickmindPersonaStage`.
     ///
-    /// No network call is made at construction time — Bifrost computes the
+    /// No network call is made at construction time — MagickMind computes the
     /// entire prompt per-request in `process()`.
     pub fn new(base_url: &str, persona_id: &str, identity: Arc<dyn Auth>) -> Self {
         Self {
@@ -100,14 +100,14 @@ impl BifrostPersonaStage {
 
     /// Override the prepared-prompt cache TTL (default 10 minutes).
     ///
-    /// A TTL of zero disables caching (every message re-fetches from Bifrost).
+    /// A TTL of zero disables caching (every message re-fetches from MagickMind).
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
         self
     }
 
     /// Resolve the system prompt for `persona_id`/`user_id`, serving a fresh
-    /// cache entry when available and otherwise fetching from Bifrost.
+    /// cache entry when available and otherwise fetching from MagickMind.
     async fn resolve_prompt(&self, persona_id: &str, user_id: Option<&str>) -> Result<String> {
         let key = (persona_id.to_string(), user_id.map(str::to_string));
 
@@ -117,12 +117,12 @@ impl BifrostPersonaStage {
             if let Some(entry) = cache.get(&key)
                 && entry.fetched_at.elapsed() < self.ttl
             {
-                debug!("BifrostPersonaStage: cache hit for {key:?}");
+                debug!("MagickmindPersonaStage: cache hit for {key:?}");
                 return Ok(entry.prompt.clone());
             }
         }
 
-        // Miss or stale: fetch from Bifrost, then populate the cache.
+        // Miss or stale: fetch from MagickMind, then populate the cache.
         let prompt = self.prepare(persona_id, user_id).await?;
         {
             let mut cache = self.cache.lock().expect("persona cache mutex poisoned");
@@ -137,7 +137,7 @@ impl BifrostPersonaStage {
         Ok(prompt)
     }
 
-    /// Call Bifrost's prepare endpoint and return the finished system prompt.
+    /// Call MagickMind's prepare endpoint and return the finished system prompt.
     async fn prepare(&self, persona_id: &str, user_id: Option<&str>) -> Result<String> {
         let url = {
             let mut u = reqwest::Url::parse(&self.base_url).map_err(|e| MindroidError::Api {
@@ -186,9 +186,9 @@ impl BifrostPersonaStage {
 }
 
 #[async_trait]
-impl PipelineStage for BifrostPersonaStage {
+impl PipelineStage for MagickmindPersonaStage {
     fn name(&self) -> &str {
-        "BifrostPersonaStage"
+        "MagickmindPersonaStage"
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
@@ -221,7 +221,7 @@ impl PipelineStage for BifrostPersonaStage {
             .map(|p| p.0.clone())
             .unwrap_or_else(|| self.persona_id.clone());
 
-        debug!("BifrostPersonaStage: preparing persona={persona_id} user={user_id:?}");
+        debug!("MagickmindPersonaStage: preparing persona={persona_id} user={user_id:?}");
         let system_prompt = self.resolve_prompt(&persona_id, user_id).await?;
 
         // Assemble LLM messages: system prompt first, then history, then user message.
@@ -239,7 +239,7 @@ impl PipelineStage for BifrostPersonaStage {
         messages.push(LlmMessage::user(user_text));
 
         debug!(
-            "BifrostPersonaStage: {} history messages, {} total llm_messages",
+            "MagickmindPersonaStage: {} history messages, {} total llm_messages",
             self.history.len(),
             messages.len(),
         );
@@ -252,7 +252,7 @@ impl PipelineStage for BifrostPersonaStage {
 
 /// Request body for `POST /v1/persona/{id}/prepare`.
 ///
-/// Mirrors Bifrost's `PreparePersonaRequest` (the `id` is a path segment).
+/// Mirrors MagickMind's `PreparePersonaRequest` (the `id` is a path segment).
 #[derive(Serialize)]
 struct PreparePersonaRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,7 +261,7 @@ struct PreparePersonaRequest<'a> {
 
 /// Response body for `POST /v1/persona/{id}/prepare`.
 ///
-/// Mirrors Bifrost's `PreparePersonaResponse`.
+/// Mirrors MagickMind's `PreparePersonaResponse`.
 #[derive(Deserialize)]
 struct PreparePersonaResponse {
     system_prompt: String,
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn default_ttl_is_ten_minutes() {
-        let stage = BifrostPersonaStage::new(
+        let stage = MagickmindPersonaStage::new(
             "https://x",
             "p1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn with_ttl_overrides_default() {
-        let stage = BifrostPersonaStage::new(
+        let stage = MagickmindPersonaStage::new(
             "https://x",
             "p1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
