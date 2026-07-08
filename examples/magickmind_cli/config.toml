@@ -2,12 +2,12 @@
 # Run with: cargo run --example magickmind_cli --features full -- --config examples/magickmind_cli/config.toml
 
 [agent]
-agent_id = "example-agent-id"      # MagickMind mindspace ID for this agent
+agent_id = "example-agent-id"      # MagickMind magickspace ID for this agent
 name = "MagickMind Assistance CLI"
 
 [transport]
 type = "centrifugo"
-url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+url = "wss://dev-centrifugo.magickmind.ai/connection/websocket"
 
 [auth]
 type = "apikey"

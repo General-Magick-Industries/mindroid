@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         .transport
         .url
         .as_deref()
-        .unwrap_or("ws://dev-centrifugo.magickmind.ai/connection/websocket");
+        .unwrap_or("wss://dev-centrifugo.magickmind.ai/connection/websocket");
 
     let agent_id = &config.agent.agent_id;
 

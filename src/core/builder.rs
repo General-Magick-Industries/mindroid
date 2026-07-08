@@ -17,7 +17,8 @@ use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
 use crate::persona::{
-    LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider,
+    LocalPersonaProvider, MagickmindPersonaClient, MagickmindPersonaStage, PersonaContextBuilder,
+    PersonaProvider,
 };
 
 #[cfg(feature = "identity")]
@@ -70,6 +71,11 @@ pub struct RuntimeBuilder {
     pub(crate) strategy: RunStrategy,
     #[cfg(feature = "persona")]
     pub(crate) persona_provider: Option<Arc<dyn PersonaProvider>>,
+    /// MagickMind-prepared persona: `(base_url, persona_id, cache_ttl_secs, allow_insecure)`.
+    /// Set when `persona.type = "magickmind-prepared"`. Built into a
+    /// `MagickmindPersonaStage` on demand.
+    #[cfg(feature = "persona")]
+    pub(crate) magickmind_persona: Option<(String, String, Option<u64>, bool)>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -90,6 +96,8 @@ impl RuntimeBuilder {
             strategy: RunStrategy::default(),
             #[cfg(feature = "persona")]
             persona_provider: None,
+            #[cfg(feature = "persona")]
+            magickmind_persona: None,
             #[cfg(feature = "identity")]
             identity_resolver: None,
         }
@@ -194,6 +202,23 @@ impl RuntimeBuilder {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Build a `MagickmindPersonaStage` from the configured MagickMind-prepared persona.
+    ///
+    /// Returns `None` unless `persona.type = "magickmind-prepared"` was configured (and
+    /// auth has been resolved). Unlike [`build_persona_stage`](Self::build_persona_stage),
+    /// this performs no network call — the server computes the prompt per-request.
+    #[cfg(feature = "persona")]
+    pub fn build_magickmind_persona_stage(&self) -> Option<MagickmindPersonaStage> {
+        let (base_url, persona_id, ttl_secs, allow_insecure) = self.magickmind_persona.as_ref()?;
+        let auth = self.auth.clone()?;
+        let mut stage = MagickmindPersonaStage::new(base_url, persona_id, auth)
+            .with_allow_insecure(*allow_insecure);
+        if let Some(secs) = ttl_secs {
+            stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
+        }
+        Some(stage)
     }
 
     /// Build an `IdentityResolutionStage` from the configured resolver.
@@ -372,6 +397,39 @@ impl Runtime {
                             "persona.persona_id is required when persona.type = \"magickmind\"",
                         ));
                     }
+                }
+                Some("magickmind-prepared") => {
+                    let persona_id = config.persona.persona_id.clone().ok_or_else(|| {
+                        MindroidError::config(
+                            "persona.persona_id is required when persona.type = \"magickmind-prepared\"",
+                        )
+                    })?;
+                    let base_url = config
+                        .persona
+                        .base_url
+                        .as_deref()
+                        .or(config.memory.base_url.as_deref())
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind-prepared persona",
+                            )
+                        })?
+                        .to_string();
+                    // Auth headers ride on every prepare request — fail fast on
+                    // a plaintext base_url unless explicitly opted in.
+                    if base_url.starts_with("http://") && !config.persona.allow_insecure {
+                        return Err(MindroidError::config(format!(
+                            "persona.base_url {base_url} is plaintext http:// — use https://, \
+                             or set persona.allow_insecure = true for local development"
+                        )));
+                    }
+                    builder.magickmind_persona = Some((
+                        base_url,
+                        persona_id,
+                        config.persona.cache_ttl_secs,
+                        config.persona.allow_insecure,
+                    ));
                 }
                 Some("local") => {
                     if let Some(persona_id) = config.persona.persona_id.as_deref() {

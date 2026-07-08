@@ -47,7 +47,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `speech` | `reqwest` | `OpenAiStt`, `DeepgramTts`, etc. |
 | `apikey` | `reqwest` | `ApiKeyAuth` |
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |
-| `persona` | `reqwest` | `PersonaContextBuilder`, `LocalPersonaProvider` |
+| `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
 | `full` | everything above | All types |
 

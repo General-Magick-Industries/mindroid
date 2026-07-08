@@ -795,12 +795,14 @@ Agent identity and model settings.
 |-------|------|---------|---------|
 | `agent_id` | String | `""` | Unique agent identifier |
 | `name` | String | `"Mindroid Agent"` | Human-readable name |
-| `persona` | String | `""` | Personality/role description |
-| `mindspace_id` | Option<String> | None | Optional workspace/organization ID |
 | `model_type` | String | `"chat"` | LLM type (chat, completion, etc.) |
 | `model_ids` | Vec<String> | `[]` | Ordered list of model IDs to try |
 | `compute_power` | u8 | 50 | Resource level 0–100 |
 | `metadata` | HashMap<String, Value> | `{}` | Custom data |
+
+Note: there is no `agent.magickspace_id` field — the magickspace ID for
+context retrieval and persistence comes from each message's `channel_id`
+(populated by the transport, e.g. from the Centrifugo push payload).
 
 Example TOML:
 
@@ -808,7 +810,6 @@ Example TOML:
 [agent]
 agent_id = "my-agent"
 name = "Assistant"
-persona = "You are helpful"
 model_type = "chat"
 model_ids = ["gpt-4", "gpt-3.5-turbo"]
 compute_power = 80
@@ -822,6 +823,7 @@ pub struct TransportConfig {
     pub transport_type: Option<String>,  // "stdio", "centrifugo", etc.
     pub url: Option<String>,
     pub channels: Vec<String>,
+    pub allow_insecure: bool,            // permit auth token over plaintext ws:// (local dev only)
     pub options: HashMap<String, Value>,
 }
 ```
@@ -865,6 +867,18 @@ pub struct ObserverConfig {
     pub observer_type: Option<String>,  // "log", custom, etc.
     pub level: Option<String>,          // "debug", "info", "error"
     pub options: HashMap<String, Value>,
+}
+```
+
+**PersonaConfig** — Persona subsystem settings:
+```rust
+pub struct PersonaConfig {
+    pub persona_type: Option<String>,   // "magickmind", "magickmind-prepared", "local"
+    pub persona_id: Option<String>,
+    pub base_url: Option<String>,       // falls back to memory.base_url, then auth.base_url
+    pub data_dir: Option<String>,       // for "local" personas
+    pub cache_ttl_secs: Option<u64>,    // prepared-prompt cache TTL (default 600; 0 disables)
+    pub allow_insecure: bool,           // permit auth headers over plaintext http:// (local dev only)
 }
 ```
 

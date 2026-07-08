@@ -4,7 +4,6 @@
 [agent]
 agent_id = "your-agent-id-here"
 name = "My Mindroid Agent"
-# mindspace_id = "ms-abc123"       # Required for Magick Mind pipeline
 model_type = "fast"
 model_ids = ["openrouter/google/gemini-3.1-pro-preview"]
 compute_power = 1                  # 0-100
@@ -13,6 +12,7 @@ compute_power = 1                  # 0-100
 type = "stdio"                      # Options: "stdio", "centrifugo"
 # url = "wss://centrifugo.example.com/connection/websocket"
 # channels = ["personal:agent-001#user-001"]
+# allow_insecure = true             # Permit auth token over plaintext ws:// (local dev only)
 
 [pipeline]
 type = "ollama"                     # Options: "ollama", "magickmind"

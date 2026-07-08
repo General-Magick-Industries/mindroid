@@ -1,9 +1,9 @@
 # Persona-driven agent configuration
-# Run with: cargo run --example persona_agent --features full -- --config examples/persona_agent/raddleweed.toml
+# Run with: cargo run --example persona_agent --features full -- --config examples/persona_agent/neidulus.toml
 
 [agent]
 agent_id = "example-agent-id"
-name = "Raddleweed"
+name = "Neidulus"
 
 [transport]
 type = "centrifugo"

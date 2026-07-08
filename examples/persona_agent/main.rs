@@ -26,8 +26,8 @@ use mindroid::pipeline::presets::magickmind::{
     MagickmindClient, MagickmindContext, MagickmindPersistence,
 };
 use mindroid::{
-    ContextPreparer, GenericLlmProcessor, LlmMessage, MindroidConfig, Pipeline, PipelineContext,
-    PipelineStage, PostProcessor, PrepareOutcome, Result, Runtime,
+    ContextPreparer, ConversationHistory, GenericLlmProcessor, MindroidConfig, Pipeline,
+    PipelineContext, PipelineStage, PostProcessor, PrepareOutcome, Result, Runtime,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,22 +97,24 @@ impl PipelineStage for MentionGate {
 }
 
 // ---------------------------------------------------------------------------
-// SharedPersonaStage — delegates to Arc<PersonaContextBuilder>
+// SharedStage — lets an Arc<dyn PipelineStage> be added to a Pipeline
 // ---------------------------------------------------------------------------
 
-/// Wraps `Arc<PersonaContextBuilder>` so it can be used as a `PipelineStage`
-/// inside a `Pipeline`. This lets us share a single, pre-initialised persona
-/// stage across requests without re-fetching the persona schema each time.
-///
-/// Per-request conversation history is injected by setting `self.history` in
-/// a new `PersonaContextBuilder` built from the shared Arc — but since
-/// `PersonaContextBuilder` doesn't implement `Clone`, we instead build the
-/// respond pipeline per-request with history passed via `with_history()`.
-///
-/// Note: this struct is NOT used in the current example because the respond
-/// pipeline is built per-request (see `main()`). It is kept here for reference.
-#[cfg(any())]
-struct SharedPersonaStage(Arc<mindroid::PersonaContextBuilder>);
+/// Wraps `Arc<dyn PipelineStage>` so a single shared stage instance (here the
+/// persona stage, which owns a prompt cache worth preserving across requests)
+/// can be added to a `Pipeline` built once at startup.
+struct SharedStage(Arc<dyn PipelineStage>);
+
+#[async_trait]
+impl PipelineStage for SharedStage {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
+        self.0.process(ctx).await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -139,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .auth
         .base_url
         .as_deref()
-        .unwrap_or("https://dev-magickmind.magickmind.ai");
+        .unwrap_or("https://magickmind.example.com");
     let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
     if let Some(api_key) = &config.auth.api_key {
         magickmind_client = magickmind_client.with_api_key(api_key);
@@ -159,30 +161,49 @@ async fn main() -> anyhow::Result<()> {
     // Gate pipeline: cheap @mention check (no API calls)
     let gate_pipeline = Arc::new(Pipeline::new().add_stage(mention_gate));
 
-    // Build the persona stage once (fetches persona schema from magickmind at init).
-    // The respond pipeline is built per-request so per-request history can be
-    // injected into PersonaContextBuilder via with_history().
-    let persona_client = builder
-        .build_persona_stage()
-        .await?
-        .expect("persona_agent requires [persona] config section with type = \"magickmind\"");
+    // Local test toggle: set MINDROID_DISABLE_GATE=1 (or =true) to answer every
+    // message on the channel (no @mention required) — e.g. plain messages from a
+    // website magickspace. Any other value (or unset) keeps the @mention gate.
+    let gate_enabled =
+        !std::env::var("MINDROID_DISABLE_GATE").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
 
-    // We need the underlying client/cache/persona_id to rebuild per-request.
-    // For simplicity, wrap the built PersonaContextBuilder in Arc and use it
-    // directly as a stage (without per-request history injection). The persona
-    // stage will use an empty history Arc — chat history is persisted via
-    // MagickmindPersistence and the LLM's context window.
-    let persona_stage = Arc::new(persona_client);
-    let respond_llm = Arc::new(respond_llm);
+    // Build the persona stage once. Two modes are supported via [persona] config:
+    //   type = "magickmind"          → PersonaContextBuilder formats the prompt in-process
+    //   type = "magickmind-prepared" → MagickmindPersonaStage delegates prompt construction
+    //                                  to the MagickMind server and uses the returned
+    //                                  system_prompt verbatim
+    // Both implement PipelineStage, so we hold whichever is configured as a
+    // trait object. Per-request conversation history is injected via the
+    // ConversationHistory context extension, so the respond pipeline is built
+    // once and shared across requests.
+    let persona_stage: Arc<dyn PipelineStage> = if let Some(prepared) =
+        builder.build_magickmind_persona_stage()
+    {
+        tracing::info!("Using MagickMind-prepared persona stage (type = \"magickmind-prepared\")");
+        Arc::new(prepared)
+    } else {
+        let persona_client = builder.build_persona_stage().await?.expect(
+                "persona_agent requires [persona] config with type = \"magickmind\" or \"magickmind-prepared\"",
+            );
+        tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
+        Arc::new(persona_client)
+    };
+
+    // Respond pipeline, built once: persona → LLM → post-process → persist.
+    let respond_pipeline = Arc::new(
+        Pipeline::new()
+            .add_stage(SharedStage(Arc::clone(&persona_stage)))
+            .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
+            .add_stage(PostProcessor)
+            .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind))),
+    );
 
     // Wire up the runtime
     let mut runtime = builder
         .on_message(move |ctx| {
             let preparer = Arc::clone(&context_preparer);
             let gate = Arc::clone(&gate_pipeline);
-            let magickmind = Arc::clone(&magickmind);
-            let respond_llm = Arc::clone(&respond_llm);
-            let persona = Arc::clone(&persona_stage);
+            let respond = Arc::clone(&respond_pipeline);
 
             async move {
                 tracing::info!(
@@ -191,27 +212,32 @@ async fn main() -> anyhow::Result<()> {
                     ctx.message.content
                 );
 
-                // Step 1: Check @mention first (cheap, no API calls)
+                // Step 1: Check @mention first (cheap, no API calls).
+                // Skipped when MINDROID_DISABLE_GATE is set (local mindroid test).
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-                if let Err(e) = ctx.run_with_context(&gate, &mut pctx).await {
-                    tracing::error!("Mention gate failed: {e}");
-                    return;
+                if gate_enabled {
+                    if let Err(e) = ctx.run_with_context(&gate, &mut pctx).await {
+                        tracing::error!("Mention gate failed: {e}");
+                        return;
+                    }
+                    if pctx.halted {
+                        tracing::info!("Not @mentioned — staying silent");
+                        return;
+                    }
+                    tracing::info!("@mentioned — proceeding");
+                } else {
+                    tracing::info!("Mention gate disabled — responding to all messages");
                 }
-                if pctx.halted {
-                    tracing::info!("Not @mentioned — staying silent");
-                    return;
-                }
-                tracing::info!("@mentioned — proceeding");
 
                 // Step 2: Fetch context from MagickMind (only after mention check passes)
                 let history = match preparer.prepare(&ctx.message).await {
-                    PrepareOutcome::Complete(msgs) => Arc::new(msgs),
+                    PrepareOutcome::Complete(msgs) => msgs,
                     PrepareOutcome::Degraded { messages, warnings } => {
                         for w in &warnings {
                             tracing::warn!("Context provider '{}' failed: {}", w.provider, w.error);
                         }
-                        Arc::new(messages)
+                        messages
                     }
                     PrepareOutcome::Failed(warnings) => {
                         for w in &warnings {
@@ -226,27 +252,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Step 3: Build the respond pipeline per-request with history injected.
-                // PersonaContextBuilder is wrapped in Arc — Pipeline::add_stage accepts
-                // Arc<T> when T: PipelineStage.
-                let respond_pipeline = Pipeline::new()
-                    .add_stage(PersonaWithHistory {
-                        persona: Arc::clone(&persona),
-                        history,
-                    })
-                    .add_streaming_stage(match LlmClient::new((*respond_llm).clone()) {
-                        Ok(c) => GenericLlmProcessor::new(c),
-                        Err(e) => {
-                            tracing::error!("LlmClient init failed: {e}");
-                            return;
-                        }
-                    })
-                    .add_stage(PostProcessor)
-                    .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
-
+                // Step 3: Run the shared respond pipeline. This request's history
+                // rides in the ConversationHistory extension, which the persona
+                // stage splices between the system prompt and the user message.
                 pctx.reset_output();
+                pctx.set_ext(ConversationHistory(history));
 
-                match ctx.run_with_context(&respond_pipeline, &mut pctx).await {
+                match ctx.run_with_context(&respond, &mut pctx).await {
                     Ok(None) => {
                         tracing::info!("No response generated");
                         return;
@@ -270,57 +282,4 @@ async fn main() -> anyhow::Result<()> {
 
     runtime.run().await?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// PersonaWithHistory — delegates to a shared PersonaContextBuilder with
-// per-request history injected by temporarily setting self.history.
-// Since PersonaContextBuilder.process() reads self.history, we need a
-// separate stage that wraps it and provides per-request history.
-// ---------------------------------------------------------------------------
-
-use mindroid::PersonaContextBuilder;
-
-struct PersonaWithHistory {
-    persona: Arc<PersonaContextBuilder>,
-    history: Arc<Vec<LlmMessage>>,
-}
-
-#[async_trait]
-impl PipelineStage for PersonaWithHistory {
-    fn name(&self) -> &str {
-        "PersonaWithHistory"
-    }
-
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<()> {
-        // Build a temporary view with history by cloning and calling with_history.
-        // PersonaContextBuilder fields are Arc-wrapped so cloning is cheap conceptually,
-        // but PersonaContextBuilder doesn't implement Clone.
-        // Instead, we manually set llm_messages using the persona stage's logic
-        // by calling process() and then prepending history to llm_messages.
-        self.persona.process(ctx).await?;
-
-        // Inject history before the user message: insert after the system prompt.
-        if !self.history.is_empty() {
-            let system_msgs: Vec<_> = ctx.llm_messages.drain(..).collect();
-            let mut new_messages = Vec::with_capacity(system_msgs.len() + self.history.len());
-            // Keep system messages first
-            let mut rest_start = 0;
-            for (i, msg) in system_msgs.iter().enumerate() {
-                if msg.role == "system".into() {
-                    new_messages.push(msg.clone());
-                    rest_start = i + 1;
-                } else {
-                    break;
-                }
-            }
-            // Insert history
-            new_messages.extend(self.history.iter().cloned());
-            // Append remaining messages (the user message)
-            new_messages.extend(system_msgs[rest_start..].iter().cloned());
-            ctx.llm_messages = new_messages;
-        }
-
-        Ok(())
-    }
 }
