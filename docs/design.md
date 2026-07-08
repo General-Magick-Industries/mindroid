@@ -98,7 +98,7 @@ Built-in implementations:
 |---|---|---|
 | *(default)* | `NoMemory` | No-op. Returns empty history, stores nothing. |
 | `sqlite` | `SqliteMemory` | Local SQLite database via `rusqlite`. Uses `spawn_blocking` for async compatibility. |
-| `magickmind` | `MagickmindMemory` | Remote REST API (`POST/GET/DELETE /v1/mindspaces/:id/messages`). Auth from `Identity`. |
+| `magickmind` | `MagickmindMemory` | Remote REST API (`POST/GET/DELETE /v1/magickspaces/:id/messages`). Auth from `Identity`. |
 
 ---
 
@@ -263,7 +263,7 @@ impl ContextPreparer {
 
 `ContextPreparer::prepare()` runs all registered providers in parallel with `join_all`, merges results, and returns the combined `Vec<LlmMessage>`. You store this in `pctx.context` once and reuse it across multiple `reset_output()` + pipeline runs.
 
-Built-in implementation: `MagickmindContext` calls `POST /v1/mindspaces/:id/context` to retrieve chat history, episodic memory (Pelican), and corpus documents. Role mapping converts the agent's own prior messages to `assistant` role so the LLM correctly understands conversation flow.
+Built-in implementation: `MagickmindContext` calls `POST /v1/magickspaces/:id/context` to retrieve chat history, episodic memory (Pelican), and corpus documents. Role mapping converts the agent's own prior messages to `assistant` role so the LLM correctly understands conversation flow.
 
 Implement `ContextProvider` yourself for: vector databases, SQL history, static system prompts, or any other context source.
 

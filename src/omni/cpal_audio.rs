@@ -14,8 +14,6 @@
 //! `rodio::OutputStream` is also `!Send`; `CpalAudioSink` stores it on a
 //! dedicated OS thread and exposes async wrappers via a command channel.
 
-#![cfg(feature = "transport-audio")]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 

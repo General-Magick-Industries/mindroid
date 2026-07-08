@@ -212,6 +212,85 @@ Communication tones: empathetic, calm, encouraging
 
 ---
 
+## MagickMind-prepared Prompt (delegated formatting)
+
+`PersonaContextBuilder` (above) fetches structured trait data and formats the
+system prompt **in-process** in Rust. An alternative is to let the **MagickMind
+server** own prompt construction: `MagickmindPersonaStage` calls the server's
+prepare endpoint and uses the returned string verbatim.
+
+```
+POST {base_url}/v1/persona/{persona_id}/prepare
+body:   { "user_id": "<optional>" }
+returns: { "system_prompt": "..." }
+```
+
+The server computes the effective personality — including numeric trait
+*banding* (e.g. "very high", "moderate") — and returns a finished
+`system_prompt` string. Use this when the MagickMind server is the single
+source of truth for prompt rendering and you do not want to duplicate
+formatting logic in Rust.
+
+| | `magickmind` (SDK formats) | `magickmind-prepared` (server formats) |
+|---|---|---|
+| Trait banding / custom phrasing | no — raw `- warmth: 0.8` | yes — banded server-side |
+| Requests from the SDK | 2 (persona + effective personality) | 1 (prepare) |
+| Formatting location | Rust (`format_trait`) | Server (single source of truth) |
+
+### Configuration
+
+```toml
+[persona]
+type = "magickmind-prepared"
+persona_id = "your-persona-id"              # default persona (see below)
+base_url = "https://magickmind.example.com" # falls back to memory/auth base_url
+cache_ttl_secs = 600                        # optional; prepared-prompt cache TTL (default 600 = 10 min, 0 disables)
+# allow_insecure = true                     # permit auth headers over plaintext http:// (local dev only)
+```
+
+Auth headers ride on every prepare request, so plaintext `http://` base URLs
+are refused unless `allow_insecure = true` explicitly opts in for local
+development.
+
+`RuntimeBuilder::build_magickmind_persona_stage()` returns the configured stage
+(no startup network call — the server computes everything per-request). The
+`persona_agent` example auto-selects it when `type = "magickmind-prepared"`; see
+`examples/persona_agent/magickmind-prepared.toml`.
+
+### Per-message persona selection (`PersonaId`)
+
+The configured `persona_id` is a **default**. To serve many personas from one
+stage (e.g. a server whose mobile clients each send their own persona id), the
+application sets a `PersonaId` extension on the inbound message context; the
+stage uses it instead of the default. This mirrors how `IdentityResolutionStage`
+sets `CanonicalUserId` — *the SDK owns the slot, the application owns the value.*
+
+```rust
+use mindroid::PersonaId;
+
+// In an upstream, application-owned step (e.g. extracting it from message metadata):
+ctx.set_ext(PersonaId(persona_id_from_mobile));
+```
+
+If no `PersonaId` extension is present, the stage falls back to the configured
+`persona_id`. Source policy (where the id comes from) is the application's job;
+the resolve-and-cache mechanism is the SDK's.
+
+### Prepared-prompt caching
+
+`MagickmindPersonaStage` caches each prepared `system_prompt` keyed by
+`(persona_id, user_id)` so voice/chat turns don't call the server on every message
+(the `prepare` response carries no TTL, so the cache lifetime is the SDK's
+choice). The default is 10 minutes; override per stage with
+`.with_ttl(Duration)` or via `cache_ttl_secs` in config. A TTL of `0` disables
+caching entirely (nothing is stored).
+
+- **Eviction:** Expired entries are swept on the write path once the cache
+  exceeds 200 entries.
+- **Degradation:** If a re-fetch fails, the last-good (stale) prompt is served
+  so a persona-service outage doesn't drop messages. With caching disabled
+  (TTL `0`) there is no stale fallback and the fetch error fails the message.
+
 ## Caching
 
 `PersonaContextBuilder` holds an in-memory TTL cache keyed by `"{persona_id}:{user_id}"`.

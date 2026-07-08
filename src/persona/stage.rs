@@ -5,10 +5,8 @@ use tracing::debug;
 
 use crate::core::context::Context;
 use crate::error::Result;
-use crate::models::{LlmMessage, SenderType};
+use crate::models::LlmMessage;
 use crate::pipeline::PipelineStage;
-#[cfg(feature = "transport-audio")]
-use crate::pipeline::extensions::TextInput;
 
 use super::cache::PersonaCache;
 use super::models::{EffectivePersonalityResponse, EffectiveTrait, PersonaSchema};
@@ -26,7 +24,9 @@ pub struct PersonaContextBuilder {
     persona_id: String,
     /// Static persona info (name, role, tones, background_story) fetched once.
     persona_info: PersonaSchema,
-    /// Pre-fetched conversation history injected at construction time.
+    /// Fallback conversation history injected at construction time. A
+    /// per-request [`ConversationHistory`](super::ConversationHistory)
+    /// extension takes precedence.
     history: Arc<Vec<LlmMessage>>,
 }
 
@@ -47,7 +47,10 @@ impl PersonaContextBuilder {
         })
     }
 
-    /// Provide conversation history for inclusion in the LLM prompt.
+    /// Provide fallback conversation history for inclusion in the LLM prompt.
+    ///
+    /// A per-request [`ConversationHistory`](super::ConversationHistory)
+    /// extension in the pipeline [`Context`] takes precedence over this.
     pub fn with_history(mut self, history: Arc<Vec<LlmMessage>>) -> Self {
         self.history = history;
         self
@@ -98,27 +101,9 @@ impl PipelineStage for PersonaContextBuilder {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        // Determine user_id for dyadic blending (only for user-sent messages)
-        // Prefer canonical user ID from identity resolution if available
-        let canonical_id: Option<String>;
-        #[cfg(feature = "identity")]
-        {
-            canonical_id = ctx
-                .get_ext::<crate::identity::CanonicalUserId>()
-                .map(|c| c.0.clone());
-        }
-        #[cfg(not(feature = "identity"))]
-        {
-            canonical_id = None;
-        }
-
-        let user_id = if ctx.message.sender_type == SenderType::User {
-            canonical_id
-                .as_deref()
-                .or(Some(ctx.message.sender_id.as_str()))
-        } else {
-            None
-        };
+        // User id for dyadic blending (only for user-sent messages).
+        let user_id = super::resolve_user_id(ctx);
+        let user_id = user_id.as_deref();
 
         // Check cache first
         let effective = if let Some(cached) = self.cache.get(&self.persona_id, user_id).await {
@@ -143,23 +128,10 @@ impl PipelineStage for PersonaContextBuilder {
         // Build the system prompt from effective personality
         let system_prompt = self.build_system_prompt(&effective);
 
-        // Assemble LLM messages: system prompt first, then history, then user message
-        let mut messages = vec![LlmMessage::system(&system_prompt)];
-        messages.extend(self.history.as_ref().clone());
-
-        #[cfg(feature = "transport-audio")]
-        let user_text = ctx
-            .get_ext::<TextInput>()
-            .map(|t| t.0.as_str())
-            .unwrap_or(&ctx.message.content);
-        #[cfg(not(feature = "transport-audio"))]
-        let user_text = &ctx.message.content;
-
-        messages.push(LlmMessage::user(user_text));
+        let messages = super::assemble_llm_messages(ctx, &system_prompt, &self.history);
 
         debug!(
-            "PersonaContextBuilder: {} history messages, {} total llm_messages, {} effective traits",
-            self.history.len(),
+            "PersonaContextBuilder: {} total llm_messages, {} effective traits",
             messages.len(),
             effective.traits.len(),
         );

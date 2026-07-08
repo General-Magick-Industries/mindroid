@@ -22,7 +22,12 @@ pub struct MagickmindPersonaClient {
 impl MagickmindPersonaClient {
     pub fn new(base_url: &str, identity: Arc<dyn Auth>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Persona fetches gate message processing — a hung server must not
+            // stall pipelines indefinitely.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
             identity,
         }

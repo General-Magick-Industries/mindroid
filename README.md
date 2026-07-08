@@ -33,9 +33,15 @@ Mindroid is a Rust framework for building AI agents that can reason, act, and co
 - **Tool execution** -- Agents can run shell commands, open URLs, set reminders, or use custom tools you define.
 - **Skills system** -- On-demand domain knowledge with deterministic prefiltering and trust-based authority.
 - **Multi-agent coordination** -- Gates and engagement tracking prevent feedback loops in multi-agent deployments.
-- **Persona system** -- Structured personality traits with per-user dyadic adaptation.
+- **Persona system** -- Structured personality traits with per-user dyadic adaptation, formatted in-process or server-prepared (`magickmind-prepared`) with per-message persona selection and prompt caching.
 - **Streaming first** -- Token-by-token LLM output with transparent tool-call buffering.
 - **Transport agnostic** -- stdio, Centrifugo WebSocket, or audio (microphone + speaker).
+
+> **Security note:** transports and persona stages refuse to send credentials
+> over plaintext connections. Existing configs pointing a Centrifugo transport
+> at `ws://` with an auth token now fail at connect — switch to `wss://`, or
+> set `transport.allow_insecure = true` for local development only. The same
+> applies to `http://` persona base URLs (`persona.allow_insecure = true`).
 
 ## Quick Start
 

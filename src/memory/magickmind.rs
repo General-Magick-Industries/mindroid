@@ -62,7 +62,7 @@ impl Memory for MagickmindMemory {
                     message: "base_url cannot be a base URL".to_string(),
                     status_code: None,
                 })?
-                .extend(&["v1", "mindspaces", channel_id, "messages"]);
+                .extend(&["v1", "magickspaces", channel_id, "messages"]);
             u
         };
         let headers = self.auth_headers().await?;
@@ -114,7 +114,7 @@ impl Memory for MagickmindMemory {
                     message: "base_url cannot be a base URL".to_string(),
                     status_code: None,
                 })?
-                .extend(&["v1", "mindspaces", &channel_id, "messages"]);
+                .extend(&["v1", "magickspaces", &channel_id, "messages"]);
             u
         };
         let headers = self.auth_headers().await?;
@@ -163,7 +163,7 @@ impl Memory for MagickmindMemory {
                     message: "base_url cannot be a base URL".to_string(),
                     status_code: None,
                 })?
-                .extend(&["v1", "mindspaces", &channel_id, "messages"]);
+                .extend(&["v1", "magickspaces", &channel_id, "messages"]);
             u
         };
         let headers = self.auth_headers().await?;

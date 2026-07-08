@@ -1,0 +1,65 @@
+# Persona-driven agent — MagickMind-prepared persona prompt.
+#
+# Identical to dazael.toml except [persona] delegates prompt construction to
+# the MagickMind server's POST /v1/persona/{id}/prepare endpoint. The server
+# computes the effective personality — including trait banding (e.g. "very
+# high", "moderate") — and returns a finished system_prompt string, which
+# mindroid uses verbatim.
+#
+# Run with:
+#   cargo run --example persona_agent --features full -- --config examples/persona_agent/magickmind-prepared.toml
+
+[agent]
+agent_id = "example-agent-id"
+name = "Dazael – Sword-mage"
+
+[transport]
+type = "centrifugo"
+url = "wss://centrifugo.example.com/connection/websocket"
+# The transport refuses to send the auth token over plaintext ws://.
+# For local development against a non-TLS server, opt in explicitly:
+# allow_insecure = true
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://magickmind.example.com"
+
+[memory]
+type = "magickmind"
+base_url = "https://magickmind.example.com"
+
+# -- Persona (MagickMind prepare endpoint) ------------------------------------
+# The MagickMind server owns prompt formatting. Point base_url at your
+# MagickMind deployment. If omitted, base_url falls back to memory.base_url,
+# then auth.base_url. Prepared prompts are cached per (persona_id, user_id)
+# for cache_ttl_secs (default 600; 0 disables caching). If the persona service
+# is unavailable, the last-good cached prompt is served; with no cached
+# prompt, the message fails.
+
+[persona]
+type = "magickmind-prepared"
+persona_id = "example-persona-id"
+base_url = "https://magickmind.example.com"
+# cache_ttl_secs = 600
+# Auth headers ride on every prepare request, so plaintext http:// base URLs
+# are refused. For local development against a non-TLS server, opt in with:
+# allow_insecure = true
+
+[observer]
+type = "log"
+level = "info"
+
+# -- LLM Providers -----------------------------------------------------------
+
+[providers.litellm]
+base_url = "https://litellm.example.com"
+api_key = "sk-your-api-key-here"
+
+# -- Named Models -------------------------------------------------------------
+
+[models.respond]
+provider = "litellm"
+model = "your-model-id-here"
