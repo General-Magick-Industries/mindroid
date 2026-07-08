@@ -20,6 +20,34 @@ fn transport_err(msg: impl Into<String>) -> MindroidError {
     }
 }
 
+/// Reject plaintext `ws://` URLs when an auth token would ride on them.
+///
+/// The JWT is sent in the connect frame and every refresh frame; over an
+/// unencrypted socket any on-path observer can read and replay it (or inject
+/// a malicious refresh TTL). Require `wss://` unless the caller explicitly
+/// opts into insecure transport for local development.
+fn check_url_security(ws_url: &str, token: &str, allow_insecure: bool) -> Result<()> {
+    if ws_url.starts_with("ws://") && !token.is_empty() && !allow_insecure {
+        return Err(transport_err(format!(
+            "refusing to send auth token over plaintext {ws_url}: use wss://, \
+             or set transport allow_insecure = true for local development"
+        )));
+    }
+    Ok(())
+}
+
+/// Minimum interval between token refreshes.
+///
+/// Guards against a hostile or buggy server handing back a tiny (or zero) TTL:
+/// `tokio::time::interval` panics on a zero period, and a very small period
+/// would hammer the auth backend.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Compute the refresh interval as 80% of the token TTL, clamped to a sane minimum.
+fn refresh_interval(ttl_secs: u64) -> Duration {
+    Duration::from_secs(ttl_secs * 80 / 100).max(MIN_REFRESH_INTERVAL)
+}
+
 /// Extract the `sub` claim from a JWT without verifying the signature.
 fn extract_jwt_sub(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
@@ -64,6 +92,7 @@ pub struct CentrifugoTransport {
     agent_id: String,
     identity: Arc<dyn Auth>,
     state: Arc<RwLock<State>>,
+    allow_insecure: bool,
 }
 
 impl CentrifugoTransport {
@@ -73,13 +102,26 @@ impl CentrifugoTransport {
             agent_id: agent_id.to_string(),
             identity,
             state: Arc::new(RwLock::new(State::default())),
+            allow_insecure: false,
         }
+    }
+
+    /// Permit sending the auth token over plaintext `ws://` (local development only).
+    pub fn with_allow_insecure(mut self, allow_insecure: bool) -> Self {
+        self.allow_insecure = allow_insecure;
+        self
     }
 }
 
 /// Perform the Centrifugo connect + subscribe handshake.
-async fn handshake(ws_url: &str, agent_id: &str, identity: &dyn Auth) -> Result<HandshakeResult> {
+async fn handshake(
+    ws_url: &str,
+    agent_id: &str,
+    identity: &dyn Auth,
+    allow_insecure: bool,
+) -> Result<HandshakeResult> {
     let token = identity.get_token().await?;
+    check_url_security(ws_url, &token, allow_insecure)?;
 
     let service_user_id = extract_jwt_sub(&token)
         .ok_or_else(|| transport_err("Failed to extract sub claim from JWT"))?;
@@ -266,9 +308,11 @@ impl Transport for CentrifugoTransport {
     }
 
     async fn connect(&mut self) -> Result<()> {
-        // Just validate that we can get a token. The actual WebSocket connection
-        // is established by listen(), which owns the connection lifecycle.
-        let _ = self.identity.get_token().await?;
+        // Just validate that we can get a token and that it won't ride on a
+        // plaintext socket. The actual WebSocket connection is established by
+        // listen(), which owns the connection lifecycle.
+        let token = self.identity.get_token().await?;
+        check_url_security(&self.ws_url, &token, self.allow_insecure)?;
         Ok(())
     }
 
@@ -287,6 +331,7 @@ impl Transport for CentrifugoTransport {
         let agent_id = self.agent_id.clone();
         let identity = Arc::clone(&self.identity);
         let state = Arc::clone(&self.state);
+        let allow_insecure = self.allow_insecure;
 
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -294,7 +339,7 @@ impl Transport for CentrifugoTransport {
             let mut cmd_id: u32 = 3; // 1=connect, 2=subscribe, 3+ for refresh
 
             loop {
-                match handshake(&ws_url, &agent_id, identity.as_ref()).await {
+                match handshake(&ws_url, &agent_id, identity.as_ref(), allow_insecure).await {
                     Ok(HandshakeResult {
                         mut sink,
                         mut stream,
@@ -308,7 +353,7 @@ impl Transport for CentrifugoTransport {
 
                         // Schedule token refresh at 80% of TTL
                         let refresh_duration = ttl
-                            .map(|t| Duration::from_secs(t * 80 / 100))
+                            .map(refresh_interval)
                             .unwrap_or(Duration::from_secs(86400)); // no expiry: sleep forever
                         let mut refresh_timer = tokio::time::interval(refresh_duration);
                         refresh_timer.tick().await; // consume the immediate first tick
@@ -329,7 +374,7 @@ impl Transport for CentrifugoTransport {
 
                                                 // Check if this is a refresh reply with a new TTL
                                                 if let Some(new_ttl) = parse_refresh_ttl(line) {
-                                                    let new_duration = Duration::from_secs(new_ttl * 80 / 100);
+                                                    let new_duration = refresh_interval(new_ttl);
                                                     refresh_timer = tokio::time::interval(new_duration);
                                                     refresh_timer.tick().await; // consume immediate tick
                                                     debug!("Token refreshed, next refresh in {}s", new_duration.as_secs());
@@ -422,5 +467,37 @@ impl MessageExt for Message {
     fn with_id(mut self, id: String) -> Self {
         self.id = id;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_token_over_plaintext_ws() {
+        assert!(check_url_security("ws://example.com/ws", "jwt-token", false).is_err());
+    }
+
+    #[test]
+    fn allows_wss_with_token() {
+        assert!(check_url_security("wss://example.com/ws", "jwt-token", false).is_ok());
+    }
+
+    #[test]
+    fn allows_plaintext_ws_without_token() {
+        assert!(check_url_security("ws://localhost:8000/ws", "", false).is_ok());
+    }
+
+    #[test]
+    fn allows_plaintext_ws_with_explicit_insecure_flag() {
+        assert!(check_url_security("ws://localhost:8000/ws", "jwt-token", true).is_ok());
+    }
+
+    #[test]
+    fn refresh_interval_clamps_hostile_ttl() {
+        assert_eq!(refresh_interval(0), MIN_REFRESH_INTERVAL);
+        assert_eq!(refresh_interval(1), MIN_REFRESH_INTERVAL);
+        assert_eq!(refresh_interval(3600), Duration::from_secs(2880));
     }
 }

@@ -68,7 +68,8 @@ pub(crate) fn build_transport(
             })?;
             let agent_id = &config.agent.agent_id;
             Ok(Box::new(
-                crate::transport::centrifugo::CentrifugoTransport::new(url, agent_id, auth.clone()),
+                crate::transport::centrifugo::CentrifugoTransport::new(url, agent_id, auth.clone())
+                    .with_allow_insecure(config.transport.allow_insecure),
             ))
         }
 

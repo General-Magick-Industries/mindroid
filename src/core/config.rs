@@ -146,6 +146,10 @@ pub struct TransportConfig {
     pub transport_type: Option<String>,
     pub url: Option<String>,
     pub channels: Vec<String>,
+    /// Permit sending the auth token over plaintext `ws://` (local development only).
+    /// Production deployments must use `wss://`.
+    #[serde(default)]
+    pub allow_insecure: bool,
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 }
