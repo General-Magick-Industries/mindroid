@@ -796,7 +796,7 @@ Agent identity and model settings.
 | `agent_id` | String | `""` | Unique agent identifier |
 | `name` | String | `"Mindroid Agent"` | Human-readable name |
 | `persona` | String | `""` | Personality/role description |
-| `mindspace_id` | Option<String> | None | Optional workspace/organization ID |
+| `magickspace_id` | Option<String> | None | Optional workspace/organization ID |
 | `model_type` | String | `"chat"` | LLM type (chat, completion, etc.) |
 | `model_ids` | Vec<String> | `[]` | Ordered list of model IDs to try |
 | `compute_power` | u8 | 50 | Resource level 0–100 |

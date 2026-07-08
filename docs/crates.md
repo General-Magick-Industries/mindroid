@@ -21,6 +21,7 @@ CentrifugoTransport::new(ws_url: &str, agent_id: &str, identity: Arc<dyn Identit
 
 **Protocol Details**:
 - Connects via WebSocket to Centrifugo server at `ws_url`
+- Requires `wss://` when an auth token is configured — plaintext `ws://` is refused unless explicitly opted in via `.with_allow_insecure(true)` (or `transport.allow_insecure = true` in config; local development only)
 - Performs automatic handshake with JWT token extracted from `Identity.get_token()`
 - Subscribes to personal channel: `personal:{agent_id}#{service_user_id}`
   - `service_user_id` extracted from JWT `sub` claim via base64 decode
@@ -42,7 +43,7 @@ No-op. Response delivery is handled by pipeline persistence stages (e.g., Magick
 use mindroid_transport_centrifugo::CentrifugoTransport;
 
 let transport = CentrifugoTransport::new(
-    "ws://centrifugo:8000/connection/websocket",
+    "wss://centrifugo:8000/connection/websocket",
     "my_agent",
     identity,
 );
@@ -108,9 +109,9 @@ magickmind_pipeline(
 **Pipeline Stages** (5 stages):
 
 1. **ContextBuilder**
-   - Calls `MagickmindClient.get_context(mindspace_id, user_id, content)`
+   - Calls `MagickmindClient.get_context(magickspace_id, user_id, content)`
    - Fetches conversation history as `Vec<LlmMessage>`
-   - Sets `ctx.llm_messages` (or system + user messages if no mindspace)
+   - Sets `ctx.llm_messages` (or system + user messages if no magickspace)
 
 2. **Router**
    - Copies `model_type`, `model_ids`, `compute_power` from `ctx.agent_config`
@@ -128,7 +129,7 @@ magickmind_pipeline(
 
 5. **MagickmindPersistence**
    - Saves final response to MagickMind via `MagickmindClient.save_message()`
-   - Skips if no `mindspace_id` configured
+   - Skips if no `magickspace_id` configured
 
 **MagickmindClient API**:
 ```rust
@@ -136,21 +137,21 @@ pub fn new(base_url: impl Into<String>, identity: Arc<dyn Identity>) -> Self
 
 pub async fn get_context(
     &self,
-    mindspace_id: &str,
+    magickspace_id: &str,
     user_id: &str,
     content: &str,
 ) -> Result<Vec<LlmMessage>>
-// POST /v1/mindspaces/{id}/context
+// POST /v1/magickspaces/{id}/context
 // Body: { user_id, content }
 
 pub async fn save_message(
     &self,
-    mindspace_id: &str,
+    magickspace_id: &str,
     sender_id: &str,
     content: &str,
     reply_to_id: Option<&str>,
 ) -> Result<Option<String>>
-// POST /v1/mindspaces/{id}/messages
+// POST /v1/magickspaces/{id}/messages
 // Body: { sender_id, content, reply_to_id }
 ```
 
@@ -159,7 +160,7 @@ pub async fn save_message(
 pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self
 
 // Internal: stream_owned() returns BoxStream<'static, StreamEvent>
-// Sends CortexRequest with { messages, model_type, compute_power, model_ids, mindspace_id, user_id }
+// Sends CortexRequest with { messages, model_type, compute_power, model_ids, magickspace_id, user_id }
 // Receives SSE events: event_type (thinking, chunk, complete, error), content, data fields
 ```
 
@@ -248,23 +249,23 @@ Remote message storage via MagickMind REST API for centralized conversation hist
 
 **Constructor**:
 ```rust
-MagickmindMemory::new(base_url: &str, mindspace_id: &str, identity: Arc<dyn Identity>)
+MagickmindMemory::new(base_url: &str, magickspace_id: &str, identity: Arc<dyn Identity>)
 ```
 
 **API Endpoints** (all authenticated):
 
 ```rust
 // Save a message
-POST /v1/mindspaces/{mindspace_id}/messages
+POST /v1/magickspaces/{magickspace_id}/messages
 Body: { channel_id, sender_id, content, reply_to_id }
 Response: { id: String }
 
 // Get message history
-GET /v1/mindspaces/{mindspace_id}/messages?channel_id={id}&limit={n}
+GET /v1/magickspaces/{magickspace_id}/messages?channel_id={id}&limit={n}
 Response: { messages: Vec<Message> }
 
 // Clear all messages for a channel
-DELETE /v1/mindspaces/{mindspace_id}/messages?channel_id={id}
+DELETE /v1/magickspaces/{magickspace_id}/messages?channel_id={id}
 ```
 
 **Authentication**:
@@ -280,7 +281,7 @@ use mindroid_memory_magickmind::MagickmindMemory;
 
 let memory = MagickmindMemory::new(
     "https://magickmind.service",
-    "mindspace_123",
+    "magickspace_123",
     identity,
 );
 runtime.with_memory(memory).build().await?;
@@ -543,7 +544,7 @@ let runtime = RuntimeBuilder::new()
     ))
     .with_memory(MagickmindMemory::new(
         "https://magickmind.service",
-        mindspace_id,
+        magickspace_id,
         identity.clone(),
     ))
     .with_observer(LogObserver::new())

@@ -107,13 +107,16 @@ impl MagickmindClient {
 
     pub async fn prepare_context(
         &self,
-        mindspace_id: &str,
+        magickspace_id: &str,
         participant_id: &str,
         query: &str,
         config: &MagickmindContextConfig,
         exclude_sender: Option<&str>,
     ) -> Result<Vec<LlmMessage>> {
-        let url = format!("{}/v1/magickspaces/{}/context", self.base_url, mindspace_id);
+        let url = format!(
+            "{}/v1/magickspaces/{}/context",
+            self.base_url, magickspace_id
+        );
         let mut headers = self.auth_headers().await?;
 
         let body = PrepareContextRequest {
@@ -179,14 +182,14 @@ impl MagickmindClient {
 
     pub async fn save_message(
         &self,
-        mindspace_id: &str,
+        magickspace_id: &str,
         sender_id: &str,
         content: &str,
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
         let url = format!(
             "{}/v1/magickspaces/{}/messages",
-            self.base_url, mindspace_id
+            self.base_url, magickspace_id
         );
         let headers = self.auth_headers().await?;
         let body = MagickmindSaveRequest {
@@ -254,7 +257,7 @@ impl Default for MagickmindContextConfig {
 /// Fetches context from Magickmind's context preparation endpoint.
 ///
 /// Calls `POST /v1/magickspaces/{channel_id}/context` using the message's
-/// `channel_id` as the mindspace ID and `sender_id` as the participant.
+/// `channel_id` as the magickspace ID and `sender_id` as the participant.
 ///
 /// ```ignore
 /// use mindroid::{ContextPreparer, MagickmindContext};
@@ -308,15 +311,15 @@ impl ContextProvider for MagickmindContext {
     }
 
     async fn fetch(&self, message: &crate::models::Message) -> Result<Vec<LlmMessage>> {
-        let mindspace_id = &message.channel_id;
-        if mindspace_id.is_empty() {
+        let magickspace_id = &message.channel_id;
+        if magickspace_id.is_empty() {
             debug!("MagickmindContext: no channel_id, skipping");
             return Ok(Vec::new());
         }
 
         self.client
             .prepare_context(
-                mindspace_id,
+                magickspace_id,
                 &message.sender_id,
                 &message.content,
                 &self.config,
@@ -392,9 +395,9 @@ impl PipelineStage for MagickmindPersistence {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        let mindspace_id = &ctx.message.channel_id;
-        if mindspace_id.is_empty() {
-            debug!("MagickmindPersistence: no mindspace_id in message, skipping save");
+        let magickspace_id = &ctx.message.channel_id;
+        if magickspace_id.is_empty() {
+            debug!("MagickmindPersistence: no magickspace_id in message, skipping save");
             return Ok(());
         }
 
@@ -402,7 +405,7 @@ impl PipelineStage for MagickmindPersistence {
 
         self.magickmind
             .save_message(
-                mindspace_id,
+                magickspace_id,
                 &ctx.agent_config.agent_id,
                 &content,
                 Some(&ctx.message.id),

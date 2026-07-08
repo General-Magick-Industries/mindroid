@@ -47,7 +47,7 @@ Place this file at `./mindroid.toml` or `~/.mindroid/config.toml`:
 agent_id = "agent-001"
 name = "My Agent"
 persona = "You are a helpful assistant."
-mindspace_id = "ms-abc123"
+magickspace_id = "ms-abc123"
 model_type = "chat"
 model_ids = ["gpt-4o"]
 compute_power = 50
@@ -55,6 +55,9 @@ compute_power = 50
 [transport]
 type = "centrifugo"
 url = "wss://centrifugo.example.com/connection/websocket"
+# The transport refuses to send the auth token over plaintext ws://.
+# For local development against a non-TLS Centrifugo, opt in explicitly:
+# allow_insecure = true
 
 [pipeline]
 type = "magickmind"
@@ -76,7 +79,7 @@ type = "log"
 ```
 
 Key fields for Magick Mind:
-- `agent.mindspace_id` — Required to enable MagickMind context retrieval
+- `agent.magickspace_id` — Required to enable MagickMind context retrieval
 - `transport.type = "centrifugo"` — Enables real-time messaging
 - `pipeline.type = "magickmind"` — Activates the 5-stage pipeline
 - `identity.type = "apikey"` — Enables JWT-based authentication
@@ -90,11 +93,11 @@ The magickmind_pipeline() creates a sequential processing pipeline with these st
 
 Retrieves conversation context from MagickMind.
 
-- Calls `MagickmindClient.get_context(mindspace_id, user_id, content)`
-- Makes POST request to `/v1/mindspaces/{mindspace_id}/context` with `{ user_id, content }`
+- Calls `MagickmindClient.get_context(magickspace_id, user_id, content)`
+- Makes POST request to `/v1/magickspaces/{magickspace_id}/context` with `{ user_id, content }`
 - Receives response containing `messages: Vec<LlmMessage>` (conversation history)
 - Sets `ctx.llm_messages` to the retrieved messages
-- If `mindspace_id` is not configured, falls back to system persona + user message
+- If `magickspace_id` is not configured, falls back to system persona + user message
 
 ### Stage 2: Router
 
@@ -115,7 +118,7 @@ Builds CortexRequest with:
 - `model_type` — from ctx.model_type (e.g., "chat")
 - `model_ids` — from ctx.model_ids (e.g., ["gpt-4o"])
 - `compute_power` — from ctx.compute_power (0-100)
-- `mindspace_id` — optional, from agent config
+- `magickspace_id` — optional, from agent config
 - `user_id` — from incoming message sender_id
 
 Sends POST request to `/v1/cortex/stream` with `x-api-key` header.
@@ -141,10 +144,10 @@ Formats the raw response into final response.
 
 Saves the agent's response to MagickMind for conversation history.
 
-- Calls `MagickmindClient.save_message(mindspace_id, sender_id, content, reply_to_id)`
-- Makes POST request to `/v1/mindspaces/{mindspace_id}/messages`
+- Calls `MagickmindClient.save_message(magickspace_id, sender_id, content, reply_to_id)`
+- Makes POST request to `/v1/magickspaces/{magickspace_id}/messages`
 - Stores response with `reply_to_id` linking to the incoming message ID
-- Skips persistence if `mindspace_id` is not configured
+- Skips persistence if `magickspace_id` is not configured
 
 ## MagickmindClient API
 
@@ -155,12 +158,12 @@ let client = MagickmindClient::new(base_url, identity);
 
 // Fetch conversation context
 let messages: Vec<LlmMessage> = client
-    .get_context(mindspace_id, user_id, content)
+    .get_context(magickspace_id, user_id, content)
     .await?;
 
 // Save a message
 let msg_id: Option<String> = client
-    .save_message(mindspace_id, sender_id, content, reply_to_id)
+    .save_message(magickspace_id, sender_id, content, reply_to_id)
     .await?;
 ```
 
@@ -240,10 +243,10 @@ async fn main() -> anyhow::Result<()> {
         .transport
         .url
         .as_deref()
-        .unwrap_or("ws://localhost:8000/connection/websocket");
+        .unwrap_or("wss://localhost:8000/connection/websocket");
 
     let agent_id = &config.agent.agent_id;
-    let mindspace_id = config.agent.mindspace_id.as_deref().unwrap_or("default");
+    let magickspace_id = config.agent.magickspace_id.as_deref().unwrap_or("default");
 
     // Create transport (connects to Centrifugo WebSocket)
     let transport = CentrifugoTransport::new(ws_url, agent_id, identity.clone());
@@ -252,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
     let pipeline = magickmind_pipeline(identity.clone(), base_url, api_key);
 
     // Create memory (MagickMind remote storage)
-    let memory = MagickmindMemory::new(base_url, mindspace_id, identity.clone());
+    let memory = MagickmindMemory::new(base_url, magickspace_id, identity.clone());
 
     // Wire everything together and start the runtime
     let mut runtime = Runtime::builder()
@@ -301,6 +304,7 @@ CentrifugoTransport reconnects automatically with exponential backoff. If WebSoc
 1. Verify the Centrifugo server URL is reachable (check firewall, DNS, TLS cert)
 2. Confirm `MINDROID_AGENT_ID` matches your agent configuration
 3. Check that the agent has permission to connect to Centrifugo
+4. Use `wss://` — the transport refuses to send the auth token over plaintext `ws://` unless `transport.allow_insecure = true` is set (local development only)
 
 ### Channel Subscription Errors
 
@@ -323,9 +327,9 @@ If streaming fails or times out:
 
 If ContextBuilder fails to fetch context:
 
-1. Ensure `agent.mindspace_id` is set in mindroid.toml
-2. Verify the mindspace exists in your Magick Mind workspace
-3. Check that the MagickMind endpoint is reachable at `{base_url}/v1/mindspaces/{mindspace_id}/context`
+1. Ensure `agent.magickspace_id` is set in mindroid.toml
+2. Verify the magickspace exists in your Magick Mind workspace
+3. Check that the MagickMind endpoint is reachable at `{base_url}/v1/magickspaces/{magickspace_id}/context`
 4. Confirm authentication headers are being sent (check logs for auth errors)
 
 ## Cross-references
