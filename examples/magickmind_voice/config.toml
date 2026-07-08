@@ -8,7 +8,7 @@ compute_power = 1
 
 [transport]
 type = "centrifugo"
-url  = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+url  = "wss://dev-centrifugo.magickmind.ai/connection/websocket"
 
 [auth]
 type = "apikey"

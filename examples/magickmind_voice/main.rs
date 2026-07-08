@@ -1,9 +1,9 @@
 //! Magickmind Voice Agent: Centrifugo websocket input → LLM with tools → TTS output.
 //!
 //! Messages arrive via Centrifugo (Magickmind websocket). The magickmind WsMessage
-//! envelope carries a ChatHistoryItem payload whose `mindspace_id` field is
+//! envelope carries a ChatHistoryItem payload whose `magickspace_id` field is
 //! extracted by the transport and placed in `message.channel_id` — that is the
-//! correct MagickMind mindspace ID to use for context and persistence calls.
+//! correct MagickMind magickspace ID to use for context and persistence calls.
 //!
 //! The agent can control the local computer using shell and open tools.
 //! Responses are spoken aloud via TTS and persisted back to MagickMind.
@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
         .transport
         .url
         .as_deref()
-        .unwrap_or("ws://dev-centrifugo.magickmind.ai/connection/websocket")
+        .unwrap_or("wss://dev-centrifugo.magickmind.ai/connection/websocket")
         .to_string();
     let agent_id = config.agent.agent_id.clone();
 
@@ -222,20 +222,22 @@ async fn main() -> anyhow::Result<()> {
             async move {
                 use futures::StreamExt;
 
-                // message.channel_id is the MagickMind mindspace_id — extracted by
-                // parse_push from the ChatHistoryItem.mindspace_id field in the
+                // message.channel_id is the MagickMind magickspace_id — extracted by
+                // parse_push from the ChatHistoryItem.magickspace_id field in the
                 // magickmind WsMessage envelope.
-                let mindspace_id = ctx.message.channel_id.clone();
+                let magickspace_id = ctx.message.channel_id.clone();
                 let sender_id = ctx.message.sender_id.clone();
                 let content = ctx.message.content.clone();
                 let msg_id = ctx.message.id.clone();
 
-                tracing::info!("Message from {sender_id} in mindspace {mindspace_id}: {content:?}");
+                tracing::info!(
+                    "Message from {sender_id} in magickspace {magickspace_id}: {content:?}"
+                );
 
                 // Fetch conversation history and knowledge from MagickMind.
                 let context = magickmind
                     .prepare_context(
-                        &mindspace_id,
+                        &magickspace_id,
                         &sender_id,
                         &content,
                         &MagickmindContextConfig::default(),
@@ -297,10 +299,10 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("\nAgent: {speakable}\n");
 
-                // Persist the response back to the same mindspace.
+                // Persist the response back to the same magickspace.
                 if let Err(e) = magickmind
                     .save_message(
-                        &mindspace_id,
+                        &magickspace_id,
                         &ctx.agent_config.agent_id,
                         &speakable,
                         Some(&msg_id),

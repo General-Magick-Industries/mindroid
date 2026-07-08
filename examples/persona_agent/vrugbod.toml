@@ -7,13 +7,10 @@ name = "Vrugbod"
 # The flat persona string is ignored when [persona] is configured.
 # It serves as a fallback if the magickmind persona service is unavailable.
 persona = "You are a helpful AI assistant."
-model_type = "fast"
-model_ids = ["openrouter/google/gemini-3.1-pro-preview"]
-compute_power = 1
 
 [transport]
 type = "centrifugo"
-url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+url = "wss://dev-centrifugo.magickmind.ai/connection/websocket"
 
 [auth]
 type = "apikey"

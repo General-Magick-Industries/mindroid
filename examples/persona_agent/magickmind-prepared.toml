@@ -13,13 +13,10 @@ agent_id = "example-agent-id"
 name = "Dazael – Sword-mage"
 # Fallback flat persona if the persona service is unavailable.
 persona = "You are a helpful AI assistant."
-model_type = "fast"
-model_ids = ["openrouter/google/gemini-3.1-pro-preview"]
-compute_power = 1
 
 [transport]
 type = "centrifugo"
-url = "ws://dev-centrifugo.magickmind.ai/connection/websocket"
+url = "wss://dev-centrifugo.magickmind.ai/connection/websocket"
 
 [auth]
 type = "apikey"
