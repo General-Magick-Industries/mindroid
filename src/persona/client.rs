@@ -13,13 +13,13 @@ use super::provider::PersonaProvider;
 ///
 /// Follows the same pattern as `MagickmindMemory` — uses `reqwest` + `Auth`
 /// for authenticated requests against the magickmind REST API.
-pub struct MagickmindPersonaClientOld {
+pub struct MagickmindPersonaClient {
     http: reqwest::Client,
     base_url: String,
     identity: Arc<dyn Auth>,
 }
 
-impl MagickmindPersonaClientOld {
+impl MagickmindPersonaClient {
     pub fn new(base_url: &str, identity: Arc<dyn Auth>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -167,7 +167,7 @@ impl MagickmindPersonaClientOld {
 }
 
 #[async_trait]
-impl PersonaProvider for MagickmindPersonaClientOld {
+impl PersonaProvider for MagickmindPersonaClient {
     fn name(&self) -> &str {
         "magickmind"
     }

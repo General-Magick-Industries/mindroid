@@ -87,34 +87,40 @@ A provider takes one of two paths. **Prepared** providers override
 client-side via `build_system_prompt`. The last two methods have no defaults;
 the first two default to "not prepared", so existing providers are unaffected.
 
-### MagickmindPersonaClient (cloud, prepared)
+### MagickmindAgentPersonaClient (cloud, prepared)
 
 Calls `POST /v1/end-users/{agent_id}/persona/prepare`, which returns a fully
 assembled `system_prompt` — identity, background, traits and tones are blended
 server-side, so no client-side formatting happens.
 
 ```rust
-let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
+let client = MagickmindAgentPersonaClient::new("https://api.magickmind.io", auth);
 let stage = PersonaContextBuilder::new(Arc::new(client), agent_id).await?;
 ```
 
 The path segment is an **agent id**, not a persona id. Passing a persona id
-returns 404 ("Agent not found"), or 403 if it collides with an end-user in
-another tenant. Configure with `persona.type = "magickmind-prepared"`, which
-reads `agent.agent_id` and ignores `persona.persona_id`.
+returns 404 ("Agent not found"). Configure with
+`persona.type = "magickmind-prepared"`, which reads `agent.agent_id` and
+ignores `persona.persona_id`.
+
+The route takes either a service-user credential or an agent's own end-user
+token (minted via `POST /v1/end-users/tokens`). Under an end-user token the
+path id must equal the token subject; naming another agent returns 403
+("agent_id does not match token subject"), so the route cannot be used to read
+another agent's prompt.
 
 `get_persona` and `get_effective_personality` return errors on this client —
 the prepare endpoint exposes neither a schema nor a trait list. Reach for
-`MagickmindPersonaClientOld` if you need that raw data.
+`MagickmindPersonaClient` if you need that raw data.
 
-### MagickmindPersonaClientOld (cloud, assembling)
+### MagickmindPersonaClient (cloud, assembling)
 
 The previous two-call path: fetches the static definition and the blended
 traits separately, then assembles the prompt client-side. Keyed by persona id.
 Behaviour is unchanged — swap to this type to keep it.
 
 ```rust
-let client = MagickmindPersonaClientOld::new("https://api.magickmind.io", auth);
+let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
 let stage = PersonaContextBuilder::new(Arc::new(client), persona_id).await?;
 ```
 
@@ -296,9 +302,9 @@ let stage = PreparedPersonaContextBuilder::new(Arc::new(client), agent_id);
 Or the legacy two-call path, keyed by persona id:
 
 ```rust
-use mindroid::persona::MagickmindPersonaClientOld;
+use mindroid::persona::MagickmindPersonaClient;
 
-let client = MagickmindPersonaClientOld::new("https://api.magickmind.io", auth);
+let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
 let stage = PersonaContextBuilder::new(Arc::new(client), "aria").await?;
 ```
 

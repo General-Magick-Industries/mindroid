@@ -305,13 +305,13 @@ let provider = LocalPersonaProvider::load("./agents", "assistant")?;
 
 See [Local Persona guide](./guides/local-persona.md) for file format and trait locking.
 
-**MagickmindPersonaClient** — Remote REST API
+**MagickmindAgentPersonaClient** — Remote REST API
 
 Fetches personas from a managed platform via HTTP:
 
 ```rust
 let identity = Arc::new(ApiKeyIdentity::new(base_url, email, password));
-let provider = MagickmindPersonaClient::new(api_url, identity);
+let provider = MagickmindAgentPersonaClient::new(api_url, identity);
 ```
 
 Calls:

@@ -7,13 +7,13 @@ mod prompt;
 mod provider;
 mod stage;
 
-pub use client::MagickmindPersonaClientOld;
+pub use client::MagickmindPersonaClient;
 pub use local::LocalPersonaProvider;
 pub use models::{
     EffectivePersonalityResponse, EffectiveSources, EffectiveTrait, PersonaSchema,
     PreparedPersonaResponse, TraitValue,
 };
-pub use prepared_client::MagickmindPersonaClient;
+pub use prepared_client::MagickmindAgentPersonaClient;
 pub use prompt::build_system_prompt;
 pub use provider::{PersonaProvider, PreparedPrompt};
 pub use stage::PersonaContextBuilder;

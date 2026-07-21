@@ -62,7 +62,7 @@ pub use models::{
 pub use observer::{NoObserver, Observer};
 #[cfg(feature = "persona")]
 pub use persona::{
-    MagickmindPersonaClient, MagickmindPersonaClientOld, PersonaContextBuilder, PersonaProvider,
+    MagickmindAgentPersonaClient, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider,
     PreparedPrompt,
 };
 pub use pipeline::combinators::{ApprovalStage, BranchStage, RetryStage, RouteFn, RouterStage};

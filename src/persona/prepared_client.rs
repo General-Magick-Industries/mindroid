@@ -13,19 +13,22 @@ use super::provider::{PersonaProvider, PreparedPrompt};
 ///
 /// `POST /v1/end-users/{agent_id}/persona/prepare`
 ///
-/// Unlike [`super::MagickmindPersonaClientOld`], this returns a fully assembled
+/// Unlike [`super::MagickmindPersonaClient`], this returns a fully assembled
 /// `system_prompt` — no client-side blending or formatting is needed.
 ///
 /// The path segment is an **agent id**, not a persona id. Passing a persona id
-/// yields a 404 ("Agent not found"), or a 403 if it collides with an end-user
-/// in another tenant.
-pub struct MagickmindPersonaClient {
+/// yields a 404 ("Agent not found").
+///
+/// The route accepts either a service-user credential or an agent's own
+/// end-user token. Under an end-user token the path id must equal the token
+/// subject — naming a different agent is a 403, not a silent substitution.
+pub struct MagickmindAgentPersonaClient {
     http: reqwest::Client,
     base_url: String,
     identity: Arc<dyn Auth>,
 }
 
-impl MagickmindPersonaClient {
+impl MagickmindAgentPersonaClient {
     pub fn new(base_url: &str, identity: Arc<dyn Auth>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -73,7 +76,9 @@ impl MagickmindPersonaClient {
             let text = resp.text().await.unwrap_or_default();
             let hint = match status.as_u16() {
                 404 => " (is this an agent id? the prepare route is keyed by agent, not persona)",
-                403 => " (agent id not visible to these credentials — possible cross-tenant id)",
+                403 => {
+                    " (agent id does not match the token subject, or is not visible to these credentials)"
+                }
                 _ => "",
             };
             return Err(MindroidError::Api {
@@ -95,7 +100,7 @@ impl MagickmindPersonaClient {
 }
 
 #[async_trait]
-impl PersonaProvider for MagickmindPersonaClient {
+impl PersonaProvider for MagickmindAgentPersonaClient {
     fn name(&self) -> &str {
         "magickmind-prepared"
     }
@@ -110,7 +115,7 @@ impl PersonaProvider for MagickmindPersonaClient {
     async fn get_persona(&self, _persona_id: &str) -> Result<PersonaSchema> {
         Err(MindroidError::Api {
             message: "the prepare endpoint returns no persona schema; \
-                      use prepared_prompt(), or MagickmindPersonaClientOld for raw persona data"
+                      use prepared_prompt(), or MagickmindPersonaClient for raw persona data"
                 .to_string(),
             status_code: None,
         })
@@ -125,7 +130,7 @@ impl PersonaProvider for MagickmindPersonaClient {
     ) -> Result<EffectivePersonalityResponse> {
         Err(MindroidError::Api {
             message: "the prepare endpoint returns no trait list; \
-                      use prepared_prompt(), or MagickmindPersonaClientOld for raw traits"
+                      use prepared_prompt(), or MagickmindPersonaClient for raw traits"
                 .to_string(),
             status_code: None,
         })

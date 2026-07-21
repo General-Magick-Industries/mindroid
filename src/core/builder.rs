@@ -17,7 +17,7 @@ use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
 use crate::persona::{
-    LocalPersonaProvider, MagickmindPersonaClientOld, PersonaContextBuilder, PersonaProvider,
+    LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider,
 };
 
 #[cfg(feature = "identity")]
@@ -374,7 +374,7 @@ impl Runtime {
                                     "persona.base_url, memory.base_url, or auth.base_url is required for magickmind persona",
                                 )
                             })?;
-                        let client = MagickmindPersonaClientOld::new(base_url, auth.clone());
+                        let client = MagickmindPersonaClient::new(base_url, auth.clone());
                         builder.persona_provider =
                             Some(Arc::new(client) as Arc<dyn PersonaProvider>);
                     } else {
@@ -402,7 +402,7 @@ impl Runtime {
                             )
                         })?;
                     let client =
-                        crate::persona::MagickmindPersonaClient::new(base_url, auth.clone());
+                        crate::persona::MagickmindAgentPersonaClient::new(base_url, auth.clone());
                     builder.persona_provider = Some(Arc::new(client) as Arc<dyn PersonaProvider>);
                 }
                 Some("local") => {
