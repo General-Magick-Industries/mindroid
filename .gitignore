@@ -36,3 +36,6 @@ audit-output.txt
 *.db
 *.db-journal
 *.db-wal
+
+# Local review notes — not for publication
+pr26-*.md
