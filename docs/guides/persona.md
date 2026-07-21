@@ -63,20 +63,59 @@ pub trait PersonaProvider: Send + Sync {
         persona_id: &str,
         user_id: Option<&str>,
     ) -> Result<EffectivePersonalityResponse>;
+
+    fn is_prepared(&self) -> bool { false }
+    async fn prepared_prompt(
+        &self,
+        id: &str,
+        user_id: Option<&str>,
+    ) -> Result<Option<PreparedPrompt>> { Ok(None) }
 }
 ```
 
 | Method | When called | Purpose |
 |--------|------------|---------|
+| `is_prepared` | Once at startup | Declare which path this provider uses |
+| `prepared_prompt` | Per request | Return a server-assembled prompt, or `None` |
 | `get_persona` | Once at startup | Fetch static definition (name, role, tones, background) |
 | `get_effective_personality` | Per request | Return blended traits, optionally scoped to a user |
 
-### MagickmindPersonaClient (cloud)
+A provider takes one of two paths. **Prepared** providers override
+`is_prepared` and `prepared_prompt`, and their prompt is used verbatim.
+**Assembling** providers implement `get_persona` and
+`get_effective_personality`, and `PersonaContextBuilder` composes the prompt
+client-side via `build_system_prompt`. The last two methods have no defaults;
+the first two default to "not prepared", so existing providers are unaffected.
 
-Contacts the Magick Mind REST API for server-side dyadic computation:
+### MagickmindPersonaClient (cloud, prepared)
+
+Calls `POST /v1/end-users/{agent_id}/persona/prepare`, which returns a fully
+assembled `system_prompt` — identity, background, traits and tones are blended
+server-side, so no client-side formatting happens.
 
 ```rust
 let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
+let stage = PersonaContextBuilder::new(Arc::new(client), agent_id).await?;
+```
+
+The path segment is an **agent id**, not a persona id. Passing a persona id
+returns 404 ("Agent not found"), or 403 if it collides with an end-user in
+another tenant. Configure with `persona.type = "magickmind-prepared"`, which
+reads `agent.agent_id` and ignores `persona.persona_id`.
+
+`get_persona` and `get_effective_personality` return errors on this client —
+the prepare endpoint exposes neither a schema nor a trait list. Reach for
+`MagickmindPersonaClientOld` if you need that raw data.
+
+### MagickmindPersonaClientOld (cloud, assembling)
+
+The previous two-call path: fetches the static definition and the blended
+traits separately, then assembles the prompt client-side. Keyed by persona id.
+Behaviour is unchanged — swap to this type to keep it.
+
+```rust
+let client = MagickmindPersonaClientOld::new("https://api.magickmind.io", auth);
+let stage = PersonaContextBuilder::new(Arc::new(client), persona_id).await?;
 ```
 
 ### LocalPersonaProvider (file-based)
@@ -177,22 +216,25 @@ The cloud provider applies an equivalent algorithm server-side and returns the a
 ```rust
 let stage = PersonaContextBuilder::new(
     Arc::new(provider),  // any PersonaProvider
-    "aria",              // persona_id
+    "aria",              // persona_id, or agent_id for prepared providers
 ).await?
 .with_history(history);  // optional conversation history
 ```
 
-`new()` fetches the `PersonaSchema` once so static fields are available without per-request network calls.
+For assembling providers, `new()` fetches the `PersonaSchema` once so static
+fields are available without per-request network calls. For prepared providers
+it fetches nothing — there is no schema to fetch.
 
 ### Per-request processing
 
 On each `process()` call:
 
 1. Determine user_id for dyadic blending (from identity resolution or sender_id)
-2. Check the in-memory TTL cache
-3. On cache miss, call `provider.get_effective_personality()`
-4. Compose the system prompt from persona fields and blended traits
-5. Set `ctx.llm_messages` to: system prompt, history, current message
+2. **Prepared providers:** call `provider.prepared_prompt()` and use it verbatim
+3. **Assembling providers:** check the TTL cache, call
+   `provider.get_effective_personality()` on miss, then compose the prompt from
+   persona fields and blended traits
+4. Set `ctx.llm_messages` to: system prompt, history, current message
 
 ### Generated system prompt
 
@@ -219,6 +261,9 @@ Communication tones: empathetic, calm, encouraging
 - **TTL source:** Set by the server via `ttl_seconds` on each response. `0` means do not cache.
 - **Eviction:** Expired entries evicted on access. Write-lock sweep at 200 entries.
 - **Local provider:** Always returns `ttl_seconds = 0` (blending is in-process, no caching needed).
+- **Prepared providers:** Not cached client-side — every request calls
+  `prepared_prompt()`. `PreparedPrompt` carries `ttl_seconds` for callers that
+  want to cache, but the stage does not act on it yet.
 
 ---
 
@@ -239,12 +284,21 @@ let pipeline = Pipeline::new()
     .add_stage(post_processor);
 ```
 
-For cloud-backed personas, substitute `MagickmindPersonaClient`:
+For cloud-backed personas, prefer the prepared path (keyed by agent id):
 
 ```rust
-use mindroid::persona::MagickmindPersonaClient;
+use mindroid::persona::{PreparedPersonaClient, PreparedPersonaContextBuilder};
 
-let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
+let client = PreparedPersonaClient::new("https://api.magickmind.io", auth);
+let stage = PreparedPersonaContextBuilder::new(Arc::new(client), agent_id);
+```
+
+Or the legacy two-call path, keyed by persona id:
+
+```rust
+use mindroid::persona::MagickmindPersonaClientOld;
+
+let client = MagickmindPersonaClientOld::new("https://api.magickmind.io", auth);
 let stage = PersonaContextBuilder::new(Arc::new(client), "aria").await?;
 ```
 

@@ -17,7 +17,7 @@ use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
 use crate::persona::{
-    LocalPersonaProvider, MagickmindPersonaClient, PersonaContextBuilder, PersonaProvider,
+    LocalPersonaProvider, MagickmindPersonaClientOld, PersonaContextBuilder, PersonaProvider,
 };
 
 #[cfg(feature = "identity")]
@@ -178,18 +178,28 @@ impl RuntimeBuilder {
     /// Build a `PersonaContextBuilder` pipeline stage from the configured
     /// persona provider.
     ///
-    /// This is async because it fetches the persona schema (name, role,
-    /// background story, tones) once at construction time.
+    /// This is async because it probes the provider, and for providers that
+    /// assemble prompts client-side also fetches the persona schema (name,
+    /// role, background story, tones) once at construction time.
+    ///
+    /// The identifier depends on `persona.type`: `"magickmind-prepared"` is
+    /// keyed by `agent.agent_id`, everything else by `persona.persona_id`.
     ///
     /// Returns `None` if no persona provider is configured.
     #[cfg(feature = "persona")]
     pub async fn build_persona_stage(&self) -> Result<Option<PersonaContextBuilder>> {
         let config = self.config.as_ref();
-        let persona_id = config.and_then(|c| c.persona.persona_id.as_deref());
+        let id = config.and_then(|c| {
+            if c.persona.persona_type.as_deref() == Some("magickmind-prepared") {
+                Some(c.agent.agent_id.as_str()).filter(|s| !s.is_empty())
+            } else {
+                c.persona.persona_id.as_deref()
+            }
+        });
 
-        match (&self.persona_provider, persona_id) {
-            (Some(provider), Some(pid)) => {
-                let stage = PersonaContextBuilder::new(provider.clone(), pid).await?;
+        match (&self.persona_provider, id) {
+            (Some(provider), Some(id)) => {
+                let stage = PersonaContextBuilder::new(provider.clone(), id).await?;
                 Ok(Some(stage))
             }
             _ => Ok(None),
@@ -364,7 +374,7 @@ impl Runtime {
                                     "persona.base_url, memory.base_url, or auth.base_url is required for magickmind persona",
                                 )
                             })?;
-                        let client = MagickmindPersonaClient::new(base_url, auth);
+                        let client = MagickmindPersonaClientOld::new(base_url, auth.clone());
                         builder.persona_provider =
                             Some(Arc::new(client) as Arc<dyn PersonaProvider>);
                     } else {
@@ -372,6 +382,28 @@ impl Runtime {
                             "persona.persona_id is required when persona.type = \"magickmind\"",
                         ));
                     }
+                }
+                Some("magickmind-prepared") => {
+                    if config.agent.agent_id.is_empty() {
+                        return Err(MindroidError::config(
+                            "agent.agent_id is required when persona.type = \"magickmind-prepared\" \
+                             (the prepare route is keyed by agent id, not persona id)",
+                        ));
+                    }
+                    let base_url = config
+                        .persona
+                        .base_url
+                        .as_deref()
+                        .or(config.memory.base_url.as_deref())
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind persona",
+                            )
+                        })?;
+                    let client =
+                        crate::persona::MagickmindPersonaClient::new(base_url, auth.clone());
+                    builder.persona_provider = Some(Arc::new(client) as Arc<dyn PersonaProvider>);
                 }
                 Some("local") => {
                     if let Some(persona_id) = config.persona.persona_id.as_deref() {

@@ -26,14 +26,18 @@ base_url = "https://dev-magickmind.magickmind.ai"
 type = "magickmind"
 base_url = "https://dev-magickmind.magickmind.ai"
 
-# -- Persona (magickmind runtime service) -------------------------------------
-# Fetches the effective personality per-request with dyadic per-user adaptation.
-# Replace persona_id with an actual persona from the magickmind persona service.
+# -- Persona (magickmind prepare endpoint) ------------------------------------
+# Fetches a server-assembled system prompt per-request, with dyadic per-user
+# adaptation. Keyed by agent.agent_id above — no persona_id needed; the server
+# resolves which persona this agent uses.
 
 [persona]
-type = "magickmind"
-persona_id = "example-persona-id"
+type = "magickmind-prepared"
 # base_url is optional — falls back to memory.base_url or auth.base_url
+
+# For the legacy two-call path (client-side blending), use instead:
+#   type = "magickmind"
+#   persona_id = "example-persona-id"
 
 [observer]
 type = "log"

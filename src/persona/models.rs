@@ -82,6 +82,30 @@ pub struct EffectiveSources {
     pub was_clamped: bool,
 }
 
+// -- Prepared persona (from end-user prepare endpoint) ------------------------
+
+/// A server-assembled persona snapshot from `POST /v1/end-users/{agent_id}/persona/prepare`.
+///
+/// `system_prompt` is complete — identity, background, traits and tones are all
+/// blended server-side, so no client-side assembly is required.
+///
+/// Note the identifier asymmetry: the request is keyed by *agent* id, while
+/// `persona_id` in the response is the persona that agent resolved to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedPersonaResponse {
+    pub agent_id: String,
+    pub persona_id: String,
+    pub active_persona_version_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub system_prompt: String,
+    /// RFC 3339 timestamp of when this prompt was computed.
+    pub computed_at: String,
+    /// Recommended cache TTL in seconds. `0` means "do not cache".
+    #[serde(default)]
+    pub ttl_seconds: u64,
+}
+
 // -- Persona schema (from persona service) ------------------------------------
 
 /// A persona definition as returned by the persona service.

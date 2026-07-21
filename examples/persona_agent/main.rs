@@ -162,10 +162,11 @@ async fn main() -> anyhow::Result<()> {
     // Build the persona stage once (fetches persona schema from magickmind at init).
     // The respond pipeline is built per-request so per-request history can be
     // injected into PersonaContextBuilder via with_history().
-    let persona_client = builder
-        .build_persona_stage()
-        .await?
-        .expect("persona_agent requires [persona] config section with type = \"magickmind\"");
+    let persona_client = builder.build_persona_stage().await?.expect(
+        "persona_agent requires a [persona] config section \
+             (type = \"magickmind-prepared\" with agent.agent_id, \
+             or type = \"magickmind\" with persona.persona_id)",
+    );
 
     // We need the underlying client/cache/persona_id to rebuild per-request.
     // For simplicity, wrap the built PersonaContextBuilder in Arc and use it
