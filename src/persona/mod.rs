@@ -13,7 +13,7 @@ pub use models::{
     EffectivePersonalityResponse, EffectiveSources, EffectiveTrait, PersonaSchema,
     PreparedPersonaResponse, TraitValue,
 };
-pub use prepared_client::MagickmindAgentPersonaClient;
+pub use prepared_client::{MagickmindAgentPersonaClient, PersonaCaller};
 pub use prompt::build_system_prompt;
 pub use provider::{PersonaProvider, PreparedPrompt};
 pub use stage::PersonaContextBuilder;

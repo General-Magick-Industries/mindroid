@@ -184,6 +184,8 @@ impl RuntimeBuilder {
     ///
     /// The identifier depends on `persona.type`: `"magickmind-prepared"` is
     /// keyed by `agent.agent_id`, everything else by `persona.persona_id`.
+    /// Under `auth.type = "enduser"` the agent comes from the token subject, so
+    /// the id is empty and unused.
     ///
     /// Returns `None` if no persona provider is configured.
     #[cfg(feature = "persona")]
@@ -191,7 +193,15 @@ impl RuntimeBuilder {
         let config = self.config.as_ref();
         let id = config.and_then(|c| {
             if c.persona.persona_type.as_deref() == Some("magickmind-prepared") {
-                Some(c.agent.agent_id.as_str()).filter(|s| !s.is_empty())
+                // An end-user credential carries the agent in its token, so an
+                // empty agent_id is expected there and must not suppress the
+                // stage. The service-user path already errored at build time if
+                // agent_id was missing.
+                if c.auth.auth_type.as_deref() == Some("enduser") {
+                    Some(c.agent.agent_id.as_str())
+                } else {
+                    Some(c.agent.agent_id.as_str()).filter(|s| !s.is_empty())
+                }
             } else {
                 c.persona.persona_id.as_deref()
             }
@@ -384,12 +394,6 @@ impl Runtime {
                     }
                 }
                 Some("magickmind-prepared") => {
-                    if config.agent.agent_id.is_empty() {
-                        return Err(MindroidError::config(
-                            "agent.agent_id is required when persona.type = \"magickmind-prepared\" \
-                             (the prepare route is keyed by agent id, not persona id)",
-                        ));
-                    }
                     let base_url = config
                         .persona
                         .base_url
@@ -401,8 +405,27 @@ impl Runtime {
                                 "persona.base_url, memory.base_url, or auth.base_url is required for magickmind persona",
                             )
                         })?;
+
+                    // The credential decides the route. An end-user JWT is the
+                    // agent itself, so it calls the id-less route and needs no
+                    // agent_id; a service-user credential names the agent in
+                    // the path and does.
+                    let caller = if config.auth.auth_type.as_deref() == Some("enduser") {
+                        crate::persona::PersonaCaller::EndUser
+                    } else {
+                        if config.agent.agent_id.is_empty() {
+                            return Err(MindroidError::config(
+                                "agent.agent_id is required when persona.type = \"magickmind-prepared\" \
+                                 with a service-user credential (the prepare route is keyed by \
+                                 agent id, not persona id); with auth.type = \"enduser\" the \
+                                 agent is taken from the token subject instead",
+                            ));
+                        }
+                        crate::persona::PersonaCaller::ServiceUser
+                    };
                     let client =
-                        crate::persona::MagickmindAgentPersonaClient::new(base_url, auth.clone());
+                        crate::persona::MagickmindAgentPersonaClient::new(base_url, auth.clone())
+                            .with_caller(caller);
                     builder.persona_provider = Some(Arc::new(client) as Arc<dyn PersonaProvider>);
                 }
                 Some("local") => {

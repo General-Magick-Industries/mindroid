@@ -29,6 +29,18 @@ pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
             Ok(Arc::new(crate::auth::static_id::StaticAuth::new(token)))
         }
 
+        // A pre-minted end-user JWT (POST /v1/end-users/tokens). Carried as a
+        // bearer token like `static`, but named separately so the runtime can
+        // route to the end-user API surface, where the agent is the token
+        // subject rather than a path parameter.
+        "enduser" => {
+            let token =
+                config.auth.token.as_deref().ok_or_else(|| {
+                    MindroidError::config("auth.token is required for enduser auth")
+                })?;
+            Ok(Arc::new(crate::auth::static_id::StaticAuth::new(token)))
+        }
+
         #[cfg(feature = "apikey")]
         "apikey" => {
             let base_url = config.auth.base_url.as_deref().ok_or_else(|| {

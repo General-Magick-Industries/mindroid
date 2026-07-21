@@ -165,6 +165,11 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// Credential kind. Supported: `"static"`, `"apikey"`, `"enduser"`.
+    ///
+    /// `"enduser"` carries a pre-minted end-user JWT in `token` and marks this
+    /// runtime as the agent itself, which routes magickmind calls to the
+    /// end-user API surface where the agent is the token subject.
     #[serde(rename = "type")]
     pub auth_type: Option<String>,
     pub email: Option<String>,

@@ -9,23 +9,42 @@ use crate::error::{MindroidError, Result};
 use super::models::{EffectivePersonalityResponse, PersonaSchema, PreparedPersonaResponse};
 use super::provider::{PersonaProvider, PreparedPrompt};
 
-/// HTTP client for the magickmind end-user persona prepare endpoint.
+/// Which credential the caller holds, and therefore which door it uses into
+/// the same persona preparation.
 ///
-/// `POST /v1/end-users/{agent_id}/persona/prepare`
+/// Bifrost exposes one preparation behind two routes: a service user names the
+/// agent in the path, while an agent reaches it as itself with no id to supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonaCaller {
+    /// Service-user credential — `POST /v1/end-users/{agent_id}/persona/prepare`.
+    ServiceUser,
+    /// The agent's own end-user JWT — `POST /v1/end-user/persona/prepare`.
+    EndUser,
+}
+
+/// HTTP client for the magickmind persona prepare endpoint.
 ///
 /// Unlike [`super::MagickmindPersonaClient`], this returns a fully assembled
 /// `system_prompt` — no client-side blending or formatting is needed.
 ///
-/// The path segment is an **agent id**, not a persona id. Passing a persona id
-/// yields a 404 ("Agent not found").
+/// The route follows the credential, set via [`Self::with_caller`]:
 ///
-/// The route accepts either a service-user credential or an agent's own
-/// end-user token. Under an end-user token the path id must equal the token
-/// subject — naming a different agent is a 403, not a silent substitution.
+/// - [`PersonaCaller::ServiceUser`] (default) — `POST /v1/end-users/{agent_id}/persona/prepare`.
+///   The path segment is an **agent id**, not a persona id; passing a persona
+///   id yields a 404 ("Agent not found").
+/// - [`PersonaCaller::EndUser`] — `POST /v1/end-user/persona/prepare`. The
+///   agent is the token subject, so no id is sent and `agent_id` is ignored.
+///
+/// Each route takes one credential: bifrost split them so no handler has to ask
+/// which kind of caller it is serving. An end-user token reaching the
+/// service-user route is still pinned to its own subject (403 on mismatch), but
+/// that is a backstop, not a supported path — hold an end-user JWT and use
+/// [`PersonaCaller::EndUser`].
 pub struct MagickmindAgentPersonaClient {
     http: reqwest::Client,
     base_url: String,
     identity: Arc<dyn Auth>,
+    caller: PersonaCaller,
 }
 
 impl MagickmindAgentPersonaClient {
@@ -34,11 +53,20 @@ impl MagickmindAgentPersonaClient {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             identity,
+            caller: PersonaCaller::ServiceUser,
         }
     }
 
-    /// Prepare the persona for `agent_id`, optionally scoped to a user for
-    /// dyadic adaptation.
+    /// Select which route to use. Defaults to [`PersonaCaller::ServiceUser`].
+    pub fn with_caller(mut self, caller: PersonaCaller) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    /// Prepare the persona, optionally scoped to a user for dyadic adaptation.
+    ///
+    /// `agent_id` names the agent on the service-user route and is ignored on
+    /// the end-user route, where the agent is the token subject.
     pub async fn prepare(
         &self,
         agent_id: &str,
@@ -49,12 +77,20 @@ impl MagickmindAgentPersonaClient {
                 message: format!("invalid base_url: {e}"),
                 status_code: None,
             })?;
-            u.path_segments_mut()
-                .map_err(|_| MindroidError::Api {
+            {
+                let mut segments = u.path_segments_mut().map_err(|_| MindroidError::Api {
                     message: "base_url cannot be a base URL".to_string(),
                     status_code: None,
-                })?
-                .extend(&["v1", "end-users", agent_id, "persona", "prepare"]);
+                })?;
+                match self.caller {
+                    PersonaCaller::ServiceUser => {
+                        segments.extend(&["v1", "end-users", agent_id, "persona", "prepare"]);
+                    }
+                    PersonaCaller::EndUser => {
+                        segments.extend(&["v1", "end-user", "persona", "prepare"]);
+                    }
+                }
+            }
             u
         };
         let headers = crate::auth::build_auth_header_map(self.identity.as_ref()).await?;
@@ -74,15 +110,27 @@ impl MagickmindAgentPersonaClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            let hint = match status.as_u16() {
-                404 => " (is this an agent id? the prepare route is keyed by agent, not persona)",
-                403 => {
-                    " (agent id does not match the token subject, or is not visible to these credentials)"
+            let hint = match (self.caller, status.as_u16()) {
+                (PersonaCaller::ServiceUser, 404) => {
+                    " (is this an agent id? the prepare route is keyed by agent, not persona)"
                 }
+                (PersonaCaller::ServiceUser, 403) => {
+                    " (agent id does not match the token subject, or is not visible to these \
+                      credentials; holding an end-user JWT, use PersonaCaller::EndUser)"
+                }
+                (PersonaCaller::EndUser, 401) => {
+                    " (this route needs an end-user JWT; with a service-user credential use \
+                      PersonaCaller::ServiceUser)"
+                }
+                (PersonaCaller::EndUser, 403) => " (end-user token revoked or not permitted)",
                 _ => "",
             };
+            let subject = match self.caller {
+                PersonaCaller::ServiceUser => format!("agent {agent_id}"),
+                PersonaCaller::EndUser => "the calling agent".to_string(),
+            };
             return Err(MindroidError::Api {
-                message: format!("Failed to prepare persona for agent {agent_id}{hint}: {text}"),
+                message: format!("Failed to prepare persona for {subject}{hint}: {text}"),
                 status_code: Some(status.as_u16()),
             });
         }
@@ -153,4 +201,62 @@ impl PersonaProvider for MagickmindAgentPersonaClient {
 struct PrepareRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<&'a str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::static_id::StaticAuth;
+
+    fn client(caller: PersonaCaller) -> MagickmindAgentPersonaClient {
+        MagickmindAgentPersonaClient::new("https://example.test", Arc::new(StaticAuth::new("t")))
+            .with_caller(caller)
+    }
+
+    /// Mirrors the path construction in `prepare` so route selection is covered
+    /// without a live server.
+    fn route(c: &MagickmindAgentPersonaClient, agent_id: &str) -> String {
+        let mut u = reqwest::Url::parse(&c.base_url).unwrap();
+        {
+            let mut s = u.path_segments_mut().unwrap();
+            match c.caller {
+                PersonaCaller::ServiceUser => {
+                    s.extend(&["v1", "end-users", agent_id, "persona", "prepare"]);
+                }
+                PersonaCaller::EndUser => {
+                    s.extend(&["v1", "end-user", "persona", "prepare"]);
+                }
+            }
+        }
+        u.path().to_string()
+    }
+
+    #[test]
+    fn service_user_route_carries_the_agent_id() {
+        let c = client(PersonaCaller::ServiceUser);
+        assert_eq!(
+            route(&c, "agent-1"),
+            "/v1/end-users/agent-1/persona/prepare"
+        );
+    }
+
+    #[test]
+    fn end_user_route_omits_the_agent_id() {
+        let c = client(PersonaCaller::EndUser);
+        let path = route(&c, "agent-1");
+        assert_eq!(path, "/v1/end-user/persona/prepare");
+        assert!(
+            !path.contains("agent-1"),
+            "end-user route must not leak an id"
+        );
+    }
+
+    #[test]
+    fn service_user_is_the_default() {
+        let c = MagickmindAgentPersonaClient::new(
+            "https://example.test",
+            Arc::new(StaticAuth::new("t")),
+        );
+        assert_eq!(c.caller, PersonaCaller::ServiceUser);
+    }
 }
