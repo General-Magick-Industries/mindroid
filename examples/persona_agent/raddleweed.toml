@@ -35,10 +35,6 @@ base_url = "https://dev-magickmind.magickmind.ai"
 type = "magickmind-prepared"
 # base_url is optional — falls back to memory.base_url or auth.base_url
 
-# For the legacy two-call path (client-side blending), use instead:
-#   type = "magickmind"
-#   persona_id = "example-persona-id"
-
 [observer]
 type = "log"
 level = "info"

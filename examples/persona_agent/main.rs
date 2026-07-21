@@ -7,7 +7,7 @@
 //!
 //! Configured with `persona.type = "magickmind-prepared"`, which is keyed by
 //! `agent.agent_id` — not a persona id. The server resolves which persona the
-//! agent uses. See the config files for the legacy client-side-blending path.
+//! agent uses.
 //!
 //! The agent only responds when mentioned with `@name` or `@agent_id`.
 //!
@@ -163,14 +163,12 @@ async fn main() -> anyhow::Result<()> {
     // Gate pipeline: cheap @mention check (no API calls)
     let gate_pipeline = Arc::new(Pipeline::new().add_stage(mention_gate));
 
-    // Build the persona stage once. On the prepared path nothing is fetched here —
-    // the prompt is resolved per-request. The legacy path fetches the schema now.
-    // The respond pipeline is built per-request so per-request history can be
-    // injected into PersonaContextBuilder via with_history().
+    // Build the persona stage once. Nothing is fetched here — the prompt is
+    // resolved per-request. The respond pipeline is built per-request so
+    // per-request history can be injected via with_history().
     let persona_client = builder.build_persona_stage().await?.expect(
-        "persona_agent requires a [persona] config section \
-             (type = \"magickmind-prepared\" with agent.agent_id, \
-             or type = \"magickmind\" with persona.persona_id)",
+        "persona_agent requires a [persona] config section with \
+             type = \"magickmind-prepared\" and agent.agent_id set",
     );
 
     // We need the underlying client/cache/id to rebuild per-request.
