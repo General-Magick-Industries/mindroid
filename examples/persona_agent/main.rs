@@ -1,16 +1,20 @@
 //! Persona-driven agent: magickmind persona + runtime integration with @mention gate.
 //!
 //! Demonstrates using a rich, versioned persona from the magickmind persona
-//! service instead of a flat persona string. The `PersonaContextBuilder`
-//! fetches the effective personality per-request (with dyadic per-user
-//! adaptation) and builds a structured system prompt from blended traits.
+//! service instead of a flat persona string. `PersonaContextBuilder` fetches a
+//! server-assembled system prompt per-request (with dyadic per-user
+//! adaptation) from the prepare endpoint.
+//!
+//! Configured with `persona.type = "magickmind-prepared"`, which is keyed by
+//! `agent.agent_id` — not a persona id. The server resolves which persona the
+//! agent uses. See the config files for the legacy client-side-blending path.
 //!
 //! The agent only responds when mentioned with `@name` or `@agent_id`.
 //!
 //! Flow:
 //!   1. MentionGate — check for @mention, skip if not mentioned (no API calls)
 //!   2. Context preparation — fetch MagickMind context (chat history, knowledge)
-//!   3. PersonaContextBuilder — fetch effective personality, build system prompt
+//!   3. PersonaContextBuilder — resolve the persona system prompt
 //!   4. LLM processor — streaming inference
 //!   5. PostProcessor — format response
 //!   6. MagickmindPersistence — save response to MagickMind
@@ -159,7 +163,8 @@ async fn main() -> anyhow::Result<()> {
     // Gate pipeline: cheap @mention check (no API calls)
     let gate_pipeline = Arc::new(Pipeline::new().add_stage(mention_gate));
 
-    // Build the persona stage once (fetches persona schema from magickmind at init).
+    // Build the persona stage once. On the prepared path nothing is fetched here —
+    // the prompt is resolved per-request. The legacy path fetches the schema now.
     // The respond pipeline is built per-request so per-request history can be
     // injected into PersonaContextBuilder via with_history().
     let persona_client = builder.build_persona_stage().await?.expect(
@@ -168,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
              or type = \"magickmind\" with persona.persona_id)",
     );
 
-    // We need the underlying client/cache/persona_id to rebuild per-request.
+    // We need the underlying client/cache/id to rebuild per-request.
     // For simplicity, wrap the built PersonaContextBuilder in Arc and use it
     // directly as a stage (without per-request history injection). The persona
     // stage will use an empty history Arc — chat history is persisted via
