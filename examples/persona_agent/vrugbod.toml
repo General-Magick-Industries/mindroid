@@ -20,11 +20,11 @@ type = "apikey"
 email = "user@example.com"
 password = "your-password-here"
 api_key = "sk-your-api-key-here"
-base_url = "https://dev-magickmind.magickmind.ai"
+base_url = "https://dev-bifrost.magickmind.ai"
 
 [memory]
 type = "magickmind"
-base_url = "https://dev-magickmind.magickmind.ai"
+base_url = "https://dev-bifrost.magickmind.ai"
 
 # -- Persona (magickmind prepare endpoint) ------------------------------------
 # Fetches a server-assembled system prompt per-request, with dyadic per-user

@@ -1,6 +1,9 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::core::context::Context;
@@ -31,6 +34,13 @@ use super::provider::PersonaProvider;
 pub struct PersonaContextBuilder {
     provider: Arc<dyn PersonaProvider>,
     cache: Arc<PersonaCache>,
+    /// TTL cache for prepared prompts, keyed by `"{id}:{user_id}"`.
+    ///
+    /// Keyed by the id this stage was built with — an agent id on the prepared
+    /// path — never by the `persona_id` the server resolves to. Two agents can
+    /// share a persona, so persona-keyed entries would serve one agent's prompt
+    /// to another, potentially across tenants.
+    prompt_cache: Arc<RwLock<HashMap<String, (String, Instant)>>>,
     persona_id: String,
     /// Static persona info, fetched once. `None` for providers that return a
     /// prepared prompt — they have no schema to fetch.
@@ -60,6 +70,7 @@ impl PersonaContextBuilder {
         Ok(Self {
             provider,
             cache: Arc::new(PersonaCache::new()),
+            prompt_cache: Arc::new(RwLock::new(HashMap::new())),
             persona_id: id.to_string(),
             persona_info,
             history: Arc::new(Vec::new()),
@@ -72,20 +83,71 @@ impl PersonaContextBuilder {
         self
     }
 
+    /// Look up a cached prompt, evicting it if expired.
+    async fn cached_prompt(&self, key: &str) -> Option<String> {
+        let now = Instant::now();
+
+        {
+            let entries = self.prompt_cache.read().await;
+            match entries.get(key) {
+                Some((prompt, expires_at)) if *expires_at > now => return Some(prompt.clone()),
+                None => return None,
+                _ => {}
+            }
+        }
+
+        let mut entries = self.prompt_cache.write().await;
+        if let Some((prompt, expires_at)) = entries.get(key)
+            && *expires_at > now
+        {
+            return Some(prompt.clone());
+        }
+        entries.remove(key);
+        None
+    }
+
+    /// Store a prompt under `key` for `ttl_seconds`.
+    async fn store_prompt(&self, key: String, prompt: &str, ttl_seconds: u64) {
+        let expires_at = Instant::now() + std::time::Duration::from_secs(ttl_seconds);
+        let mut entries = self.prompt_cache.write().await;
+
+        if entries.len() > 200 {
+            let now = Instant::now();
+            entries.retain(|_, (_, exp)| *exp > now);
+        }
+
+        entries.insert(key, (prompt.to_string(), expires_at));
+    }
+
     /// Resolve the system prompt for this request, via whichever path the
     /// provider supports.
     async fn resolve_system_prompt(&self, user_id: Option<&str>) -> Result<String> {
-        if self.persona_info.is_none()
-            && let Some(prepared) = self
+        if self.persona_info.is_none() {
+            let key = format!("{}:{}", self.persona_id, user_id.unwrap_or(""));
+
+            if let Some(prompt) = self.cached_prompt(&key).await {
+                debug!(
+                    "PersonaContextBuilder: prompt cache hit for id={} user={:?}",
+                    self.persona_id, user_id
+                );
+                return Ok(prompt);
+            }
+
+            if let Some(prepared) = self
                 .provider
                 .prepared_prompt(&self.persona_id, user_id)
                 .await?
-        {
-            debug!(
-                "PersonaContextBuilder: using prepared prompt for id={} user={:?}",
-                self.persona_id, user_id
-            );
-            return Ok(prepared.system_prompt);
+            {
+                debug!(
+                    "PersonaContextBuilder: prepared prompt for id={} user={:?} (ttl={}s)",
+                    self.persona_id, user_id, prepared.ttl_seconds
+                );
+                if prepared.ttl_seconds > 0 {
+                    self.store_prompt(key, &prepared.system_prompt, prepared.ttl_seconds)
+                        .await;
+                }
+                return Ok(prepared.system_prompt);
+            }
         }
 
         let effective = if let Some(cached) = self.cache.get(&self.persona_id, user_id).await {
@@ -258,6 +320,93 @@ mod tests {
             .unwrap();
         let prompt = stage.resolve_system_prompt(Some("u1")).await.unwrap();
         assert_eq!(prompt, "server prompt for agent-1");
+    }
+
+    struct CountingPreparedProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        ttl_seconds: u64,
+    }
+
+    #[async_trait]
+    impl PersonaProvider for CountingPreparedProvider {
+        fn name(&self) -> &str {
+            "test-counting"
+        }
+        fn is_prepared(&self) -> bool {
+            true
+        }
+        async fn get_persona(&self, _id: &str) -> Result<PersonaSchema> {
+            unreachable!()
+        }
+        async fn get_effective_personality(
+            &self,
+            _id: &str,
+            _user_id: Option<&str>,
+        ) -> Result<EffectivePersonalityResponse> {
+            unreachable!()
+        }
+        async fn prepared_prompt(
+            &self,
+            _id: &str,
+            _user_id: Option<&str>,
+        ) -> Result<Option<PreparedPrompt>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(PreparedPrompt {
+                system_prompt: format!("prompt #{n}"),
+                ttl_seconds: self.ttl_seconds,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_prompt_is_cached_within_ttl() {
+        let provider = Arc::new(CountingPreparedProvider {
+            calls: Default::default(),
+            ttl_seconds: 300,
+        });
+        let stage = PersonaContextBuilder::new(provider.clone(), "agent-1")
+            .await
+            .unwrap();
+
+        let first = stage.resolve_system_prompt(Some("u1")).await.unwrap();
+        let second = stage.resolve_system_prompt(Some("u1")).await.unwrap();
+
+        assert_eq!(first, "prompt #0");
+        assert_eq!(second, "prompt #0", "second call should hit the cache");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_is_scoped_per_user() {
+        let provider = Arc::new(CountingPreparedProvider {
+            calls: Default::default(),
+            ttl_seconds: 300,
+        });
+        let stage = PersonaContextBuilder::new(provider.clone(), "agent-1")
+            .await
+            .unwrap();
+
+        let a = stage.resolve_system_prompt(Some("alice")).await.unwrap();
+        let b = stage.resolve_system_prompt(Some("bob")).await.unwrap();
+
+        assert_ne!(a, b, "distinct users must not share a cached prompt");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn zero_ttl_disables_caching() {
+        let provider = Arc::new(CountingPreparedProvider {
+            calls: Default::default(),
+            ttl_seconds: 0,
+        });
+        let stage = PersonaContextBuilder::new(provider.clone(), "agent-1")
+            .await
+            .unwrap();
+
+        stage.resolve_system_prompt(Some("u1")).await.unwrap();
+        stage.resolve_system_prompt(Some("u1")).await.unwrap();
+
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

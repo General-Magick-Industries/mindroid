@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .auth
         .base_url
         .as_deref()
-        .unwrap_or("https://dev-magickmind.magickmind.ai");
+        .unwrap_or("https://dev-bifrost.magickmind.ai");
     let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
     if let Some(api_key) = &config.auth.api_key {
         magickmind_client = magickmind_client.with_api_key(api_key);
