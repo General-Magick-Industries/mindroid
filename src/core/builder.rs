@@ -262,7 +262,7 @@ impl RuntimeBuilder {
     /// Resolve `(base_url, caller, allow_insecure)` for episode ingest from
     /// config, or `None` if `episodes.enabled` is false / unconfigured.
     #[cfg(feature = "persona")]
-    fn episode_ingest_params(&self) -> Option<(String, crate::persona::PersonaCaller, bool)> {
+    fn episode_ingest_params(&self) -> Option<(String, crate::persona::PersonaCaller, bool, bool)> {
         let config = self.config.as_ref()?;
         if !config.episodes.enabled {
             return None;
@@ -279,7 +279,12 @@ impl RuntimeBuilder {
         } else {
             crate::persona::PersonaCaller::ServiceUser
         };
-        Some((base_url, caller, config.episodes.allow_insecure))
+        Some((
+            base_url,
+            caller,
+            config.episodes.allow_insecure,
+            config.episodes.skip_persona,
+        ))
     }
 
     /// Build the **inbound** episode-ingest stage from `[episodes]` config.
@@ -289,11 +294,12 @@ impl RuntimeBuilder {
     /// (and auth resolved).
     #[cfg(feature = "persona")]
     pub fn build_episode_ingest_stage(&self) -> Option<crate::episode::EpisodeIngestStage> {
-        let (base_url, caller, allow_insecure) = self.episode_ingest_params()?;
+        let (base_url, caller, allow_insecure, skip_persona) = self.episode_ingest_params()?;
         let auth = self.auth.clone()?;
         Some(
             crate::episode::EpisodeIngestStage::new(&base_url, auth, caller)
-                .with_allow_insecure(allow_insecure),
+                .with_allow_insecure(allow_insecure)
+                .with_skip_persona(skip_persona),
         )
     }
 
@@ -305,11 +311,12 @@ impl RuntimeBuilder {
     pub fn build_episode_reply_ingest_stage(
         &self,
     ) -> Option<crate::episode::EpisodeReplyIngestStage> {
-        let (base_url, caller, allow_insecure) = self.episode_ingest_params()?;
+        let (base_url, caller, allow_insecure, skip_persona) = self.episode_ingest_params()?;
         let auth = self.auth.clone()?;
         Some(
             crate::episode::EpisodeReplyIngestStage::new(&base_url, auth, caller)
-                .with_allow_insecure(allow_insecure),
+                .with_allow_insecure(allow_insecure)
+                .with_skip_persona(skip_persona),
         )
     }
 

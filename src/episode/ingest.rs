@@ -28,6 +28,10 @@ struct EpisodeClient {
     identity: Arc<dyn Auth>,
     caller: PersonaCaller,
     allow_insecure: bool,
+    /// Ask the server NOT to resolve and attach the agent's persona to each
+    /// stored episode. Persona resolution runs per message and costs a lookup;
+    /// opt out when the persona snapshot isn't needed.
+    skip_persona: bool,
 }
 
 impl EpisodeClient {
@@ -43,6 +47,7 @@ impl EpisodeClient {
             identity,
             caller,
             allow_insecure: false,
+            skip_persona: false,
         }
     }
 
@@ -95,6 +100,7 @@ impl EpisodeClient {
             message_id: msg.message_id,
             display_name: msg.display_name,
             is_group: msg.is_group,
+            skip_persona: self.skip_persona,
         };
 
         let resp = self
@@ -157,6 +163,14 @@ impl EpisodeIngestStage {
         self.client.allow_insecure = allow_insecure;
         self
     }
+
+    /// Ask the server not to resolve and attach the agent's persona to each
+    /// stored episode. Saves a per-message persona lookup when the snapshot
+    /// isn't needed. Default: `false` (persona is attached).
+    pub fn with_skip_persona(mut self, skip_persona: bool) -> Self {
+        self.client.skip_persona = skip_persona;
+        self
+    }
 }
 
 #[async_trait]
@@ -205,6 +219,13 @@ impl EpisodeReplyIngestStage {
 
     pub fn with_allow_insecure(mut self, allow_insecure: bool) -> Self {
         self.client.allow_insecure = allow_insecure;
+        self
+    }
+
+    /// Ask the server not to resolve and attach the agent's persona to each
+    /// stored episode. Default: `false` (persona is attached).
+    pub fn with_skip_persona(mut self, skip_persona: bool) -> Self {
+        self.client.skip_persona = skip_persona;
         self
     }
 }
@@ -257,6 +278,8 @@ struct ProcessEpisodeRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<&'a str>,
     is_group: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    skip_persona: bool,
 }
 
 #[cfg(test)]
@@ -280,33 +303,39 @@ mod tests {
         assert_eq!(u.path(), "/v1/end-user/episodes/process");
     }
 
-    #[test]
-    fn service_user_body_carries_agent_id() {
-        let body = ProcessEpisodeRequest {
-            agent_id: Some("a-1"),
+    fn req(agent_id: Option<&'static str>, skip_persona: bool) -> ProcessEpisodeRequest<'static> {
+        ProcessEpisodeRequest {
+            agent_id,
             magickspace_id: "ms",
             sender_id: "u",
             message: "hi",
             message_id: "m1",
             display_name: None,
             is_group: false,
-        };
-        let json = serde_json::to_value(&body).unwrap();
+            skip_persona,
+        }
+    }
+
+    #[test]
+    fn service_user_body_carries_agent_id() {
+        let json = serde_json::to_value(req(Some("a-1"), false)).unwrap();
         assert_eq!(json["agent_id"], "a-1");
     }
 
     #[test]
     fn end_user_body_omits_agent_id() {
-        let body = ProcessEpisodeRequest {
-            agent_id: None,
-            magickspace_id: "ms",
-            sender_id: "u",
-            message: "hi",
-            message_id: "m1",
-            display_name: None,
-            is_group: false,
-        };
-        let json = serde_json::to_value(&body).unwrap();
+        let json = serde_json::to_value(req(None, false)).unwrap();
         assert!(json.get("agent_id").is_none());
+    }
+
+    #[test]
+    fn skip_persona_omitted_when_false_present_when_true() {
+        let off = serde_json::to_value(req(None, false)).unwrap();
+        assert!(
+            off.get("skip_persona").is_none(),
+            "false must not serialize"
+        );
+        let on = serde_json::to_value(req(None, true)).unwrap();
+        assert_eq!(on["skip_persona"], true);
     }
 }

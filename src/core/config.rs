@@ -257,6 +257,10 @@ pub struct EpisodesConfig {
     pub base_url: Option<String>,
     /// Permit sending auth headers over plaintext `http://` (local dev only).
     pub allow_insecure: bool,
+    /// Ask the server not to resolve the agent's persona for each ingested
+    /// message. The server otherwise attaches a persona snapshot per message,
+    /// which costs a lookup. Default: false (persona attached).
+    pub skip_persona: bool,
 }
 
 /// Configuration for cross-platform identity resolution.
