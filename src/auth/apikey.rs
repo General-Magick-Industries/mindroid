@@ -154,6 +154,16 @@ const EXPIRY_SKEW: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Overall ceiling for one acquisition (a refresh that may chain into a login).
+///
+/// `acquire` runs under the state write lock, and on the rejected-refresh path
+/// it makes two sequential requests — each bounded by `REQUEST_TIMEOUT`, so the
+/// lock could otherwise be held for ~2x that against a half-open gateway,
+/// stalling every other caller (including ones holding a still-valid token).
+/// A deadline overrun is transient: it proves nothing about the cached token,
+/// so the session is retained and backoff bounds the retry rate.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Backoff bounds applied after a failed acquisition.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -452,7 +462,24 @@ impl ApiKeyAuth {
             return Err(state.backoff_error());
         }
 
-        match self.acquire(state.token.as_ref()).await {
+        let acquired = tokio::time::timeout(ACQUIRE_TIMEOUT, self.acquire(state.token.as_ref()))
+            .await
+            .unwrap_or_else(|_| {
+                // Deadline overrun: treat as transient (session_dead: false) so
+                // a still-valid token survives and backoff throttles the retry.
+                Err(AcquireFailure {
+                    error: MindroidError::Auth {
+                        message: format!(
+                            "auth acquisition exceeded {}s deadline",
+                            ACQUIRE_TIMEOUT.as_secs()
+                        ),
+                        source: None,
+                    },
+                    session_dead: false,
+                })
+            });
+
+        match acquired {
             Ok(auth) => {
                 let token = auth.access_token.clone();
                 state.token = Some(Self::store_auth_response(auth));
