@@ -172,9 +172,7 @@ fn checked_deadline(base: Instant, secs: u64) -> Option<Instant> {
 /// human to unlock the account.
 fn backoff_delay(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(6);
-    BACKOFF_BASE
-        .saturating_mul(1u32 << shift)
-        .min(BACKOFF_MAX)
+    BACKOFF_BASE.saturating_mul(1u32 << shift).min(BACKOFF_MAX)
 }
 
 /// Session state plus what we've learned from failures.
@@ -286,9 +284,7 @@ impl ApiKeyAuth {
         // Only timeouts are configured, so this build cannot realistically
         // fail; fall back to a default client rather than panicking in a
         // constructor callers expect to be infallible.
-        let client = builder
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
             base_url,
@@ -856,7 +852,11 @@ mod tests {
             "from_refresh"
         );
         assert_eq!(gw.refresh_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(gw.login_hits.load(Ordering::SeqCst), 0, "login must not run");
+        assert_eq!(
+            gw.login_hits.load(Ordering::SeqCst),
+            0,
+            "login must not run"
+        );
 
         // Rotation end-to-end: the token from the refresh response has to
         // reach the cached state, not just the returned access token.
@@ -1050,7 +1050,10 @@ mod tests {
         let auth = ApiKeyAuth::new(&gw.base_url, "user@example.com", "pw");
 
         assert!(with_deadline(auth.get_token()).await.is_err());
-        let err = with_deadline(auth.get_token()).await.unwrap_err().to_string();
+        let err = with_deadline(auth.get_token())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("backoff"), "got: {err}");
         assert!(
             err.contains("consecutive failures"),
@@ -1160,12 +1163,10 @@ mod tests {
         let gw = spawn_gateway(GatewayConfig::new(400, 200)).await;
         let auth = Arc::new(ApiKeyAuth::new(&gw.base_url, "user@example.com", "pw"));
 
-        let tokens = with_deadline(futures::future::join_all(
-            (0..10).map(|_| {
-                let a = auth.clone();
-                async move { a.get_token().await.unwrap() }
-            }),
-        ))
+        let tokens = with_deadline(futures::future::join_all((0..10).map(|_| {
+            let a = auth.clone();
+            async move { a.get_token().await.unwrap() }
+        })))
         .await;
 
         assert!(tokens.iter().all(|t| t == "from_login"));
