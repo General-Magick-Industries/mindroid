@@ -144,6 +144,12 @@ impl MagickmindAgentPersonaStage {
     }
 
     /// The cache-key agent component for the active route.
+    ///
+    /// The key's user component is `Option<String>`: `resolve_user_id` returns
+    /// `None` only for non-user senders, so the `None` slot holds the agent's
+    /// generic, non-personalized prompt and two real users never share it. That
+    /// invariant depends on the server not personalizing a request that carries
+    /// no `user_id` — if it ever does, this slot must be split per caller.
     fn agent_cache_key(&self) -> String {
         match self.caller {
             PersonaCaller::ServiceUser => self.agent_id.clone(),
@@ -412,6 +418,87 @@ mod tests {
         let err = s.prepare(None).await.unwrap_err().to_string();
         assert!(err.contains("http://persona.internal"), "got: {err}");
         assert!(err.contains("persona.allow_insecure"), "got: {err}");
+    }
+
+    fn key(agent: &str, user: Option<&str>) -> CacheKey {
+        (agent.to_string(), user.map(str::to_string))
+    }
+
+    #[test]
+    fn fresh_entry_is_served() {
+        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::from_secs(60));
+        s.cache_insert(key("agent-1", Some("u1")), "prompt".into());
+        assert_eq!(
+            s.cache_get_fresh(&key("agent-1", Some("u1"))).as_deref(),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn expired_entry_is_not_fresh_but_serves_stale() {
+        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::from_millis(1));
+        s.cache_insert(key("agent-1", None), "prompt".into());
+        std::thread::sleep(Duration::from_millis(5));
+        // Expired: not fresh, but still available as the last-good fallback.
+        assert_eq!(s.cache_get_fresh(&key("agent-1", None)), None);
+        assert_eq!(
+            s.cache_get_any(&key("agent-1", None)).as_deref(),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn insert_sweeps_expired_entries_beyond_threshold() {
+        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::from_millis(1));
+        for i in 0..=MagickmindAgentPersonaStage::CACHE_SWEEP_THRESHOLD {
+            s.cache_insert(key(&format!("a{i}"), None), "prompt".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        s.cache_insert(key("fresh", None), "prompt".into());
+        // All expired entries were swept; only the newest insert survives.
+        assert_eq!(s.cache.lock().unwrap().len(), 1);
+    }
+
+    /// The graceful-degradation guarantee: when prepare() fails, a previously
+    /// cached prompt is served rather than failing the message.
+    #[tokio::test]
+    async fn stale_prompt_is_served_when_prepare_fails() {
+        // Port 1 is unreachable, so prepare() always errors.
+        let s = MagickmindAgentPersonaStage::new(
+            "https://127.0.0.1:1",
+            "agent-1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        )
+        .with_ttl(Duration::from_millis(1));
+
+        s.cache_insert(key("agent-1", Some("u1")), "last good".into());
+        std::thread::sleep(Duration::from_millis(5));
+
+        let prompt = s.resolve_prompt(Some("u1")).await.unwrap();
+        assert_eq!(prompt, "last good");
+    }
+
+    /// With nothing cached, a prepare failure must propagate rather than
+    /// silently yielding an empty prompt.
+    #[tokio::test]
+    async fn prepare_failure_without_cache_propagates() {
+        let s = MagickmindAgentPersonaStage::new(
+            "https://127.0.0.1:1",
+            "agent-1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        );
+        assert!(s.resolve_prompt(Some("u1")).await.is_err());
+    }
+
+    #[test]
+    fn request_includes_user_id_when_present() {
+        let body = PreparePersonaRequest {
+            user_id: Some("user-123"),
+        };
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"user_id":"user-123"}"#
+        );
     }
 
     #[test]

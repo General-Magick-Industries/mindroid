@@ -245,10 +245,10 @@ async fn main() -> anyhow::Result<()> {
 
                 // Step 0: Remember this message before anything can halt. Every
                 // received message is ingested, whether or not the agent replies.
-                if let Some(ingest) = &inbound_ingest
-                    && let Err(e) = ingest.process(&mut pctx).await
-                {
-                    tracing::warn!("Episode ingest failed (continuing): {e}");
+                // Ingest is best-effort: the stage logs its own failures and
+                // always returns Ok, so there is nothing to handle here.
+                if let Some(ingest) = &inbound_ingest {
+                    let _ = ingest.process(&mut pctx).await;
                 }
 
                 // Step 1: Check @mention first (cheap, no API calls).

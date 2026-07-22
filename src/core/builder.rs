@@ -582,12 +582,13 @@ impl Runtime {
                             )
                         })?
                         .to_string();
-                    if base_url.starts_with("http://") && !config.persona.allow_insecure {
-                        return Err(MindroidError::config(format!(
-                            "persona.base_url {base_url} is plaintext http:// — use https://, \
-                             or set persona.allow_insecure = true for local development"
-                        )));
-                    }
+                    // Auth headers ride on every prepare request — fail fast on
+                    // a non-TLS base_url unless explicitly opted in.
+                    crate::core::net::require_secure_url(
+                        &base_url,
+                        config.persona.allow_insecure,
+                        "persona.allow_insecure",
+                    )?;
 
                     // The credential decides the route. An end-user JWT is the
                     // agent itself (id-less route); a service-user credential
@@ -603,6 +604,22 @@ impl Runtime {
                                  with auth.type = \"enduser\" the agent is taken from the token \
                                  subject instead",
                             ));
+                        }
+                        // The id becomes a URL path segment. Percent-encoding
+                        // handles separators, but `.` and `..` are path
+                        // navigation and would silently drop the preceding
+                        // segment — rewriting the route instead of 404ing.
+                        if !config
+                            .agent
+                            .agent_id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                        {
+                            return Err(MindroidError::config(format!(
+                                "agent.agent_id {:?} must contain only ASCII letters, digits, \
+                                 '-' or '_' — it is sent as a URL path segment",
+                                config.agent.agent_id
+                            )));
                         }
                         config.agent.agent_id.clone()
                     };

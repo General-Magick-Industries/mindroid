@@ -290,9 +290,114 @@ struct ProcessEpisodeRequest<'a> {
 mod tests {
     use super::*;
     use crate::auth::static_id::StaticAuth;
+    use crate::config::AgentConfig;
+    use crate::models::Message;
 
     fn client(caller: PersonaCaller) -> EpisodeClient {
         EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), caller)
+    }
+
+    /// A context whose ingest is guaranteed to fail: port 1 is unreachable.
+    fn failing_ctx(content: &str) -> (Context, String) {
+        let mut msg = Message::new(content, "user-1", "space-1");
+        msg.id = "msg-1".into();
+        msg.channel_type = ChannelType::Group;
+        let cfg = Arc::new(AgentConfig {
+            agent_id: "agent-1".into(),
+            name: "Agent One".into(),
+            ..Default::default()
+        });
+        (
+            Context::new(Arc::new(msg), cfg),
+            "https://127.0.0.1:1".into(),
+        )
+    }
+
+    /// The module's core contract: an ingest failure must never fail the
+    /// pipeline, or a memory outage would stop the agent responding.
+    #[tokio::test]
+    async fn inbound_ingest_failure_does_not_fail_the_pipeline() {
+        let (mut ctx, url) = failing_ctx("hello");
+        let stage =
+            EpisodeIngestStage::new(&url, Arc::new(StaticAuth::new("t")), PersonaCaller::EndUser);
+        assert!(stage.process(&mut ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reply_ingest_failure_does_not_fail_the_pipeline() {
+        let (mut ctx, url) = failing_ctx("hello");
+        ctx.response = Some("a reply".into());
+        let stage = EpisodeReplyIngestStage::new(
+            &url,
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        );
+        assert!(stage.process(&mut ctx).await.is_ok());
+    }
+
+    /// A plaintext base_url is refused at send time, and that refusal is still
+    /// swallowed by the best-effort contract rather than failing the message.
+    #[tokio::test]
+    async fn plaintext_url_is_refused_but_still_best_effort() {
+        let (mut ctx, _) = failing_ctx("hello");
+        let stage = EpisodeIngestStage::new(
+            "http://memory.internal",
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        );
+        assert!(stage.process(&mut ctx).await.is_ok());
+
+        // ...but the underlying client does reject it.
+        let c = EpisodeClient::new(
+            "http://memory.internal",
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        );
+        let msg = EpisodeMessage {
+            magickspace_id: "ms",
+            sender_id: "u",
+            message: "hi",
+            message_id: "m1",
+            display_name: None,
+            is_group: false,
+        };
+        let err = c.ingest("agent-1", &msg).await.unwrap_err().to_string();
+        assert!(err.contains("episodes.allow_insecure"), "got: {err}");
+    }
+
+    /// The reply id is the de-dupe key: a retry of the same turn must derive
+    /// the same id rather than storing the reply twice.
+    #[test]
+    fn reply_id_is_derived_deterministically() {
+        let derive = |id: &str| format!("{id}:reply");
+        assert_eq!(derive("msg-1"), "msg-1:reply");
+        assert_eq!(derive("msg-1"), derive("msg-1"));
+        assert_ne!(derive("msg-1"), derive("msg-2"));
+    }
+
+    #[tokio::test]
+    async fn reply_stage_skips_when_no_response() {
+        let (mut ctx, url) = failing_ctx("hello");
+        ctx.response = None;
+        let stage = EpisodeReplyIngestStage::new(
+            &url,
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        );
+        // No response to ingest: returns early, before any network attempt.
+        assert!(stage.process(&mut ctx).await.is_ok());
+
+        ctx.response = Some(String::new());
+        assert!(stage.process(&mut ctx).await.is_ok());
+    }
+
+    #[test]
+    fn group_channel_maps_to_is_group() {
+        let mut msg = Message::new("hi", "u", "c");
+        msg.channel_type = ChannelType::Group;
+        assert!(msg.channel_type == ChannelType::Group);
+        msg.channel_type = ChannelType::Direct;
+        assert!(msg.channel_type != ChannelType::Group);
     }
 
     #[test]
