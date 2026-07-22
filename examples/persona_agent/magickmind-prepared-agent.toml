@@ -1,0 +1,54 @@
+# Persona-driven agent — agent-scoped MagickMind-prepared prompt (service user).
+#
+# Like magickmind-prepared.toml, but keyed by AGENT id instead of persona id:
+# POST /v1/end-users/{agent_id}/persona/prepare. The server resolves the agent's
+# active persona and returns a finished system_prompt. agent.agent_id below is
+# the path key — passing a persona id there yields a 404.
+#
+# This variant uses a service-user credential (auth.type = "apikey"), which may
+# prepare any agent in its tenant. For an agent acting as itself with its own
+# end-user token, see magickmind-prepared-enduser.toml.
+#
+# Run with:
+#   cargo run --example persona_agent --features full -- --config examples/persona_agent/magickmind-prepared-agent.toml
+
+[agent]
+agent_id = "example-agent-id"
+name = "Dazael – Sword-mage"
+
+[transport]
+type = "centrifugo"
+url = "wss://centrifugo.example.com/connection/websocket"
+
+[auth]
+type = "apikey"
+email = "user@example.com"
+password = "your-password-here"
+api_key = "sk-your-api-key-here"
+base_url = "https://bifrost.example.com"
+
+[memory]
+type = "magickmind"
+base_url = "https://bifrost.example.com"
+
+# -- Persona (agent-keyed prepare endpoint) -----------------------------------
+# Keyed by agent.agent_id above. base_url falls back to memory.base_url, then
+# auth.base_url. Same caching/degradation as magickmind-prepared.
+
+[persona]
+type = "magickmind-prepared-agent"
+base_url = "https://bifrost.example.com"
+# cache_ttl_secs = 600
+# allow_insecure = true   # local non-TLS dev only
+
+[observer]
+type = "log"
+level = "info"
+
+[providers.litellm]
+base_url = "https://litellm.example.com"
+api_key = "sk-your-api-key-here"
+
+[models.respond]
+provider = "litellm"
+model = "your-model-id-here"

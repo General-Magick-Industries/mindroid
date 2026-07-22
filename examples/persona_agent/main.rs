@@ -167,23 +167,32 @@ async fn main() -> anyhow::Result<()> {
     let gate_enabled =
         !std::env::var("MINDROID_DISABLE_GATE").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
 
-    // Build the persona stage once. Two modes are supported via [persona] config:
-    //   type = "magickmind"          → PersonaContextBuilder formats the prompt in-process
-    //   type = "magickmind-prepared" → MagickmindPersonaStage delegates prompt construction
-    //                                  to the MagickMind server and uses the returned
-    //                                  system_prompt verbatim
-    // Both implement PipelineStage, so we hold whichever is configured as a
+    // Build the persona stage once. Three modes are supported via [persona] config:
+    //   type = "magickmind"                → PersonaContextBuilder formats the prompt in-process
+    //   type = "magickmind-prepared"       → MagickmindPersonaStage delegates prompt construction
+    //                                        to the server (persona-keyed) and uses the returned
+    //                                        system_prompt verbatim
+    //   type = "magickmind-prepared-agent" → MagickmindAgentPersonaStage, same server-prepared
+    //                                        prompt but agent-keyed; the route follows auth.type
+    //                                        (service-user names agent_id, "enduser" uses the
+    //                                        id-less end-user route)
+    // All implement PipelineStage, so we hold whichever is configured as a
     // trait object. Per-request conversation history is injected via the
     // ConversationHistory context extension, so the respond pipeline is built
     // once and shared across requests.
-    let persona_stage: Arc<dyn PipelineStage> = if let Some(prepared) =
-        builder.build_magickmind_persona_stage()
+    let persona_stage: Arc<dyn PipelineStage> = if let Some(agent_prepared) =
+        builder.build_magickmind_agent_persona_stage()
     {
+        tracing::info!(
+            "Using agent-scoped prepared persona stage (type = \"magickmind-prepared-agent\")"
+        );
+        Arc::new(agent_prepared)
+    } else if let Some(prepared) = builder.build_magickmind_persona_stage() {
         tracing::info!("Using MagickMind-prepared persona stage (type = \"magickmind-prepared\")");
         Arc::new(prepared)
     } else {
         let persona_client = builder.build_persona_stage().await?.expect(
-                "persona_agent requires [persona] config with type = \"magickmind\" or \"magickmind-prepared\"",
+                "persona_agent requires [persona] config with type = \"magickmind\", \"magickmind-prepared\", or \"magickmind-prepared-agent\"",
             );
         tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
         Arc::new(persona_client)

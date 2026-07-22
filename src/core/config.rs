@@ -169,6 +169,11 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// Credential kind. Supported: `"static"`, `"apikey"`, `"enduser"`.
+    ///
+    /// `"enduser"` carries a pre-minted end-user JWT in `token` and marks this
+    /// runtime as the agent itself, routing `magickmind-prepared-agent` persona
+    /// calls to the id-less end-user prepare route.
     #[serde(rename = "type")]
     pub auth_type: Option<String>,
     pub email: Option<String>,
@@ -205,7 +210,11 @@ pub struct ObserverConfig {
 /// from the magickmind runtime service per-request and format the prompt in-process.
 /// When `type = "magickmind-prepared"`, the runtime delegates prompt construction to the
 /// MagickMind server's `POST /v1/persona/{id}/prepare` endpoint and uses the returned
-/// `system_prompt` verbatim (the server owns trait banding / formatting).
+/// `system_prompt` verbatim (the server owns trait banding / formatting). Keyed by persona id.
+/// When `type = "magickmind-prepared-agent"`, same server-prepared prompt but keyed by
+/// **agent id**: the route follows `auth.type` — a service-user credential names the agent in
+/// the path (`agent.agent_id` required), while `auth.type = "enduser"` uses the id-less
+/// end-user route where the agent is the token subject.
 /// When `type = "local"`, the persona is loaded from a local `persona.md` file.
 /// When `type = "markdown"`, the system prompt is loaded from a local file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

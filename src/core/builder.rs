@@ -76,6 +76,13 @@ pub struct RuntimeBuilder {
     /// `MagickmindPersonaStage` on demand.
     #[cfg(feature = "persona")]
     pub(crate) magickmind_persona: Option<(String, String, Option<u64>, bool)>,
+    /// Agent-scoped prepared persona:
+    /// `(base_url, agent_id, is_enduser, cache_ttl_secs, allow_insecure)`.
+    /// Set when `persona.type = "magickmind-prepared-agent"`. Built into a
+    /// `MagickmindAgentPersonaStage` on demand. `agent_id` is empty on the
+    /// end-user route, where the token subject supplies it.
+    #[cfg(feature = "persona")]
+    pub(crate) magickmind_agent_persona: Option<(String, String, bool, Option<u64>, bool)>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -98,6 +105,8 @@ impl RuntimeBuilder {
             persona_provider: None,
             #[cfg(feature = "persona")]
             magickmind_persona: None,
+            #[cfg(feature = "persona")]
+            magickmind_agent_persona: None,
             #[cfg(feature = "identity")]
             identity_resolver: None,
         }
@@ -214,6 +223,35 @@ impl RuntimeBuilder {
         let (base_url, persona_id, ttl_secs, allow_insecure) = self.magickmind_persona.as_ref()?;
         let auth = self.auth.clone()?;
         let mut stage = MagickmindPersonaStage::new(base_url, persona_id, auth)
+            .with_allow_insecure(*allow_insecure);
+        if let Some(secs) = ttl_secs {
+            stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
+        }
+        Some(stage)
+    }
+
+    /// Build a `MagickmindAgentPersonaStage` from the configured
+    /// agent-scoped prepared persona.
+    ///
+    /// Returns `None` unless `persona.type = "magickmind-prepared-agent"` was
+    /// configured (and auth resolved). The route follows `auth.type`: a
+    /// service-user credential names `agent.agent_id` in the path, while
+    /// `auth.type = "enduser"` uses the id-less end-user route. No network call
+    /// is made here — the server computes the prompt per-request.
+    #[cfg(feature = "persona")]
+    pub fn build_magickmind_agent_persona_stage(
+        &self,
+    ) -> Option<crate::persona::MagickmindAgentPersonaStage> {
+        let (base_url, agent_id, is_enduser, ttl_secs, allow_insecure) =
+            self.magickmind_agent_persona.as_ref()?;
+        let auth = self.auth.clone()?;
+        let caller = if *is_enduser {
+            crate::persona::PersonaCaller::EndUser
+        } else {
+            crate::persona::PersonaCaller::ServiceUser
+        };
+        let mut stage = crate::persona::MagickmindAgentPersonaStage::new(base_url, agent_id, auth)
+            .with_caller(caller)
             .with_allow_insecure(*allow_insecure);
         if let Some(secs) = ttl_secs {
             stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
@@ -427,6 +465,51 @@ impl Runtime {
                     builder.magickmind_persona = Some((
                         base_url,
                         persona_id,
+                        config.persona.cache_ttl_secs,
+                        config.persona.allow_insecure,
+                    ));
+                }
+                Some("magickmind-prepared-agent") => {
+                    let base_url = config
+                        .persona
+                        .base_url
+                        .as_deref()
+                        .or(config.memory.base_url.as_deref())
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind-prepared-agent persona",
+                            )
+                        })?
+                        .to_string();
+                    if base_url.starts_with("http://") && !config.persona.allow_insecure {
+                        return Err(MindroidError::config(format!(
+                            "persona.base_url {base_url} is plaintext http:// — use https://, \
+                             or set persona.allow_insecure = true for local development"
+                        )));
+                    }
+
+                    // The credential decides the route. An end-user JWT is the
+                    // agent itself (id-less route); a service-user credential
+                    // names the agent in the path and so requires agent_id.
+                    let is_enduser = config.auth.auth_type.as_deref() == Some("enduser");
+                    let agent_id = if is_enduser {
+                        String::new()
+                    } else {
+                        if config.agent.agent_id.is_empty() {
+                            return Err(MindroidError::config(
+                                "agent.agent_id is required when persona.type = \
+                                 \"magickmind-prepared-agent\" with a service-user credential; \
+                                 with auth.type = \"enduser\" the agent is taken from the token \
+                                 subject instead",
+                            ));
+                        }
+                        config.agent.agent_id.clone()
+                    };
+                    builder.magickmind_agent_persona = Some((
+                        base_url,
+                        agent_id,
+                        is_enduser,
                         config.persona.cache_ttl_secs,
                         config.persona.allow_insecure,
                     ));
