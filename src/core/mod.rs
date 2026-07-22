@@ -9,6 +9,16 @@ pub mod extension_map;
 pub(crate) mod factory;
 pub mod message;
 pub mod models;
+/// Shared HTTP/URL helpers. Gated on the features that pull in `reqwest`.
+#[cfg(any(
+    feature = "apikey",
+    feature = "llm-client",
+    feature = "llm-hosted",
+    feature = "persistence",
+    feature = "persona",
+    feature = "speech"
+))]
+pub(crate) mod net;
 pub mod routine;
 pub mod runtime;
 pub mod strategy;

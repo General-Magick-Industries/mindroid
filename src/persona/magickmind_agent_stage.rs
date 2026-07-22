@@ -89,6 +89,11 @@ impl MagickmindAgentPersonaStage {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
+                // A prepare endpoint has no reason to redirect, and reqwest's
+                // cross-host header strip compares host and port but not scheme
+                // — so a same-host https->http redirect would forward the
+                // bearer token in cleartext. Refuse to follow at all.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -231,16 +236,13 @@ impl MagickmindAgentPersonaStage {
 
     /// Call the prepare endpoint and return the finished system prompt.
     async fn prepare(&self, user_id: Option<&str>) -> Result<String> {
-        if self.base_url.starts_with("http://") && !self.allow_insecure {
-            return Err(MindroidError::Api {
-                message: format!(
-                    "refusing to send auth headers over plaintext {}: use https://, \
-                     or set persona.allow_insecure = true for local development",
-                    self.base_url
-                ),
-                status_code: None,
-            });
-        }
+        // Defense in depth: the builder already refuses a non-TLS base_url at
+        // startup, but a directly-constructed stage has not been through it.
+        crate::core::net::require_secure_url(
+            &self.base_url,
+            self.allow_insecure,
+            "persona.allow_insecure",
+        )?;
 
         let url = self.prepare_url()?;
         let headers = crate::auth::build_auth_header_map(self.identity.as_ref()).await?;
@@ -260,7 +262,7 @@ impl MagickmindAgentPersonaStage {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
             let hint = match (self.caller, status.as_u16()) {
                 (PersonaCaller::ServiceUser, 404) => {
                     " (is this an agent id? this route is keyed by agent, not persona)"
@@ -407,8 +409,9 @@ mod tests {
             "agent-1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         );
-        let err = s.prepare(None).await.unwrap_err();
-        assert!(err.to_string().contains("plaintext"), "got: {err}");
+        let err = s.prepare(None).await.unwrap_err().to_string();
+        assert!(err.contains("http://persona.internal"), "got: {err}");
+        assert!(err.contains("persona.allow_insecure"), "got: {err}");
     }
 
     #[test]

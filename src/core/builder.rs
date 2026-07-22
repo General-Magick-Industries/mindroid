@@ -259,65 +259,105 @@ impl RuntimeBuilder {
         Some(stage)
     }
 
-    /// Resolve `(base_url, caller, allow_insecure)` for episode ingest from
-    /// config, or `None` if `episodes.enabled` is false / unconfigured.
+    /// Resolve `(base_url, caller, allow_insecure, skip_persona)` for episode
+    /// ingest, or `Ok(None)` when `episodes.enabled` is false.
+    ///
+    /// Enabling episodes with an unusable configuration is an error, not a
+    /// silent no-op: ingest failures are swallowed by design (a memory outage
+    /// must not stop the agent), so a bad URL would otherwise warn once per
+    /// message forever while storing nothing. This mirrors the persona path,
+    /// which also refuses to start rather than degrade invisibly.
     #[cfg(feature = "persona")]
-    fn episode_ingest_params(&self) -> Option<(String, crate::persona::PersonaCaller, bool, bool)> {
-        let config = self.config.as_ref()?;
+    fn episode_ingest_params(
+        &self,
+    ) -> Result<Option<(String, crate::persona::PersonaCaller, bool, bool)>> {
+        let Some(config) = self.config.as_ref() else {
+            return Ok(None);
+        };
         if !config.episodes.enabled {
-            return None;
+            return Ok(None);
         }
+
         let base_url = config
             .episodes
             .base_url
             .as_deref()
             .or(config.memory.base_url.as_deref())
-            .or(config.auth.base_url.as_deref())?
+            .or(config.auth.base_url.as_deref())
+            .ok_or_else(|| {
+                MindroidError::config(
+                    "episodes.base_url, memory.base_url, or auth.base_url is required when \
+                     episodes.enabled = true",
+                )
+            })?
             .to_string();
+
+        crate::core::net::require_secure_url(
+            &base_url,
+            config.episodes.allow_insecure,
+            "episodes.allow_insecure",
+        )?;
+
         let caller = if config.auth.auth_type.as_deref() == Some("enduser") {
             crate::persona::PersonaCaller::EndUser
         } else {
             crate::persona::PersonaCaller::ServiceUser
         };
-        Some((
+        Ok(Some((
             base_url,
             caller,
             config.episodes.allow_insecure,
             config.episodes.skip_persona,
-        ))
+        )))
     }
 
     /// Build the **inbound** episode-ingest stage from `[episodes]` config.
     ///
     /// Place it early — before any gate that may halt — so every received
-    /// message is remembered. Returns `None` unless `episodes.enabled = true`
-    /// (and auth resolved).
+    /// message is remembered. Returns `Ok(None)` when `episodes.enabled` is
+    /// false or auth is unresolved; returns `Err` when episodes are enabled but
+    /// misconfigured, rather than silently ingesting nothing.
     #[cfg(feature = "persona")]
-    pub fn build_episode_ingest_stage(&self) -> Option<crate::episode::EpisodeIngestStage> {
-        let (base_url, caller, allow_insecure, skip_persona) = self.episode_ingest_params()?;
-        let auth = self.auth.clone()?;
-        Some(
+    pub fn build_episode_ingest_stage(&self) -> Result<Option<crate::episode::EpisodeIngestStage>> {
+        let Some((base_url, caller, allow_insecure, skip_persona)) =
+            self.episode_ingest_params()?
+        else {
+            return Ok(None);
+        };
+        let Some(auth) = self.auth.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(
             crate::episode::EpisodeIngestStage::new(&base_url, auth, caller)
                 .with_allow_insecure(allow_insecure)
                 .with_skip_persona(skip_persona),
-        )
+        ))
     }
 
     /// Build the **outbound** reply-ingest stage from `[episodes]` config.
     ///
-    /// Place it after response generation (near persistence). Returns `None`
-    /// unless `episodes.enabled = true` (and auth resolved).
+    /// Place it after response generation, but **before** any stage that can
+    /// fail the pipeline — a stage returning `Err` aborts the run, and the
+    /// agent's own turn would never reach episodic memory.
+    ///
+    /// Same `Ok(None)` / `Err` contract as [`build_episode_ingest_stage`](Self::build_episode_ingest_stage).
     #[cfg(feature = "persona")]
     pub fn build_episode_reply_ingest_stage(
         &self,
-    ) -> Option<crate::episode::EpisodeReplyIngestStage> {
-        let (base_url, caller, allow_insecure, skip_persona) = self.episode_ingest_params()?;
-        let auth = self.auth.clone()?;
-        Some(
+    ) -> Result<Option<crate::episode::EpisodeReplyIngestStage>> {
+        let Some((base_url, caller, allow_insecure, skip_persona)) =
+            self.episode_ingest_params()?
+        else {
+            return Ok(None);
+        };
+        let Some(auth) = self.auth.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(
             crate::episode::EpisodeReplyIngestStage::new(&base_url, auth, caller)
                 .with_allow_insecure(allow_insecure)
                 .with_skip_persona(skip_persona),
-        )
+        ))
     }
 
     /// Build an `IdentityResolutionStage` from the configured resolver.
@@ -516,13 +556,12 @@ impl Runtime {
                         })?
                         .to_string();
                     // Auth headers ride on every prepare request — fail fast on
-                    // a plaintext base_url unless explicitly opted in.
-                    if base_url.starts_with("http://") && !config.persona.allow_insecure {
-                        return Err(MindroidError::config(format!(
-                            "persona.base_url {base_url} is plaintext http:// — use https://, \
-                             or set persona.allow_insecure = true for local development"
-                        )));
-                    }
+                    // a non-TLS base_url unless explicitly opted in.
+                    crate::core::net::require_secure_url(
+                        &base_url,
+                        config.persona.allow_insecure,
+                        "persona.allow_insecure",
+                    )?;
                     builder.magickmind_persona = Some((
                         base_url,
                         persona_id,

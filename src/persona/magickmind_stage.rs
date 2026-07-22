@@ -97,6 +97,11 @@ impl MagickmindPersonaStage {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
+                // A prepare endpoint has no reason to redirect, and reqwest's
+                // cross-host header strip compares host and port but not scheme
+                // — so a same-host https->http redirect would forward the
+                // bearer token in cleartext. Refuse to follow at all.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -216,16 +221,13 @@ impl MagickmindPersonaStage {
     async fn prepare(&self, persona_id: &str, user_id: Option<&str>) -> Result<String> {
         // Auth headers ride on every prepare request — refuse to send them
         // over an unencrypted connection unless explicitly opted in.
-        if self.base_url.starts_with("http://") && !self.allow_insecure {
-            return Err(MindroidError::Api {
-                message: format!(
-                    "refusing to send auth headers over plaintext {}: use https://, \
-                     or set persona.allow_insecure = true for local development",
-                    self.base_url
-                ),
-                status_code: None,
-            });
-        }
+        // Defense in depth: the builder already refuses a non-TLS base_url at
+        // startup, but a directly-constructed stage has not been through it.
+        crate::core::net::require_secure_url(
+            &self.base_url,
+            self.allow_insecure,
+            "persona.allow_insecure",
+        )?;
 
         let url = {
             let mut u = reqwest::Url::parse(&self.base_url).map_err(|e| MindroidError::Api {
@@ -257,7 +259,7 @@ impl MagickmindPersonaStage {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
             return Err(MindroidError::Api {
                 message: format!("Failed to prepare persona {persona_id}: {text}"),
                 status_code: Some(status.as_u16()),
@@ -420,8 +422,9 @@ mod tests {
             "p1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         );
-        let err = s.prepare("p1", None).await.unwrap_err();
-        assert!(err.to_string().contains("plaintext"), "got: {err}");
+        let err = s.prepare("p1", None).await.unwrap_err().to_string();
+        assert!(err.contains("http://persona.internal"), "got: {err}");
+        assert!(err.contains("persona.allow_insecure"), "got: {err}");
     }
 
     #[tokio::test]
@@ -434,7 +437,9 @@ mod tests {
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         )
         .with_allow_insecure(true);
-        let err = s.prepare("p1", None).await.unwrap_err();
-        assert!(!err.to_string().contains("plaintext"), "got: {err}");
+        // With the flag set the scheme check passes; the request then fails at
+        // the network layer, which proves we got past the guard.
+        let err = s.prepare("p1", None).await.unwrap_err().to_string();
+        assert!(!err.contains("allow_insecure"), "got: {err}");
     }
 }

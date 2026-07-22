@@ -203,22 +203,28 @@ async fn main() -> anyhow::Result<()> {
     // ones the agent replies to. The reply stage runs after generation to
     // capture the agent's own message, which mindroid drops from the inbound
     // path (runtime skips the agent's own messages to avoid loops).
-    let inbound_ingest = builder.build_episode_ingest_stage().map(Arc::new);
+    let inbound_ingest = builder.build_episode_ingest_stage()?.map(Arc::new);
     if inbound_ingest.is_some() {
         tracing::info!("Episode ingest enabled");
     }
 
-    // Respond pipeline, built once: persona → LLM → post-process → persist →
-    // (optional) reply ingest.
+    // Respond pipeline, built once: persona → LLM → post-process →
+    // (optional) reply ingest → persist.
+    //
+    // Reply ingest goes BEFORE persistence: a stage returning Err aborts the
+    // run, and MagickmindPersistence fails when the chat-history service is
+    // down. Ordered the other way, the agent's own turn would be dropped from
+    // episodic memory during exactly the outage best-effort ingest exists to
+    // survive — leaving a half-turn (user message stored, reply missing).
     let mut respond = Pipeline::new()
         .add_stage(SharedStage(Arc::clone(&persona_stage)))
         .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
-        .add_stage(PostProcessor)
-        .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind)));
-    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage() {
+        .add_stage(PostProcessor);
+    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage()? {
         respond = respond.add_stage(reply_ingest);
     }
-    let respond_pipeline = Arc::new(respond);
+    let respond_pipeline =
+        Arc::new(respond.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind))));
 
     // Wire up the runtime
     let mut runtime = builder
@@ -239,10 +245,10 @@ async fn main() -> anyhow::Result<()> {
 
                 // Step 0: Remember this message before anything can halt. Every
                 // received message is ingested, whether or not the agent replies.
-                if let Some(ingest) = &inbound_ingest {
-                    if let Err(e) = ingest.process(&mut pctx).await {
-                        tracing::warn!("Episode ingest failed (continuing): {e}");
-                    }
+                if let Some(ingest) = &inbound_ingest
+                    && let Err(e) = ingest.process(&mut pctx).await
+                {
+                    tracing::warn!("Episode ingest failed (continuing): {e}");
                 }
 
                 // Step 1: Check @mention first (cheap, no API calls).

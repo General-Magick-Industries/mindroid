@@ -41,6 +41,11 @@ impl EpisodeClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
+                // An ingest endpoint has no reason to redirect, and reqwest's
+                // cross-host header strip compares host and port but not scheme
+                // — so a same-host https->http redirect would forward the
+                // bearer token in cleartext. Refuse to follow at all.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("failed to build HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -76,16 +81,13 @@ impl EpisodeClient {
     /// `agent_id` names the memory owner on the service-user route and is
     /// omitted on the end-user route (the token subject owns).
     async fn ingest(&self, agent_id: &str, msg: &EpisodeMessage<'_>) -> Result<()> {
-        if self.base_url.starts_with("http://") && !self.allow_insecure {
-            return Err(MindroidError::Api {
-                message: format!(
-                    "refusing to send auth headers over plaintext {}: use https://, \
-                     or set episodes.allow_insecure = true for local development",
-                    self.base_url
-                ),
-                status_code: None,
-            });
-        }
+        // Defense in depth: the builder already refuses a non-TLS base_url at
+        // startup, but a directly-constructed client has not been through it.
+        crate::core::net::require_secure_url(
+            &self.base_url,
+            self.allow_insecure,
+            "episodes.allow_insecure",
+        )?;
 
         let url = self.process_url()?;
         let headers = crate::auth::build_auth_header_map(self.identity.as_ref()).await?;
@@ -117,7 +119,7 @@ impl EpisodeClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
             return Err(MindroidError::Api {
                 message: format!("episode ingest failed: {text}"),
                 status_code: Some(status.as_u16()),
@@ -186,9 +188,11 @@ impl PipelineStage for EpisodeIngestStage {
             sender_id: &ctx.message.sender_id,
             message: &ctx.message.content,
             message_id: &ctx.message.id,
-            // mindroid's Message has no display name; fall back to sender_id so
-            // episodes always has a non-blank label.
-            display_name: Some(&ctx.message.sender_id),
+            // mindroid's Message carries no human-readable name. Sending the
+            // raw sender_id would write an opaque platform id into permanent
+            // memory as if it were a display name, and stored labels are hard
+            // to backfill — leave it unset and let the server resolve one.
+            display_name: None,
             is_group,
         };
 
