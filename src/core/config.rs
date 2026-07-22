@@ -23,6 +23,8 @@ pub struct MindroidConfig {
     pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
     pub identity: IdentityConfig,
+    #[serde(default)]
+    pub episodes: EpisodesConfig,
 }
 
 impl MindroidConfig {
@@ -236,6 +238,29 @@ pub struct PersonaConfig {
     /// Permit sending auth headers over plaintext `http://` (local development only).
     /// Production deployments must use `https://`.
     pub allow_insecure: bool,
+}
+
+/// Configuration for episodic-memory ingest.
+///
+/// When `enabled`, every inbound message and the agent's own reply is sent to
+/// MagickMind's episode `/process` endpoint. The route follows `auth.type`, as
+/// with the persona stage: `auth.type = "enduser"` uses the id-less end-user
+/// route (owner is the token subject), otherwise the service-user route with
+/// `agent.agent_id` as the owner.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EpisodesConfig {
+    /// Enable episodic-memory ingest. Default: false.
+    pub enabled: bool,
+    /// Base URL for the episode API. Falls back to `memory.base_url`, then
+    /// `auth.base_url`, if absent.
+    pub base_url: Option<String>,
+    /// Permit sending auth headers over plaintext `http://` (local dev only).
+    pub allow_insecure: bool,
+    /// Ask the server not to resolve the agent's persona for each ingested
+    /// message. The server otherwise attaches a persona snapshot per message,
+    /// which costs a lookup. Default: false (persona attached).
+    pub skip_persona: bool,
 }
 
 /// Configuration for cross-platform identity resolution.

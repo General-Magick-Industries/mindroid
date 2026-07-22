@@ -35,6 +35,8 @@ pub mod transport;
 pub mod llm_client;
 
 #[cfg(feature = "persona")]
+pub mod episode;
+#[cfg(feature = "persona")]
 pub mod persona;
 
 #[cfg(feature = "identity")]
@@ -53,6 +55,8 @@ pub use core::context::Context;
 pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
 pub use core::events::PipelineEvent;
 pub use core::strategy::RunStrategy;
+#[cfg(feature = "persona")]
+pub use episode::{EpisodeIngestStage, EpisodeReplyIngestStage};
 pub use error::{MindroidError, Result};
 pub use memory::{Memory, NoMemory};
 pub use models::{
