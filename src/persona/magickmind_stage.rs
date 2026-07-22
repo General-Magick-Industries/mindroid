@@ -1,13 +1,13 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::auth::Auth;
 use crate::core::context::Context;
+use crate::core::net::{PreparedPromptCache, PromptCacheKey};
 use crate::error::{MindroidError, Result};
 use crate::models::LlmMessage;
 use crate::pipeline::PipelineStage;
@@ -62,21 +62,11 @@ pub struct MagickmindPersonaStage {
     /// per-request [`ConversationHistory`](super::ConversationHistory)
     /// extension takes precedence.
     history: Arc<Vec<LlmMessage>>,
-    /// How long a prepared prompt stays valid in [`Self::cache`].
-    ttl: Duration,
-    /// Cache of prepared system prompts keyed by `(persona_id, user_id)`.
-    cache: Mutex<HashMap<(String, Option<String>), CacheEntry>>,
+    /// Prepared prompts keyed by `(persona_id, user_id)`.
+    cache: PreparedPromptCache,
     /// Permit sending auth headers over plaintext `http://` (local dev only).
     allow_insecure: bool,
 }
-
-/// A cached prepared prompt plus the instant it was fetched.
-struct CacheEntry {
-    prompt: String,
-    fetched_at: Instant,
-}
-
-type CacheKey = (String, Option<String>);
 
 /// Per-message persona selector stored in the pipeline [`Context`].
 ///
@@ -95,21 +85,14 @@ impl MagickmindPersonaStage {
     /// entire prompt per-request in `process()`.
     pub fn new(base_url: &str, persona_id: &str, identity: Arc<dyn Auth>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
-                // A prepare endpoint has no reason to redirect, and reqwest's
-                // cross-host header strip compares host and port but not scheme
-                // — so a same-host https->http redirect would forward the
-                // bearer token in cleartext. Refuse to follow at all.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("failed to build HTTP client"),
+            http: crate::core::net::secure_json_client(Duration::from_secs(
+                Self::HTTP_TIMEOUT_SECS,
+            )),
             base_url: base_url.trim_end_matches('/').to_string(),
             persona_id: persona_id.to_string(),
             identity,
             history: Arc::new(Vec::new()),
-            ttl: Duration::from_secs(Self::DEFAULT_TTL_SECS),
-            cache: Mutex::new(HashMap::new()),
+            cache: PreparedPromptCache::new(Duration::from_secs(Self::DEFAULT_TTL_SECS)),
             allow_insecure: false,
         }
     }
@@ -120,9 +103,6 @@ impl MagickmindPersonaStage {
     /// Total HTTP request timeout in seconds. The prepare call gates message
     /// processing, so a hung server must not stall pipelines indefinitely.
     pub const HTTP_TIMEOUT_SECS: u64 = 10;
-
-    /// Evict expired cache entries once the cache grows beyond this size.
-    const CACHE_SWEEP_THRESHOLD: usize = 200;
 
     /// Provide fallback conversation history for inclusion in the LLM prompt.
     ///
@@ -138,7 +118,7 @@ impl MagickmindPersonaStage {
     /// A TTL of zero disables caching: every message re-fetches from
     /// MagickMind, nothing is stored, and there is no stale fallback.
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
+        self.cache.set_ttl(ttl);
         self
     }
 
@@ -152,24 +132,27 @@ impl MagickmindPersonaStage {
     /// when available, otherwise fetch from MagickMind, and on fetch failure
     /// degrade to the last-good (stale) entry.
     async fn resolve_prompt(&self, persona_id: &str, user_id: Option<&str>) -> Result<String> {
-        let key: CacheKey = (persona_id.to_string(), user_id.map(str::to_string));
+        let key: PromptCacheKey = (persona_id.to_string(), user_id.map(str::to_string));
 
-        if let Some(prompt) = self.cache_get_fresh(&key) {
-            debug!("MagickmindPersonaStage: cache hit for {key:?}");
+        // Log the persona component only — the key's other half is an end-user id.
+        let scope = key.0.clone();
+
+        if let Some(prompt) = self.cache.get_fresh(&key) {
+            debug!("MagickmindPersonaStage: cache hit for persona={scope}");
             return Ok(prompt);
         }
 
         match self.prepare(persona_id, user_id).await {
             Ok(prompt) => {
-                self.cache_insert(key, prompt.clone());
+                self.cache.insert(key, prompt.clone());
                 Ok(prompt)
             }
             Err(e) => {
                 // Persona service unavailable: serve the last-good prompt
                 // rather than dropping the message.
-                if let Some(stale) = self.cache_get_any(&key) {
+                if let Some(stale) = self.cache.get_any(&key) {
                     warn!(
-                        "MagickmindPersonaStage: prepare failed for {key:?}, \
+                        "MagickmindPersonaStage: prepare failed for persona={scope}, \
                          serving stale cached prompt: {e}"
                     );
                     Ok(stale)
@@ -178,43 +161,6 @@ impl MagickmindPersonaStage {
                 }
             }
         }
-    }
-
-    /// Get a cache entry that is still within TTL. Never evicts — expired
-    /// entries are kept as stale fallbacks until the write-path sweep.
-    fn cache_get_fresh(&self, key: &CacheKey) -> Option<String> {
-        let cache = self.cache.lock().expect("persona cache mutex poisoned");
-        cache
-            .get(key)
-            .filter(|e| e.fetched_at.elapsed() < self.ttl)
-            .map(|e| e.prompt.clone())
-    }
-
-    /// Get a cache entry regardless of age (stale-serve fallback).
-    fn cache_get_any(&self, key: &CacheKey) -> Option<String> {
-        let cache = self.cache.lock().expect("persona cache mutex poisoned");
-        cache.get(key).map(|e| e.prompt.clone())
-    }
-
-    /// Insert a prepared prompt. Skips insertion when caching is disabled
-    /// (zero TTL) and sweeps expired entries once the cache grows beyond
-    /// [`Self::CACHE_SWEEP_THRESHOLD`].
-    fn cache_insert(&self, key: CacheKey, prompt: String) {
-        if self.ttl.is_zero() {
-            return;
-        }
-
-        let mut cache = self.cache.lock().expect("persona cache mutex poisoned");
-        if cache.len() > Self::CACHE_SWEEP_THRESHOLD {
-            cache.retain(|_, e| e.fetched_at.elapsed() < self.ttl);
-        }
-        cache.insert(
-            key,
-            CacheEntry {
-                prompt,
-                fetched_at: Instant::now(),
-            },
-        );
     }
 
     /// Call MagickMind's prepare endpoint and return the finished system prompt.
@@ -334,7 +280,7 @@ mod tests {
         .with_ttl(ttl)
     }
 
-    fn key(persona: &str, user: Option<&str>) -> CacheKey {
+    fn key(persona: &str, user: Option<&str>) -> PromptCacheKey {
         (persona.to_string(), user.map(str::to_string))
     }
 
@@ -369,50 +315,49 @@ mod tests {
             "p1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         );
-        assert_eq!(s.ttl, Duration::from_secs(600));
+        assert_eq!(s.cache.ttl(), Duration::from_secs(600));
     }
 
     #[test]
     fn with_ttl_overrides_default() {
-        assert_eq!(stage(Duration::from_secs(30)).ttl, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn zero_ttl_never_inserts() {
-        let s = stage(Duration::ZERO);
-        s.cache_insert(key("p1", Some("u1")), "prompt".into());
-        assert!(s.cache.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn fresh_entry_is_served() {
-        let s = stage(Duration::from_secs(60));
-        s.cache_insert(key("p1", Some("u1")), "prompt".into());
         assert_eq!(
-            s.cache_get_fresh(&key("p1", Some("u1"))).as_deref(),
-            Some("prompt")
+            stage(Duration::from_secs(30)).cache.ttl(),
+            Duration::from_secs(30)
         );
     }
 
-    #[test]
-    fn expired_entry_is_not_fresh_but_serves_stale() {
-        let s = stage(Duration::from_millis(1));
-        s.cache_insert(key("p1", None), "prompt".into());
+    // TTL, staleness and sweep behaviour live in core::net, shared with
+    // MagickmindAgentPersonaStage. What follows is specific to this stage:
+    // how resolve_prompt drives that cache.
+
+    /// Graceful degradation: a prepare failure serves the last-good prompt
+    /// rather than dropping the message.
+    #[tokio::test]
+    async fn stale_prompt_is_served_when_prepare_fails() {
+        // Port 1 is unreachable, so prepare() always errors.
+        let s = MagickmindPersonaStage::new(
+            "https://127.0.0.1:1",
+            "p1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        )
+        .with_ttl(Duration::from_millis(1));
+
+        s.cache.insert(key("p1", Some("u1")), "last good".into());
         std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(s.cache_get_fresh(&key("p1", None)), None);
-        assert_eq!(s.cache_get_any(&key("p1", None)).as_deref(), Some("prompt"));
+
+        let prompt = s.resolve_prompt("p1", Some("u1")).await.unwrap();
+        assert_eq!(prompt, "last good");
     }
 
-    #[test]
-    fn insert_sweeps_expired_entries_beyond_threshold() {
-        let s = stage(Duration::from_millis(1));
-        for i in 0..=MagickmindPersonaStage::CACHE_SWEEP_THRESHOLD {
-            s.cache_insert(key(&format!("p{i}"), None), "prompt".into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-        s.cache_insert(key("fresh", None), "prompt".into());
-        // All expired entries were swept; only the newest insert survives.
-        assert_eq!(s.cache.lock().unwrap().len(), 1);
+    /// With nothing cached, the failure must propagate.
+    #[tokio::test]
+    async fn prepare_failure_without_cache_propagates() {
+        let s = MagickmindPersonaStage::new(
+            "https://127.0.0.1:1",
+            "p1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        );
+        assert!(s.resolve_prompt("p1", Some("u1")).await.is_err());
     }
 
     #[tokio::test]

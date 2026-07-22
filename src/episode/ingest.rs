@@ -39,15 +39,9 @@ impl EpisodeClient {
 
     fn new(base_url: &str, identity: Arc<dyn Auth>, caller: PersonaCaller) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
-                // An ingest endpoint has no reason to redirect, and reqwest's
-                // cross-host header strip compares host and port but not scheme
-                // — so a same-host https->http redirect would forward the
-                // bearer token in cleartext. Refuse to follow at all.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("failed to build HTTP client"),
+            http: crate::core::net::secure_json_client(std::time::Duration::from_secs(
+                Self::HTTP_TIMEOUT_SECS,
+            )),
             base_url: base_url.trim_end_matches('/').to_string(),
             identity,
             caller,

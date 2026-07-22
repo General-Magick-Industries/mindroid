@@ -1,4 +1,115 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crate::error::{MindroidError, Result};
+
+/// Build an HTTP client for a credential-bearing JSON API.
+///
+/// Redirects are refused: reqwest strips `Authorization` across hosts but
+/// compares host and port without the scheme, so a same-host `https -> http`
+/// redirect would forward the bearer token in cleartext. These endpoints have
+/// no reason to redirect, so failing loudly is correct.
+pub(crate) fn secure_json_client(timeout: Duration) -> reqwest::Client {
+    let builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+
+    // reqwest honours HTTP_PROXY/ALL_PROXY and does not exempt loopback, so a
+    // proxied dev machine or egress-controlled CI runner would route a test's
+    // ephemeral-port request into the void.
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+
+    builder.build().expect("failed to build HTTP client")
+}
+
+/// Cache key: the scope being prepared, plus the user it is personalized for.
+///
+/// The user component is `None` for non-user senders, whose prompt is the
+/// generic, non-personalized one. Two real users never share that slot.
+pub(crate) type PromptCacheKey = (String, Option<String>);
+
+struct CacheEntry {
+    prompt: String,
+    fetched_at: Instant,
+}
+
+/// TTL cache of server-prepared prompts, with stale-serve degradation.
+///
+/// Expired entries are kept rather than evicted on read, so a failed re-fetch
+/// can fall back to the last-good prompt instead of dropping the message. A
+/// zero TTL disables caching entirely: nothing is stored, so there is no stale
+/// fallback and a fetch failure propagates.
+pub(crate) struct PreparedPromptCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<PromptCacheKey, CacheEntry>>,
+}
+
+impl PreparedPromptCache {
+    /// Evict expired entries once the map grows beyond this size.
+    const SWEEP_THRESHOLD: usize = 200;
+
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    pub(crate) fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    /// A cached prompt that is still within TTL. Never evicts — an expired
+    /// entry stays available to [`Self::get_any`] as a stale fallback.
+    pub(crate) fn get_fresh(&self, key: &PromptCacheKey) -> Option<String> {
+        let entries = self.entries.lock().expect("prompt cache mutex poisoned");
+        entries
+            .get(key)
+            .filter(|e| e.fetched_at.elapsed() < self.ttl)
+            .map(|e| e.prompt.clone())
+    }
+
+    /// A cached prompt regardless of age (the stale-serve fallback).
+    pub(crate) fn get_any(&self, key: &PromptCacheKey) -> Option<String> {
+        let entries = self.entries.lock().expect("prompt cache mutex poisoned");
+        entries.get(key).map(|e| e.prompt.clone())
+    }
+
+    /// Store a prompt. No-op when caching is disabled (zero TTL); sweeps
+    /// expired entries once the map grows past [`Self::SWEEP_THRESHOLD`].
+    pub(crate) fn insert(&self, key: PromptCacheKey, prompt: String) {
+        if self.ttl.is_zero() {
+            return;
+        }
+
+        let mut entries = self.entries.lock().expect("prompt cache mutex poisoned");
+        if entries.len() > Self::SWEEP_THRESHOLD {
+            let now = Instant::now();
+            entries.retain(|_, e| now.duration_since(e.fetched_at) < self.ttl);
+        }
+        entries.insert(
+            key,
+            CacheEntry {
+                prompt,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("prompt cache mutex poisoned")
+            .len()
+    }
+}
 
 /// Reject a base URL that would carry auth headers over a non-TLS scheme.
 ///
@@ -107,5 +218,79 @@ mod tests {
         let out = error_excerpt(&"x".repeat(MAX_ERR_BODY + 100));
         assert!(out.ends_with("... (truncated)"));
         assert_eq!(out.chars().filter(|c| *c == 'x').count(), MAX_ERR_BODY);
+    }
+
+    // -- PreparedPromptCache -------------------------------------------------
+    //
+    // These cover both prepare stages: each owns a PreparedPromptCache, so a
+    // regression here surfaces once rather than needing duplicate suites.
+
+    fn key(scope: &str, user: Option<&str>) -> PromptCacheKey {
+        (scope.to_string(), user.map(str::to_string))
+    }
+
+    #[test]
+    fn fresh_entry_is_served() {
+        let c = PreparedPromptCache::new(Duration::from_secs(60));
+        c.insert(key("a1", Some("u1")), "prompt".into());
+        assert_eq!(
+            c.get_fresh(&key("a1", Some("u1"))).as_deref(),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn expired_entry_is_not_fresh_but_serves_stale() {
+        let c = PreparedPromptCache::new(Duration::from_millis(1));
+        c.insert(key("a1", None), "prompt".into());
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(c.get_fresh(&key("a1", None)), None);
+        assert_eq!(c.get_any(&key("a1", None)).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn zero_ttl_never_inserts() {
+        let c = PreparedPromptCache::new(Duration::ZERO);
+        c.insert(key("a1", Some("u1")), "prompt".into());
+        assert_eq!(c.len(), 0);
+        // Nothing stored means no stale fallback, so a failure propagates.
+        assert_eq!(c.get_any(&key("a1", Some("u1"))), None);
+    }
+
+    #[test]
+    fn insert_sweeps_expired_entries_beyond_threshold() {
+        let c = PreparedPromptCache::new(Duration::from_millis(1));
+        for i in 0..=PreparedPromptCache::SWEEP_THRESHOLD {
+            c.insert(key(&format!("a{i}"), None), "prompt".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        c.insert(key("fresh", None), "prompt".into());
+        assert_eq!(c.len(), 1, "expired entries should have been swept");
+    }
+
+    #[test]
+    fn distinct_users_do_not_share_an_entry() {
+        let c = PreparedPromptCache::new(Duration::from_secs(60));
+        c.insert(key("a1", Some("alice")), "for alice".into());
+        c.insert(key("a1", Some("bob")), "for bob".into());
+        assert_eq!(
+            c.get_fresh(&key("a1", Some("alice"))).as_deref(),
+            Some("for alice")
+        );
+        assert_eq!(
+            c.get_fresh(&key("a1", Some("bob"))).as_deref(),
+            Some("for bob")
+        );
+        // The non-personalized slot is separate from both.
+        assert_eq!(c.get_fresh(&key("a1", None)), None);
+    }
+
+    #[test]
+    fn distinct_scopes_do_not_share_an_entry() {
+        let c = PreparedPromptCache::new(Duration::from_secs(60));
+        c.insert(key("agent-1", None), "one".into());
+        c.insert(key("agent-2", None), "two".into());
+        assert_eq!(c.get_fresh(&key("agent-1", None)).as_deref(), Some("one"));
+        assert_eq!(c.get_fresh(&key("agent-2", None)).as_deref(), Some("two"));
     }
 }

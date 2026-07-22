@@ -1,13 +1,13 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::auth::Auth;
 use crate::core::context::Context;
+use crate::core::net::{PreparedPromptCache, PromptCacheKey};
 use crate::error::{MindroidError, Result};
 use crate::models::LlmMessage;
 use crate::pipeline::PipelineStage;
@@ -65,17 +65,9 @@ pub struct MagickmindAgentPersonaStage {
     /// per-request [`ConversationHistory`](super::ConversationHistory)
     /// extension takes precedence.
     history: Arc<Vec<LlmMessage>>,
-    ttl: Duration,
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: PreparedPromptCache,
     allow_insecure: bool,
 }
-
-struct CacheEntry {
-    prompt: String,
-    fetched_at: Instant,
-}
-
-type CacheKey = (String, Option<String>);
 
 /// The cache-key agent component on the end-user route, where no agent id is
 /// sent and the subject is fixed by the token.
@@ -87,22 +79,15 @@ impl MagickmindAgentPersonaStage {
     /// No network call is made at construction time.
     pub fn new(base_url: &str, agent_id: &str, identity: Arc<dyn Auth>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
-                // A prepare endpoint has no reason to redirect, and reqwest's
-                // cross-host header strip compares host and port but not scheme
-                // — so a same-host https->http redirect would forward the
-                // bearer token in cleartext. Refuse to follow at all.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("failed to build HTTP client"),
+            http: crate::core::net::secure_json_client(Duration::from_secs(
+                Self::HTTP_TIMEOUT_SECS,
+            )),
             base_url: base_url.trim_end_matches('/').to_string(),
             agent_id: agent_id.to_string(),
             caller: PersonaCaller::ServiceUser,
             identity,
             history: Arc::new(Vec::new()),
-            ttl: Duration::from_secs(Self::DEFAULT_TTL_SECS),
-            cache: Mutex::new(HashMap::new()),
+            cache: PreparedPromptCache::new(Duration::from_secs(Self::DEFAULT_TTL_SECS)),
             allow_insecure: false,
         }
     }
@@ -113,8 +98,6 @@ impl MagickmindAgentPersonaStage {
     /// Total HTTP request timeout in seconds. The prepare call gates message
     /// processing, so a hung server must not stall pipelines indefinitely.
     pub const HTTP_TIMEOUT_SECS: u64 = 10;
-
-    const CACHE_SWEEP_THRESHOLD: usize = 200;
 
     /// Select which route the stage uses. Defaults to [`PersonaCaller::ServiceUser`].
     pub fn with_caller(mut self, caller: PersonaCaller) -> Self {
@@ -133,7 +116,7 @@ impl MagickmindAgentPersonaStage {
     /// A TTL of zero disables caching: every message re-fetches, nothing is
     /// stored, and there is no stale fallback.
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
+        self.cache.set_ttl(ttl);
         self
     }
 
@@ -160,22 +143,27 @@ impl MagickmindAgentPersonaStage {
     /// Resolve the system prompt: fresh cache entry, else fetch, else the
     /// last-good (stale) entry on failure.
     async fn resolve_prompt(&self, user_id: Option<&str>) -> Result<String> {
-        let key: CacheKey = (self.agent_cache_key(), user_id.map(str::to_string));
+        let key: PromptCacheKey = (self.agent_cache_key(), user_id.map(str::to_string));
 
-        if let Some(prompt) = self.cache_get_fresh(&key) {
-            debug!("MagickmindAgentPersonaStage: cache hit for {key:?}");
+        // Log the agent component only. The key's other half is the end-user
+        // id — operator-owned data is fine to log, but a user's identity is
+        // not, and these lines can leave the device.
+        let scope = key.0.clone();
+
+        if let Some(prompt) = self.cache.get_fresh(&key) {
+            debug!("MagickmindAgentPersonaStage: cache hit for agent={scope}");
             return Ok(prompt);
         }
 
         match self.prepare(user_id).await {
             Ok(prompt) => {
-                self.cache_insert(key, prompt.clone());
+                self.cache.insert(key, prompt.clone());
                 Ok(prompt)
             }
             Err(e) => {
-                if let Some(stale) = self.cache_get_any(&key) {
+                if let Some(stale) = self.cache.get_any(&key) {
                     warn!(
-                        "MagickmindAgentPersonaStage: prepare failed for {key:?}, \
+                        "MagickmindAgentPersonaStage: prepare failed for agent={scope}, \
                          serving stale cached prompt: {e}"
                     );
                     Ok(stale)
@@ -184,37 +172,6 @@ impl MagickmindAgentPersonaStage {
                 }
             }
         }
-    }
-
-    fn cache_get_fresh(&self, key: &CacheKey) -> Option<String> {
-        let cache = self.cache.lock().expect("persona cache mutex poisoned");
-        cache
-            .get(key)
-            .filter(|e| e.fetched_at.elapsed() < self.ttl)
-            .map(|e| e.prompt.clone())
-    }
-
-    fn cache_get_any(&self, key: &CacheKey) -> Option<String> {
-        let cache = self.cache.lock().expect("persona cache mutex poisoned");
-        cache.get(key).map(|e| e.prompt.clone())
-    }
-
-    fn cache_insert(&self, key: CacheKey, prompt: String) {
-        if self.ttl.is_zero() {
-            return;
-        }
-
-        let mut cache = self.cache.lock().expect("persona cache mutex poisoned");
-        if cache.len() > Self::CACHE_SWEEP_THRESHOLD {
-            cache.retain(|_, e| e.fetched_at.elapsed() < self.ttl);
-        }
-        cache.insert(
-            key,
-            CacheEntry {
-                prompt,
-                fetched_at: Instant::now(),
-            },
-        );
     }
 
     /// Build the prepare URL for the active route.
@@ -312,9 +269,14 @@ impl PipelineStage for MagickmindAgentPersonaStage {
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         let user_id = super::resolve_user_id(ctx);
 
+        // On the end-user route `agent_id` is empty by construction (the token
+        // carries the subject), so name the route instead of logging a blank
+        // field. `user_id` is deliberately omitted — see resolve_prompt.
         debug!(
-            "MagickmindAgentPersonaStage: preparing agent={} caller={:?} user={user_id:?}",
-            self.agent_id, self.caller
+            "MagickmindAgentPersonaStage: preparing agent={} caller={:?} personalized={}",
+            self.agent_cache_key(),
+            self.caller,
+            user_id.is_some()
         );
         let system_prompt = self.resolve_prompt(user_id.as_deref()).await?;
 
@@ -420,44 +382,13 @@ mod tests {
         assert!(err.contains("persona.allow_insecure"), "got: {err}");
     }
 
-    fn key(agent: &str, user: Option<&str>) -> CacheKey {
+    fn key(agent: &str, user: Option<&str>) -> PromptCacheKey {
         (agent.to_string(), user.map(str::to_string))
     }
 
-    #[test]
-    fn fresh_entry_is_served() {
-        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::from_secs(60));
-        s.cache_insert(key("agent-1", Some("u1")), "prompt".into());
-        assert_eq!(
-            s.cache_get_fresh(&key("agent-1", Some("u1"))).as_deref(),
-            Some("prompt")
-        );
-    }
-
-    #[test]
-    fn expired_entry_is_not_fresh_but_serves_stale() {
-        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::from_millis(1));
-        s.cache_insert(key("agent-1", None), "prompt".into());
-        std::thread::sleep(Duration::from_millis(5));
-        // Expired: not fresh, but still available as the last-good fallback.
-        assert_eq!(s.cache_get_fresh(&key("agent-1", None)), None);
-        assert_eq!(
-            s.cache_get_any(&key("agent-1", None)).as_deref(),
-            Some("prompt")
-        );
-    }
-
-    #[test]
-    fn insert_sweeps_expired_entries_beyond_threshold() {
-        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::from_millis(1));
-        for i in 0..=MagickmindAgentPersonaStage::CACHE_SWEEP_THRESHOLD {
-            s.cache_insert(key(&format!("a{i}"), None), "prompt".into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-        s.cache_insert(key("fresh", None), "prompt".into());
-        // All expired entries were swept; only the newest insert survives.
-        assert_eq!(s.cache.lock().unwrap().len(), 1);
-    }
+    // TTL, staleness and sweep behaviour are covered once in core::net, since
+    // both prepare stages share PreparedPromptCache. The tests below cover what
+    // is specific to this stage: how resolve_prompt drives that cache.
 
     /// The graceful-degradation guarantee: when prepare() fails, a previously
     /// cached prompt is served rather than failing the message.
@@ -471,7 +402,8 @@ mod tests {
         )
         .with_ttl(Duration::from_millis(1));
 
-        s.cache_insert(key("agent-1", Some("u1")), "last good".into());
+        s.cache
+            .insert(key("agent-1", Some("u1")), "last good".into());
         std::thread::sleep(Duration::from_millis(5));
 
         let prompt = s.resolve_prompt(Some("u1")).await.unwrap();
@@ -501,10 +433,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn zero_ttl_never_inserts() {
-        let s = stage(PersonaCaller::ServiceUser).with_ttl(Duration::ZERO);
-        s.cache_insert(("agent-1".into(), None), "p".into());
-        assert!(s.cache.lock().unwrap().is_empty());
+    /// With caching disabled there is no stale entry to fall back on, so a
+    /// prepare failure must surface rather than serving a phantom prompt.
+    #[tokio::test]
+    async fn zero_ttl_disables_stale_serve() {
+        let s = MagickmindAgentPersonaStage::new(
+            "https://127.0.0.1:1",
+            "agent-1",
+            Arc::new(crate::auth::static_id::StaticAuth::new("t")),
+        )
+        .with_ttl(Duration::ZERO);
+
+        s.cache.insert(key("agent-1", Some("u1")), "ignored".into());
+        assert!(s.resolve_prompt(Some("u1")).await.is_err());
     }
 }
