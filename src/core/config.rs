@@ -176,6 +176,10 @@ pub struct AuthConfig {
     pub api_key: Option<String>,
     pub token: Option<String>,
     pub base_url: Option<String>,
+    /// Permit sending credentials over plaintext `http://` (local development
+    /// only). Production deployments must use `https://`.
+    #[serde(default)]
+    pub allow_insecure: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -36,9 +36,12 @@ pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
             })?;
             let email = config.auth.email.as_deref().unwrap_or("");
             let password = config.auth.password.as_deref().unwrap_or("");
-            Ok(Arc::new(crate::auth::apikey::ApiKeyAuth::new(
-                base_url, email, password,
-            )))
+            Ok(Arc::new(crate::auth::apikey::ApiKeyAuth::try_new(
+                base_url,
+                email,
+                password,
+                config.auth.allow_insecure,
+            )?))
         }
 
         other => Err(MindroidError::config(format!(
