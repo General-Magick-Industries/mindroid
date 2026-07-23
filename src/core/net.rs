@@ -57,6 +57,9 @@ impl PreparedPromptCache {
         }
     }
 
+    /// The configured TTL. Only read by tests asserting the default and the
+    /// `with_ttl` override; the cache itself uses `self.ttl` directly.
+    #[cfg(test)]
     pub(crate) fn ttl(&self) -> Duration {
         self.ttl
     }
