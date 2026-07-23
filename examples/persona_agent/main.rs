@@ -243,11 +243,19 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
-                // Step 0: Remember this message before anything can halt. Every
-                // received message is ingested, whether or not the agent replies.
+                // Step 0: Remember this message before anything can halt, so
+                // messages the agent never answers are still recorded.
+                //
+                // Skipped here under IngestScope::Addressed, which only records
+                // messages that passed the gate — that scope cannot be enforced
+                // inside the stage, because nothing has evaluated the gate yet.
+                // It is ingested after Step 1 instead.
+                //
                 // Ingest is best-effort: the stage logs its own failures and
                 // always returns Ok, so there is nothing to handle here.
-                if let Some(ingest) = &inbound_ingest {
+                if let Some(ingest) = &inbound_ingest
+                    && !ingest.runs_after_gate()
+                {
                     let _ = ingest.process(&mut pctx).await;
                 }
 
@@ -265,6 +273,14 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("@mentioned — proceeding");
                 } else {
                     tracing::info!("Mention gate disabled — responding to all messages");
+                }
+
+                // Under IngestScope::Addressed the gate has now passed, so this
+                // message is in scope. Reaching here is the enforcement.
+                if let Some(ingest) = &inbound_ingest
+                    && ingest.runs_after_gate()
+                {
+                    let _ = ingest.process(&mut pctx).await;
                 }
 
                 // Step 2: Fetch context from MagickMind (only after mention check passes)

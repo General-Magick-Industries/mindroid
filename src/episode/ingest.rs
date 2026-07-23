@@ -5,6 +5,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::auth::Auth;
+use crate::config::IngestScope;
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::models::ChannelType;
@@ -144,6 +145,7 @@ struct EpisodeMessage<'a> {
 /// Ingest is best-effort: a failure is logged and the message proceeds.
 pub struct EpisodeIngestStage {
     client: EpisodeClient,
+    scope: IngestScope,
 }
 
 impl EpisodeIngestStage {
@@ -151,6 +153,7 @@ impl EpisodeIngestStage {
     pub fn new(base_url: &str, identity: Arc<dyn Auth>, caller: PersonaCaller) -> Self {
         Self {
             client: EpisodeClient::new(base_url, identity, caller),
+            scope: IngestScope::All,
         }
     }
 
@@ -167,6 +170,37 @@ impl EpisodeIngestStage {
         self.client.skip_persona = skip_persona;
         self
     }
+
+    /// Restrict which messages are ingested. Default: [`IngestScope::All`].
+    ///
+    /// [`IngestScope::DirectOnly`] is enforced here. [`IngestScope::Addressed`]
+    /// cannot be — this stage runs before any gate, so it has no way to know
+    /// whether the agent was addressed; the caller enforces it by invoking the
+    /// stage only after the gate passes. [`Self::runs_after_gate`] reports
+    /// which placement the configured scope requires.
+    pub fn with_scope(mut self, scope: IngestScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// Whether the configured scope requires this stage to be called *after*
+    /// the agent's gate rather than before it.
+    ///
+    /// `true` only for [`IngestScope::Addressed`]. Calling the stage pre-gate
+    /// under that scope would silently record everything.
+    pub fn runs_after_gate(&self) -> bool {
+        self.scope == IngestScope::Addressed
+    }
+
+    /// Whether this message is in scope for ingest.
+    fn in_scope(&self, ctx: &Context) -> bool {
+        match self.scope {
+            // Addressed is enforced by call-site placement, not here: at this
+            // point nothing has evaluated whether the agent was addressed.
+            IngestScope::All | IngestScope::Addressed => true,
+            IngestScope::DirectOnly => ctx.message.channel_type == ChannelType::Direct,
+        }
+    }
 }
 
 #[async_trait]
@@ -176,6 +210,14 @@ impl PipelineStage for EpisodeIngestStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        if !self.in_scope(ctx) {
+            debug!(
+                "EpisodeIngestStage: {} out of scope for {:?}, not ingesting",
+                ctx.message.id, self.scope
+            );
+            return Ok(());
+        }
+
         let is_group = ctx.message.channel_type == ChannelType::Group;
         let msg = EpisodeMessage {
             magickspace_id: &ctx.message.channel_id,
@@ -383,6 +425,66 @@ mod tests {
 
         ctx.response = Some(String::new());
         assert!(stage.process(&mut ctx).await.is_ok());
+    }
+
+    #[test]
+    fn scope_defaults_to_all() {
+        let s = EpisodeIngestStage::new(
+            "https://x",
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        );
+        assert_eq!(s.scope, IngestScope::All);
+        // All is a pre-gate scope: recording everything requires seeing
+        // everything, including messages that halt at the gate.
+        assert!(!s.runs_after_gate());
+    }
+
+    /// Addressed cannot be enforced inside the stage — at Step 0 nothing has
+    /// evaluated the gate. The caller enforces it by placement, so the stage
+    /// must report that it needs the post-gate slot.
+    #[test]
+    fn addressed_requires_post_gate_placement() {
+        let s = EpisodeIngestStage::new(
+            "https://x",
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        )
+        .with_scope(IngestScope::Addressed);
+        assert!(s.runs_after_gate());
+    }
+
+    #[test]
+    fn direct_only_is_enforced_in_the_stage() {
+        let s = EpisodeIngestStage::new(
+            "https://x",
+            Arc::new(StaticAuth::new("t")),
+            PersonaCaller::EndUser,
+        )
+        .with_scope(IngestScope::DirectOnly);
+        // Enforced here, so no post-gate placement is needed.
+        assert!(!s.runs_after_gate());
+
+        let (group_ctx, _) = failing_ctx("hi");
+        assert!(!s.in_scope(&group_ctx), "group traffic is out of scope");
+
+        let mut direct = Message::new("hi", "user-1", "space-1");
+        direct.channel_type = ChannelType::Direct;
+        let direct_ctx = Context::new(Arc::new(direct), group_ctx.agent_config.clone());
+        assert!(s.in_scope(&direct_ctx), "direct traffic is in scope");
+    }
+
+    /// A group message under DirectOnly must not reach the network at all.
+    #[tokio::test]
+    async fn out_of_scope_message_is_not_ingested() {
+        let (mut ctx, url) = failing_ctx("hi");
+        let s =
+            EpisodeIngestStage::new(&url, Arc::new(StaticAuth::new("t")), PersonaCaller::EndUser)
+                .with_scope(IngestScope::DirectOnly);
+        // The URL is unreachable, so an attempted send would still return Ok
+        // (best-effort) — what this pins is the early return before that.
+        assert!(s.process(&mut ctx).await.is_ok());
+        assert!(!s.in_scope(&ctx));
     }
 
     #[test]

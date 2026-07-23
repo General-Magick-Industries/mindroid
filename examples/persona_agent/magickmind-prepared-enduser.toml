@@ -41,6 +41,24 @@ base_url = "https://bifrost.example.com"
 # cache_ttl_secs = 600
 # allow_insecure = true   # local non-TLS dev only
 
+# -- Episodic memory ingest (off by default) ----------------------------------
+# When enabled, received messages and the agent's own replies are sent to
+# MagickMind's episode endpoint and stored durably.
+#
+# scope controls which INBOUND messages are recorded:
+#   "all"         every received message, addressed to this agent or not.
+#                 In a group this includes participants who never addressed the
+#                 agent and may not know it is listening — obtain notice before
+#                 using this in shared spaces.
+#   "addressed"   only messages that passed the agent's gate.
+#   "direct_only" only 1:1 channels; group and broadcast traffic is skipped.
+#
+# [episodes]
+# enabled = true
+# scope = "all"
+# base_url = "https://bifrost.example.com"   # else falls back to memory.base_url
+# skip_persona = true    # skip the server's per-message persona snapshot
+
 [observer]
 type = "log"
 level = "info"
