@@ -238,7 +238,12 @@ impl PipelineStage for MagickmindPersonaStage {
             .map(|p| p.0.clone())
             .unwrap_or_else(|| self.persona_id.clone());
 
-        debug!("MagickmindPersonaStage: preparing persona={persona_id} user={user_id:?}");
+        // `user_id` is deliberately not logged — see resolve_prompt. Record
+        // only whether the prompt is personalized.
+        debug!(
+            "MagickmindPersonaStage: preparing persona={persona_id} personalized={}",
+            user_id.is_some()
+        );
         let system_prompt = self.resolve_prompt(&persona_id, user_id.as_deref()).await?;
 
         let messages = super::assemble_llm_messages(ctx, &system_prompt, &self.history);
