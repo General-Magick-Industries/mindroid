@@ -167,36 +167,64 @@ async fn main() -> anyhow::Result<()> {
     let gate_enabled =
         !std::env::var("MINDROID_DISABLE_GATE").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
 
-    // Build the persona stage once. Two modes are supported via [persona] config:
-    //   type = "magickmind"          → PersonaContextBuilder formats the prompt in-process
-    //   type = "magickmind-prepared" → MagickmindPersonaStage delegates prompt construction
-    //                                  to the MagickMind server and uses the returned
-    //                                  system_prompt verbatim
-    // Both implement PipelineStage, so we hold whichever is configured as a
+    // Build the persona stage once. Three modes are supported via [persona] config:
+    //   type = "magickmind"                → PersonaContextBuilder formats the prompt in-process
+    //   type = "magickmind-prepared"       → MagickmindPersonaStage delegates prompt construction
+    //                                        to the server (persona-keyed) and uses the returned
+    //                                        system_prompt verbatim
+    //   type = "magickmind-prepared-agent" → MagickmindAgentPersonaStage, same server-prepared
+    //                                        prompt but agent-keyed; the route follows auth.type
+    //                                        (service-user names agent_id, "enduser" uses the
+    //                                        id-less end-user route)
+    // All implement PipelineStage, so we hold whichever is configured as a
     // trait object. Per-request conversation history is injected via the
     // ConversationHistory context extension, so the respond pipeline is built
     // once and shared across requests.
-    let persona_stage: Arc<dyn PipelineStage> = if let Some(prepared) =
-        builder.build_magickmind_persona_stage()
+    let persona_stage: Arc<dyn PipelineStage> = if let Some(agent_prepared) =
+        builder.build_magickmind_agent_persona_stage()
     {
+        tracing::info!(
+            "Using agent-scoped prepared persona stage (type = \"magickmind-prepared-agent\")"
+        );
+        Arc::new(agent_prepared)
+    } else if let Some(prepared) = builder.build_magickmind_persona_stage() {
         tracing::info!("Using MagickMind-prepared persona stage (type = \"magickmind-prepared\")");
         Arc::new(prepared)
     } else {
         let persona_client = builder.build_persona_stage().await?.expect(
-                "persona_agent requires [persona] config with type = \"magickmind\" or \"magickmind-prepared\"",
+                "persona_agent requires [persona] config with type = \"magickmind\", \"magickmind-prepared\", or \"magickmind-prepared-agent\"",
             );
         tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
         Arc::new(persona_client)
     };
 
-    // Respond pipeline, built once: persona → LLM → post-process → persist.
-    let respond_pipeline = Arc::new(
-        Pipeline::new()
-            .add_stage(SharedStage(Arc::clone(&persona_stage)))
-            .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
-            .add_stage(PostProcessor)
-            .add_stage(MagickmindPersistence::new(Arc::clone(&magickmind))),
-    );
+    // Episode ingest (optional, [episodes] config). The inbound stage runs
+    // before the mention gate so EVERY received message is remembered, not just
+    // ones the agent replies to. The reply stage runs after generation to
+    // capture the agent's own message, which mindroid drops from the inbound
+    // path (runtime skips the agent's own messages to avoid loops).
+    let inbound_ingest = builder.build_episode_ingest_stage()?.map(Arc::new);
+    if inbound_ingest.is_some() {
+        tracing::info!("Episode ingest enabled");
+    }
+
+    // Respond pipeline, built once: persona → LLM → post-process →
+    // (optional) reply ingest → persist.
+    //
+    // Reply ingest goes BEFORE persistence: a stage returning Err aborts the
+    // run, and MagickmindPersistence fails when the chat-history service is
+    // down. Ordered the other way, the agent's own turn would be dropped from
+    // episodic memory during exactly the outage best-effort ingest exists to
+    // survive — leaving a half-turn (user message stored, reply missing).
+    let mut respond = Pipeline::new()
+        .add_stage(SharedStage(Arc::clone(&persona_stage)))
+        .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
+        .add_stage(PostProcessor);
+    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage()? {
+        respond = respond.add_stage(reply_ingest);
+    }
+    let respond_pipeline =
+        Arc::new(respond.add_stage(MagickmindPersistence::new(Arc::clone(&magickmind))));
 
     // Wire up the runtime
     let mut runtime = builder
@@ -204,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
             let preparer = Arc::clone(&context_preparer);
             let gate = Arc::clone(&gate_pipeline);
             let respond = Arc::clone(&respond_pipeline);
+            let inbound_ingest = inbound_ingest.clone();
 
             async move {
                 tracing::info!(
@@ -212,10 +241,26 @@ async fn main() -> anyhow::Result<()> {
                     ctx.message.content
                 );
 
-                // Step 1: Check @mention first (cheap, no API calls).
-                // Skipped when MINDROID_DISABLE_GATE is set (local mindroid test).
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 
+                // Step 0: Remember this message before anything can halt, so
+                // messages the agent never answers are still recorded.
+                //
+                // Skipped here under IngestScope::Addressed, which only records
+                // messages that passed the gate — that scope cannot be enforced
+                // inside the stage, because nothing has evaluated the gate yet.
+                // It is ingested after Step 1 instead.
+                //
+                // Ingest is best-effort: the stage logs its own failures and
+                // always returns Ok, so there is nothing to handle here.
+                if let Some(ingest) = &inbound_ingest
+                    && !ingest.runs_after_gate()
+                {
+                    let _ = ingest.process(&mut pctx).await;
+                }
+
+                // Step 1: Check @mention first (cheap, no API calls).
+                // Skipped when MINDROID_DISABLE_GATE is set (local mindroid test).
                 if gate_enabled {
                     if let Err(e) = ctx.run_with_context(&gate, &mut pctx).await {
                         tracing::error!("Mention gate failed: {e}");
@@ -228,6 +273,14 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("@mentioned — proceeding");
                 } else {
                     tracing::info!("Mention gate disabled — responding to all messages");
+                }
+
+                // Under IngestScope::Addressed the gate has now passed, so this
+                // message is in scope. Reaching here is the enforcement.
+                if let Some(ingest) = &inbound_ingest
+                    && ingest.runs_after_gate()
+                {
+                    let _ = ingest.process(&mut pctx).await;
                 }
 
                 // Step 2: Fetch context from MagickMind (only after mention check passes)

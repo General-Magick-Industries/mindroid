@@ -44,16 +44,27 @@ impl<T: Auth> Auth for Arc<T> {
     feature = "persona"
 ))]
 pub async fn build_auth_header_map(auth: &dyn Auth) -> crate::Result<reqwest::header::HeaderMap> {
+    use crate::error::MindroidError;
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let headers = auth.get_auth_headers().await?;
     let mut map = HeaderMap::new();
     for (k, v) in headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(&v),
-        ) {
-            map.insert(name, value);
-        }
+        // Dropping a malformed auth header would send the request
+        // unauthenticated and surface as a confusing server 401. Fail here
+        // instead, where the cause is knowable. The value is never included in
+        // the error — it is the credential.
+        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| MindroidError::Auth {
+            message: format!("auth header name {k:?} is not a valid HTTP header name: {e}"),
+            source: None,
+        })?;
+        let value = HeaderValue::from_str(&v).map_err(|_| MindroidError::Auth {
+            message: format!(
+                "auth header {k:?} has a value that is not valid for an HTTP header \
+                 (check the configured token for stray whitespace or non-ASCII bytes)"
+            ),
+            source: None,
+        })?;
+        map.insert(name, value);
     }
     Ok(map)
 }

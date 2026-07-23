@@ -23,6 +23,8 @@ pub struct MindroidConfig {
     pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
     pub identity: IdentityConfig,
+    #[serde(default)]
+    pub episodes: EpisodesConfig,
 }
 
 impl MindroidConfig {
@@ -169,6 +171,11 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// Credential kind. Supported: `"static"`, `"apikey"`, `"enduser"`.
+    ///
+    /// `"enduser"` carries a pre-minted end-user JWT in `token` and marks this
+    /// runtime as the agent itself, routing `magickmind-prepared-agent` persona
+    /// calls to the id-less end-user prepare route.
     #[serde(rename = "type")]
     pub auth_type: Option<String>,
     pub email: Option<String>,
@@ -209,7 +216,11 @@ pub struct ObserverConfig {
 /// from the magickmind runtime service per-request and format the prompt in-process.
 /// When `type = "magickmind-prepared"`, the runtime delegates prompt construction to the
 /// MagickMind server's `POST /v1/persona/{id}/prepare` endpoint and uses the returned
-/// `system_prompt` verbatim (the server owns trait banding / formatting).
+/// `system_prompt` verbatim (the server owns trait banding / formatting). Keyed by persona id.
+/// When `type = "magickmind-prepared-agent"`, same server-prepared prompt but keyed by
+/// **agent id**: the route follows `auth.type` — a service-user credential names the agent in
+/// the path (`agent.agent_id` required), while `auth.type = "enduser"` uses the id-less
+/// end-user route where the agent is the token subject.
 /// When `type = "local"`, the persona is loaded from a local `persona.md` file.
 /// When `type = "markdown"`, the system prompt is loaded from a local file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -231,6 +242,56 @@ pub struct PersonaConfig {
     /// Permit sending auth headers over plaintext `http://` (local development only).
     /// Production deployments must use `https://`.
     pub allow_insecure: bool,
+}
+
+/// Configuration for episodic-memory ingest.
+///
+/// When `enabled`, every inbound message and the agent's own reply is sent to
+/// MagickMind's episode `/process` endpoint. The route follows `auth.type`, as
+/// with the persona stage: `auth.type = "enduser"` uses the id-less end-user
+/// route (owner is the token subject), otherwise the service-user route with
+/// `agent.agent_id` as the owner.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EpisodesConfig {
+    /// Enable episodic-memory ingest. Default: false.
+    pub enabled: bool,
+    /// Base URL for the episode API. Falls back to `memory.base_url`, then
+    /// `auth.base_url`, if absent.
+    pub base_url: Option<String>,
+    /// Permit sending auth headers over plaintext `http://` (local dev only).
+    pub allow_insecure: bool,
+    /// Ask the server not to resolve the agent's persona for each ingested
+    /// message. The server otherwise attaches a persona snapshot per message,
+    /// which costs a lookup. Default: false (persona attached).
+    pub skip_persona: bool,
+    /// Which inbound messages are ingested. Default: [`IngestScope::All`].
+    pub scope: IngestScope,
+}
+
+/// Which inbound messages reach episodic memory.
+///
+/// In a group magickspace an agent may be present without being addressed. The
+/// default records everything, which is what episodic memory is usually for —
+/// but it means messages from participants who never addressed the agent, and
+/// who may not know it is listening, are stored durably. Operators who cannot
+/// give those participants notice should narrow this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestScope {
+    /// Every received message, addressed to the agent or not. The default, and
+    /// the behaviour before this setting existed.
+    #[default]
+    All,
+    /// Only messages that passed the agent's gate — i.e. that were addressed to
+    /// it. Bystander traffic in group channels is not recorded.
+    ///
+    /// The runtime cannot enforce this from inside the ingest stage, which runs
+    /// before any gate; it is enforced by *where* the integrator calls the
+    /// stage. See the `persona_agent` example.
+    Addressed,
+    /// Only 1:1 channels. Group and broadcast traffic is not recorded.
+    DirectOnly,
 }
 
 /// Configuration for cross-platform identity resolution.

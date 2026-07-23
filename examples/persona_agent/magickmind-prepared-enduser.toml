@@ -1,0 +1,72 @@
+# Persona-driven agent — agent-scoped prepared prompt, called AS the agent.
+#
+# Same server-prepared prompt as magickmind-prepared-agent.toml, but the agent
+# authenticates with its own end-user JWT (minted via POST /v1/end-users/tokens)
+# and reaches the id-less route: POST /v1/end-user/persona/prepare. There is no
+# agent id in the path — the agent is the token subject, so it cannot ask for
+# another agent's prompt.
+#
+# auth.type = "enduser" is what selects this route. agent.agent_id is not needed
+# here (the token carries it) but is kept for the @mention gate and persistence.
+#
+# Run with:
+#   cargo run --example persona_agent --features full -- --config examples/persona_agent/magickmind-prepared-enduser.toml
+
+[agent]
+agent_id = "example-agent-id"
+name = "Dazael – Sword-mage"
+
+[transport]
+type = "centrifugo"
+url = "wss://centrifugo.example.com/connection/websocket"
+
+[auth]
+type = "enduser"
+# The pre-minted end-user JWT for this agent. Mint it with a service-user
+# credential via POST /v1/end-users/tokens {"subject_id": "<agent_id>"}.
+token = "eyJ...your-end-user-jwt..."
+base_url = "https://bifrost.example.com"
+
+[memory]
+type = "magickmind"
+base_url = "https://bifrost.example.com"
+
+# -- Persona (id-less end-user prepare endpoint) ------------------------------
+# The route is chosen by auth.type = "enduser": POST /v1/end-user/persona/prepare
+# with no id. Same caching/degradation as the other prepared modes.
+
+[persona]
+type = "magickmind-prepared-agent"
+base_url = "https://bifrost.example.com"
+# cache_ttl_secs = 600
+# allow_insecure = true   # local non-TLS dev only
+
+# -- Episodic memory ingest (off by default) ----------------------------------
+# When enabled, received messages and the agent's own replies are sent to
+# MagickMind's episode endpoint and stored durably.
+#
+# scope controls which INBOUND messages are recorded:
+#   "all"         every received message, addressed to this agent or not.
+#                 In a group this includes participants who never addressed the
+#                 agent and may not know it is listening — obtain notice before
+#                 using this in shared spaces.
+#   "addressed"   only messages that passed the agent's gate.
+#   "direct_only" only 1:1 channels; group and broadcast traffic is skipped.
+#
+# [episodes]
+# enabled = true
+# scope = "all"
+# base_url = "https://bifrost.example.com"   # else falls back to memory.base_url
+# skip_persona = true    # skip the server's per-message persona snapshot
+
+[observer]
+type = "log"
+level = "info"
+
+[providers.litellm]
+base_url = "https://litellm.example.com"
+api_key = "sk-your-api-key-here"
+
+[models.respond]
+provider = "litellm"
+model = "your-model-id-here"

@@ -1,6 +1,7 @@
 mod cache;
 mod client;
 pub mod local;
+mod magickmind_agent_stage;
 mod magickmind_stage;
 pub mod models;
 mod provider;
@@ -8,6 +9,7 @@ mod stage;
 
 pub use client::MagickmindPersonaClient;
 pub use local::LocalPersonaProvider;
+pub use magickmind_agent_stage::{MagickmindAgentPersonaStage, PersonaCaller};
 pub use magickmind_stage::{MagickmindPersonaStage, PersonaId};
 pub use models::{
     EffectivePersonalityResponse, EffectiveSources, EffectiveTrait, PersonaSchema, TraitValue,

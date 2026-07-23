@@ -57,6 +57,16 @@ use crate::identity::{IdentityResolutionStage, IdentityResolver};
 /// let config = MindroidConfig::from_file("./mindroid.toml")?;
 /// Runtime::builder().config(config).build()?
 /// ```
+/// Resolved `[episodes]` settings, shared by the two ingest-stage builders.
+#[cfg(feature = "persona")]
+struct EpisodeIngestParams {
+    base_url: String,
+    caller: crate::persona::PersonaCaller,
+    allow_insecure: bool,
+    skip_persona: bool,
+    scope: crate::config::IngestScope,
+}
+
 pub struct RuntimeBuilder {
     pub(crate) transport: Option<Box<dyn Transport>>,
     pub(crate) pipeline: Option<Pipeline>,
@@ -76,6 +86,13 @@ pub struct RuntimeBuilder {
     /// `MagickmindPersonaStage` on demand.
     #[cfg(feature = "persona")]
     pub(crate) magickmind_persona: Option<(String, String, Option<u64>, bool)>,
+    /// Agent-scoped prepared persona:
+    /// `(base_url, agent_id, is_enduser, cache_ttl_secs, allow_insecure)`.
+    /// Set when `persona.type = "magickmind-prepared-agent"`. Built into a
+    /// `MagickmindAgentPersonaStage` on demand. `agent_id` is empty on the
+    /// end-user route, where the token subject supplies it.
+    #[cfg(feature = "persona")]
+    pub(crate) magickmind_agent_persona: Option<(String, String, bool, Option<u64>, bool)>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -98,6 +115,8 @@ impl RuntimeBuilder {
             persona_provider: None,
             #[cfg(feature = "persona")]
             magickmind_persona: None,
+            #[cfg(feature = "persona")]
+            magickmind_agent_persona: None,
             #[cfg(feature = "identity")]
             identity_resolver: None,
         }
@@ -219,6 +238,134 @@ impl RuntimeBuilder {
             stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
         }
         Some(stage)
+    }
+
+    /// Build a `MagickmindAgentPersonaStage` from the configured
+    /// agent-scoped prepared persona.
+    ///
+    /// Returns `None` unless `persona.type = "magickmind-prepared-agent"` was
+    /// configured (and auth resolved). The route follows `auth.type`: a
+    /// service-user credential names `agent.agent_id` in the path, while
+    /// `auth.type = "enduser"` uses the id-less end-user route. No network call
+    /// is made here — the server computes the prompt per-request.
+    #[cfg(feature = "persona")]
+    pub fn build_magickmind_agent_persona_stage(
+        &self,
+    ) -> Option<crate::persona::MagickmindAgentPersonaStage> {
+        let (base_url, agent_id, is_enduser, ttl_secs, allow_insecure) =
+            self.magickmind_agent_persona.as_ref()?;
+        let auth = self.auth.clone()?;
+        let caller = if *is_enduser {
+            crate::persona::PersonaCaller::EndUser
+        } else {
+            crate::persona::PersonaCaller::ServiceUser
+        };
+        let mut stage = crate::persona::MagickmindAgentPersonaStage::new(base_url, agent_id, auth)
+            .with_caller(caller)
+            .with_allow_insecure(*allow_insecure);
+        if let Some(secs) = ttl_secs {
+            stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
+        }
+        Some(stage)
+    }
+
+    /// Resolve episode-ingest settings, or `Ok(None)` when `episodes.enabled`
+    /// is false.
+    ///
+    /// Enabling episodes with an unusable configuration is an error, not a
+    /// silent no-op: ingest failures are swallowed by design (a memory outage
+    /// must not stop the agent), so a bad URL would otherwise warn once per
+    /// message forever while storing nothing. This mirrors the persona path,
+    /// which also refuses to start rather than degrade invisibly.
+    #[cfg(feature = "persona")]
+    fn episode_ingest_params(&self) -> Result<Option<EpisodeIngestParams>> {
+        let Some(config) = self.config.as_ref() else {
+            return Ok(None);
+        };
+        if !config.episodes.enabled {
+            return Ok(None);
+        }
+
+        let base_url = config
+            .episodes
+            .base_url
+            .as_deref()
+            .or(config.memory.base_url.as_deref())
+            .or(config.auth.base_url.as_deref())
+            .ok_or_else(|| {
+                MindroidError::config(
+                    "episodes.base_url, memory.base_url, or auth.base_url is required when \
+                     episodes.enabled = true",
+                )
+            })?
+            .to_string();
+
+        crate::core::net::require_secure_url(
+            &base_url,
+            config.episodes.allow_insecure,
+            "episodes.allow_insecure",
+        )?;
+
+        let caller = if config.auth.auth_type.as_deref() == Some("enduser") {
+            crate::persona::PersonaCaller::EndUser
+        } else {
+            crate::persona::PersonaCaller::ServiceUser
+        };
+        Ok(Some(EpisodeIngestParams {
+            base_url,
+            caller,
+            allow_insecure: config.episodes.allow_insecure,
+            skip_persona: config.episodes.skip_persona,
+            scope: config.episodes.scope,
+        }))
+    }
+
+    /// Build the **inbound** episode-ingest stage from `[episodes]` config.
+    ///
+    /// Place it early — before any gate that may halt — so every received
+    /// message is remembered. Returns `Ok(None)` when `episodes.enabled` is
+    /// false or auth is unresolved; returns `Err` when episodes are enabled but
+    /// misconfigured, rather than silently ingesting nothing.
+    #[cfg(feature = "persona")]
+    pub fn build_episode_ingest_stage(&self) -> Result<Option<crate::episode::EpisodeIngestStage>> {
+        let Some(p) = self.episode_ingest_params()? else {
+            return Ok(None);
+        };
+        let Some(auth) = self.auth.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::episode::EpisodeIngestStage::new(&p.base_url, auth, p.caller)
+                .with_allow_insecure(p.allow_insecure)
+                .with_skip_persona(p.skip_persona)
+                .with_scope(p.scope),
+        ))
+    }
+
+    /// Build the **outbound** reply-ingest stage from `[episodes]` config.
+    ///
+    /// Place it after response generation, but **before** any stage that can
+    /// fail the pipeline — a stage returning `Err` aborts the run, and the
+    /// agent's own turn would never reach episodic memory.
+    ///
+    /// Same `Ok(None)` / `Err` contract as [`build_episode_ingest_stage`](Self::build_episode_ingest_stage).
+    #[cfg(feature = "persona")]
+    pub fn build_episode_reply_ingest_stage(
+        &self,
+    ) -> Result<Option<crate::episode::EpisodeReplyIngestStage>> {
+        let Some(p) = self.episode_ingest_params()? else {
+            return Ok(None);
+        };
+        let Some(auth) = self.auth.clone() else {
+            return Ok(None);
+        };
+        // The reply is the agent's own message, so it is always in scope — the
+        // scope setting governs which *inbound* traffic is recorded.
+        Ok(Some(
+            crate::episode::EpisodeReplyIngestStage::new(&p.base_url, auth, p.caller)
+                .with_allow_insecure(p.allow_insecure)
+                .with_skip_persona(p.skip_persona),
+        ))
     }
 
     /// Build an `IdentityResolutionStage` from the configured resolver.
@@ -417,16 +564,77 @@ impl Runtime {
                         })?
                         .to_string();
                     // Auth headers ride on every prepare request — fail fast on
-                    // a plaintext base_url unless explicitly opted in.
-                    if base_url.starts_with("http://") && !config.persona.allow_insecure {
-                        return Err(MindroidError::config(format!(
-                            "persona.base_url {base_url} is plaintext http:// — use https://, \
-                             or set persona.allow_insecure = true for local development"
-                        )));
-                    }
+                    // a non-TLS base_url unless explicitly opted in.
+                    crate::core::net::require_secure_url(
+                        &base_url,
+                        config.persona.allow_insecure,
+                        "persona.allow_insecure",
+                    )?;
                     builder.magickmind_persona = Some((
                         base_url,
                         persona_id,
+                        config.persona.cache_ttl_secs,
+                        config.persona.allow_insecure,
+                    ));
+                }
+                Some("magickmind-prepared-agent") => {
+                    let base_url = config
+                        .persona
+                        .base_url
+                        .as_deref()
+                        .or(config.memory.base_url.as_deref())
+                        .or(config.auth.base_url.as_deref())
+                        .ok_or_else(|| {
+                            MindroidError::config(
+                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind-prepared-agent persona",
+                            )
+                        })?
+                        .to_string();
+                    // Auth headers ride on every prepare request — fail fast on
+                    // a non-TLS base_url unless explicitly opted in.
+                    crate::core::net::require_secure_url(
+                        &base_url,
+                        config.persona.allow_insecure,
+                        "persona.allow_insecure",
+                    )?;
+
+                    // The credential decides the route. An end-user JWT is the
+                    // agent itself (id-less route); a service-user credential
+                    // names the agent in the path and so requires agent_id.
+                    let is_enduser = config.auth.auth_type.as_deref() == Some("enduser");
+                    let agent_id = if is_enduser {
+                        String::new()
+                    } else {
+                        if config.agent.agent_id.is_empty() {
+                            return Err(MindroidError::config(
+                                "agent.agent_id is required when persona.type = \
+                                 \"magickmind-prepared-agent\" with a service-user credential; \
+                                 with auth.type = \"enduser\" the agent is taken from the token \
+                                 subject instead",
+                            ));
+                        }
+                        // The id becomes a URL path segment. Percent-encoding
+                        // handles separators, but `.` and `..` are path
+                        // navigation and would silently drop the preceding
+                        // segment — rewriting the route instead of 404ing.
+                        if !config
+                            .agent
+                            .agent_id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                        {
+                            return Err(MindroidError::config(format!(
+                                "agent.agent_id {:?} must contain only ASCII letters, digits, \
+                                 '-' or '_' — it is sent as a URL path segment",
+                                config.agent.agent_id
+                            )));
+                        }
+                        config.agent.agent_id.clone()
+                    };
+                    builder.magickmind_agent_persona = Some((
+                        base_url,
+                        agent_id,
+                        is_enduser,
                         config.persona.cache_ttl_secs,
                         config.persona.allow_insecure,
                     ));
