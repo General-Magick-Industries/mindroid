@@ -7,6 +7,23 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
+/// Where a credential's token belongs in a Centrifugo connect frame.
+///
+/// Centrifugo's top-level `connect.token` is a hard auth gate validated by the
+/// configured verifier (e.g. Keycloak JWKS). When it is absent, Centrifugo
+/// instead calls the connect proxy, forwarding `connect.data` to the backend.
+/// A bifrost end-user token (HS256) is validated by the proxy, not JWKS, so it
+/// must ride in `data`; a Keycloak token is JWKS-verified and belongs in the
+/// top-level field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenPlacement {
+    /// Top-level `connect.token` — verified by Centrifugo (JWKS/HMAC). Default.
+    #[default]
+    Token,
+    /// `connect.data.token` — forwarded to the bifrost connect proxy.
+    Data,
+}
+
 #[async_trait]
 pub trait Auth: Send + Sync + 'static {
     async fn get_token(&self) -> Result<String>;
@@ -16,6 +33,13 @@ pub trait Auth: Send + Sync + 'static {
     fn is_authenticated(&self) -> bool;
 
     async fn refresh(&self) -> Result<()>;
+
+    /// Which Centrifugo connect-frame field this credential's token belongs in.
+    /// Defaults to the top-level `token` (JWKS/HMAC verified); end-user
+    /// credentials that must reach the connect proxy override this to `Data`.
+    fn connect_token_placement(&self) -> TokenPlacement {
+        TokenPlacement::Token
+    }
 }
 
 #[async_trait]
@@ -34,6 +58,10 @@ impl<T: Auth> Auth for Arc<T> {
 
     async fn refresh(&self) -> Result<()> {
         (**self).refresh().await
+    }
+
+    fn connect_token_placement(&self) -> TokenPlacement {
+        (**self).connect_token_placement()
     }
 }
 

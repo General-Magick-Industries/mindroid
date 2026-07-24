@@ -43,7 +43,12 @@ pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
                 config.auth.token.as_deref().ok_or_else(|| {
                     MindroidError::config("auth.token is required for enduser auth")
                 })?;
-            Ok(Arc::new(crate::auth::static_id::StaticAuth::new(token)))
+            // End-user tokens (HS256) are validated by the bifrost connect
+            // proxy, not Centrifugo's JWKS gate, so the token must ride in the
+            // connect frame's `data` field. new_end_user sets that placement.
+            Ok(Arc::new(crate::auth::static_id::StaticAuth::new_end_user(
+                token,
+            )))
         }
 
         #[cfg(feature = "apikey")]

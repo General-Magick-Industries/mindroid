@@ -45,7 +45,7 @@ pub mod identity;
 pub use identity::{CanonicalUserId, IdentityResolutionStage, IdentityResolver};
 
 // Re-export core types at crate root
-pub use auth::Auth;
+pub use auth::{Auth, TokenPlacement};
 pub use config::{
     AgentConfig, MindroidConfig, ModelConfig, OpenToolConfig, ProviderConfig, ShellToolConfig,
     ToolsConfig,

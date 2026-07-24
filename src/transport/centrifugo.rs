@@ -66,6 +66,27 @@ fn extract_jwt_sub(token: &str) -> Option<String> {
     json.get("sub")?.as_str().map(|s| s.to_string())
 }
 
+/// Build the Centrifugo `connect` command. `Token` placement sends the token
+/// top-level (Centrifugo-verified, JWKS/HMAC); `Data` sends it in `data.token`
+/// and omits the top-level field so Centrifugo routes to the connect proxy.
+fn build_connect_cmd(
+    id: u64,
+    token: &str,
+    placement: crate::auth::TokenPlacement,
+) -> serde_json::Value {
+    let connect = match placement {
+        crate::auth::TokenPlacement::Token => serde_json::json!({
+            "token": token,
+            "name": "mindroid",
+        }),
+        crate::auth::TokenPlacement::Data => serde_json::json!({
+            "data": { "token": token },
+            "name": "mindroid",
+        }),
+    };
+    serde_json::json!({ "id": id, "connect": connect })
+}
+
 #[derive(Debug, Default)]
 struct State {
     connected: bool,
@@ -145,14 +166,8 @@ async fn handshake(
 
     let (mut sink, mut stream) = ws_stream.split();
 
-    // Send connect command
-    let connect_cmd = serde_json::json!({
-        "id": 1,
-        "connect": {
-            "token": token,
-            "name": "mindroid"
-        }
-    });
+    // Send connect command.
+    let connect_cmd = build_connect_cmd(1, &token, identity.connect_token_placement());
     sink.send(WsMessage::Text(connect_cmd.to_string()))
         .await
         .map_err(|e| MindroidError::Transport {
@@ -414,6 +429,12 @@ impl Transport for CentrifugoTransport {
                                     }
                                 }
                                 _ = refresh_timer.tick() => {
+                                    // Refresh frames carry only a top-level `token`
+                                    // (JWKS-gated, no `data`), so skip them for
+                                    // proxy-routed creds — the proxy governs expiry.
+                                    if identity.connect_token_placement() == crate::auth::TokenPlacement::Data {
+                                        continue;
+                                    }
                                     // Time to refresh the token
                                     match identity.get_token().await {
                                         Ok(new_token) => {
@@ -502,6 +523,32 @@ mod tests {
     #[test]
     fn allows_plaintext_ws_with_explicit_insecure_flag() {
         assert!(check_url_security("ws://localhost:8000/ws", "jwt-token", true).is_ok());
+    }
+
+    #[test]
+    fn connect_cmd_token_placement_uses_top_level_field() {
+        let cmd = build_connect_cmd(1, "jwt-abc", crate::auth::TokenPlacement::Token);
+        let connect = &cmd["connect"];
+        assert_eq!(connect["token"], "jwt-abc");
+        assert!(
+            connect.get("data").is_none(),
+            "must not send data field on JWKS path"
+        );
+        assert_eq!(connect["name"], "mindroid");
+    }
+
+    #[test]
+    fn connect_cmd_data_placement_routes_to_proxy() {
+        let cmd = build_connect_cmd(1, "eu-hs256", crate::auth::TokenPlacement::Data);
+        let connect = &cmd["connect"];
+        // Token rides in data.token; top-level token is absent so Centrifugo
+        // skips JWKS and calls the connect proxy.
+        assert_eq!(connect["data"]["token"], "eu-hs256");
+        assert!(
+            connect.get("token").is_none(),
+            "top-level token must be absent so JWKS is skipped and the proxy runs"
+        );
+        assert_eq!(connect["name"], "mindroid");
     }
 
     #[test]
