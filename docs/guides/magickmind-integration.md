@@ -2,6 +2,14 @@
 
 Connect your Mindroid agent to the Magick Mind platform using Centrifugo, MagickMind, and Cortex.
 
+> **Choosing credentials:** this guide's examples use the `apikey`
+> (email/password + API key) flow, which is the right tool for the
+> **development loop**. For any agent running unattended, or more than one
+> agent, run the process on a participant-scoped **end-user token** instead —
+> see **[End-User Authentication](enduser-auth.md)** for why (enforced memory
+> ownership, least privilege, revocability) and how (mint → `auth.type =
+> "enduser"` → token lifetime handling).
+
 ## Architecture Overview
 
 The Magick Mind integration connects three platform services that work together to deliver real-time messaging, conversation context, and LLM inference:
