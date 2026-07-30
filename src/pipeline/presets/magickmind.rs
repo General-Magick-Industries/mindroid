@@ -98,6 +98,8 @@ impl MagickmindClient {
         }
     }
 
+    /// x-api-key for the pelican fetcher, sent only on context prepare (the one
+    /// route that uses pelican).
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self

@@ -56,11 +56,7 @@ async fn main() -> anyhow::Result<()> {
             let respond = Arc::clone(&respond_pipeline);
 
             async move {
-                tracing::info!(
-                    "Message from {}: {:?}",
-                    ctx.message.sender_id,
-                    ctx.message.content
-                );
+                tracing::debug!("Message from {}", ctx.message.sender_id);
 
                 let mut pctx = PipelineContext::new(ctx.message.clone(), ctx.agent_config.clone());
 

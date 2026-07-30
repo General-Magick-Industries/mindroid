@@ -23,7 +23,7 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 /// The [`CredentialKind`] implied by `auth.type`: `"enduser"` acts as an end
 /// user, everything else as a service user. Pass it to adapters (the Centrifugo
 /// transport via `with_credential_kind`, the magickmind clients via
-/// `with_caller`) so route and connect behavior follow the configured credential.
+/// `with_credential_kind`) so route and connect behavior follow the credential.
 ///
 /// [`CredentialKind`]: crate::models::CredentialKind
 pub fn credential_kind_from_config(config: &MindroidConfig) -> crate::models::CredentialKind {

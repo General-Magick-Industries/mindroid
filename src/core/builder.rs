@@ -271,7 +271,7 @@ impl RuntimeBuilder {
     }
 
     /// A `MagickmindClient` fully wired from config (base URL, auth, credential
-    /// kind, api key). `None` if no auth or `auth.base_url` is set.
+    /// kind, api key). `None` if no config, auth, or `auth.base_url` is set.
     #[cfg(feature = "llm-hosted")]
     pub fn magickmind_client(
         &self,

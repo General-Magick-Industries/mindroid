@@ -175,7 +175,7 @@ impl EpisodeIngestStage {
     ///
     /// [`IngestScope::DirectOnly`] is enforced here. [`IngestScope::Addressed`]
     /// cannot be — this stage runs before any gate, so it has no way to know
-    /// whether the agent was addressed; the credential_kind enforces it by invoking the
+    /// whether the agent was addressed; the caller enforces it by invoking the
     /// stage only after the gate passes. [`Self::runs_after_gate`] reports
     /// which placement the configured scope requires.
     pub fn with_scope(mut self, scope: IngestScope) -> Self {
@@ -444,7 +444,7 @@ mod tests {
     }
 
     /// Addressed cannot be enforced inside the stage — at Step 0 nothing has
-    /// evaluated the gate. The credential_kind enforces it by placement, so the stage
+    /// evaluated the gate. The caller enforces it by placement, so the stage
     /// must report that it needs the post-gate slot.
     #[test]
     fn addressed_requires_post_gate_placement() {
