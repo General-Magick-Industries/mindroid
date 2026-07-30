@@ -37,5 +37,13 @@ audit-output.txt
 *.db-journal
 *.db-wal
 
+# Local run configs holding real credentials — never commit
+*.local.toml
+
+# Kubeconfigs (cluster bearer tokens) — never commit
+*kubeconfig*
+*.kubeconfig
+nuos-eks-dev*.yaml
+
 # Local review notes — not for publication
 pr26-*.md
