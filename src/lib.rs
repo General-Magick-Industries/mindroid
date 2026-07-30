@@ -45,7 +45,7 @@ pub mod identity;
 pub use identity::{CanonicalUserId, IdentityResolutionStage, IdentityResolver};
 
 // Re-export core types at crate root
-pub use auth::{Auth, CredentialKind, TokenPlacement};
+pub use auth::Auth;
 pub use config::{
     AgentConfig, MindroidConfig, ModelConfig, OpenToolConfig, ProviderConfig, ShellToolConfig,
     ToolsConfig,
@@ -54,14 +54,15 @@ pub use core::content::{ContentPart, ContentSource};
 pub use core::context::Context;
 pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
 pub use core::events::PipelineEvent;
+pub use core::factory::credential_kind_from_config;
 pub use core::strategy::RunStrategy;
 #[cfg(feature = "persona")]
 pub use episode::{EpisodeIngestStage, EpisodeReplyIngestStage};
 pub use error::{MindroidError, Result};
 pub use memory::{Memory, NoMemory};
 pub use models::{
-    ChannelType, LlmMessage, Message, MessageType, Response, Role, SenderType, StreamEvent,
-    TokenUsage,
+    ChannelType, CredentialKind, LlmMessage, Message, MessageType, Response, Role, SenderType,
+    StreamEvent, TokenUsage,
 };
 pub use observer::{NoObserver, Observer};
 #[cfg(feature = "persona")]

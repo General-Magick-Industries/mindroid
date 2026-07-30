@@ -20,6 +20,20 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// The [`CredentialKind`] implied by `auth.type`: `"enduser"` acts as an end
+/// user, everything else as a service user. Pass it to adapters (the Centrifugo
+/// transport via `with_credential_kind`, the magickmind clients via
+/// `with_caller`) so route and connect behavior follow the configured credential.
+///
+/// [`CredentialKind`]: crate::models::CredentialKind
+pub fn credential_kind_from_config(config: &MindroidConfig) -> crate::models::CredentialKind {
+    if config.auth.auth_type.as_deref() == Some("enduser") {
+        crate::models::CredentialKind::EndUser
+    } else {
+        crate::models::CredentialKind::ServiceUser
+    }
+}
+
 pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
     let auth_type = config.auth.auth_type.as_deref().unwrap_or("static");
 
@@ -39,16 +53,14 @@ pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
         // the feature the variant would be silently meaningless, so reject it.
         #[cfg(feature = "persona")]
         "enduser" => {
+            // A pre-minted end-user JWT, carried as a bearer token like `static`.
+            // The end-user vs service-user routing decision is made by the
+            // transport and magickmind clients from `auth.type`, not here.
             let token =
                 config.auth.token.as_deref().ok_or_else(|| {
                     MindroidError::config("auth.token is required for enduser auth")
                 })?;
-            // End-user tokens (HS256) are validated by the bifrost connect
-            // proxy, not Centrifugo's JWKS gate, so the token must ride in the
-            // connect frame's `data` field. new_end_user sets that placement.
-            Ok(Arc::new(crate::auth::static_id::StaticAuth::new_end_user(
-                token,
-            )))
+            Ok(Arc::new(crate::auth::static_id::StaticAuth::new(token)))
         }
 
         #[cfg(feature = "apikey")]
@@ -92,8 +104,10 @@ pub(crate) fn build_transport(
                 MindroidError::config("transport.url is required for centrifugo transport")
             })?;
             let agent_id = &config.agent.agent_id;
+            let kind = credential_kind_from_config(config);
             Ok(Box::new(
                 crate::transport::centrifugo::CentrifugoTransport::new(url, agent_id, auth.clone())
+                    .with_credential_kind(kind)
                     .with_allow_insecure(config.transport.allow_insecure),
             ))
         }

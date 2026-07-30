@@ -5,11 +5,11 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::auth::Auth;
-use crate::auth::CredentialKind;
 use crate::config::IngestScope;
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::models::ChannelType;
+use crate::models::CredentialKind;
 use crate::pipeline::PipelineStage;
 
 /// Shared HTTP client for the episode-ingest endpoint.

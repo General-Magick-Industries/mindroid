@@ -66,20 +66,21 @@ fn extract_jwt_sub(token: &str) -> Option<String> {
     json.get("sub")?.as_str().map(|s| s.to_string())
 }
 
-/// Build the Centrifugo `connect` command. `Token` placement sends the token
-/// top-level (Centrifugo-verified, JWKS/HMAC); `Data` sends it in `data.token`
-/// and omits the top-level field so Centrifugo routes to the connect proxy.
+/// Build the Centrifugo `connect` command. A service user's token goes
+/// top-level (Centrifugo-verified, JWKS/HMAC); an end user's token goes in
+/// `data.token` with the top-level field omitted, so Centrifugo routes to the
+/// bifrost connect proxy.
 fn build_connect_cmd(
     id: u64,
     token: &str,
-    placement: crate::auth::TokenPlacement,
+    kind: crate::models::CredentialKind,
 ) -> serde_json::Value {
-    let connect = match placement {
-        crate::auth::TokenPlacement::Token => serde_json::json!({
+    let connect = match kind {
+        crate::models::CredentialKind::ServiceUser => serde_json::json!({
             "token": token,
             "name": "mindroid",
         }),
-        crate::auth::TokenPlacement::Data => serde_json::json!({
+        crate::models::CredentialKind::EndUser => serde_json::json!({
             "data": { "token": token },
             "name": "mindroid",
         }),
@@ -115,6 +116,7 @@ pub struct CentrifugoTransport {
     ws_url: String,
     agent_id: String,
     identity: Arc<dyn Auth>,
+    kind: crate::models::CredentialKind,
     state: Arc<RwLock<State>>,
     allow_insecure: bool,
 }
@@ -125,9 +127,19 @@ impl CentrifugoTransport {
             ws_url: ws_url.to_string(),
             agent_id: agent_id.to_string(),
             identity,
+            kind: crate::models::CredentialKind::ServiceUser,
             state: Arc::new(RwLock::new(State::default())),
             allow_insecure: false,
         }
+    }
+
+    /// Select the credential kind. An end-user credential connects via the
+    /// bifrost connect proxy (token in `connect.data`) and listens on its own
+    /// `user:` channel; a service user is JWKS-verified (top-level `token`) and
+    /// listens on `personal:`.
+    pub fn with_credential_kind(mut self, kind: crate::models::CredentialKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Permit sending the auth token over plaintext `ws://` (local development only).
@@ -142,6 +154,7 @@ async fn handshake(
     ws_url: &str,
     agent_id: &str,
     identity: &dyn Auth,
+    kind: crate::models::CredentialKind,
     allow_insecure: bool,
 ) -> Result<HandshakeResult> {
     let token = identity.get_token().await?;
@@ -167,7 +180,7 @@ async fn handshake(
     let (mut sink, mut stream) = ws_stream.split();
 
     // Send connect command.
-    let connect_cmd = build_connect_cmd(1, &token, identity.connect_token_placement());
+    let connect_cmd = build_connect_cmd(1, &token, kind);
     sink.send(WsMessage::Text(connect_cmd.to_string()))
         .await
         .map_err(|e| MindroidError::Transport {
@@ -215,9 +228,9 @@ async fn handshake(
     // proxy (the MM-378 fan-out target), so no explicit subscribe is sent — a
     // duplicate would be rejected. A service-user credential must explicitly
     // subscribe to `personal:{agent}#{sub}`.
-    let channel = match identity.connect_token_placement() {
-        crate::auth::TokenPlacement::Data => format!("user:{agent_id}#{agent_id}"),
-        crate::auth::TokenPlacement::Token => {
+    let channel = match kind {
+        crate::models::CredentialKind::EndUser => format!("user:{agent_id}#{agent_id}"),
+        crate::models::CredentialKind::ServiceUser => {
             let channel = format!("personal:{agent_id}#{service_user_id}");
             let subscribe_cmd = serde_json::json!({
                 "id": 2,
@@ -355,6 +368,7 @@ impl Transport for CentrifugoTransport {
         let ws_url = self.ws_url.clone();
         let agent_id = self.agent_id.clone();
         let identity = Arc::clone(&self.identity);
+        let kind = self.kind;
         let state = Arc::clone(&self.state);
         let allow_insecure = self.allow_insecure;
 
@@ -364,7 +378,7 @@ impl Transport for CentrifugoTransport {
             let mut cmd_id: u32 = 3; // 1=connect, 2=subscribe, 3+ for refresh
 
             loop {
-                match handshake(&ws_url, &agent_id, identity.as_ref(), allow_insecure).await {
+                match handshake(&ws_url, &agent_id, identity.as_ref(), kind, allow_insecure).await {
                     Ok(HandshakeResult {
                         mut sink,
                         mut stream,
@@ -439,7 +453,7 @@ impl Transport for CentrifugoTransport {
                                     // Refresh frames carry only a top-level `token`
                                     // (JWKS-gated, no `data`), so skip them for
                                     // proxy-routed creds — the proxy governs expiry.
-                                    if identity.connect_token_placement() == crate::auth::TokenPlacement::Data {
+                                    if kind == crate::models::CredentialKind::EndUser {
                                         continue;
                                     }
                                     // Time to refresh the token
@@ -533,28 +547,21 @@ mod tests {
     }
 
     #[test]
-    fn connect_cmd_token_placement_uses_top_level_field() {
-        let cmd = build_connect_cmd(1, "jwt-abc", crate::auth::TokenPlacement::Token);
+    fn connect_cmd_service_user_uses_top_level_field() {
+        let cmd = build_connect_cmd(1, "jwt-abc", crate::models::CredentialKind::ServiceUser);
         let connect = &cmd["connect"];
         assert_eq!(connect["token"], "jwt-abc");
-        assert!(
-            connect.get("data").is_none(),
-            "must not send data field on JWKS path"
-        );
+        assert!(connect.get("data").is_none());
         assert_eq!(connect["name"], "mindroid");
     }
 
     #[test]
-    fn connect_cmd_data_placement_routes_to_proxy() {
-        let cmd = build_connect_cmd(1, "eu-hs256", crate::auth::TokenPlacement::Data);
+    fn connect_cmd_end_user_routes_to_proxy() {
+        // Token in data.token, top-level absent → Centrifugo skips JWKS and calls the proxy.
+        let cmd = build_connect_cmd(1, "eu-hs256", crate::models::CredentialKind::EndUser);
         let connect = &cmd["connect"];
-        // Token rides in data.token; top-level token is absent so Centrifugo
-        // skips JWKS and calls the connect proxy.
         assert_eq!(connect["data"]["token"], "eu-hs256");
-        assert!(
-            connect.get("token").is_none(),
-            "top-level token must be absent so JWKS is skipped and the proxy runs"
-        );
+        assert!(connect.get("token").is_none());
         assert_eq!(connect["name"], "mindroid");
     }
 

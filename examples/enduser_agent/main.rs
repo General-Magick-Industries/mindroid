@@ -42,9 +42,9 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .unwrap_or("https://magickmind.example.com");
 
-    // Route surface (end-user vs service-user) is derived from `identity` here —
-    // no auth.type branching in the example.
-    let magickmind = Arc::new(MagickmindClient::new(base_url, identity));
+    // Route surface follows the configured credential.
+    let kind = mindroid::credential_kind_from_config(config);
+    let magickmind = Arc::new(MagickmindClient::new(base_url, identity).with_caller(kind));
 
     let agent_id = config.agent.agent_id.clone();
     let context_preparer = Arc::new(

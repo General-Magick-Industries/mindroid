@@ -142,9 +142,9 @@ async fn main() -> anyhow::Result<()> {
         .base_url
         .as_deref()
         .unwrap_or("https://magickmind.example.com");
-    // Route surface (service-user vs end-user) is derived from the credential
-    // inside MagickmindClient::new.
-    let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
+    // Route surface follows the configured credential.
+    let caller = mindroid::credential_kind_from_config(config);
+    let mut magickmind_client = MagickmindClient::new(magickmind_url, identity).with_caller(caller);
     if let Some(api_key) = &config.auth.api_key {
         magickmind_client = magickmind_client.with_api_key(api_key);
     }

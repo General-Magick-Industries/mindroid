@@ -5,10 +5,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::auth::{Auth, CredentialKind};
+use crate::auth::Auth;
 use crate::core::context::Context;
 use crate::core::net::{PreparedPromptCache, PromptCacheKey};
 use crate::error::{MindroidError, Result};
+use crate::models::CredentialKind;
 use crate::models::LlmMessage;
 use crate::pipeline::PipelineStage;
 

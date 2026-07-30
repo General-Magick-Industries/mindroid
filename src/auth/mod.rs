@@ -7,35 +7,6 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
-/// The kind of identity a credential authenticates as. This is the single axis
-/// the magickmind/bifrost API surface splits on: a service user acts on behalf
-/// of its tenant; an end user (e.g. an agent's own JWT) acts as itself. Route
-/// selection and Centrifugo token placement are both derived from it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CredentialKind {
-    /// A service-user credential (Keycloak login). Targets the tenant-scoped
-    /// `/v1/...` routes and is JWKS-verified on Centrifugo connect. Default.
-    #[default]
-    ServiceUser,
-    /// An end-user credential (e.g. an agent's own bifrost JWT). Targets the
-    /// `/v1/end-user/...` routes and is validated by the Centrifugo connect
-    /// proxy rather than the JWKS gate.
-    EndUser,
-}
-
-/// Where a credential's token belongs in a Centrifugo connect frame. Derived
-/// from [`CredentialKind`]: a service user's token is JWKS-verified in the
-/// top-level `token`; an end user's token rides in `data`, routed to the
-/// bifrost connect proxy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TokenPlacement {
-    /// Top-level `connect.token` — verified by Centrifugo (JWKS/HMAC). Default.
-    #[default]
-    Token,
-    /// `connect.data.token` — forwarded to the bifrost connect proxy.
-    Data,
-}
-
 #[async_trait]
 pub trait Auth: Send + Sync + 'static {
     async fn get_token(&self) -> Result<String>;
@@ -45,21 +16,6 @@ pub trait Auth: Send + Sync + 'static {
     fn is_authenticated(&self) -> bool;
 
     async fn refresh(&self) -> Result<()>;
-
-    /// The identity kind this credential authenticates as. Defaults to
-    /// [`CredentialKind::ServiceUser`]; end-user credentials override it.
-    fn credential_kind(&self) -> CredentialKind {
-        CredentialKind::ServiceUser
-    }
-
-    /// Which Centrifugo connect-frame field the token belongs in, derived from
-    /// [`Auth::credential_kind`].
-    fn connect_token_placement(&self) -> TokenPlacement {
-        match self.credential_kind() {
-            CredentialKind::EndUser => TokenPlacement::Data,
-            CredentialKind::ServiceUser => TokenPlacement::Token,
-        }
-    }
 }
 
 #[async_trait]
@@ -78,10 +34,6 @@ impl<T: Auth> Auth for Arc<T> {
 
     async fn refresh(&self) -> Result<()> {
         (**self).refresh().await
-    }
-
-    fn credential_kind(&self) -> CredentialKind {
-        (**self).credential_kind()
     }
 }
 
