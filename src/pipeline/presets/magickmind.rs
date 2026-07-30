@@ -84,6 +84,7 @@ pub struct MagickmindClient {
     base_url: String,
     identity: Arc<dyn Auth>,
     api_key: Option<String>,
+    caller: crate::persona::PersonaCaller,
 }
 
 impl MagickmindClient {
@@ -93,11 +94,20 @@ impl MagickmindClient {
             base_url: base_url.into(),
             identity,
             api_key: None,
+            caller: crate::persona::PersonaCaller::ServiceUser,
         }
     }
 
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Select which credential surface the magickspace routes target. Defaults
+    /// to `ServiceUser` (`/v1/magickspaces/...`); `EndUser` routes to the
+    /// membership-scoped `/v1/end-user/magickspaces/...` surface.
+    pub fn with_caller(mut self, caller: crate::persona::PersonaCaller) -> Self {
+        self.caller = caller;
         self
     }
 
@@ -113,10 +123,18 @@ impl MagickmindClient {
         config: &MagickmindContextConfig,
         exclude_sender: Option<&str>,
     ) -> Result<Vec<LlmMessage>> {
-        let url = format!(
-            "{}/v1/magickspaces/{}/context",
-            self.base_url, magickspace_id
-        );
+        // Service-user → tenant-scoped route; end-user JWT → membership-scoped
+        // /v1/end-user/... route (participant = token subject).
+        let url = match self.caller {
+            crate::persona::PersonaCaller::ServiceUser => format!(
+                "{}/v1/magickspaces/{}/context",
+                self.base_url, magickspace_id
+            ),
+            crate::persona::PersonaCaller::EndUser => format!(
+                "{}/v1/end-user/magickspaces/{}/context",
+                self.base_url, magickspace_id
+            ),
+        };
         let mut headers = self.auth_headers().await?;
 
         let body = PrepareContextRequest {
@@ -187,10 +205,17 @@ impl MagickmindClient {
         content: &str,
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let url = format!(
-            "{}/v1/magickspaces/{}/messages",
-            self.base_url, magickspace_id
-        );
+        // Same credential split as prepare_context (end-user send route: MM-378).
+        let url = match self.caller {
+            crate::persona::PersonaCaller::ServiceUser => format!(
+                "{}/v1/magickspaces/{}/messages",
+                self.base_url, magickspace_id
+            ),
+            crate::persona::PersonaCaller::EndUser => format!(
+                "{}/v1/end-user/magickspaces/{}/messages",
+                self.base_url, magickspace_id
+            ),
+        };
         let headers = self.auth_headers().await?;
         let body = MagickmindSaveRequest {
             sender_id,

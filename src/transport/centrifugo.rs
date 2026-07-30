@@ -210,46 +210,53 @@ async fn handshake(
         }
     }
 
-    // Subscribe to personal channel
-    let channel = format!("personal:{}#{}", agent_id, service_user_id);
-    let subscribe_cmd = serde_json::json!({
-        "id": 2,
-        "subscribe": {
-            "channel": channel
-        }
-    });
-    sink.send(WsMessage::Text(subscribe_cmd.to_string()))
-        .await
-        .map_err(|e| MindroidError::Transport {
-            message: format!("Failed to send subscribe command: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+    // Inbound channel follows the credential. An end-user token is already
+    // auto-subscribed to its own `user:{agent}#{agent}` channel by the connect
+    // proxy (the MM-378 fan-out target), so no explicit subscribe is sent — a
+    // duplicate would be rejected. A service-user credential must explicitly
+    // subscribe to `personal:{agent}#{sub}`.
+    let channel = match identity.connect_token_placement() {
+        crate::auth::TokenPlacement::Data => format!("user:{agent_id}#{agent_id}"),
+        crate::auth::TokenPlacement::Token => {
+            let channel = format!("personal:{agent_id}#{service_user_id}");
+            let subscribe_cmd = serde_json::json!({
+                "id": 2,
+                "subscribe": { "channel": channel },
+            });
+            sink.send(WsMessage::Text(subscribe_cmd.to_string()))
+                .await
+                .map_err(|e| MindroidError::Transport {
+                    message: format!("Failed to send subscribe command: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
 
-    // Read subscribe reply
-    let sub_reply = stream
-        .next()
-        .await
-        .ok_or_else(|| transport_err("WebSocket closed before subscribe reply"))?
-        .map_err(|e| MindroidError::Transport {
-            message: format!("WebSocket error reading subscribe reply: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+            let sub_reply = stream
+                .next()
+                .await
+                .ok_or_else(|| transport_err("WebSocket closed before subscribe reply"))?
+                .map_err(|e| MindroidError::Transport {
+                    message: format!("WebSocket error reading subscribe reply: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
 
-    match &sub_reply {
-        WsMessage::Text(text) => {
-            let val: serde_json::Value = serde_json::from_str(text)
-                .map_err(|e| transport_err(format!("Invalid subscribe reply JSON: {e}")))?;
-            if val.get("error").is_some() {
-                return Err(transport_err(format!("Centrifugo subscribe error: {val}")));
+            match &sub_reply {
+                WsMessage::Text(text) => {
+                    let val: serde_json::Value = serde_json::from_str(text)
+                        .map_err(|e| transport_err(format!("Invalid subscribe reply JSON: {e}")))?;
+                    if val.get("error").is_some() {
+                        return Err(transport_err(format!("Centrifugo subscribe error: {val}")));
+                    }
+                }
+                other => {
+                    return Err(transport_err(format!(
+                        "Unexpected subscribe reply frame: {other:?}"
+                    )));
+                }
             }
-            info!("Subscribed to channel: {channel}");
+            channel
         }
-        other => {
-            return Err(transport_err(format!(
-                "Unexpected subscribe reply frame: {other:?}"
-            )));
-        }
-    }
+    };
+    info!("Listening on channel: {channel}");
 
     Ok(HandshakeResult {
         sink,
