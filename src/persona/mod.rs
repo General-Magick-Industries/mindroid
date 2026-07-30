@@ -9,7 +9,7 @@ mod stage;
 
 pub use client::MagickmindPersonaClient;
 pub use local::LocalPersonaProvider;
-pub use magickmind_agent_stage::{MagickmindAgentPersonaStage, PersonaCaller};
+pub use magickmind_agent_stage::MagickmindAgentPersonaStage;
 pub use magickmind_stage::{MagickmindPersonaStage, PersonaId};
 pub use models::{
     EffectivePersonalityResponse, EffectiveSources, EffectiveTrait, PersonaSchema, TraitValue,

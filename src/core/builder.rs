@@ -61,7 +61,7 @@ use crate::identity::{IdentityResolutionStage, IdentityResolver};
 #[cfg(feature = "persona")]
 struct EpisodeIngestParams {
     base_url: String,
-    caller: crate::persona::PersonaCaller,
+    caller: crate::auth::CredentialKind,
     allow_insecure: bool,
     skip_persona: bool,
     scope: crate::config::IngestScope,
@@ -256,9 +256,9 @@ impl RuntimeBuilder {
             self.magickmind_agent_persona.as_ref()?;
         let auth = self.auth.clone()?;
         let caller = if *is_enduser {
-            crate::persona::PersonaCaller::EndUser
+            crate::auth::CredentialKind::EndUser
         } else {
-            crate::persona::PersonaCaller::ServiceUser
+            crate::auth::CredentialKind::ServiceUser
         };
         let mut stage = crate::persona::MagickmindAgentPersonaStage::new(base_url, agent_id, auth)
             .with_caller(caller)
@@ -307,9 +307,9 @@ impl RuntimeBuilder {
         )?;
 
         let caller = if config.auth.auth_type.as_deref() == Some("enduser") {
-            crate::persona::PersonaCaller::EndUser
+            crate::auth::CredentialKind::EndUser
         } else {
-            crate::persona::PersonaCaller::ServiceUser
+            crate::auth::CredentialKind::ServiceUser
         };
         Ok(Some(EpisodeIngestParams {
             base_url,

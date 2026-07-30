@@ -1,28 +1,28 @@
 use async_trait::async_trait;
 
-use crate::auth::TokenPlacement;
+use crate::auth::CredentialKind;
 use crate::{Auth, Result};
 
 pub struct StaticAuth {
     token: String,
-    placement: TokenPlacement,
+    kind: CredentialKind,
 }
 
 impl StaticAuth {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
-            placement: TokenPlacement::Token,
+            kind: CredentialKind::ServiceUser,
         }
     }
 
-    /// A static credential whose token is delivered in the Centrifugo connect
-    /// frame's `data` field (routing to the connect proxy) rather than the
-    /// JWKS-gated top-level `token`. Used for bifrost end-user tokens.
+    /// A static credential that authenticates as an end user (a bifrost
+    /// end-user JWT): it targets the `/v1/end-user/...` routes and rides in the
+    /// Centrifugo connect frame's `data` field, routed to the connect proxy.
     pub fn new_end_user(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
-            placement: TokenPlacement::Data,
+            kind: CredentialKind::EndUser,
         }
     }
 }
@@ -48,7 +48,7 @@ impl Auth for StaticAuth {
         Ok(())
     }
 
-    fn connect_token_placement(&self) -> TokenPlacement {
-        self.placement
+    fn credential_kind(&self) -> CredentialKind {
+        self.kind
     }
 }

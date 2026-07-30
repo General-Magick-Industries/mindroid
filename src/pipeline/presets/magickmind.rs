@@ -84,17 +84,13 @@ pub struct MagickmindClient {
     base_url: String,
     identity: Arc<dyn Auth>,
     api_key: Option<String>,
-    caller: crate::persona::PersonaCaller,
+    caller: crate::auth::CredentialKind,
 }
 
 impl MagickmindClient {
     pub fn new(base_url: impl Into<String>, identity: Arc<dyn Auth>) -> Self {
-        // Route surface follows the credential (Data → end-user routes);
-        // with_caller overrides.
-        let caller = match identity.connect_token_placement() {
-            crate::auth::TokenPlacement::Data => crate::persona::PersonaCaller::EndUser,
-            crate::auth::TokenPlacement::Token => crate::persona::PersonaCaller::ServiceUser,
-        };
+        // Route surface follows the credential; with_caller overrides.
+        let caller = identity.credential_kind();
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
@@ -112,7 +108,7 @@ impl MagickmindClient {
     /// Override the credential surface the magickspace routes target. By default
     /// this is derived from the auth credential (end-user token →
     /// `/v1/end-user/magickspaces/...`, else `/v1/magickspaces/...`).
-    pub fn with_caller(mut self, caller: crate::persona::PersonaCaller) -> Self {
+    pub fn with_caller(mut self, caller: crate::auth::CredentialKind) -> Self {
         self.caller = caller;
         self
     }
@@ -132,11 +128,11 @@ impl MagickmindClient {
         // Service-user → tenant-scoped route; end-user JWT → membership-scoped
         // /v1/end-user/... route (participant = token subject).
         let url = match self.caller {
-            crate::persona::PersonaCaller::ServiceUser => format!(
+            crate::auth::CredentialKind::ServiceUser => format!(
                 "{}/v1/magickspaces/{}/context",
                 self.base_url, magickspace_id
             ),
-            crate::persona::PersonaCaller::EndUser => format!(
+            crate::auth::CredentialKind::EndUser => format!(
                 "{}/v1/end-user/magickspaces/{}/context",
                 self.base_url, magickspace_id
             ),
@@ -213,11 +209,11 @@ impl MagickmindClient {
     ) -> Result<Option<String>> {
         // Same credential split as prepare_context (end-user send route: MM-378).
         let url = match self.caller {
-            crate::persona::PersonaCaller::ServiceUser => format!(
+            crate::auth::CredentialKind::ServiceUser => format!(
                 "{}/v1/magickspaces/{}/messages",
                 self.base_url, magickspace_id
             ),
-            crate::persona::PersonaCaller::EndUser => format!(
+            crate::auth::CredentialKind::EndUser => format!(
                 "{}/v1/end-user/magickspaces/{}/messages",
                 self.base_url, magickspace_id
             ),

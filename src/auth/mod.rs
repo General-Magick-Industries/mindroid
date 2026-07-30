@@ -7,14 +7,26 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
-/// Where a credential's token belongs in a Centrifugo connect frame.
-///
-/// Centrifugo's top-level `connect.token` is a hard auth gate validated by the
-/// configured verifier (e.g. Keycloak JWKS). When it is absent, Centrifugo
-/// instead calls the connect proxy, forwarding `connect.data` to the backend.
-/// A bifrost end-user token (HS256) is validated by the proxy, not JWKS, so it
-/// must ride in `data`; a Keycloak token is JWKS-verified and belongs in the
-/// top-level field.
+/// The kind of identity a credential authenticates as. This is the single axis
+/// the magickmind/bifrost API surface splits on: a service user acts on behalf
+/// of its tenant; an end user (e.g. an agent's own JWT) acts as itself. Route
+/// selection and Centrifugo token placement are both derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialKind {
+    /// A service-user credential (Keycloak login). Targets the tenant-scoped
+    /// `/v1/...` routes and is JWKS-verified on Centrifugo connect. Default.
+    #[default]
+    ServiceUser,
+    /// An end-user credential (e.g. an agent's own bifrost JWT). Targets the
+    /// `/v1/end-user/...` routes and is validated by the Centrifugo connect
+    /// proxy rather than the JWKS gate.
+    EndUser,
+}
+
+/// Where a credential's token belongs in a Centrifugo connect frame. Derived
+/// from [`CredentialKind`]: a service user's token is JWKS-verified in the
+/// top-level `token`; an end user's token rides in `data`, routed to the
+/// bifrost connect proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TokenPlacement {
     /// Top-level `connect.token` — verified by Centrifugo (JWKS/HMAC). Default.
@@ -34,11 +46,19 @@ pub trait Auth: Send + Sync + 'static {
 
     async fn refresh(&self) -> Result<()>;
 
-    /// Which Centrifugo connect-frame field this credential's token belongs in.
-    /// Defaults to the top-level `token` (JWKS/HMAC verified); end-user
-    /// credentials that must reach the connect proxy override this to `Data`.
+    /// The identity kind this credential authenticates as. Defaults to
+    /// [`CredentialKind::ServiceUser`]; end-user credentials override it.
+    fn credential_kind(&self) -> CredentialKind {
+        CredentialKind::ServiceUser
+    }
+
+    /// Which Centrifugo connect-frame field the token belongs in, derived from
+    /// [`Auth::credential_kind`].
     fn connect_token_placement(&self) -> TokenPlacement {
-        TokenPlacement::Token
+        match self.credential_kind() {
+            CredentialKind::EndUser => TokenPlacement::Data,
+            CredentialKind::ServiceUser => TokenPlacement::Token,
+        }
     }
 }
 
@@ -60,8 +80,8 @@ impl<T: Auth> Auth for Arc<T> {
         (**self).refresh().await
     }
 
-    fn connect_token_placement(&self) -> TokenPlacement {
-        (**self).connect_token_placement()
+    fn credential_kind(&self) -> CredentialKind {
+        (**self).credential_kind()
     }
 }
 
