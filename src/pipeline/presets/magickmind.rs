@@ -89,12 +89,18 @@ pub struct MagickmindClient {
 
 impl MagickmindClient {
     pub fn new(base_url: impl Into<String>, identity: Arc<dyn Auth>) -> Self {
+        // Route surface follows the credential (Data → end-user routes);
+        // with_caller overrides.
+        let caller = match identity.connect_token_placement() {
+            crate::auth::TokenPlacement::Data => crate::persona::PersonaCaller::EndUser,
+            crate::auth::TokenPlacement::Token => crate::persona::PersonaCaller::ServiceUser,
+        };
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             identity,
             api_key: None,
-            caller: crate::persona::PersonaCaller::ServiceUser,
+            caller,
         }
     }
 
@@ -103,9 +109,9 @@ impl MagickmindClient {
         self
     }
 
-    /// Select which credential surface the magickspace routes target. Defaults
-    /// to `ServiceUser` (`/v1/magickspaces/...`); `EndUser` routes to the
-    /// membership-scoped `/v1/end-user/magickspaces/...` surface.
+    /// Override the credential surface the magickspace routes target. By default
+    /// this is derived from the auth credential (end-user token →
+    /// `/v1/end-user/magickspaces/...`, else `/v1/magickspaces/...`).
     pub fn with_caller(mut self, caller: crate::persona::PersonaCaller) -> Self {
         self.caller = caller;
         self

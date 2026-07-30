@@ -142,17 +142,12 @@ async fn main() -> anyhow::Result<()> {
         .base_url
         .as_deref()
         .unwrap_or("https://magickmind.example.com");
+    // Route surface (service-user vs end-user) is derived from the credential
+    // inside MagickmindClient::new.
     let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
     if let Some(api_key) = &config.auth.api_key {
         magickmind_client = magickmind_client.with_api_key(api_key);
     }
-    // Route surface follows the credential, same as the persona stage.
-    let caller = if config.auth.auth_type.as_deref() == Some("enduser") {
-        mindroid::persona::PersonaCaller::EndUser
-    } else {
-        mindroid::persona::PersonaCaller::ServiceUser
-    };
-    magickmind_client = magickmind_client.with_caller(caller);
     let magickmind = Arc::new(magickmind_client);
 
     // Mention gate: only respond when @mentioned

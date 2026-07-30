@@ -13,6 +13,7 @@ members = [
     "examples/magickmind",
     "examples/magickmind_ollama",
     "examples/persona_agent",
+    "examples/enduser_agent",
     "examples/magickmind_voice",
     "examples/cot_trip_agent",
     "examples/cot_budget_agent",
