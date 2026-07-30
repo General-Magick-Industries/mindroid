@@ -84,7 +84,7 @@ pub struct MagickmindClient {
     base_url: String,
     identity: Arc<dyn Auth>,
     api_key: Option<String>,
-    caller: crate::models::CredentialKind,
+    credential_kind: crate::models::CredentialKind,
 }
 
 impl MagickmindClient {
@@ -94,7 +94,7 @@ impl MagickmindClient {
             base_url: base_url.into(),
             identity,
             api_key: None,
-            caller: crate::models::CredentialKind::ServiceUser,
+            credential_kind: crate::models::CredentialKind::ServiceUser,
         }
     }
 
@@ -104,8 +104,8 @@ impl MagickmindClient {
     }
 
     /// Credential surface for the magickspace routes. Default `ServiceUser`.
-    pub fn with_caller(mut self, caller: crate::models::CredentialKind) -> Self {
-        self.caller = caller;
+    pub fn with_credential_kind(mut self, credential_kind: crate::models::CredentialKind) -> Self {
+        self.credential_kind = credential_kind;
         self
     }
 
@@ -123,7 +123,7 @@ impl MagickmindClient {
     ) -> Result<Vec<LlmMessage>> {
         // Service-user → tenant-scoped route; end-user JWT → membership-scoped
         // /v1/end-user/... route (participant = token subject).
-        let url = match self.caller {
+        let url = match self.credential_kind {
             crate::models::CredentialKind::ServiceUser => format!(
                 "{}/v1/magickspaces/{}/context",
                 self.base_url, magickspace_id
@@ -204,7 +204,7 @@ impl MagickmindClient {
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
         // Same credential split as prepare_context (end-user send route: MM-378).
-        let url = match self.caller {
+        let url = match self.credential_kind {
             crate::models::CredentialKind::ServiceUser => format!(
                 "{}/v1/magickspaces/{}/messages",
                 self.base_url, magickspace_id

@@ -27,7 +27,7 @@ struct EpisodeClient {
     http: reqwest::Client,
     base_url: String,
     identity: Arc<dyn Auth>,
-    caller: CredentialKind,
+    credential_kind: CredentialKind,
     allow_insecure: bool,
     /// Ask the server NOT to resolve and attach the agent's persona to each
     /// stored episode. Persona resolution runs per message and costs a lookup;
@@ -38,14 +38,14 @@ struct EpisodeClient {
 impl EpisodeClient {
     const HTTP_TIMEOUT_SECS: u64 = 10;
 
-    fn new(base_url: &str, identity: Arc<dyn Auth>, caller: CredentialKind) -> Self {
+    fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
             http: crate::core::net::secure_json_client(std::time::Duration::from_secs(
                 Self::HTTP_TIMEOUT_SECS,
             )),
             base_url: base_url.trim_end_matches('/').to_string(),
             identity,
-            caller,
+            credential_kind,
             allow_insecure: false,
             skip_persona: false,
         }
@@ -61,7 +61,7 @@ impl EpisodeClient {
                 message: "base_url cannot be a base URL".to_string(),
                 status_code: None,
             })?;
-            match self.caller {
+            match self.credential_kind {
                 CredentialKind::ServiceUser => segments.extend(&["v1", "episodes", "process"]),
                 CredentialKind::EndUser => {
                     segments.extend(&["v1", "end-user", "episodes", "process"])
@@ -87,7 +87,7 @@ impl EpisodeClient {
         let url = self.process_url()?;
         let headers = crate::auth::build_auth_header_map(self.identity.as_ref()).await?;
         let body = ProcessEpisodeRequest {
-            agent_id: match self.caller {
+            agent_id: match self.credential_kind {
                 CredentialKind::ServiceUser => Some(agent_id),
                 CredentialKind::EndUser => None,
             },
@@ -150,9 +150,9 @@ pub struct EpisodeIngestStage {
 
 impl EpisodeIngestStage {
     /// Create a stage that ingests inbound messages via the given credential route.
-    pub fn new(base_url: &str, identity: Arc<dyn Auth>, caller: CredentialKind) -> Self {
+    pub fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
-            client: EpisodeClient::new(base_url, identity, caller),
+            client: EpisodeClient::new(base_url, identity, credential_kind),
             scope: IngestScope::All,
         }
     }
@@ -175,7 +175,7 @@ impl EpisodeIngestStage {
     ///
     /// [`IngestScope::DirectOnly`] is enforced here. [`IngestScope::Addressed`]
     /// cannot be — this stage runs before any gate, so it has no way to know
-    /// whether the agent was addressed; the caller enforces it by invoking the
+    /// whether the agent was addressed; the credential_kind enforces it by invoking the
     /// stage only after the gate passes. [`Self::runs_after_gate`] reports
     /// which placement the configured scope requires.
     pub fn with_scope(mut self, scope: IngestScope) -> Self {
@@ -251,9 +251,9 @@ pub struct EpisodeReplyIngestStage {
 }
 
 impl EpisodeReplyIngestStage {
-    pub fn new(base_url: &str, identity: Arc<dyn Auth>, caller: CredentialKind) -> Self {
+    pub fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
-            client: EpisodeClient::new(base_url, identity, caller),
+            client: EpisodeClient::new(base_url, identity, credential_kind),
         }
     }
 
@@ -329,8 +329,8 @@ mod tests {
     use crate::config::AgentConfig;
     use crate::models::Message;
 
-    fn client(caller: CredentialKind) -> EpisodeClient {
-        EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), caller)
+    fn client(credential_kind: CredentialKind) -> EpisodeClient {
+        EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), credential_kind)
     }
 
     /// A context whose ingest is guaranteed to fail: port 1 is unreachable.
@@ -444,7 +444,7 @@ mod tests {
     }
 
     /// Addressed cannot be enforced inside the stage — at Step 0 nothing has
-    /// evaluated the gate. The caller enforces it by placement, so the stage
+    /// evaluated the gate. The credential_kind enforces it by placement, so the stage
     /// must report that it needs the post-gate slot.
     #[test]
     fn addressed_requires_post_gate_placement() {

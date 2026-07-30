@@ -7,6 +7,7 @@ use crate::core::content::ContentPart;
 /// Which identity a credential acts as; adapters use it to pick service-user
 /// (`/v1/...`) vs end-user (`/v1/end-user/...`) routes and connect behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum CredentialKind {
     #[default]
     ServiceUser,

@@ -1,9 +1,8 @@
 //! End-user platform agent — acts on its own end-user identity, not a service
 //! user. With `auth.type = "enduser"` the whole magickmind surface (Centrifugo
 //! connect + subscribe, context/history, send-with-fan-out) routes to the
-//! end-user API automatically: `MagickmindClient` derives it from the `Auth`
-//! credential, so the same code runs a service-user (`apikey`) config against
-//! `/v1/magickspaces/...` instead.
+//! end-user API. Routing follows the config, so the same code runs a
+//! service-user (`apikey`) config against `/v1/magickspaces/...` instead.
 //!
 //! Flow per message: fetch context → LLM → persist (fans out to participants).
 //!
@@ -13,9 +12,7 @@
 use std::sync::Arc;
 
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{
-    MagickmindClient, MagickmindContext, MagickmindPersistence,
-};
+use mindroid::pipeline::presets::magickmind::{MagickmindContext, MagickmindPersistence};
 use mindroid::{
     ContextPreparer, GenericLlmProcessor, MindroidConfig, Pipeline, PipelineContext, PostProcessor,
     PrepareOutcome, Runtime,
@@ -33,20 +30,12 @@ async fn main() -> anyhow::Result<()> {
     // Auth, transport, memory, observer come from config. auth.type = "enduser"
     // makes the transport connect + subscribe as the agent's own identity.
     let builder = Runtime::from_config(config)?;
-    let identity = builder.auth_arc().unwrap();
-    let config = builder.config_ref().unwrap();
-
-    let base_url = config
-        .auth
-        .base_url
-        .as_deref()
-        .unwrap_or("https://magickmind.example.com");
-
-    // Route surface follows the configured credential.
-    let kind = mindroid::credential_kind_from_config(config);
-    let magickmind = Arc::new(MagickmindClient::new(base_url, identity).with_caller(kind));
-
-    let agent_id = config.agent.agent_id.clone();
+    let magickmind = Arc::new(
+        builder
+            .magickmind_client()
+            .expect("auth + base_url required"),
+    );
+    let agent_id = builder.config_ref().unwrap().agent.agent_id.clone();
     let context_preparer = Arc::new(
         ContextPreparer::new()
             .add_provider(MagickmindContext::new(magickmind.clone()).with_self_id(agent_id)),

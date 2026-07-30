@@ -61,7 +61,7 @@ use crate::identity::{IdentityResolutionStage, IdentityResolver};
 #[cfg(feature = "persona")]
 struct EpisodeIngestParams {
     base_url: String,
-    caller: crate::models::CredentialKind,
+    credential_kind: crate::models::CredentialKind,
     allow_insecure: bool,
     skip_persona: bool,
     scope: crate::config::IngestScope,
@@ -87,12 +87,18 @@ pub struct RuntimeBuilder {
     #[cfg(feature = "persona")]
     pub(crate) magickmind_persona: Option<(String, String, Option<u64>, bool)>,
     /// Agent-scoped prepared persona:
-    /// `(base_url, agent_id, is_enduser, cache_ttl_secs, allow_insecure)`.
+    /// `(base_url, agent_id, credential_kind, cache_ttl_secs, allow_insecure)`.
     /// Set when `persona.type = "magickmind-prepared-agent"`. Built into a
     /// `MagickmindAgentPersonaStage` on demand. `agent_id` is empty on the
     /// end-user route, where the token subject supplies it.
     #[cfg(feature = "persona")]
-    pub(crate) magickmind_agent_persona: Option<(String, String, bool, Option<u64>, bool)>,
+    pub(crate) magickmind_agent_persona: Option<(
+        String,
+        String,
+        crate::models::CredentialKind,
+        Option<u64>,
+        bool,
+    )>,
     #[cfg(feature = "identity")]
     pub(crate) identity_resolver: Option<Arc<IdentityResolver>>,
 }
@@ -252,21 +258,35 @@ impl RuntimeBuilder {
     pub fn build_magickmind_agent_persona_stage(
         &self,
     ) -> Option<crate::persona::MagickmindAgentPersonaStage> {
-        let (base_url, agent_id, is_enduser, ttl_secs, allow_insecure) =
+        let (base_url, agent_id, credential_kind, ttl_secs, allow_insecure) =
             self.magickmind_agent_persona.as_ref()?;
         let auth = self.auth.clone()?;
-        let caller = if *is_enduser {
-            crate::models::CredentialKind::EndUser
-        } else {
-            crate::models::CredentialKind::ServiceUser
-        };
         let mut stage = crate::persona::MagickmindAgentPersonaStage::new(base_url, agent_id, auth)
-            .with_caller(caller)
+            .with_credential_kind(*credential_kind)
             .with_allow_insecure(*allow_insecure);
         if let Some(secs) = ttl_secs {
             stage = stage.with_ttl(std::time::Duration::from_secs(*secs));
         }
         Some(stage)
+    }
+
+    /// A `MagickmindClient` fully wired from config (base URL, auth, credential
+    /// kind, api key). `None` if no auth or `auth.base_url` is set.
+    #[cfg(feature = "llm-hosted")]
+    pub fn magickmind_client(
+        &self,
+    ) -> Option<crate::pipeline::presets::magickmind::MagickmindClient> {
+        let config = self.config.as_ref()?;
+        let auth = self.auth.clone()?;
+        let base_url = config.auth.base_url.as_deref()?;
+        let kind = crate::core::factory::credential_kind_from_config(config);
+        let mut client =
+            crate::pipeline::presets::magickmind::MagickmindClient::new(base_url, auth)
+                .with_credential_kind(kind);
+        if let Some(api_key) = &config.auth.api_key {
+            client = client.with_api_key(api_key);
+        }
+        Some(client)
     }
 
     /// Resolve episode-ingest settings, or `Ok(None)` when `episodes.enabled`
@@ -306,14 +326,10 @@ impl RuntimeBuilder {
             "episodes.allow_insecure",
         )?;
 
-        let caller = if config.auth.auth_type.as_deref() == Some("enduser") {
-            crate::models::CredentialKind::EndUser
-        } else {
-            crate::models::CredentialKind::ServiceUser
-        };
+        let credential_kind = crate::core::factory::credential_kind_from_config(config);
         Ok(Some(EpisodeIngestParams {
             base_url,
-            caller,
+            credential_kind,
             allow_insecure: config.episodes.allow_insecure,
             skip_persona: config.episodes.skip_persona,
             scope: config.episodes.scope,
@@ -335,7 +351,7 @@ impl RuntimeBuilder {
             return Ok(None);
         };
         Ok(Some(
-            crate::episode::EpisodeIngestStage::new(&p.base_url, auth, p.caller)
+            crate::episode::EpisodeIngestStage::new(&p.base_url, auth, p.credential_kind)
                 .with_allow_insecure(p.allow_insecure)
                 .with_skip_persona(p.skip_persona)
                 .with_scope(p.scope),
@@ -362,7 +378,7 @@ impl RuntimeBuilder {
         // The reply is the agent's own message, so it is always in scope — the
         // scope setting governs which *inbound* traffic is recorded.
         Ok(Some(
-            crate::episode::EpisodeReplyIngestStage::new(&p.base_url, auth, p.caller)
+            crate::episode::EpisodeReplyIngestStage::new(&p.base_url, auth, p.credential_kind)
                 .with_allow_insecure(p.allow_insecure)
                 .with_skip_persona(p.skip_persona),
         ))
@@ -601,7 +617,9 @@ impl Runtime {
                     // The credential decides the route. An end-user JWT is the
                     // agent itself (id-less route); a service-user credential
                     // names the agent in the path and so requires agent_id.
-                    let is_enduser = config.auth.auth_type.as_deref() == Some("enduser");
+                    let credential_kind =
+                        crate::core::factory::credential_kind_from_config(&config);
+                    let is_enduser = credential_kind == crate::models::CredentialKind::EndUser;
                     let agent_id = if is_enduser {
                         String::new()
                     } else {
@@ -634,7 +652,7 @@ impl Runtime {
                     builder.magickmind_agent_persona = Some((
                         base_url,
                         agent_id,
-                        is_enduser,
+                        credential_kind,
                         config.persona.cache_ttl_secs,
                         config.persona.allow_insecure,
                     ));
