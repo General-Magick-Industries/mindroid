@@ -65,6 +65,8 @@ impl OmniSession {
         let has_local_turn_detection =
             matches!(&self.config.turn_detection, TurnDetection::Local(_));
         let has_local_barge_in = matches!(&self.config.barge_in, BargeInMode::LocalVad);
+        // Only read under `transport-audio`, like the VAD channels below.
+        #[cfg_attr(not(feature = "transport-audio"), allow(unused_variables))]
         let use_local_vad = has_local_turn_detection || has_local_barge_in;
 
         // 5. Set up the VAD inference offload.
