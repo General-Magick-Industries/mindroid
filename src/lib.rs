@@ -65,6 +65,7 @@ pub use core::events::PipelineEvent;
 #[cfg(feature = "artifacts")]
 pub use core::factory::build_artifact_store;
 pub use core::factory::credential_kind_from_config;
+pub use core::health::{Health, HealthReporter, HealthWatcher};
 pub use core::strategy::RunStrategy;
 #[cfg(feature = "persona")]
 pub use episode::{EpisodeIngestStage, EpisodeReplyIngestStage};
