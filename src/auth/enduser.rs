@@ -439,7 +439,11 @@ impl RotateFailure {
         match status {
             429 => Self::RateLimited(err),
             // 403 is the supervised bar; 401 covers expired/revoked/replayed.
-            401 | 403 => Self::Rejected(err),
+            // 404 means the deployment has no refresh route at all — waiting
+            // cannot make one appear, and treating it as an outage would leave
+            // the agent alive but unable to renew, reporting healthy right up
+            // until its token quietly expires.
+            401 | 403 | 404 => Self::Rejected(err),
             // 400 is a malformed request — an over-cap `token_ttl_seconds`, say.
             // The credential may be perfectly good, so latching Dead here turns a
             // config typo into an agent that kills itself an hour after start and
@@ -1668,6 +1672,20 @@ mod tests {
         );
     }
 
+    /// A deployment without the refresh route must fail loudly. Classified as an
+    /// outage, the agent would keep retrying and report healthy until its token
+    /// expired — alive but unable to renew.
+    #[tokio::test]
+    async fn missing_refresh_route_is_terminal() {
+        let gw = spawn_gateway(vec![(404, r#"{"msg":"not found"}"#.into())], None).await;
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let auth = EndUserAuth::try_new(&gw.base_url, "original", Some(&expires), true).unwrap();
+
+        assert!(with_deadline(auth.get_token()).await.is_err());
+        assert!(auth.is_terminal(), "404 must not be treated as transient");
+    }
+
+    /// A revoked chain (401) is equally terminal.
     #[tokio::test]
     async fn revoked_chain_is_terminal() {
         let gw = spawn_gateway(vec![(401, r#"{"msg":"invalid token"}"#.into())], None).await;
