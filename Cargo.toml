@@ -134,6 +134,10 @@ tempfile = "3"
 dirs = "6"
 clap = { version = "4", features = ["derive"] }
 
+# Applies when building THIS crate's own binaries and examples. Cargo ignores a
+# dependency's profile, so a host embedding mindroid picks its own — notably
+# `panic`. A host running many runtimes in one process wants "unwind", so it can
+# catch_unwind per agent instead of one agent's panic aborting every agent.
 [profile.release]
 opt-level = "z"
 lto = "thin"

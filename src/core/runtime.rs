@@ -560,6 +560,15 @@ mod health_wiring_tests {
         }
     }
 
+    /// Embedding N agents as N tokio tasks requires `Send`. A non-Send field
+    /// would break every embedding host at once, so pin it here.
+    #[test]
+    fn runtime_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Runtime>();
+        assert_send::<crate::core::health::HealthWatcher>();
+    }
+
     #[tokio::test]
     async fn starts_as_starting() {
         let rt = runtime_with(Box::new(DeadTransport {
