@@ -320,7 +320,8 @@ impl OmniSession {
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| MindroidError::pipeline(format!("tool not found: {name}")))?;
-        tool.execute(args).await
+        tool.execute(args, &crate::tools::ToolContext::default())
+            .await
     }
 
     /// Test-only entry point that injects a pre-populated VAD results channel,
@@ -850,7 +851,11 @@ mod tests {
             serde_json::json!({ "type": "object", "properties": {} })
         }
 
-        async fn execute(&self, args: Value) -> crate::error::Result<String> {
+        async fn execute(
+            &self,
+            args: Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
             Ok(args.to_string())
         }
     }

@@ -9,7 +9,7 @@ use crate::config::IngestScope;
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::models::ChannelType;
-use crate::persona::PersonaCaller;
+use crate::models::CredentialKind;
 use crate::pipeline::PipelineStage;
 
 /// Shared HTTP client for the episode-ingest endpoint.
@@ -19,15 +19,15 @@ use crate::pipeline::PipelineStage;
 ///
 /// The route follows the credential, exactly like the persona prepare stage:
 ///
-/// - [`PersonaCaller::ServiceUser`] — `POST /v1/episodes/process`, `agent_id` in
+/// - [`CredentialKind::ServiceUser`] — `POST /v1/episodes/process`, `agent_id` in
 ///   the body names the memory owner.
-/// - [`PersonaCaller::EndUser`] — `POST /v1/end-user/episodes/process`, owner is
+/// - [`CredentialKind::EndUser`] — `POST /v1/end-user/episodes/process`, owner is
 ///   the token subject, so no `agent_id` is sent.
 struct EpisodeClient {
     http: reqwest::Client,
     base_url: String,
     identity: Arc<dyn Auth>,
-    caller: PersonaCaller,
+    credential_kind: CredentialKind,
     allow_insecure: bool,
     /// Ask the server NOT to resolve and attach the agent's persona to each
     /// stored episode. Persona resolution runs per message and costs a lookup;
@@ -38,14 +38,14 @@ struct EpisodeClient {
 impl EpisodeClient {
     const HTTP_TIMEOUT_SECS: u64 = 10;
 
-    fn new(base_url: &str, identity: Arc<dyn Auth>, caller: PersonaCaller) -> Self {
+    fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
             http: crate::core::net::secure_json_client(std::time::Duration::from_secs(
                 Self::HTTP_TIMEOUT_SECS,
             )),
             base_url: base_url.trim_end_matches('/').to_string(),
             identity,
-            caller,
+            credential_kind,
             allow_insecure: false,
             skip_persona: false,
         }
@@ -61,9 +61,9 @@ impl EpisodeClient {
                 message: "base_url cannot be a base URL".to_string(),
                 status_code: None,
             })?;
-            match self.caller {
-                PersonaCaller::ServiceUser => segments.extend(&["v1", "episodes", "process"]),
-                PersonaCaller::EndUser => {
+            match self.credential_kind {
+                CredentialKind::ServiceUser => segments.extend(&["v1", "episodes", "process"]),
+                CredentialKind::EndUser => {
                     segments.extend(&["v1", "end-user", "episodes", "process"])
                 }
             };
@@ -87,9 +87,9 @@ impl EpisodeClient {
         let url = self.process_url()?;
         let headers = crate::auth::build_auth_header_map(self.identity.as_ref()).await?;
         let body = ProcessEpisodeRequest {
-            agent_id: match self.caller {
-                PersonaCaller::ServiceUser => Some(agent_id),
-                PersonaCaller::EndUser => None,
+            agent_id: match self.credential_kind {
+                CredentialKind::ServiceUser => Some(agent_id),
+                CredentialKind::EndUser => None,
             },
             magickspace_id: msg.magickspace_id,
             sender_id: msg.sender_id,
@@ -113,6 +113,7 @@ impl EpisodeClient {
             })?;
 
         let status = resp.status();
+        crate::core::net::note_auth_status(self.identity.as_ref(), status);
         if !status.is_success() {
             let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
             return Err(MindroidError::Api {
@@ -150,9 +151,9 @@ pub struct EpisodeIngestStage {
 
 impl EpisodeIngestStage {
     /// Create a stage that ingests inbound messages via the given credential route.
-    pub fn new(base_url: &str, identity: Arc<dyn Auth>, caller: PersonaCaller) -> Self {
+    pub fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
-            client: EpisodeClient::new(base_url, identity, caller),
+            client: EpisodeClient::new(base_url, identity, credential_kind),
             scope: IngestScope::All,
         }
     }
@@ -251,9 +252,9 @@ pub struct EpisodeReplyIngestStage {
 }
 
 impl EpisodeReplyIngestStage {
-    pub fn new(base_url: &str, identity: Arc<dyn Auth>, caller: PersonaCaller) -> Self {
+    pub fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
-            client: EpisodeClient::new(base_url, identity, caller),
+            client: EpisodeClient::new(base_url, identity, credential_kind),
         }
     }
 
@@ -329,8 +330,8 @@ mod tests {
     use crate::config::AgentConfig;
     use crate::models::Message;
 
-    fn client(caller: PersonaCaller) -> EpisodeClient {
-        EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), caller)
+    fn client(credential_kind: CredentialKind) -> EpisodeClient {
+        EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), credential_kind)
     }
 
     /// A context whose ingest is guaranteed to fail: port 1 is unreachable.
@@ -354,8 +355,11 @@ mod tests {
     #[tokio::test]
     async fn inbound_ingest_failure_does_not_fail_the_pipeline() {
         let (mut ctx, url) = failing_ctx("hello");
-        let stage =
-            EpisodeIngestStage::new(&url, Arc::new(StaticAuth::new("t")), PersonaCaller::EndUser);
+        let stage = EpisodeIngestStage::new(
+            &url,
+            Arc::new(StaticAuth::new("t")),
+            CredentialKind::EndUser,
+        );
         assert!(stage.process(&mut ctx).await.is_ok());
     }
 
@@ -366,7 +370,7 @@ mod tests {
         let stage = EpisodeReplyIngestStage::new(
             &url,
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         );
         assert!(stage.process(&mut ctx).await.is_ok());
     }
@@ -379,7 +383,7 @@ mod tests {
         let stage = EpisodeIngestStage::new(
             "http://memory.internal",
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         );
         assert!(stage.process(&mut ctx).await.is_ok());
 
@@ -387,7 +391,7 @@ mod tests {
         let c = EpisodeClient::new(
             "http://memory.internal",
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         );
         let msg = EpisodeMessage {
             magickspace_id: "ms",
@@ -418,7 +422,7 @@ mod tests {
         let stage = EpisodeReplyIngestStage::new(
             &url,
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         );
         // No response to ingest: returns early, before any network attempt.
         assert!(stage.process(&mut ctx).await.is_ok());
@@ -432,7 +436,7 @@ mod tests {
         let s = EpisodeIngestStage::new(
             "https://x",
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         );
         assert_eq!(s.scope, IngestScope::All);
         // All is a pre-gate scope: recording everything requires seeing
@@ -448,7 +452,7 @@ mod tests {
         let s = EpisodeIngestStage::new(
             "https://x",
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         )
         .with_scope(IngestScope::Addressed);
         assert!(s.runs_after_gate());
@@ -459,7 +463,7 @@ mod tests {
         let s = EpisodeIngestStage::new(
             "https://x",
             Arc::new(StaticAuth::new("t")),
-            PersonaCaller::EndUser,
+            CredentialKind::EndUser,
         )
         .with_scope(IngestScope::DirectOnly);
         // Enforced here, so no post-gate placement is needed.
@@ -478,9 +482,12 @@ mod tests {
     #[tokio::test]
     async fn out_of_scope_message_is_not_ingested() {
         let (mut ctx, url) = failing_ctx("hi");
-        let s =
-            EpisodeIngestStage::new(&url, Arc::new(StaticAuth::new("t")), PersonaCaller::EndUser)
-                .with_scope(IngestScope::DirectOnly);
+        let s = EpisodeIngestStage::new(
+            &url,
+            Arc::new(StaticAuth::new("t")),
+            CredentialKind::EndUser,
+        )
+        .with_scope(IngestScope::DirectOnly);
         // The URL is unreachable, so an attempted send would still return Ok
         // (best-effort) — what this pins is the early return before that.
         assert!(s.process(&mut ctx).await.is_ok());
@@ -498,13 +505,13 @@ mod tests {
 
     #[test]
     fn service_user_route() {
-        let u = client(PersonaCaller::ServiceUser).process_url().unwrap();
+        let u = client(CredentialKind::ServiceUser).process_url().unwrap();
         assert_eq!(u.path(), "/v1/episodes/process");
     }
 
     #[test]
     fn end_user_route() {
-        let u = client(PersonaCaller::EndUser).process_url().unwrap();
+        let u = client(CredentialKind::EndUser).process_url().unwrap();
         assert_eq!(u.path(), "/v1/end-user/episodes/process");
     }
 

@@ -79,25 +79,54 @@ struct CorpusItem {
 
 // ── MagickmindClient ──────────────────────────────────────────────────────────
 
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct MagickmindClient {
     http: reqwest::Client,
     base_url: String,
     identity: Arc<dyn Auth>,
     api_key: Option<String>,
+    credential_kind: crate::models::CredentialKind,
 }
 
 impl MagickmindClient {
+    /// Build a client. Prefer [`try_new`](Self::try_new), which also refuses a
+    /// non-TLS `base_url` — this constructor cannot, being infallible.
     pub fn new(base_url: impl Into<String>, identity: Arc<dyn Auth>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Redirects are banned: reqwest strips Authorization across hosts by
+            // comparing host and port without the scheme, and it never strips
+            // custom headers like the api key at all.
+            http: crate::core::net::secure_json_client(REQUEST_TIMEOUT),
             base_url: base_url.into(),
             identity,
             api_key: None,
+            credential_kind: crate::models::CredentialKind::ServiceUser,
         }
     }
 
+    /// Like [`new`](Self::new), but rejects a `base_url` that would carry the
+    /// credential in cleartext.
+    pub fn try_new(
+        base_url: impl Into<String>,
+        identity: Arc<dyn Auth>,
+        allow_insecure: bool,
+    ) -> Result<Self> {
+        let base_url = base_url.into();
+        crate::core::net::require_secure_url(&base_url, allow_insecure, "memory.allow_insecure")?;
+        Ok(Self::new(base_url, identity))
+    }
+
+    /// x-api-key for the pelican fetcher, sent only on context prepare (the one
+    /// route that uses pelican).
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Credential surface for the magickspace routes. Default `ServiceUser`.
+    pub fn with_credential_kind(mut self, credential_kind: crate::models::CredentialKind) -> Self {
+        self.credential_kind = credential_kind;
         self
     }
 
@@ -113,10 +142,18 @@ impl MagickmindClient {
         config: &MagickmindContextConfig,
         exclude_sender: Option<&str>,
     ) -> Result<Vec<LlmMessage>> {
-        let url = format!(
-            "{}/v1/magickspaces/{}/context",
-            self.base_url, magickspace_id
-        );
+        // Service-user → tenant-scoped route; end-user JWT → membership-scoped
+        // /v1/end-user/... route (participant = token subject).
+        let url = match self.credential_kind {
+            crate::models::CredentialKind::ServiceUser => format!(
+                "{}/v1/magickspaces/{}/context",
+                self.base_url, magickspace_id
+            ),
+            crate::models::CredentialKind::EndUser => format!(
+                "{}/v1/end-user/magickspaces/{}/context",
+                self.base_url, magickspace_id
+            ),
+        };
         let mut headers = self.auth_headers().await?;
 
         let body = PrepareContextRequest {
@@ -165,6 +202,7 @@ impl MagickmindClient {
             })?;
 
         let status = resp.status();
+        crate::core::net::note_auth_status(self.identity.as_ref(), status);
         if !status.is_success() {
             return Err(MindroidError::Api {
                 message: format!("Magickmind prepare_context returned {status}"),
@@ -187,10 +225,17 @@ impl MagickmindClient {
         content: &str,
         reply_to_message_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let url = format!(
-            "{}/v1/magickspaces/{}/messages",
-            self.base_url, magickspace_id
-        );
+        // Same credential split as prepare_context.
+        let url = match self.credential_kind {
+            crate::models::CredentialKind::ServiceUser => format!(
+                "{}/v1/magickspaces/{}/messages",
+                self.base_url, magickspace_id
+            ),
+            crate::models::CredentialKind::EndUser => format!(
+                "{}/v1/end-user/magickspaces/{}/messages",
+                self.base_url, magickspace_id
+            ),
+        };
         let headers = self.auth_headers().await?;
         let body = MagickmindSaveRequest {
             sender_id,
@@ -213,6 +258,7 @@ impl MagickmindClient {
             })?;
 
         let status = resp.status();
+        crate::core::net::note_auth_status(self.identity.as_ref(), status);
         if !status.is_success() {
             return Err(MindroidError::Api {
                 message: "Magickmind save_message returned non-success status".to_string(),

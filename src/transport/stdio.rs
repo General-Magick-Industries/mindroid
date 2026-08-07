@@ -56,9 +56,12 @@ impl Transport for StdioTransport {
 
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!("StdioTransport received line: {}", line);
+                // A client tool result may arrive as a {type:"tool_result",…}
+                // envelope; rewrite it into the <tool_result> history form.
+                let content = crate::tools::remote::normalize_tool_result(&line).unwrap_or(line);
                 let message = Message {
                     id: Uuid::new_v4().to_string(),
-                    content: line,
+                    content,
                     sender_id: "stdin".to_string(),
                     sender_type: SenderType::User,
                     channel_id: "stdio".to_string(),

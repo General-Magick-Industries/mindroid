@@ -31,6 +31,8 @@ Mindroid is a Rust framework for building AI agents that can reason, act, and co
 - **Composable pipelines** -- Chain processing stages in any order. Add gates, tool execution, speech, or custom stages.
 - **Any LLM backend** -- Works with Ollama, OpenAI, litellm, vLLM, OpenRouter, or any OpenAI-compatible endpoint.
 - **Tool execution** -- Agents can run shell commands, open URLs, set reminders, or use custom tools you define.
+- **Remote tools** -- Declare tools the *client* executes: the pipeline emits the call as its response instead of running it, and the client returns the result as a new message.
+- **Artifact storage** -- Move images/audio out of conversation history after the model reads them, and re-fetch by id on demand instead of re-sending bytes every turn.
 - **Skills system** -- On-demand domain knowledge with deterministic prefiltering and trust-based authority.
 - **Multi-agent coordination** -- Gates and engagement tracking prevent feedback loops in multi-agent deployments.
 - **Persona system** -- Structured personality traits with per-user dyadic adaptation, formatted in-process or server-prepared (`magickmind-prepared`) with per-message persona selection and prompt caching.
@@ -91,7 +93,10 @@ async fn main() -> mindroid::Result<()> {
 | `persistence` | no | SQLite and Magick Mind memory backends |
 | `persona` | no | Persona system (cloud and local providers) |
 | `identity` | no | Cross-platform identity resolution |
-| `full` | no | All features |
+| `artifacts` | no | Out-of-band media storage (offload + on-demand re-injection) |
+| `magickmind` | no | Magick Mind service integration (end-user credentials, backend-routed tools) |
+| `magickmind-artifacts` | no | Remote artifact backend (stub — panics; excluded from `full`) |
+| `full` | no | All features except `magickmind-artifacts` |
 
 ## Configuration
 

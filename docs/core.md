@@ -839,17 +839,54 @@ pub struct PipelineConfig {
 }
 ```
 
-**IdentityConfig** — Auth settings:
+**AuthConfig** — Auth settings (TOML section `[auth]`):
 ```rust
-pub struct IdentityConfig {
-    pub identity_type: Option<String>,   // "static", "apikey", etc.
+pub struct AuthConfig {
+    pub auth_type: Option<String>,       // TOML key `type`: "static", "apikey", "enduser"
     pub email: Option<String>,
     pub password: Option<String>,
     pub api_key: Option<String>,
     pub token: Option<String>,
     pub base_url: Option<String>,
+    pub allow_insecure: bool,            // permit credentials over plaintext http:// (local dev only)
+
+    // `enduser` only — see "End-user tokens" below.
+    pub token_expires_at: Option<String>, // RFC 3339 expiry of `token`, from the mint response
+    pub rotate_token: bool,               // default true
+    pub token_ttl_seconds: Option<i64>,   // TTL requested per rotation; server default (1h) if unset
 }
 ```
+
+### End-user tokens
+
+`type = "enduser"` carries a Magick Mind end-user JWT (from `POST /v1/end-users/tokens`)
+and routes magickmind calls to the id-less end-user API surface, where the agent is the
+token subject rather than a path parameter.
+
+These tokens are short-lived — one hour by default, 24 hours at the server's hard maximum
+— so `rotate_token` defaults to **true**: `EndUserAuth` exchanges the token via
+`POST /v1/end-user/tokens/refresh` before it expires. Without rotation a long-running
+agent stops working within a day, and the failure is silent (calls simply begin returning
+401).
+
+Rotation follows RFC 9700: the presented token is **revoked as the successor is issued**.
+Three consequences the SDK handles, and one the caller must:
+
+- Rotation is single-flight under a write lock. Two concurrent rotations would present the
+  same `jti`; the second lands outside the replay window and the server revokes the
+  **entire chain**.
+- A rejected rotation (400/401/403) is **terminal** — there is no fallback credential to
+  fall back to, unlike `apikey`. `EndUserAuth::is_terminal()` reports this so a supervisor
+  can tell "retry" from "re-mint or stop". 429 and 5xx are *not* terminal; they back off.
+- A chain is bounded server-side (30 days absolute, 14 days idle by default). Past either
+  cap, only a fresh mint restores service.
+- **Caller's job:** `Auth::refresh()` consumes the current token. Call it only when
+  reacting to a 401 from elsewhere — `get_token()` already rotates on its own schedule,
+  and each extra call spends one slot of the chain's rate-limit budget (60/hour default).
+
+Set `rotate_token = false` only when a supervisor rotates the token out of band. A token
+minted with `supervised: true` is barred from the self-refresh route server-side and will
+return 403, which `EndUserAuth` treats as terminal.
 
 **MemoryConfig** — Persistence settings:
 ```rust

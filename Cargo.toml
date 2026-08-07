@@ -1,10 +1,15 @@
 [package]
 name = "mindroid"
-version = "0.0.1-a.1"
+version = "0.0.2-a.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/General-Magick-Industries/mindroid"
 description = "Modular AI agent SDK with trait-based component swappability"
+# Each example is its own workspace member with its own deps, so `--workspace`
+# already builds them. Without this, `examples/*/main.rs` is ALSO auto-discovered
+# as a root-crate example target and compiled against the root's dependencies —
+# which fails for any example carrying a dep of its own.
+autoexamples = false
 
 [workspace]
 members = [
@@ -13,6 +18,7 @@ members = [
     "examples/magickmind",
     "examples/magickmind_ollama",
     "examples/persona_agent",
+    "examples/enduser_agent",
     "examples/magickmind_voice",
     "examples/cot_trip_agent",
     "examples/cot_budget_agent",
@@ -20,6 +26,8 @@ members = [
     "examples/voice_agent",
     "examples/local_persona",
     "examples/coordinator_demo",
+    "examples/remote_tool",
+    "examples/artifact_agent",
 ]
 resolver = "3"
 
@@ -42,8 +50,8 @@ default = ["llm-local"]
 # Transports
 transport-ws = ["dep:tokio-tungstenite", "dep:base64"]
 transport-audio = ["dep:cpal", "dep:hound", "dep:base64", "dep:voice_activity_detector", "dep:rodio"]
-# LLM
-llm-client = ["dep:async-openai", "dep:reqwest"]
+# LLM (base64 needed for inline image encoding + ingest)
+llm-client = ["dep:async-openai", "dep:reqwest", "dep:base64"]
 llm-local = ["llm-client"]
 llm-hosted = ["llm-client", "dep:reqwest"]
 # Speech (STT + TTS providers)
@@ -56,8 +64,19 @@ persistence = ["dep:reqwest", "dep:rusqlite"]
 persona = ["dep:reqwest"]
 # Identity resolution
 identity = []
+# Artifact storage (out-of-band media offload). Pulls in base64 so inline-image
+# encoding works without requiring the transport-ws feature (see llm_client).
+artifacts = ["llm-client", "dep:base64"]
+# Magick Mind service integration: end-user credentials, backend-routed tools,
+# and the remote artifact backend. Backend-specific — enabling `persona` should
+# not compile in a token client for one service.
+magickmind = ["artifacts", "persona", "dep:reqwest"]
+# The remote artifact backend alone. Blocked on the backend presigned-GET
+# download endpoint; `artifacts_magickmind` panics today, so this is
+# deliberately excluded from `full` while `magickmind` itself is not.
+magickmind-artifacts = ["magickmind"]
 # All features
-full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity"]
+full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity", "artifacts", "magickmind"]
 
 [dependencies]
 # Core (always required)

@@ -25,11 +25,11 @@ type = "enduser"
 # The pre-minted end-user JWT for this agent. Mint it with a service-user
 # credential via POST /v1/end-users/tokens {"subject_id": "<agent_id>"}.
 token = "eyJ...your-end-user-jwt..."
-base_url = "https://bifrost.example.com"
+base_url = "https://api.example.com"
 
 [memory]
 type = "magickmind"
-base_url = "https://bifrost.example.com"
+base_url = "https://api.example.com"
 
 # -- Persona (id-less end-user prepare endpoint) ------------------------------
 # The route is chosen by auth.type = "enduser": POST /v1/end-user/persona/prepare
@@ -37,7 +37,7 @@ base_url = "https://bifrost.example.com"
 
 [persona]
 type = "magickmind-prepared-agent"
-base_url = "https://bifrost.example.com"
+base_url = "https://api.example.com"
 # cache_ttl_secs = 600
 # allow_insecure = true   # local non-TLS dev only
 
@@ -56,7 +56,7 @@ base_url = "https://bifrost.example.com"
 # [episodes]
 # enabled = true
 # scope = "all"
-# base_url = "https://bifrost.example.com"   # else falls back to memory.base_url
+# base_url = "https://api.example.com"   # else falls back to memory.base_url
 # skip_persona = true    # skip the server's per-message persona snapshot
 
 [observer]
@@ -70,3 +70,18 @@ api_key = "sk-your-api-key-here"
 [models.respond]
 provider = "litellm"
 model = "your-model-id-here"
+
+# Episodic memory. Under an end-user token the server forces every write and
+# read to the token's own subject, so one agent cannot reach another's memory.
+#
+# scope decides which inbound messages are recorded:
+#   "all"         — everything received, addressed or not (default)
+#   "addressed"   — only messages that passed the agent's gate
+#   "direct_only" — only 1:1 channels
+#
+# "addressed" is enforced by WHERE the ingest stage is placed, not by the stage
+# itself — it runs before any gate. See examples/persona_agent/main.rs.
+[episodes]
+enabled = true
+scope = "addressed"
+# base_url falls back to memory.base_url, then auth.base_url.

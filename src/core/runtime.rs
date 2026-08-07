@@ -36,8 +36,24 @@ impl Runtime {
         RuntimeBuilder::new()
     }
 
-    /// Start the runtime main loop. Blocks until shutdown.
+    /// Start the runtime main loop. Blocks until the transport closes.
     pub async fn run(&mut self) -> Result<()> {
+        self.run_inner(None).await
+    }
+
+    /// Like [`run`](Self::run), but also stops when `cancel` is cancelled —
+    /// breaking the message loop and running [`shutdown`](Self::shutdown) for a
+    /// clean exit (transport disconnected, routines cancelled).
+    ///
+    /// For a control plane that activates/deactivates agents: spawn the runtime
+    /// with a per-agent [`CancellationToken`], and cancel it to stop that agent
+    /// gracefully (vs. `handle.abort()`, which drops mid-await with no clean
+    /// disconnect).
+    pub async fn run_until_cancelled(&mut self, cancel: CancellationToken) -> Result<()> {
+        self.run_inner(Some(cancel)).await
+    }
+
+    async fn run_inner(&mut self, cancel: Option<CancellationToken>) -> Result<()> {
         // Connect transport
         self.transport.connect().await?;
         tracing::info!("Transport '{}' connected", self.transport.name());
@@ -117,7 +133,27 @@ impl Runtime {
         // Process messages
         let mut seen_ids = std::collections::HashSet::<String>::new();
         const MAX_SEEN_IDS: usize = 10_000;
-        while let Some(msg) = rx.recv().await {
+        // A future that never resolves when there's no cancel token, so the
+        // select! reduces to plain rx.recv() in the uncancellable `run()` case.
+        let cancelled = async {
+            match &cancel {
+                Some(c) => c.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = &mut cancelled => {
+                    tracing::info!("Runtime cancelled — shutting down");
+                    break;
+                }
+                msg = rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break, // transport closed
+                },
+            };
             tracing::debug!("Received message: {} from {}", msg.id, msg.sender_id);
 
             // Skip own messages to prevent infinite loops
@@ -191,5 +227,119 @@ impl Runtime {
         self.transport.disconnect().await?;
         tracing::info!("Shutdown complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Response;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Transport that parks the sender instead of dropping it, so `rx.recv()`
+    /// genuinely pends and the loop can only exit via cancellation. Dropping the
+    /// transport (or clearing `held`) is what closes the channel.
+    struct SilentTransport {
+        hold_sender: bool,
+        held: Mutex<Option<mpsc::Sender<Message>>>,
+        disconnected: Arc<AtomicBool>,
+    }
+
+    impl SilentTransport {
+        fn new(hold_sender: bool, disconnected: Arc<AtomicBool>) -> Self {
+            Self {
+                hold_sender,
+                held: Mutex::new(None),
+                disconnected,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for SilentTransport {
+        fn name(&self) -> &str {
+            "silent"
+        }
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            self.disconnected.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn listen(&self, tx: mpsc::Sender<Message>) -> Result<()> {
+            if self.hold_sender {
+                *self.held.lock().unwrap() = Some(tx);
+            }
+            Ok(())
+        }
+        async fn send(&self, _response: &Response) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn runtime_with(hold_sender: bool, disconnected: Arc<AtomicBool>) -> Runtime {
+        Runtime::builder()
+            .transport(SilentTransport::new(hold_sender, disconnected))
+            .build()
+            .expect("builder should produce a runtime")
+    }
+
+    #[tokio::test]
+    async fn cancelling_breaks_the_message_loop_and_shuts_down() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut rt = runtime_with(true, disconnected.clone());
+        let cancel = CancellationToken::new();
+
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rt.run_until_cancelled(cancel))
+            .await
+            .expect("cancellation must break the loop, not hang");
+
+        assert!(result.is_ok());
+        assert!(
+            disconnected.load(Ordering::SeqCst),
+            "shutdown must disconnect the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_already_cancelled_token_exits_without_processing() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut rt = runtime_with(true, disconnected.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), rt.run_until_cancelled(cancel))
+            .await
+            .expect("a pre-cancelled token must exit promptly")
+            .expect("clean exit");
+
+        assert!(disconnected.load(Ordering::SeqCst));
+    }
+
+    /// The `run()` path selects on `std::future::pending()`; it must still
+    /// terminate when the transport drops its sender.
+    #[tokio::test]
+    async fn run_without_cancellation_still_exits_when_transport_closes() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut rt = runtime_with(false, disconnected.clone());
+
+        tokio::time::timeout(Duration::from_secs(5), rt.run())
+            .await
+            .expect("the no-cancel branch must not block shutdown on transport close")
+            .expect("clean exit");
+
+        assert!(disconnected.load(Ordering::SeqCst));
     }
 }

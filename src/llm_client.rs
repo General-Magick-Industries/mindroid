@@ -99,6 +99,26 @@ fn has_multimodal_content(content: &[ContentPart]) -> bool {
     content.iter().any(|p| !p.is_text())
 }
 
+/// Render the model-visible subset of an artifact's metadata as a compact suffix
+/// for the reference line (e.g. ` {entities: ["person"], caption: "..."}`).
+///
+/// Metadata is **visible to the model by default** — artifact metadata is usually
+/// descriptive (captions, tags, entities) and meant to inform the model. To keep a
+/// key code-only (backend plumbing: paths, etags, ids), prefix its name with an
+/// underscore (`_directory`, `_etag`); underscore-prefixed keys are never rendered.
+fn render_llm_metadata(metadata: &crate::core::content::ContentMetadata) -> String {
+    let pairs: Vec<String> = metadata
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_'))
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect();
+    if pairs.is_empty() {
+        String::new()
+    } else {
+        format!(" {{{}}}", pairs.join(", "))
+    }
+}
+
 /// Convert `ContentPart`s to OpenAI user message content parts for multimodal messages.
 /// Text-only messages should use the fast text path instead.
 fn content_parts_to_openai(
@@ -110,31 +130,50 @@ fn content_parts_to_openai(
             ContentPart::Text { text } => Some(ChatCompletionRequestUserMessageContentPart::Text(
                 ChatCompletionRequestMessageContentPartText { text: text.clone() },
             )),
-            ContentPart::Image { source, mime_type } => {
+            ContentPart::Image { source, mime_type, .. } => {
                 let url = match source {
                     ContentSource::Uri { uri } => uri.clone(),
                     ContentSource::Inline { data } => {
-                        #[cfg(feature = "transport-ws")]
-                        {
-                            use base64::Engine;
-                            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-                            format!("data:{};base64,{}", mime_type, encoded)
-                        }
-                        #[cfg(not(feature = "transport-ws"))]
-                        {
-                            let _ = (data, mime_type);
-                            tracing::warn!(
-                                "Skipping inline image in OpenAI conversion: base64 encoding \
-                                 requires the `transport-ws` feature"
-                            );
-                            return None;
-                        }
+                        // base64 is available whenever `llm-client` is enabled (which
+                        // this fn requires), so inline images always encode — no
+                        // silent drop regardless of transport features (Defect 4).
+                        use base64::Engine;
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+                        format!("data:{};base64,{}", mime_type, encoded)
                     }
                 };
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         image_url: ImageUrl { url, detail: None },
                     },
+                ))
+            }
+            // A `File` whose source is an artifact reference (a bare id) is rendered
+            // to a compact text line the model reads — it can then call
+            // `get_artifact(<id>)` to re-attach the bytes. Other File parts fall
+            // through to the same text rendering (best-effort).
+            ContentPart::File {
+                source,
+                mime_type,
+                filename,
+                metadata,
+            } => {
+                let id = match source {
+                    ContentSource::Uri { uri } => uri.as_str(),
+                    ContentSource::Inline { .. } => "inline",
+                };
+                let name_part = match filename.as_deref() {
+                    Some(f) if !f.is_empty() => format!(" \"{f}\""),
+                    _ => String::new(),
+                };
+                // Metadata (captions, tags, entities…) is visible to the model by
+                // default; keys prefixed with `_` are kept code-only.
+                let meta = render_llm_metadata(metadata);
+                let line = format!(
+                    "[{mime_type} artifact {id}{name_part}{meta} — call get_artifact(\"{id}\") to view]"
+                );
+                Some(ChatCompletionRequestUserMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text: line },
                 ))
             }
             other => {
@@ -153,6 +192,7 @@ fn content_parts_to_openai(
 // ---------------------------------------------------------------------------
 
 /// OpenAI-compatible LLM client backed by `async-openai`.
+#[derive(Clone)]
 pub struct LlmClient {
     config: LlmClientConfig,
     client: Client<OpenAIConfig>,
@@ -245,11 +285,25 @@ impl LlmClient {
                         .build()
                         .ok()
                         .map(Into::into),
-                    Role::Tool => ChatCompletionRequestUserMessageArgs::default()
-                        .content(text.as_str())
-                        .build()
-                        .ok()
-                        .map(Into::into),
+                    // Tool results map to an OpenAI *user* message (the real `tool`
+                    // role can't carry image parts). Branch on multimodal so a
+                    // re-injected artifact image survives instead of being dropped
+                    // by `msg.text()`.
+                    Role::Tool => {
+                        if has_multimodal_content(&msg.content) {
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(content_parts_to_openai(&msg.content))
+                                .build()
+                                .ok()
+                                .map(Into::into)
+                        } else {
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(text.as_str())
+                                .build()
+                                .ok()
+                                .map(Into::into)
+                        }
+                    }
                 }
             })
             .collect()
@@ -475,6 +529,83 @@ mod tests {
     }
 
     #[test]
+    fn file_reference_renders_to_text_not_dropped() {
+        // A bare-id File reference must render to a text part the model reads,
+        // including any visible metadata (e.g. a caption).
+        let mut meta = crate::core::content::ContentMetadata::new();
+        meta.insert("caption".into(), serde_json::json!("a red bicycle"));
+        let mut part = ContentPart::file(
+            ContentSource::Uri {
+                uri: "abc123".into(),
+            },
+            "image/png",
+            None,
+        );
+        *part.metadata_mut().unwrap() = meta;
+
+        let out = content_parts_to_openai(&[part]);
+        assert_eq!(out.len(), 1, "File reference must not be dropped");
+        match &out[0] {
+            ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                assert!(t.text.contains("abc123"));
+                assert!(
+                    t.text.contains("a red bicycle"),
+                    "visible metadata must render: {}",
+                    t.text
+                );
+                assert!(t.text.contains("get_artifact"));
+            }
+            _ => panic!("expected a text part"),
+        }
+    }
+
+    #[test]
+    fn metadata_visible_by_default_underscore_hides() {
+        use crate::core::content::ContentMetadata;
+        let mut meta = ContentMetadata::new();
+        meta.insert("entities".into(), serde_json::json!(["person", "monitor"]));
+        meta.insert("_directory".into(), serde_json::json!("/secret/path")); // hidden
+
+        let rendered = render_llm_metadata(&meta);
+        assert!(
+            rendered.contains("entities"),
+            "plain key must show: {rendered}"
+        );
+        assert!(rendered.contains("person"));
+        assert!(
+            !rendered.contains("directory"),
+            "underscore key must be hidden"
+        );
+
+        // All keys hidden → nothing rendered.
+        let mut hidden = ContentMetadata::new();
+        hidden.insert("_etag".into(), serde_json::json!("abc"));
+        assert_eq!(render_llm_metadata(&hidden), "");
+
+        // Empty metadata → nothing rendered.
+        assert_eq!(render_llm_metadata(&ContentMetadata::new()), "");
+    }
+
+    #[test]
+    fn tool_role_keeps_multimodal_image() {
+        // A re-injected image on a Role::Tool message must survive conversion.
+        let msg = LlmMessage::with_parts(
+            Role::Tool,
+            vec![
+                ContentPart::text("<tool_result name=\"get_artifact\">loaded</tool_result>"),
+                ContentPart::image(
+                    ContentSource::Inline {
+                        data: vec![1, 2, 3],
+                    },
+                    "image/png",
+                ),
+            ],
+        );
+        let converted = LlmClient::convert_messages(&[msg]);
+        assert_eq!(converted.len(), 1, "multimodal tool message must convert");
+    }
+
+    #[test]
     fn custom_headers_applied() {
         let mut config = LlmClientConfig::new("http://localhost/v1");
         config.custom_headers = HashMap::from([("X-Custom".into(), "value".into())]);
@@ -500,12 +631,12 @@ mod tests {
             role: Role::User,
             content: vec![
                 ContentPart::text("Look at this:"),
-                ContentPart::Image {
-                    source: ContentSource::Uri {
+                ContentPart::image(
+                    ContentSource::Uri {
                         uri: "https://example.com/cat.jpg".into(),
                     },
-                    mime_type: "image/jpeg".into(),
-                },
+                    "image/jpeg",
+                ),
             ],
         };
         assert!(has_multimodal_content(&msg.content));

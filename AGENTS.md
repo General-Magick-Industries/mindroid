@@ -49,7 +49,15 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |
 | `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
-| `full` | everything above | All types |
+| `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
+| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `AgentCredentials`, `auth.type = "enduser"` |
+| `magickmind-artifacts` | (includes `magickmind`) | `artifacts_magickmind` (panicking stub — see below) |
+| `full` | everything above **except `magickmind-artifacts`** | All types |
+
+Backend-specific code lives behind `magickmind`, not `persona` — enabling the
+persona system must not compile in a token client for one service.
+`magickmind-artifacts` is the narrower opt-in: its only item panics pending a
+backend endpoint, so it is excluded from `full` while `magickmind` is not.
 
 ## Architecture
 
@@ -114,6 +122,14 @@ Use `Runtime::from_config(config)?` when you need `auth_arc()` before `build()` 
 
 Implement `Tool` trait → register in `ToolRegistry` → `ToolExecutorStage` picks it up automatically. Schema is JSON Schema for arguments.
 
+```rust
+async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
+```
+
+`ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
+extension map for backend data (credentials, agent id) set by a stage. Never take
+identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0005
+
 ### Adding a New Pipeline Stage
 
 Implement `PipelineStage` (or `StreamingStage` for streaming). Use `pipeline.add_stage()` / `pipeline.add_streaming_stage()`. Only one streaming stage per pipeline.
@@ -157,9 +173,11 @@ src/
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
 ├── omni/           # OmniSession, OmniProvider, audio source/sink, VAD (ADR-0003)
+├── artifacts/      # ArtifactStore trait + local, manager (ADR-0004)
+├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls
 ├── observer/       # Observer trait + log impl
-├── tools/          # Tool trait + shell, open, reminder
+├── tools/          # Tool trait + shell, open, reminder, get_artifact, remote
 ├── skills/         # SkillRegistry, manifest parsing, prefiltering
 ├── persona/        # PersonaProvider, cache, local/cloud providers
 ├── identity/       # IdentityResolver, cross-platform resolution

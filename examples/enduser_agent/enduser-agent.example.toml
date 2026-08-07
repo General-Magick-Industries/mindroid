@@ -1,0 +1,73 @@
+# End-user platform agent — example config.
+#
+# Copy to a git-ignored file (e.g. enduser-agent.local.toml) and fill in real
+# values before running:
+#   cargo run --example enduser_agent --features full -- --config ./enduser-agent.local.toml
+#
+# auth.type = "enduser" makes the whole magickmind surface route to the
+# end-user API (connect proxy, user: channel, /v1/end-user/magickspaces/...).
+
+[agent]
+agent_id = "<AGENT_ID>"
+name = "Agent"
+model_type = "chat"
+
+[transport]
+type = "centrifugo"
+url = "wss://centrifugo.example.com/connection/websocket"
+
+# Pre-minted end-user JWT (POST /v1/end-users/tokens with a service-user login).
+#
+# The token here is READ ONLY at startup. With rotation on (the default), the
+# runtime rotates in memory and the server revokes the old token — so this file
+# is stale after the first rotation, and a restart presents a revoked token and
+# gets a 401. If the stale token_expires_at still shows time remaining, the
+# runtime serves it without attempting a rotation, and the failure is a silent
+# 401 from every call rather than an auth error.
+#
+# So for a process that may restart, either:
+#   * set token_file (below) and have your control plane write fresh mints there,
+#   * have your control plane mint a fresh token per process start, or
+#   * set rotate_token = false and rotate out of band.
+#
+# The token must also be minted WITH self-refresh enabled. A supervised token is
+# barred from the refresh route, and mindroid now rejects that combination at
+# startup rather than dying at the first rotation.
+[auth]
+type = "enduser"
+token = "<END_USER_JWT>"
+base_url = "https://api.example.com"
+
+# Optional: a path your control plane writes freshly minted credentials to, in
+# the shape the mint route returns:
+#
+#   { "token": "eyJ...", "expires_at": "2026-08-07T12:00:00Z" }
+#
+# Read before rotating and whenever the credential is terminal, so a chain that
+# hit its 30-day absolute cap — which no rotation can extend — recovers without
+# a restart. Write it atomically (temp file in the same directory, then rename)
+# or a half-written file may be read; mode 0600, it is a live credential.
+#
+# The runtime never writes here. No file, or nothing written, simply means no
+# rescue: the credential dies and the process exits for your supervisor.
+# token_file = "/run/agent/token.json"
+
+[memory]
+type = "magickmind"
+base_url = "https://api.example.com"
+
+[persona]
+type = "magickmind-prepared-agent"
+base_url = "https://api.example.com"
+
+[observer]
+type = "log"
+level = "info"
+
+[providers.litellm]
+base_url = "https://litellm.example.com"
+api_key = "<LITELLM_KEY>"
+
+[models.respond]
+provider = "litellm"
+model = "openrouter/openai/gpt-5-mini"

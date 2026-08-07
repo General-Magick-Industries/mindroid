@@ -25,11 +25,11 @@ type = "apikey"
 email = "user@example.com"
 password = "your-password-here"
 api_key = "sk-your-api-key-here"
-base_url = "https://bifrost.example.com"
+base_url = "https://api.example.com"
 
 [memory]
 type = "magickmind"
-base_url = "https://bifrost.example.com"
+base_url = "https://api.example.com"
 
 # -- Persona (agent-keyed prepare endpoint) -----------------------------------
 # Keyed by agent.agent_id above. base_url falls back to memory.base_url, then
@@ -37,7 +37,7 @@ base_url = "https://bifrost.example.com"
 
 [persona]
 type = "magickmind-prepared-agent"
-base_url = "https://bifrost.example.com"
+base_url = "https://api.example.com"
 # cache_ttl_secs = 600
 # allow_insecure = true   # local non-TLS dev only
 
