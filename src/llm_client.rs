@@ -99,6 +99,23 @@ fn has_multimodal_content(content: &[ContentPart]) -> bool {
     content.iter().any(|p| !p.is_text())
 }
 
+/// Cap on one model-visible artifact field (a filename or metadata value).
+const MAX_LLM_VISIBLE_FIELD: usize = 256;
+
+/// Flatten a store-supplied value to one bounded, structure-free fragment.
+fn sanitize_llm_visible(s: &str) -> String {
+    let flattened: String = s
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '[' | ']' | '{' | '}' | '"' => '\'',
+            c => c,
+        })
+        .take(MAX_LLM_VISIBLE_FIELD)
+        .collect();
+    flattened.trim().to_string()
+}
+
 /// Render the model-visible subset of an artifact's metadata as a compact suffix
 /// for the reference line (e.g. ` {entities: ["person"], caption: "..."}`).
 ///
@@ -106,11 +123,21 @@ fn has_multimodal_content(content: &[ContentPart]) -> bool {
 /// descriptive (captions, tags, entities) and meant to inform the model. To keep a
 /// key code-only (backend plumbing: paths, etags, ids), prefix its name with an
 /// underscore (`_directory`, `_etag`); underscore-prefixed keys are never rendered.
+///
+/// Values are store-supplied and land in a line the model reads as runtime-
+/// authored, so each is flattened and capped: newlines and brackets would
+/// otherwise let a caption close the reference and forge prompt structure.
 fn render_llm_metadata(metadata: &crate::core::content::ContentMetadata) -> String {
     let pairs: Vec<String> = metadata
         .iter()
         .filter(|(k, _)| !k.starts_with('_'))
-        .map(|(k, v)| format!("{k}: {v}"))
+        .map(|(k, v)| {
+            format!(
+                "{}: {}",
+                sanitize_llm_visible(k),
+                sanitize_llm_visible(&v.to_string())
+            )
+        })
         .collect();
     if pairs.is_empty() {
         String::new()
@@ -162,7 +189,7 @@ fn content_parts_to_openai(
                     ContentSource::Uri { uri } => uri.as_str(),
                     ContentSource::Inline { .. } => "inline",
                 };
-                let name_part = match filename.as_deref() {
+                let name_part = match filename.as_deref().map(sanitize_llm_visible) {
                     Some(f) if !f.is_empty() => format!(" \"{f}\""),
                     _ => String::new(),
                 };

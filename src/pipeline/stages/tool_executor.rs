@@ -114,6 +114,15 @@ impl PendingRemoteCalls {
     fn record(&self, channel: &str, id: &str, name: &str) {
         let mut map = self.inner.lock().unwrap();
         let now = std::time::Instant::now();
+
+        // Sweep channels that have gone quiet. Pruning only the touched channel
+        // leaves one permanent key per channel ever seen, which pins memory in a
+        // process serving many short-lived channels.
+        map.retain(|_, calls| {
+            calls.retain(|c| now.duration_since(c.issued) < PENDING_TTL);
+            !calls.is_empty()
+        });
+
         let entry = map.entry(channel.to_string()).or_default();
         entry.retain(|c| now.duration_since(c.issued) < PENDING_TTL);
         if entry.len() >= MAX_PENDING_PER_CHANNEL {
@@ -136,8 +145,14 @@ impl PendingRemoteCalls {
         let entry = map.get_mut(channel)?;
         let now = std::time::Instant::now();
         entry.retain(|c| now.duration_since(c.issued) < PENDING_TTL);
-        let pos = entry.iter().position(|c| c.id == id)?;
-        Some(entry.remove(pos).name)
+        let claimed = entry
+            .iter()
+            .position(|c| c.id == id)
+            .map(|pos| entry.remove(pos).name);
+        if entry.is_empty() {
+            map.remove(channel);
+        }
+        claimed
     }
 }
 
@@ -169,10 +184,27 @@ impl PipelineStage for RemoteResultGate {
             return Ok(());
         }
 
+        // Every block must correlate. Claiming only the first would let
+        // uncorrelated blocks ride in on its claim as genuine executed output.
+        let blocks = content.matches("<tool_result").count();
         let claimed = crate::tools::remote::tool_result_call_id(content)
+            .filter(|_| blocks == 1)
             .and_then(|id| self.pending.claim(&ctx.message.channel_id, id));
 
         match claimed {
+            // A claimed id whose name disagrees with the recorded call is a
+            // result attributed to the wrong tool; the claim is already spent,
+            // so it cannot be replayed against the right one.
+            Some(expected)
+                if crate::tools::remote::tool_result_name(content)
+                    .is_some_and(|got| got != expected) =>
+            {
+                warn!(
+                    %expected,
+                    "Dropping a tool_result whose name does not match the call it claims"
+                );
+                ctx.halted = true;
+            }
             Some(expected) => {
                 // Strip the correlation attribute; the model sees only the result.
                 let cleaned = crate::tools::remote::strip_call_attribute(content);
@@ -827,10 +859,24 @@ async fn finalize_round_message(
     if let Some(store) = &artifacts.store {
         for id in load_ids {
             match store.load(&artifacts.scope, &id).await {
-                Ok(art) => parts.push(ContentPart::image(
+                // Only images round-trip as an `image_url` data URL; offload also
+                // covers audio/video/file, and a non-image sent that way is a hard
+                // provider 400 rather than graceful degradation.
+                Ok(art) if art.mime_type.starts_with("image/") => parts.push(ContentPart::image(
                     ContentSource::Inline { data: art.data },
                     art.mime_type,
                 )),
+                Ok(art) => {
+                    warn!(
+                        "ToolExecutorStage: artifact '{id}' is {}, not an image; \
+                         referencing it instead of inlining",
+                        art.mime_type
+                    );
+                    parts.push(ContentPart::text(format!(
+                        "(artifact {id} is {}, which cannot be shown inline)",
+                        art.mime_type
+                    )));
+                }
                 Err(e) => {
                     warn!("ToolExecutorStage: get_artifact '{id}' failed: {e}");
                     parts.push(ContentPart::text(format!(

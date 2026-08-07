@@ -97,12 +97,14 @@ impl MindroidConfig {
             source: Some(Box::new(e)),
         })?;
         merge_toml_value(&mut base, overlay);
-        let mut merged: Self = base.try_into().map_err(|e| MindroidError::Config {
+        // Deliberately no `apply_env_overrides` here: the base already had env
+        // applied when it was loaded, and re-applying would let a process-wide
+        // var outrank an explicitly overlaid key — inverting the override the
+        // caller just asked for, so every spawned agent shares one `agent_id`.
+        base.try_into().map_err(|e| MindroidError::Config {
             message: format!("failed to apply config overlay: {e}"),
             source: Some(Box::new(e)),
-        })?;
-        merged.apply_env_overrides();
-        Ok(merged)
+        })
     }
 
     /// Resolve config: explicit path → `MINDROID_CONFIG` env → `./mindroid.toml` → `~/.mindroid/config.toml` → defaults.

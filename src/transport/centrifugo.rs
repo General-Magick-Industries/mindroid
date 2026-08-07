@@ -62,12 +62,22 @@ fn refresh_interval(ttl_secs: u64) -> Duration {
     candidate.max(MIN_REFRESH_INTERVAL)
 }
 
-/// Tick used when the connect reply carries no TTL.
+/// Lifetime assumed when the connect reply carries no TTL.
 ///
 /// Not "sleep forever": a missing TTL means unknown, not infinite, and the
-/// server's default is one hour. Polling hourly costs one cheap call and keeps
-/// an idle agent alive; assuming a day silently outlives the token.
-const UNKNOWN_TTL_INTERVAL: Duration = Duration::from_secs(3600);
+/// server's default is one hour. The end-user route always lands here — the
+/// connect proxy owns expiry, so no TTL ever comes back on the reply.
+const ASSUMED_TTL_SECS: u64 = 3600;
+
+/// Tick used when the connect reply carries no TTL.
+///
+/// Derived from [`ASSUMED_TTL_SECS`] through [`refresh_interval`] rather than
+/// used raw: a tick equal to the assumed lifetime fires at or after expiry,
+/// outside the rotation window, so the first poll would present an already-dead
+/// token and latch the credential.
+fn unknown_ttl_interval() -> Duration {
+    refresh_interval(ASSUMED_TTL_SECS)
+}
 
 /// Extract the `sub` claim from a JWT without verifying the signature.
 fn extract_jwt_sub(token: &str) -> Option<String> {
@@ -653,8 +663,9 @@ impl Transport for CentrifugoTransport {
 
                         // Act on the token before it expires. A missing TTL means
                         // unknown, not infinite — poll at the server's default.
-                        let refresh_duration =
-                            ttl.map(refresh_interval).unwrap_or(UNKNOWN_TTL_INTERVAL);
+                        let refresh_duration = ttl
+                            .map(refresh_interval)
+                            .unwrap_or_else(unknown_ttl_interval);
                         let mut refresh_timer = tokio::time::interval(refresh_duration);
                         refresh_timer.tick().await; // consume the immediate first tick
 
@@ -1112,12 +1123,20 @@ mod tests {
         }
     }
 
-    /// A connect reply without a TTL must not be read as "no expiry".
+    /// A connect reply without a TTL must not be read as "no expiry", and must
+    /// leave real headroom before the assumed expiry — a tick landing *at* it is
+    /// already too late. The end-user route always takes this path.
     #[test]
     fn an_unknown_ttl_polls_within_the_server_default_lifetime() {
+        let interval = unknown_ttl_interval();
         assert!(
-            UNKNOWN_TTL_INTERVAL <= Duration::from_secs(3600),
+            interval < Duration::from_secs(ASSUMED_TTL_SECS),
             "a missing TTL means unknown, not infinite"
+        );
+        assert_eq!(
+            interval,
+            refresh_interval(ASSUMED_TTL_SECS),
+            "the unknown-TTL tick must respect the same rotation window as a known one"
         );
     }
 }

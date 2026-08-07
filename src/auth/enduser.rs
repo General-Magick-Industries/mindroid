@@ -131,6 +131,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// would park every caller behind it.
 const ROTATE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Ceiling on reading the delivered-token file. Also held under the write lock,
+/// and a token file commonly lives on a mount that can hang.
+const DELIVERY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 /// Ceiling on retry spacing.
@@ -183,6 +187,33 @@ struct DeliveredToken {
 /// caller then proceeds with whatever it already held — so a supervisor that
 /// writes nothing simply leaves the credential to die on its own terms, which is
 /// the correct outcome.
+/// Runs on a blocking thread under a deadline: `rotate_into` calls this while
+/// holding the async write lock, so a hung path (a stalled network mount) would
+/// otherwise park the worker thread and every concurrent `get_token` behind it.
+/// `ROTATE_TIMEOUT` covers only the HTTP call, not this.
+async fn read_delivered_async(path: &str, current: &str) -> Option<DeliveredToken> {
+    let (path, current) = (path.to_string(), current.to_string());
+    match tokio::time::timeout(
+        DELIVERY_READ_TIMEOUT,
+        tokio::task::spawn_blocking(move || read_delivered(&path, &current)),
+    )
+    .await
+    {
+        Ok(Ok(delivered)) => delivered,
+        Ok(Err(e)) => {
+            warn!("Delivered-token read panicked: {e}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "Delivered-token read exceeded {}s; proceeding without it",
+                DELIVERY_READ_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
+}
+
 fn read_delivered(path: &str, current: &str) -> Option<DeliveredToken> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| debug!("No delivered token at {path}: {e}"))
@@ -661,7 +692,7 @@ impl EndUserAuth {
         // credential dies on its own terms — the file is a chance to recover,
         // not a requirement.
         if let Some(path) = &self.token_file
-            && let Some(delivered) = read_delivered(path, &state.token.token)
+            && let Some(delivered) = read_delivered_async(path, &state.token.token).await
         {
             info!("Adopting a delivered end-user token from {path}");
             state.token = TokenState {

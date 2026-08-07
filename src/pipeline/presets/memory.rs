@@ -225,11 +225,16 @@ impl PipelineStage for MemoryPersistence {
         // `LlmMessage`, store that via `to_stored()` (JSON) so the reference
         // survives in history. Plain-text turns fall back to the raw message
         // content and stay stored as bare strings (backward-compatible).
+        //
+        // Only a *structured* trailing user message is taken: when the pipeline
+        // injected history without appending this turn, the last user message is
+        // a previous turn, and storing it would duplicate history while losing
+        // the real content. Structured content is what offload produces, so it
+        // reliably marks the rewritten current turn.
         let user_content = ctx
             .llm_messages
-            .iter()
-            .rev()
-            .find(|m| m.role == crate::models::Role::User)
+            .last()
+            .filter(|m| m.role == crate::models::Role::User && m.content.len() != 1)
             .map(|m| m.to_stored())
             .unwrap_or_else(|| ctx.message.content.clone());
 

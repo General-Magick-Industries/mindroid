@@ -289,9 +289,19 @@ impl LlmMessage {
             })
             .collect();
 
+        // A media-only turn filters down to nothing. Storing the empty marker
+        // would reload as a zero-part message, silently losing the turn — so
+        // keep a placeholder recording that something was attached.
+        if storable.is_empty() {
+            return "(media attachment omitted from history)".to_string();
+        }
+
         match serde_json::to_string(&storable) {
             Ok(json) => format!("{STRUCTURED_PREFIX}{json}"),
-            Err(_) => String::new(),
+            Err(e) => {
+                tracing::warn!("Failed to serialize message parts for storage: {e}");
+                self.text()
+            }
         }
     }
 
