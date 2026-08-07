@@ -243,6 +243,9 @@ pub struct CentrifugoTransport {
     connected: Arc<Connected>,
     allow_insecure: bool,
     listener: std::sync::Mutex<Listener>,
+    /// Set by the runtime before connect, so the reconnect loop can publish
+    /// transitions from the first attempt onward.
+    health: Option<crate::core::health::HealthReporter>,
 }
 
 /// Lifecycle of the spawned listener.
@@ -280,6 +283,7 @@ impl CentrifugoTransport {
             connected: Arc::new(Connected::new(false)),
             allow_insecure: false,
             listener: std::sync::Mutex::new(Listener::Idle),
+            health: None,
         }
     }
 
@@ -638,6 +642,10 @@ impl Transport for CentrifugoTransport {
         "centrifugo"
     }
 
+    fn set_health_reporter(&mut self, reporter: crate::core::health::HealthReporter) {
+        self.health = Some(reporter);
+    }
+
     async fn connect(&mut self) -> Result<()> {
         // Just validate that we can get a token and that it won't ride on a
         // plaintext socket. The actual WebSocket connection is established by
@@ -725,6 +733,7 @@ impl Transport for CentrifugoTransport {
         let connected = Arc::clone(&self.connected);
         let allow_insecure = self.allow_insecure;
         let cancel_for_task = cancel.clone();
+        let health = self.health.clone();
 
         let handle = tokio::spawn(async move {
             let cancel = cancel_for_task;
@@ -755,6 +764,9 @@ impl Transport for CentrifugoTransport {
                         ttl,
                     }) => {
                         connected.store(true, Ordering::SeqCst);
+                        if let Some(h) = &health {
+                            h.set(crate::core::health::Health::Ready);
+                        }
                         backoff = Duration::from_secs(1); // reset on success
 
                         info!("Centrifugo listen loop started");
@@ -881,9 +893,18 @@ impl Transport for CentrifugoTransport {
                         }
 
                         connected.store(false, Ordering::SeqCst);
+                        // The socket dropped but the process is alive and about
+                        // to retry — the "alive but deaf" window a supervisor
+                        // cannot otherwise see.
+                        if let Some(h) = &health {
+                            h.set(crate::core::health::Health::Reconnecting);
+                        }
                     }
                     Err(e) => {
                         error!("Centrifugo handshake failed: {e}");
+                        if let Some(h) = &health {
+                            h.set(crate::core::health::Health::Reconnecting);
+                        }
                     }
                 }
 
@@ -910,6 +931,12 @@ impl Transport for CentrifugoTransport {
             }
 
             connected.store(false, Ordering::SeqCst);
+            // The loop only exits on cancellation or a terminal credential —
+            // either way this listener is not coming back, so `Reconnecting`
+            // would be a lie a supervisor waits on forever.
+            if let Some(h) = &health {
+                h.set(crate::core::health::Health::Stopped);
+            }
         });
 
         *slot = Listener::Running { handle, cancel };
@@ -1304,6 +1331,33 @@ mod tests {
         );
 
         transport.disconnect().await.expect("clean disconnect");
+    }
+
+    /// A failing handshake must publish `Reconnecting` — the "alive but deaf"
+    /// window. Without it a supervisor sees a live process and a watcher stuck
+    /// on `Starting`, with no way to tell the difference from healthy.
+    #[tokio::test]
+    async fn a_failing_handshake_reports_reconnecting() {
+        let (reporter, watcher) = crate::core::health::HealthReporter::new();
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
+        let mut transport = CentrifugoTransport::new("ws://127.0.0.1:1/ws", "agent", auth)
+            .with_allow_insecure(true);
+        transport.set_health_reporter(reporter);
+
+        let (tx, _rx) = mpsc::channel(8);
+        transport.listen(tx).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            watcher.get(),
+            crate::core::health::Health::Reconnecting,
+            "a listener retrying a dead endpoint is not Ready"
+        );
+
+        // Cancelling ends the listener for good, so it must not linger on
+        // Reconnecting — that is a state a supervisor waits on forever.
+        transport.disconnect().await.unwrap();
+        assert_eq!(watcher.get(), crate::core::health::Health::Stopped);
     }
 
     /// `is_connected` must not report "disconnected" merely because a writer is
