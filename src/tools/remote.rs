@@ -9,6 +9,11 @@ use super::{DynamicRegistry, Tool, ToolContext};
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_MANIFEST_TOOLS: usize = 64;
+const MAX_SCHEMA_BYTES: usize = 16 * 1024;
+const MAX_SCHEMA_DEPTH: usize = 16;
+
 /// A tool the runtime does not execute — it declares the tool to the LLM and,
 /// when called, [`ToolExecutorStage`] emits the call as the pipeline response
 /// for the client to perform. See [`Tool::is_remote`].
@@ -22,20 +27,21 @@ use crate::error::{MindroidError, Result};
 ///
 /// # Reliability
 ///
-/// Results are correlated: place
-/// [`ToolExecutorStage::result_gate`](crate::pipeline::stages::ToolExecutorStage::result_gate)
-/// before the executor and a result answering no outstanding call is dropped,
-/// including a redelivered duplicate.
+/// Results are correlated by [`ToolExecutorStage`], and a result answering no
+/// outstanding call is dropped, including a redelivered duplicate. Its
+/// [`result_gate`](crate::pipeline::stages::ToolExecutorStage::result_gate) can
+/// additionally reject results before context-building stages run.
 ///
 /// Still unguarded: a call the client never answers has no timeout, so the
-/// conversation stays truncated until the pending entry expires (5 minutes), and
-/// there is no retry. See `docs/design/remote-tool-reliability.md`.
+/// conversation stays truncated. Its pending entry expires after 5 minutes, but
+/// no retry resumes the turn. See `docs/design/remote-tool-reliability.md`.
 ///
 /// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
 pub struct RemoteTool {
     name: String,
     description: String,
     schema: Value,
+    executor_id: Option<String>,
 }
 
 impl RemoteTool {
@@ -44,12 +50,19 @@ impl RemoteTool {
             name: name.into(),
             description: description.into(),
             schema: json!({ "type": "object", "properties": {} }),
+            executor_id: None,
         }
     }
 
     /// Set the JSON Schema describing the tool's arguments.
     pub fn schema(mut self, schema: Value) -> Self {
         self.schema = schema;
+        self
+    }
+
+    /// Bind results for this tool to an authenticated executor identity.
+    pub fn executor_id(mut self, executor_id: impl Into<String>) -> Self {
+        self.executor_id = Some(executor_id.into());
         self
     }
 }
@@ -79,6 +92,10 @@ impl Tool for RemoteTool {
     fn is_remote(&self) -> bool {
         true
     }
+
+    fn remote_executor_id(&self) -> Option<&str> {
+        self.executor_id.as_deref()
+    }
 }
 
 /// One tool a client advertises in a [`ToolsManifest`].
@@ -107,6 +124,10 @@ impl ToolsManifest {
     /// Parse a `{"type":"tools_manifest","payload":{"tools":[…]}}` envelope.
     /// Returns `None` if `content` is not a manifest envelope.
     pub fn from_envelope(content: &str) -> Option<Self> {
+        if content.len() > MAX_MANIFEST_BYTES {
+            tracing::warn!("Dropping tools_manifest that exceeds the size limit");
+            return None;
+        }
         let v: Value = serde_json::from_str(content).ok()?;
         if v.get("type")?.as_str()? != "tools_manifest" {
             return None;
@@ -119,6 +140,10 @@ impl ToolsManifest {
     /// (which persists), these apply to THIS message only. Returns `None` if the
     /// message has no `tools` array.
     pub fn per_turn_from_message(content: &str) -> Option<Self> {
+        if content.len() > MAX_MANIFEST_BYTES {
+            tracing::warn!("Dropping per-turn tools that exceed the size limit");
+            return None;
+        }
         let v: Value = serde_json::from_str(content).ok()?;
         let tools = v.get("tools")?.clone();
         serde_json::from_value(serde_json::json!({ "tools": tools })).ok()
@@ -127,16 +152,28 @@ impl ToolsManifest {
     /// Build a [`RemoteTool`] per entry, dropping invalid names. Names and
     /// descriptions reach the system prompt, so both are validated.
     pub fn build_tools(self) -> Vec<RemoteTool> {
+        self.build_tools_for(None)
+    }
+
+    fn build_tools_for(self, executor_id: Option<&str>) -> Vec<RemoteTool> {
         self.tools
             .into_iter()
+            .take(MAX_MANIFEST_TOOLS)
             .filter(|t| {
-                let ok = is_valid_tool_name(&t.name);
+                let ok = is_valid_tool_name(&t.name) && schema_is_bounded(&t.schema, 0);
                 if !ok {
-                    tracing::warn!(name = %t.name, "Dropping manifest tool with an invalid name");
+                    tracing::warn!(name = %t.name, "Dropping invalid or oversized manifest tool");
                 }
                 ok
             })
-            .map(|t| RemoteTool::new(t.name, sanitize_description(&t.description)).schema(t.schema))
+            .map(|t| {
+                let tool =
+                    RemoteTool::new(t.name, sanitize_description(&t.description)).schema(t.schema);
+                match executor_id {
+                    Some(executor_id) => tool.executor_id(executor_id),
+                    None => tool,
+                }
+            })
             .collect()
     }
 }
@@ -188,13 +225,15 @@ impl crate::pipeline::PipelineStage for ManifestStage {
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         if let Some(manifest) = ToolsManifest::from_envelope(&ctx.message.content) {
+            let Some(authenticated_sender) = ctx.message.trusted_sender_id() else {
+                tracing::warn!("Ignoring tools_manifest without an authenticated sender");
+                ctx.halted = true;
+                return Ok(());
+            };
             if let Some(trusted) = &self.trusted_sender
-                && ctx.message.sender_id != *trusted
+                && authenticated_sender != trusted
             {
-                tracing::warn!(
-                    sender = %ctx.message.sender_id,
-                    "Ignoring tools_manifest from an untrusted sender"
-                );
+                tracing::warn!("Ignoring tools_manifest from an untrusted sender");
                 ctx.halted = true;
                 return Ok(());
             }
@@ -211,7 +250,7 @@ impl crate::pipeline::PipelineStage for ManifestStage {
                 .collect();
 
             let remote: Vec<Arc<dyn Tool>> = manifest
-                .build_tools()
+                .build_tools_for(Some(authenticated_sender))
                 .into_iter()
                 .filter(|t| {
                     let clash = local.contains(t.name());
@@ -257,7 +296,7 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         if let Some(manifest) = ToolsManifest::per_turn_from_message(&ctx.message.content) {
             let tools: Vec<Arc<dyn Tool>> = manifest
-                .build_tools()
+                .build_tools_for(ctx.message.trusted_sender_id())
                 .into_iter()
                 .map(|t| Arc::new(t) as Arc<dyn Tool>)
                 .collect();
@@ -399,6 +438,24 @@ fn sanitize_description(s: &str) -> String {
     truncate_on_char_boundary(flattened.trim(), MAX_DESCRIPTION_BYTES).to_string()
 }
 
+fn schema_is_bounded(value: &Value, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_DEPTH
+        || serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() > MAX_SCHEMA_BYTES)
+    {
+        return false;
+    }
+    match value {
+        Value::Object(map) => {
+            map.len() <= 64 && map.values().all(|v| schema_is_bounded(v, depth + 1))
+        }
+        Value::Array(values) => {
+            values.len() <= 64 && values.iter().all(|v| schema_is_bounded(v, depth + 1))
+        }
+        Value::String(s) => s.len() <= MAX_DESCRIPTION_BYTES && !s.chars().any(char::is_control),
+        _ => true,
+    }
+}
+
 /// Names reach an XML attribute and the system prompt, so the charset must not
 /// be able to break out of either.
 fn is_valid_tool_name(name: &str) -> bool {
@@ -431,6 +488,7 @@ fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::PipelineStage;
 
     fn envelope(name: &str, content: &str) -> String {
         serde_json::json!({
@@ -641,6 +699,84 @@ mod tests {
     fn manifest_rejects_non_manifest() {
         assert!(ToolsManifest::from_envelope(r#"{"type":"chat_message"}"#).is_none());
         assert!(ToolsManifest::from_envelope("not json").is_none());
+    }
+
+    #[test]
+    fn manifest_size_and_schema_depth_are_bounded() {
+        let huge = format!(
+            "{{\"type\":\"tools_manifest\",\"payload\":{{\"tools\":[]}},\"padding\":\"{}\"}}",
+            "x".repeat(MAX_MANIFEST_BYTES)
+        );
+        assert!(ToolsManifest::from_envelope(&huge).is_none());
+
+        let mut schema = serde_json::json!({"type": "string"});
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            schema = serde_json::json!({"items": schema});
+        }
+        let manifest = ToolsManifest {
+            tools: vec![ManifestTool {
+                name: "deep".into(),
+                description: String::new(),
+                schema,
+            }],
+        };
+        assert!(manifest.build_tools().is_empty());
+    }
+
+    #[test]
+    fn oversized_per_turn_tools_are_rejected_before_parsing() {
+        let message = format!(
+            "{{\"content\":\"hi\",\"tools\":[],\"padding\":\"{}\"}}",
+            "x".repeat(MAX_MANIFEST_BYTES)
+        );
+        assert!(ToolsManifest::per_turn_from_message(&message).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_persistent_manifest_requires_authenticated_transport_identity() {
+        let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
+        let stage = ManifestStage::new(registry.clone());
+        let mut message = crate::models::Message::new(
+            r#"{"type":"tools_manifest","payload":{"tools":[{"name":"remote"}]}}"#,
+            "payload-user",
+            "channel",
+        );
+        message.platform = Some("centrifugo".into());
+        let mut ctx = Context::new(
+            Arc::new(message),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        stage.process(&mut ctx).await.unwrap();
+
+        assert!(ctx.halted);
+        assert!(registry.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_persistent_manifest_binds_tools_to_its_authenticated_publisher() {
+        let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
+        let stage = ManifestStage::new(registry.clone());
+        let mut message = crate::models::Message::new(
+            r#"{"type":"tools_manifest","payload":{"tools":[{"name":"remote"}]}}"#,
+            "payload-user",
+            "channel",
+        );
+        message.platform = Some("centrifugo".into());
+        message.metadata.insert(
+            "authenticated_sender_id".into(),
+            serde_json::Value::String("robot".into()),
+        );
+        let mut ctx = Context::new(
+            Arc::new(message),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        stage.process(&mut ctx).await.unwrap();
+
+        let snapshot = registry.load();
+        let tool = snapshot.get("remote").unwrap();
+        assert_eq!(tool.remote_executor_id(), Some("robot"));
     }
 
     #[test]

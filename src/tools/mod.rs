@@ -126,6 +126,14 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Authenticated identity expected to execute this remote tool.
+    ///
+    /// Manifest-backed tools set this to their publisher. Static remote tools
+    /// return `None` and are executed by the authenticated caller.
+    fn remote_executor_id(&self) -> Option<&str> {
+        None
+    }
+
     /// If this tool is backed by an [`ArtifactStore`](crate::artifacts::ArtifactStore),
     /// expose it so the executor can re-inject loaded bytes without a separate
     /// store injection. Defaults to `None` (most tools have no store).

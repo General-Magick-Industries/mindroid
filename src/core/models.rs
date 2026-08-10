@@ -85,6 +85,22 @@ impl Message {
             platform: None,
         }
     }
+
+    /// Sender identity suitable for persistent or privileged decisions.
+    ///
+    /// Centrifugo message bodies are publisher-controlled, so their
+    /// `sender_id` is descriptive only. The transport records Centrifugo's
+    /// authenticated publication identity separately when it is available.
+    /// Other transports are responsible for constructing trusted `Message`s.
+    pub fn trusted_sender_id(&self) -> Option<&str> {
+        if self.platform.as_deref() == Some("centrifugo") {
+            self.metadata
+                .get("authenticated_sender_id")
+                .and_then(serde_json::Value::as_str)
+        } else {
+            Some(&self.sender_id)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

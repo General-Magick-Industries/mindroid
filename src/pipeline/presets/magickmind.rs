@@ -87,6 +87,7 @@ pub struct MagickmindClient {
     identity: Arc<dyn Auth>,
     api_key: Option<String>,
     credential_kind: crate::models::CredentialKind,
+    allow_insecure: bool,
 }
 
 impl MagickmindClient {
@@ -102,6 +103,7 @@ impl MagickmindClient {
             identity,
             api_key: None,
             credential_kind: crate::models::CredentialKind::ServiceUser,
+            allow_insecure: false,
         }
     }
 
@@ -114,7 +116,10 @@ impl MagickmindClient {
     ) -> Result<Self> {
         let base_url = base_url.into();
         crate::core::net::require_secure_url(&base_url, allow_insecure, "memory.allow_insecure")?;
-        Ok(Self::new(base_url, identity))
+        Ok(Self {
+            allow_insecure,
+            ..Self::new(base_url, identity)
+        })
     }
 
     /// x-api-key for the pelican fetcher, sent only on context prepare (the one
@@ -131,6 +136,11 @@ impl MagickmindClient {
     }
 
     async fn auth_headers(&self) -> Result<reqwest::header::HeaderMap> {
+        crate::core::net::require_secure_url(
+            &self.base_url,
+            self.allow_insecure,
+            "memory.allow_insecure",
+        )?;
         crate::auth::build_auth_header_map(self.identity.as_ref()).await
     }
 
@@ -475,7 +485,7 @@ pub fn magickmind_pipeline(
     api_key: &str,
     compute_power: u8,
 ) -> crate::Result<Pipeline> {
-    let magickmind = Arc::new(MagickmindClient::new(base_url, identity));
+    let magickmind = Arc::new(MagickmindClient::try_new(base_url, identity, false)?);
 
     let mut config = LlmClientConfig::new(format!("{base_url}/v1"));
     config.api_key = Some(api_key.to_string());
@@ -498,7 +508,7 @@ pub fn magickmind_ollama_pipeline(
     ollama_url: &str,
     model: &str,
 ) -> crate::Result<Pipeline> {
-    let magickmind = Arc::new(MagickmindClient::new(magickmind_url, identity));
+    let magickmind = Arc::new(MagickmindClient::try_new(magickmind_url, identity, false)?);
 
     let mut config = LlmClientConfig::new(format!("{ollama_url}/v1"));
     config.default_model = Some(model.to_string());
@@ -509,4 +519,27 @@ pub fn magickmind_ollama_pipeline(
         .add_streaming_stage(GenericLlmProcessor::new(client))
         .add_stage(PostProcessor)
         .add_stage(MagickmindPersistence::new(magickmind)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::static_id::StaticAuth;
+
+    #[test]
+    fn credentialed_presets_reject_plaintext_gateways() {
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        assert!(magickmind_pipeline(identity.clone(), "http://gateway", "key", 1).is_err());
+        assert!(
+            magickmind_ollama_pipeline(identity, "http://gateway", "http://localhost", "model")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unchecked_client_still_fails_before_building_auth_headers() {
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        let client = MagickmindClient::new("http://gateway", identity);
+        assert!(client.auth_headers().await.is_err());
+    }
 }

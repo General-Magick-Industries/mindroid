@@ -85,7 +85,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::{Auth, MindroidError, Result};
@@ -191,16 +191,46 @@ struct DeliveredToken {
 /// holding the async write lock, so a hung path (a stalled network mount) would
 /// otherwise park the worker thread and every concurrent `get_token` behind it.
 /// `ROTATE_TIMEOUT` covers only the HTTP call, not this.
-async fn read_delivered_async(path: &str, current: &str) -> Option<DeliveredToken> {
-    let (path, current) = (path.to_string(), current.to_string());
-    match tokio::time::timeout(
-        DELIVERY_READ_TIMEOUT,
-        tokio::task::spawn_blocking(move || read_delivered(&path, &current)),
-    )
-    .await
-    {
-        Ok(Ok(delivered)) => delivered,
+struct PendingDeliveryRead {
+    current: String,
+    handle: tokio::task::JoinHandle<Option<DeliveredToken>>,
+}
+
+type DeliveryRead = Arc<Mutex<Option<PendingDeliveryRead>>>;
+
+async fn read_delivered_async(
+    pending: &DeliveryRead,
+    path: &str,
+    current: &str,
+) -> Option<DeliveredToken> {
+    read_delivered_with_timeout(pending, path, current, DELIVERY_READ_TIMEOUT).await
+}
+
+async fn read_delivered_with_timeout(
+    pending: &DeliveryRead,
+    path: &str,
+    current: &str,
+    timeout: Duration,
+) -> Option<DeliveredToken> {
+    let mut pending = pending.lock().await;
+    if pending.is_none() {
+        let (path, current) = (path.to_string(), current.to_string());
+        let snapshot = current.clone();
+        *pending = Some(PendingDeliveryRead {
+            current: snapshot,
+            handle: tokio::task::spawn_blocking(move || read_delivered(&path, &current)),
+        });
+    }
+    let read = pending.as_mut()?;
+    let same_generation = read.current == current;
+    let result = tokio::time::timeout(timeout, &mut read.handle).await;
+    match result {
+        Ok(Ok(delivered)) => {
+            pending.take();
+            same_generation.then_some(delivered).flatten()
+        }
         Ok(Err(e)) => {
+            pending.take();
             warn!("Delivered-token read panicked: {e}");
             None
         }
@@ -459,6 +489,7 @@ pub struct EndUserAuth {
     /// Path a control plane writes freshly minted credentials to, re-read on
     /// need. `None` disables the channel.
     token_file: Option<String>,
+    delivery_read: DeliveryRead,
 }
 
 impl EndUserAuth {
@@ -502,6 +533,7 @@ impl EndUserAuth {
             client,
             supervised: false,
             token_file: None,
+            delivery_read: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(AuthState {
                 token: TokenState {
                     token: token.into(),
@@ -692,7 +724,8 @@ impl EndUserAuth {
         // credential dies on its own terms — the file is a chance to recover,
         // not a requirement.
         if let Some(path) = &self.token_file
-            && let Some(delivered) = read_delivered_async(path, &state.token.token).await
+            && let Some(delivered) =
+                read_delivered_async(&self.delivery_read, path, &state.token.token).await
         {
             info!("Adopting a delivered end-user token from {path}");
             state.token = TokenState {
@@ -1186,6 +1219,57 @@ mod tests {
             .with_token_file(path.to_string_lossy().as_ref());
 
         assert_eq!(with_deadline(auth.get_token()).await.unwrap(), "held");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_delivery_read_is_reused_instead_of_respawned() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            worker_barrier.wait();
+            None
+        });
+        let task_id = handle.id();
+        let pending: DeliveryRead = Arc::new(Mutex::new(Some(PendingDeliveryRead {
+            current: "unused".to_string(),
+            handle,
+        })));
+
+        assert!(
+            read_delivered_with_timeout(&pending, "unused", "unused", Duration::from_millis(10),)
+                .await
+                .is_none()
+        );
+        assert_eq!(pending.lock().await.as_ref().unwrap().handle.id(), task_id);
+
+        barrier.wait();
+        assert!(
+            read_delivered_with_timeout(&pending, "unused", "unused", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        assert!(pending.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_completed_delivery_read_is_ignored_after_token_generation_changes() {
+        let handle = tokio::task::spawn_blocking(|| {
+            Some(DeliveredToken {
+                token: "delivered-for-old-generation".to_string(),
+                expires_at: None,
+                expires_in: None,
+            })
+        });
+        let pending: DeliveryRead = Arc::new(Mutex::new(Some(PendingDeliveryRead {
+            current: "old".to_string(),
+            handle,
+        })));
+
+        let delivered =
+            read_delivered_with_timeout(&pending, "unused", "new", Duration::from_secs(1)).await;
+
+        assert!(delivered.is_none());
+        assert!(pending.lock().await.is_none());
     }
 
     /// Re-delivering the same token must not look like a new credential.

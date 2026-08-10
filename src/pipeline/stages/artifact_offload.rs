@@ -55,18 +55,33 @@ impl PipelineStage for ArtifactOffload {
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         let scope = ctx.message.channel_id.clone();
+        let current_user = ctx
+            .get_run::<crate::pipeline::extensions::CurrentUserMessage>()
+            .map(|current| current.0);
 
-        let Some(user_msg) = ctx
-            .llm_messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == Role::User)
-        else {
+        let user_index = current_user
+            .filter(|&index| {
+                ctx.llm_messages
+                    .get(index)
+                    .is_some_and(|message| message.role == Role::User)
+            })
+            .or_else(|| {
+                ctx.llm_messages
+                    .iter()
+                    .rposition(|message| message.role == Role::User)
+            });
+
+        let Some(user_index) = user_index else {
             debug!("ArtifactOffload: no user message; pass-through");
             return Ok(());
         };
 
+        let user_msg = &mut ctx.llm_messages[user_index];
         self.manager.offload(&scope, &mut user_msg.content).await?;
+        if current_user == Some(user_index) {
+            let stored = user_msg.to_stored();
+            ctx.set(crate::pipeline::extensions::PersistedUserTurn(stored));
+        }
         Ok(())
     }
 }

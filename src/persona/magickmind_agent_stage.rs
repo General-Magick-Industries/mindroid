@@ -273,7 +273,11 @@ impl PipelineStage for MagickmindAgentPersonaStage {
             messages.len(),
         );
 
+        let current_user = messages.len() - 1;
         ctx.llm_messages = messages;
+        ctx.set(crate::pipeline::extensions::CurrentUserMessage(
+            current_user,
+        ));
 
         Ok(())
     }

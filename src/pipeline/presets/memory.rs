@@ -220,22 +220,9 @@ impl PipelineStage for MemoryPersistence {
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         let channel_id = &ctx.message.channel_id;
 
-        // Persist the user turn. If an earlier stage (e.g. ArtifactOffload) put
-        // structured content (an artifact reference) into the last user
-        // `LlmMessage`, store that via `to_stored()` (JSON) so the reference
-        // survives in history. Plain-text turns fall back to the raw message
-        // content and stay stored as bare strings (backward-compatible).
-        //
-        // Only a *structured* trailing user message is taken: when the pipeline
-        // injected history without appending this turn, the last user message is
-        // a previous turn, and storing it would duplicate history while losing
-        // the real content. Structured content is what offload produces, so it
-        // reliably marks the rewritten current turn.
         let user_content = ctx
-            .llm_messages
-            .last()
-            .filter(|m| m.role == crate::models::Role::User && m.content.len() != 1)
-            .map(|m| m.to_stored())
+            .get_run::<crate::pipeline::extensions::PersistedUserTurn>()
+            .map(|turn| turn.0.clone())
             .unwrap_or_else(|| ctx.message.content.clone());
 
         // Save user message
@@ -448,6 +435,7 @@ mod tests {
                 ),
             ],
         ));
+        pctx.set(crate::pipeline::extensions::CurrentUserMessage(0));
 
         offload.process(&mut pctx).await.unwrap();
         persistence.process(&mut pctx).await.unwrap();
@@ -481,5 +469,88 @@ mod tests {
             .expect("expected a File reference after read-back");
         let art = store.load("chan1", &file_part).await.unwrap();
         assert_eq!(art.data, vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "artifacts")]
+    #[tokio::test]
+    async fn media_only_offload_persists_its_single_artifact_reference() {
+        use crate::artifacts::LocalArtifactStore;
+        use crate::core::content::{ContentPart, ContentSource};
+        use crate::models::{LlmMessage, Role};
+        use crate::pipeline::stages::ArtifactOffload;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalArtifactStore::new(tmp.path()));
+        let mem = Arc::new(SqliteMemory::new(":memory:").unwrap());
+        let client = Arc::new(MemoryClient::new(mem.clone()));
+        let mut ctx = Context::new(
+            test_message("chan1", "user-1", "").into(),
+            crate::config::AgentConfig::default().into(),
+        );
+        ctx.llm_messages.push(LlmMessage::with_parts(
+            Role::User,
+            vec![ContentPart::image(
+                ContentSource::Inline {
+                    data: vec![1, 2, 3],
+                },
+                "image/png",
+            )],
+        ));
+        ctx.set(crate::pipeline::extensions::CurrentUserMessage(0));
+
+        ArtifactOffload::new(store).process(&mut ctx).await.unwrap();
+        MemoryPersistence::new(client)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        let history = mem.get_history("chan1", 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0]
+                .content
+                .starts_with(crate::models::STRUCTURED_PREFIX)
+        );
+        assert!(history[0].content.contains("\"file\""));
+    }
+
+    #[cfg(feature = "artifacts")]
+    #[tokio::test]
+    async fn offload_does_not_persist_a_historical_user_turn_as_current() {
+        use crate::artifacts::LocalArtifactStore;
+        use crate::core::content::{ContentPart, ContentSource};
+        use crate::models::{LlmMessage, Role};
+        use crate::pipeline::stages::ArtifactOffload;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalArtifactStore::new(tmp.path()));
+        let mem = Arc::new(SqliteMemory::new(":memory:").unwrap());
+        let client = Arc::new(MemoryClient::new(mem.clone()));
+        let mut ctx = Context::new(
+            test_message("chan1", "user-1", "current turn").into(),
+            crate::config::AgentConfig::default().into(),
+        );
+        ctx.llm_messages.push(LlmMessage::with_parts(
+            Role::User,
+            vec![
+                ContentPart::text("historical turn"),
+                ContentPart::image(
+                    ContentSource::Inline {
+                        data: vec![1, 2, 3],
+                    },
+                    "image/png",
+                ),
+            ],
+        ));
+
+        ArtifactOffload::new(store).process(&mut ctx).await.unwrap();
+        MemoryPersistence::new(client)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        let history = mem.get_history("chan1", 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "current turn");
     }
 }

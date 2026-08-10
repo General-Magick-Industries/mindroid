@@ -514,6 +514,18 @@ fn parse_push(text: &str, subscribed_channel: &str) -> Option<Message> {
 
     let mut msg = Message::new(content, sender_id, channel_id).with_id(id);
     msg.platform = Some("centrifugo".into());
+    if let Some(authenticated_sender) = push
+        .get("pub")
+        .and_then(|publication| publication.get("info"))
+        .and_then(|info| info.get("user"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|sender| !sender.is_empty())
+    {
+        msg.metadata.insert(
+            "authenticated_sender_id".into(),
+            serde_json::Value::String(authenticated_sender.to_string()),
+        );
+    }
     attach_image_metadata(&mut msg, inner);
     Some(msg)
 }
@@ -1087,6 +1099,24 @@ mod tests {
         assert_eq!(msg.id, "m-7");
         assert_eq!(msg.sender_id, "u1");
         assert_eq!(msg.content, "hello");
+    }
+
+    #[test]
+    fn authenticated_publication_identity_is_separate_from_payload_sender() {
+        let frame = serde_json::json!({
+            "push": {
+                "channel": "user:a1#a1",
+                "pub": {
+                    "info": { "user": "authenticated-user" },
+                    "data": { "content": "hello", "sender_id": "payload-user" }
+                }
+            }
+        })
+        .to_string();
+        let msg = parse_push(&frame, "user:a1#a1").unwrap();
+
+        assert_eq!(msg.sender_id, "payload-user");
+        assert_eq!(msg.trusted_sender_id(), Some("authenticated-user"));
     }
 
     #[test]

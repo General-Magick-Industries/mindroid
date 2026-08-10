@@ -24,14 +24,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> Value;  // JSON Schema
-    async fn execute(&self, args: Value) -> Result<String>;
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>;
 }
 ```
 
 ### Custom Tool Example
 
 ```rust
-use mindroid::tools::Tool;
+use mindroid::tools::{Tool, ToolContext};
 use serde_json::{json, Value};
 
 struct WeatherTool;
@@ -54,7 +54,7 @@ impl Tool for WeatherTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> mindroid::Result<String> {
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> mindroid::Result<String> {
         let city = args["city"].as_str().unwrap_or("unknown");
         Ok(format!("Weather in {city}: 22C, sunny"))
     }
@@ -122,7 +122,7 @@ The parser extracts these, executes each tool, and feeds results back as user me
 ### Configuration
 
 ```rust
-ToolExecutorStage::new(registry, llm_config)
+ToolExecutorStage::new(client, registry)
     .with_max_iterations(10)       // default: 20
     .with_parser(MyCustomParser)   // default: XmlToolCallParser
 ```

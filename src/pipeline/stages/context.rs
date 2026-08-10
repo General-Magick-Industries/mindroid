@@ -114,6 +114,7 @@ impl PipelineStage for SimpleContextBuilder {
         let user_text = &ctx.message.content;
 
         messages.push(LlmMessage::user(user_text));
+        let current_user = messages.len() - 1;
 
         debug!(
             "SimpleContextBuilder: {} history messages, {} total llm_messages",
@@ -130,6 +131,9 @@ impl PipelineStage for SimpleContextBuilder {
         }
 
         ctx.llm_messages = messages;
+        ctx.set(crate::pipeline::extensions::CurrentUserMessage(
+            current_user,
+        ));
 
         Ok(())
     }

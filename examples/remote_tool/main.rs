@@ -70,18 +70,20 @@ async fn load_history(mem: &SqliteMemory) -> Result<Arc<Vec<LlmMessage>>> {
 /// current user turn.
 async fn run_turn(
     mem: &SqliteMemory,
-    registry: Arc<ToolRegistry>,
+    executor: ToolExecutorStage,
     content: &str,
 ) -> Result<String> {
     let history = load_history(mem).await?;
     // ToolExecutorStage IS the LLM caller (it adds the tool prompt and parses
     // <tool_call>), so it's the streaming stage — no separate LLM stage.
+    let gate = executor.result_gate();
     let pipeline = Pipeline::new()
+        .add_stage(gate)
         .add_stage(SimpleContextBuilder::with_prompt_and_history(
             SYSTEM_PROMPT,
             history,
         ))
-        .add_streaming_stage(ToolExecutorStage::new(llm_client()?, registry));
+        .add_streaming_stage(executor);
 
     let msg = Arc::new(Message::new(content, SENDER, CHANNEL));
     let mut ctx = PipelineContext::new(msg, Arc::new(AgentConfig::default()));
@@ -111,11 +113,12 @@ async fn main() -> anyhow::Result<()> {
             "type": "object", "properties": {}
         })),
     ));
+    let executor = ToolExecutorStage::new(llm_client()?, registry);
 
     // ── run 1: user asks; LLM should emit the remote tool call ───────────────
     let question = "What time is it?";
     println!("[user]      {question}");
-    let emitted = run_turn(&mem, registry.clone(), question).await?;
+    let emitted = run_turn(&mem, executor.clone(), question).await?;
     println!("[runtime →] {emitted}");
 
     // Persist the turn: user question + the emitted call (assistant turn) so
@@ -142,13 +145,17 @@ async fn main() -> anyhow::Result<()> {
     // "Execute" get_time on the client side and feed the result back as a new
     // inbound message (stored in the local db, seen by run 2's history).
     let now = "2026-08-03T15:04:05Z";
-    let tool_result = format!("<tool_result name=\"get_time\">{now}</tool_result>");
+    let call_id = call["payload"]["tool_call_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("tool call omitted its correlation id"))?;
+    let tool_result =
+        format!("<tool_result name=\"get_time\" call=\"{call_id}\">{now}</tool_result>");
     println!("[client]    performed get_time -> {now}");
 
     // Run 2: the result is the current turn (ContextBuilder appends it), so run
     // first, then persist both the result and the agent's answer — matching the
     // run-1 ordering and avoiding a double-append.
-    let answer = run_turn(&mem, registry, &tool_result).await?;
+    let answer = run_turn(&mem, executor, &tool_result).await?;
     mem.save_message(CHANNEL, SENDER, &tool_result, None)
         .await?;
     mem.save_message(CHANNEL, "assistant", &answer, None)

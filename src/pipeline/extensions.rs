@@ -20,6 +20,20 @@ pub struct AudioOutput(pub Vec<u8>);
 #[cfg(feature = "transport-audio")]
 pub struct TextInput(pub String);
 
+/// Index of the current inbound user turn in [`Context::llm_messages`].
+///
+/// Context builders set this after assembling history so stages that transform
+/// message content never mistake an older user message for the active turn.
+/// Custom context builders should set it when they append the inbound message.
+///
+/// [`Context::llm_messages`]: crate::Context::llm_messages
+#[derive(Debug, Clone, Copy)]
+pub struct CurrentUserMessage(pub usize);
+
+pub(crate) struct PersistedUserTurn(pub String);
+
+pub(crate) struct CorrelatedRemoteResult;
+
 /// A single binary attachment (image, audio, video, or arbitrary file) to send
 /// to the LLM, stored in [`PipelineContext`] extensions as part of [`FileInputs`].
 ///

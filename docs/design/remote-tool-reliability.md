@@ -1,8 +1,9 @@
-# Remote-tool reliability (design sketch)
+# Remote-tool reliability
 
-Status: **design only, not implemented.** Build-ready plan for hardening the
-remote (client-executed) tool round trip against an unreliable transport
-(game/robot over Centrifugo or a websocket).
+Status: **partially implemented.** Process-local correlation, server-side
+deduplication, sender binding, input bounds, and mandatory result gating are in
+place. Durable outstanding-call storage, timeouts, client-side deduplication,
+and reconnect recovery remain design work.
 
 ## Context
 
@@ -13,17 +14,19 @@ result back, which re-enters as a new inbound message. This is
 task token (cf. Temporal signals, Step Functions `waitForTaskToken`, A2A
 `PushNotificationConfig`, ADK `LongRunningFunctionTool`).
 
-The happy path is correct. What's missing is the reliability envelope every
-mature system adds, because a game/robot client can deliver twice, disconnect, or
-never respond. Three gaps.
+The happy path and the process-local safety envelope are implemented. A client
+can still disconnect, never respond, repeat execution, or outlive the runtime
+process. Three durability and delivery gaps remain.
 
 ## The correlation token
 
-Everything below keys off `tool_call_id` (already minted in `frame_remote_call`).
-Treat it as a **task token**: server-generated, single-use, validated against a
-set of outstanding calls — never trust an id the client invents.
+Everything below keys off `tool_call_id`, minted in `frame_remote_call`.
+`PendingRemoteCalls` already treats it as a process-local **task token**:
+server-generated, single-use, TTL-bounded, and matched atomically with channel,
+authenticated sender, and tool name. Durable storage would preserve that state
+across process restarts.
 
-## Outstanding-calls table (backs gaps 1 & 2)
+## Durable outstanding-calls table (backs gaps 1 & 2)
 
 A small store, backed by the existing `Memory`/persistence layer, one row per
 in-flight remote call:
@@ -39,19 +42,18 @@ outstanding_tool_calls
 
 - **On dispatch** (a remote call is framed and emitted): insert a row,
   `consumed = 0`, `deadline = now + timeout`.
-- **On result ingest** (inbound `tool_result` with an id): accept only if a row
-  exists with `consumed = 0`; then atomically set `consumed = 1`. A duplicate or
+- **On result ingest** (inbound `tool_result` with an id): preserve the current
+  atomic identity/name match, then set `consumed = 1`. A duplicate or
   post-timeout result finds `consumed = 1` (or no row) and is **dropped**.
 
 ## Gap 1 — idempotency / dedup
 
 Pub-sub is at-least-once; duplicates are normal, not edge cases.
 
-- **Server side (result ingest):** the atomic `consumed` check above — a
-  `tool_result` for an already-consumed or unknown `tool_call_id` is dropped, so
-  history is never double-appended. Add this check where inbound results are
-  normalized (`normalize_tool_result` call sites in the transports, or a stage
-  just after).
+- **Server side (result ingest): implemented process-locally.**
+  `ToolExecutorStage` performs mandatory correlation and one-shot claim; an
+  unknown, mismatched, or already-consumed result is dropped. Moving the same
+  check to durable storage remains necessary for restart safety.
 - **Client side (command execution):** the client must dedup by `tool_call_id`
   before executing, OR tools must be idempotent by construction (prefer absolute
   actions — `move_to(x,y)` — over relative — `move(dx,dy)` — so a double-execute
@@ -99,8 +101,8 @@ client can also miss the outbound command.
 
 ## Build order (smallest first)
 
-1. **Outstanding-calls table + dedup on ingest** (gap 1 server side) — closes the
-   most dangerous case (double-applied history / actions) with one small store.
+1. **Persist the process-local outstanding-call set** — keeps the implemented
+   server-side correlation and dedup guarantees across restarts.
 2. **Timeout sweep + synthesized error result** (gap 2) — stops orphaned hangs;
    reuses `RetryStage`/routines.
 3. **Centrifugo recovery config + resubscribe-with-recovery** (gap 3) — mostly

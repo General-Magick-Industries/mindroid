@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
@@ -131,6 +132,8 @@ impl Runtime {
         }
 
         // Process messages
+        let handler_cancel = CancellationToken::new();
+        let mut handler_tasks = JoinSet::new();
         let mut seen_ids = std::collections::HashSet::<String>::new();
         const MAX_SEEN_IDS: usize = 10_000;
         // A future that never resolves when there's no cancel token, so the
@@ -148,6 +151,12 @@ impl Runtime {
                 _ = &mut cancelled => {
                     tracing::info!("Runtime cancelled — shutting down");
                     break;
+                }
+                Some(result) = handler_tasks.join_next(), if !handler_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "Message handler task failed");
+                    }
+                    continue;
                 }
                 msg = rx.recv() => match msg {
                     Some(m) => m,
@@ -185,20 +194,45 @@ impl Runtime {
                 }
             };
 
+            let message_cancel = CancellationToken::new();
             let ctx = MessageContext {
                 message: Arc::new(msg),
                 agent_config: self.agent_config.clone(),
                 pipeline: self.pipeline.clone(),
                 transport: self.transport_sender.clone(),
                 observers: self.observers.clone(),
-                cancel: Some(permit.token().clone()),
+                cancel: Some(message_cancel.child_token()),
             };
 
-            let handler_fut = (self.handler)(ctx);
-            tokio::spawn(async move {
+            let mut handler_fut = (self.handler)(ctx);
+            let permit_cancel = permit.token().clone();
+            let runtime_cancel = handler_cancel.child_token();
+            handler_tasks.spawn(async move {
                 let _permit = permit; // drop guard signals completion for Sequential
+                tokio::select! {
+                    () = &mut handler_fut => return,
+                    () = permit_cancel.cancelled() => message_cancel.cancel(),
+                    () = runtime_cancel.cancelled() => message_cancel.cancel(),
+                }
                 handler_fut.await;
             });
+        }
+
+        handler_cancel.cancel();
+        self.coordinator.close_all();
+        if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(result) = handler_tasks.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Message handler task failed during shutdown");
+                }
+            }
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("Message handlers did not stop within timeout; aborting");
+            handler_tasks.abort_all();
+            while handler_tasks.join_next().await.is_some() {}
         }
 
         self.shutdown().await
@@ -206,13 +240,15 @@ impl Runtime {
 
     /// Gracefully shut down the runtime.
     pub async fn shutdown(&mut self) -> Result<()> {
-        for (token, handle) in self.routine_handles.drain(..) {
+        for (token, mut handle) in self.routine_handles.drain(..) {
             token.cancel();
-            let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), handle);
+            let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle);
             match timeout.await {
                 Ok(_) => {}
                 Err(_) => {
                     tracing::warn!("Routine did not stop within timeout; aborting");
+                    handle.abort();
+                    let _ = handle.await;
                 }
             }
         }
@@ -245,6 +281,36 @@ mod tests {
         hold_sender: bool,
         held: Mutex<Option<mpsc::Sender<Message>>>,
         disconnected: Arc<AtomicBool>,
+    }
+
+    struct OneMessageTransport {
+        disconnected: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for OneMessageTransport {
+        fn name(&self) -> &str {
+            "one-message"
+        }
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            self.disconnected.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn listen(&self, tx: mpsc::Sender<Message>) -> Result<()> {
+            tx.send(Message::new("hello", "user", "channel"))
+                .await
+                .unwrap();
+            Ok(())
+        }
+        async fn send(&self, _response: &Response) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
     }
 
     impl SilentTransport {
@@ -324,6 +390,69 @@ mod tests {
             .await
             .expect("a pre-cancelled token must exit promptly")
             .expect("clean exit");
+
+        assert!(disconnected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_in_flight_handler_to_finish() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let handler_started = started.clone();
+        let handler_completed = completed.clone();
+        let mut rt = Runtime::builder()
+            .transport(OneMessageTransport {
+                disconnected: disconnected.clone(),
+            })
+            .on_message(move |ctx| {
+                let started = handler_started.clone();
+                let completed = handler_completed.clone();
+                async move {
+                    started.notify_one();
+                    ctx.cancel.as_ref().unwrap().cancelled().await;
+                    completed.store(true, Ordering::SeqCst);
+                }
+            })
+            .build()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            started.notified().await;
+            trigger.cancel();
+        });
+
+        rt.run_until_cancelled(cancel).await.unwrap();
+
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(disconnected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn completed_handlers_are_reaped_while_the_runtime_is_active() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let handler_completed = completed.clone();
+        let mut rt = Runtime::builder()
+            .transport(OneMessageTransport {
+                disconnected: disconnected.clone(),
+            })
+            .on_message(move |_| {
+                let completed = handler_completed.clone();
+                async move { completed.notify_one() }
+            })
+            .build()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            completed.notified().await;
+            tokio::task::yield_now().await;
+            trigger.cancel();
+        });
+
+        rt.run_until_cancelled(cancel).await.unwrap();
 
         assert!(disconnected.load(Ordering::SeqCst));
     }
