@@ -1103,20 +1103,28 @@ mod tests {
         let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
         let mut transport = CentrifugoTransport::new("wss://example.com/ws", "agent", auth);
 
-        // Just past disconnect's ~6s ceiling: long enough that the abort cannot
-        // land first, short enough that runtime teardown does not wait on it.
-        let handle = tokio::spawn(async {
+        // Outlasts disconnect's ~6s ceiling, so the listener is provably still
+        // running when disconnect returns. The runtime drop waits out the
+        // remainder, which is why this is 7s and not 60s.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        let handle = tokio::spawn(async move {
             std::thread::sleep(Duration::from_secs(7));
+            flag.store(true, Ordering::SeqCst);
         });
         *transport.listener.lock().unwrap() = Some(handle);
 
-        let started = std::time::Instant::now();
-        transport.disconnect().await.expect("must not hang");
+        tokio::time::timeout(Duration::from_secs(15), transport.disconnect())
+            .await
+            .expect("disconnect must not hang")
+            .expect("disconnect must not error");
 
+        // The point of the bounded join: return without the listener, rather
+        // than outlast it. A timing bound alone would also pass if disconnect
+        // simply waited for the sleep.
         assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "disconnect must be bounded even when the listener never yields, took {:?}",
-            started.elapsed()
+            !finished.load(Ordering::SeqCst),
+            "disconnect waited for the blocked listener instead of abandoning it"
         );
     }
 

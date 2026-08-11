@@ -126,48 +126,67 @@ impl LocalArtifactStore {
         Ok(())
     }
 
-    /// Open for reading without following a final-component symlink, so the
-    /// path that was validated is the path that is read.
-    async fn open_no_follow(path: &Path) -> Result<tokio::fs::File> {
+    /// Open for reading, refusing a final-component symlink, so the path that
+    /// was validated is the path that is read.
+    ///
+    /// `O_NOFOLLOW` fails the open outright. Windows has no equivalent:
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` opens the link itself rather than
+    /// failing, so the refusal is asserted here against the opened handle
+    /// instead of being inferred from what a later read happens to do.
+    async fn open_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
         let mut opts = tokio::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
         opts.custom_flags(libc::O_NOFOLLOW);
-        // FILE_FLAG_OPEN_REPARSE_POINT: open the link, never its target.
         #[cfg(windows)]
-        opts.custom_flags(0x0020_0000);
-        opts.open(path)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("open failed: {e}")))
+        {
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = opts.open(path).await?;
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if file.metadata().await?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to follow a reparse point",
+                ));
+            }
+        }
+        Ok(file)
     }
 
-    async fn read_no_follow(path: &Path) -> Result<Vec<u8>> {
+    async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 
-        let mut buf = Vec::new();
-        Self::open_no_follow(path)
-            .await?
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("read failed: {e}")))?;
+        let mut file = Self::open_no_follow(path).await?;
+        let cap = file.metadata().await.map(|m| m.len() as usize).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
+        file.read_to_end(&mut buf).await?;
         Ok(buf)
     }
 
     /// `create_new` is `O_EXCL`: it fails if anything already occupies the path,
     /// symlink included, so a write can never land on an attacker's target. Ids
     /// are fresh UUIDs, so a collision is a bug, not a case to overwrite.
-    async fn write_new(path: &Path, data: &[u8]) -> Result<()> {
+    ///
+    /// The `flush` is load-bearing, not hygiene: `tokio::fs::File` hands the
+    /// write to a blocking task and reports its error only on a later poll, so
+    /// dropping the handle after `write_all` discards a failed write entirely.
+    async fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("open failed: {e}")))?
-            .write_all(data)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("write failed: {e}")))
+            .await?;
+        file.write_all(data).await?;
+        file.flush().await
     }
 }
 
@@ -199,10 +218,10 @@ impl ArtifactStore for LocalArtifactStore {
 
         let data = Self::read_no_follow(&bytes_path)
             .await
-            .map_err(|e| MindroidError::artifact(format!("artifact '{id}' not found: {e}")))?;
+            .map_err(|e| MindroidError::artifact(format!("read artifact '{id}' failed: {e}")))?;
         let json = Self::read_no_follow(&sidecar_path)
             .await
-            .map_err(|e| MindroidError::artifact(format!("sidecar for '{id}' not found: {e}")))?;
+            .map_err(|e| MindroidError::artifact(format!("read sidecar for '{id}' failed: {e}")))?;
         let sidecar: Sidecar = serde_json::from_slice(&json)
             .map_err(|e| MindroidError::artifact(format!("parse sidecar failed: {e}")))?;
 
@@ -340,6 +359,21 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    /// The write path needs a direct test: `tokio::fs::File` reports a failed
+    /// write only on a later poll, so without the flush this would pass while
+    /// silently dropping the bytes.
+    #[tokio::test]
+    async fn write_new_persists_the_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fresh");
+
+        LocalArtifactStore::write_new(&path, b"payload")
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
     /// `(base_dir, outside_dir, store)` where `<base>/evil` symlinks to `outside`,

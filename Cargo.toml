@@ -66,7 +66,7 @@ persona = ["dep:reqwest"]
 identity = []
 # Artifact storage (out-of-band media offload). Pulls in base64 so inline-image
 # encoding works without requiring the transport-ws feature (see llm_client).
-artifacts = ["llm-client", "dep:base64"]
+artifacts = ["llm-client", "dep:base64", "dep:libc"]
 # Magick Mind service integration: end-user credentials and backend-routed
 # tools. Backend-specific — enabling `persona` should not compile in a token
 # client for one service.
@@ -124,7 +124,7 @@ async-openai = { version = "0.33", features = ["chat-completion", "audio"], opti
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for the artifact store's no-follow opens.
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 mockall = "0.13"
