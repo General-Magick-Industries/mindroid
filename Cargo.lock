@@ -1513,6 +1513,7 @@ dependencies = [
  "dirs",
  "futures",
  "hound",
+ "libc",
  "mockall",
  "regex",
  "reqwest",

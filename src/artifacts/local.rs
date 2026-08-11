@@ -109,9 +109,10 @@ impl LocalArtifactStore {
         Ok((bytes_path, sidecar_path))
     }
 
-    /// Best-effort: this stats before the caller opens the path, so it does not
-    /// close the check-then-use race against an attacker who can already write
-    /// into the scope dir. Closing that needs `O_NOFOLLOW` at open time.
+    /// A fast, clear rejection for the common case. It is *not* what closes the
+    /// check-then-use race — [`open_no_follow`](Self::open_no_follow) and the
+    /// `create_new` write path do that at open time, so a symlink swapped in
+    /// after this stat still cannot be followed.
     async fn reject_symlink(path: &Path) -> Result<()> {
         let is_symlink = tokio::fs::symlink_metadata(path)
             .await
@@ -124,6 +125,50 @@ impl LocalArtifactStore {
         }
         Ok(())
     }
+
+    /// Open for reading without following a final-component symlink, so the
+    /// path that was validated is the path that is read.
+    async fn open_no_follow(path: &Path) -> Result<tokio::fs::File> {
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW);
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the link, never its target.
+        #[cfg(windows)]
+        opts.custom_flags(0x0020_0000);
+        opts.open(path)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("open failed: {e}")))
+    }
+
+    async fn read_no_follow(path: &Path) -> Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        Self::open_no_follow(path)
+            .await?
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("read failed: {e}")))?;
+        Ok(buf)
+    }
+
+    /// `create_new` is `O_EXCL`: it fails if anything already occupies the path,
+    /// symlink included, so a write can never land on an attacker's target. Ids
+    /// are fresh UUIDs, so a collision is a bug, not a case to overwrite.
+    async fn write_new(path: &Path, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("open failed: {e}")))?
+            .write_all(data)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("write failed: {e}")))
+    }
 }
 
 #[async_trait]
@@ -132,7 +177,7 @@ impl ArtifactStore for LocalArtifactStore {
         let id = Uuid::new_v4().to_string();
         let (bytes_path, sidecar_path) = self.resolve_paths(scope, &id, true).await?;
 
-        tokio::fs::write(&bytes_path, data)
+        Self::write_new(&bytes_path, data)
             .await
             .map_err(|e| MindroidError::artifact(format!("write bytes failed: {e}")))?;
 
@@ -141,7 +186,7 @@ impl ArtifactStore for LocalArtifactStore {
         };
         let json = serde_json::to_vec(&sidecar)
             .map_err(|e| MindroidError::artifact(format!("serialize sidecar failed: {e}")))?;
-        tokio::fs::write(&sidecar_path, json)
+        Self::write_new(&sidecar_path, &json)
             .await
             .map_err(|e| MindroidError::artifact(format!("write sidecar failed: {e}")))?;
 
@@ -152,10 +197,10 @@ impl ArtifactStore for LocalArtifactStore {
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact> {
         let (bytes_path, sidecar_path) = self.resolve_paths(scope, id, false).await?;
 
-        let data = tokio::fs::read(&bytes_path)
+        let data = Self::read_no_follow(&bytes_path)
             .await
             .map_err(|e| MindroidError::artifact(format!("artifact '{id}' not found: {e}")))?;
-        let json = tokio::fs::read(&sidecar_path)
+        let json = Self::read_no_follow(&sidecar_path)
             .await
             .map_err(|e| MindroidError::artifact(format!("sidecar for '{id}' not found: {e}")))?;
         let sidecar: Sidecar = serde_json::from_slice(&json)
@@ -262,6 +307,40 @@ mod tests {
     use std::os::unix::fs::{symlink as symlink_dir, symlink as symlink_file};
     #[cfg(windows)]
     use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    /// The race-closing guarantee, exercised directly rather than through the
+    /// `reject_symlink` pre-check: even handed a symlink, the open must refuse
+    /// to follow it. This is what holds when a swap wins the race.
+    #[cfg_attr(not(unix), ignore = "creating symlinks needs privileges")]
+    #[tokio::test]
+    async fn read_no_follow_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("secret");
+        std::fs::write(&target, b"top secret").unwrap();
+        let link = tmp.path().join("link");
+        symlink_file(&target, &link).unwrap();
+
+        assert!(LocalArtifactStore::read_no_follow(&link).await.is_err());
+        assert_eq!(
+            LocalArtifactStore::read_no_follow(&target).await.unwrap(),
+            b"top secret"
+        );
+    }
+
+    /// `create_new` is what stops a write landing on a path an attacker placed.
+    #[tokio::test]
+    async fn write_new_refuses_an_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("taken");
+        std::fs::write(&path, b"original").unwrap();
+
+        assert!(
+            LocalArtifactStore::write_new(&path, b"overwrite")
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
 
     /// `(base_dir, outside_dir, store)` where `<base>/evil` symlinks to `outside`,
     /// which holds `secret` + `secret.json`.

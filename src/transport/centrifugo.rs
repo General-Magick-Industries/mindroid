@@ -1094,6 +1094,32 @@ mod tests {
         );
     }
 
+    /// The case `abort` alone cannot handle: a listener wedged in a blocking
+    /// call never reaches a yield point, so the abort never lands and the join
+    /// would hang forever. `disconnect` must give up and return. Real time, no
+    /// pause — a paused clock would not reproduce a blocked thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_abandons_a_listener_wedged_in_blocking_code() {
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
+        let mut transport = CentrifugoTransport::new("wss://example.com/ws", "agent", auth);
+
+        // Just past disconnect's ~6s ceiling: long enough that the abort cannot
+        // land first, short enough that runtime teardown does not wait on it.
+        let handle = tokio::spawn(async {
+            std::thread::sleep(Duration::from_secs(7));
+        });
+        *transport.listener.lock().unwrap() = Some(handle);
+
+        let started = std::time::Instant::now();
+        transport.disconnect().await.expect("must not hang");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "disconnect must be bounded even when the listener never yields, took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// `is_connected` must not report "disconnected" merely because a writer is
     /// in flight — a supervisor would bounce a healthy agent.
     #[tokio::test]

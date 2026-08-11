@@ -82,6 +82,11 @@ built-in `LocalArtifactStore`.
 
 ### Fixed
 
+- **The local artifact store no longer follows symlinks, even under a race.**
+  Reads open with `O_NOFOLLOW` (`FILE_FLAG_OPEN_REPARSE_POINT` on Windows) and
+  writes use `create_new`, so the path that was validated is the path that is
+  used. The prior stat-then-open check left a window in which an attacker able
+  to write into the scope directory could swap in a symlink.
 - **A model-supplied artifact id can no longer escape the store's base
   directory on Windows.** `LocalArtifactStore` rejected absolute paths, but a
   drive-relative component like `C:evil` is not absolute — and joining one
