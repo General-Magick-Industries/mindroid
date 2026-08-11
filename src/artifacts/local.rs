@@ -14,6 +14,14 @@ struct Sidecar {
     mime_type: String,
 }
 
+/// Ceiling on a single artifact read. Anyone who can write into the store's
+/// directories chooses this size otherwise.
+const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The sidecar holds one mime type, so it gets a far tighter bound than the
+/// bytes it describes — it is fed to a JSON parser.
+const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+
 /// Stores artifacts on the local filesystem under a base directory.
 ///
 /// Layout: `<base>/<scope>/<id>` holds the raw bytes, `<base>/<scope>/<id>.json`
@@ -57,6 +65,37 @@ impl LocalArtifactStore {
             return Err(MindroidError::artifact(format!(
                 "{label} is not a plain path component"
             )));
+        }
+        // Windows resolves these to devices, not files, and opening one can
+        // block. Verbatim `\\?\` paths happen to bypass that today, so this
+        // does not depend on the canonicalize step staying where it is.
+        #[cfg(windows)]
+        {
+            const EXACT: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+            // Devices only when numbered 1-9; bare `COM`/`LPT` are ordinary names.
+            const NUMBERED: [&str; 2] = ["COM", "LPT"];
+            // Win32 resolves the name before the first `.` or `:` and strips
+            // trailing dots and spaces. Compared as bytes so a multi-byte id
+            // cannot land mid-codepoint.
+            let stem = s
+                .split(['.', ':'])
+                .next()
+                .unwrap_or(s)
+                .trim_end_matches([' ', '.'])
+                .as_bytes();
+            let is_reserved = EXACT
+                .iter()
+                .any(|r| stem.eq_ignore_ascii_case(r.as_bytes()))
+                || (stem.len() == 4
+                    && matches!(stem[3], b'1'..=b'9')
+                    && NUMBERED
+                        .iter()
+                        .any(|r| stem[..3].eq_ignore_ascii_case(r.as_bytes())));
+            if is_reserved {
+                return Err(MindroidError::artifact(format!(
+                    "{label} is a reserved device name"
+                )));
+            }
         }
         Ok(())
     }
@@ -104,8 +143,8 @@ impl LocalArtifactStore {
                 "artifact '{id}' resolves outside its scope"
             )));
         }
-        Self::reject_symlink(&bytes_path).await?;
-        Self::reject_symlink(&sidecar_path).await?;
+        Self::reject_symlink(&bytes_path, "artifact", id).await?;
+        Self::reject_symlink(&sidecar_path, "sidecar", id).await?;
         Ok((bytes_path, sidecar_path))
     }
 
@@ -113,14 +152,16 @@ impl LocalArtifactStore {
     /// check-then-use race — [`open_no_follow`](Self::open_no_follow) and the
     /// `create_new` write path do that at open time, so a symlink swapped in
     /// after this stat still cannot be followed.
-    async fn reject_symlink(path: &Path) -> Result<()> {
+    async fn reject_symlink(path: &Path, kind: &str, id: &str) -> Result<()> {
         let is_symlink = tokio::fs::symlink_metadata(path)
             .await
             .is_ok_and(|m| m.file_type().is_symlink());
         if is_symlink {
+            // Only the absolute path is withheld — it reaches the model and the
+            // wire and would disclose the host's layout. The id is the caller's.
+            tracing::debug!(path = %path.display(), "refusing to follow symlink");
             return Err(MindroidError::artifact(format!(
-                "refusing to follow symlink at '{}'",
-                path.display()
+                "refusing to follow a symlinked {kind} for '{id}'"
             )));
         }
         Ok(())
@@ -133,6 +174,8 @@ impl LocalArtifactStore {
     /// `FILE_FLAG_OPEN_REPARSE_POINT` opens the link itself rather than
     /// failing, so the refusal is asserted here against the opened handle
     /// instead of being inferred from what a later read happens to do.
+    ///
+    /// The Windows check is tag-agnostic by design — see ADR-0006.
     async fn open_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
         let mut opts = tokio::fs::OpenOptions::new();
         opts.read(true);
@@ -160,13 +203,24 @@ impl LocalArtifactStore {
         Ok(file)
     }
 
-    async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    /// Capped with `take` rather than a `metadata()` pre-size: the length is
+    /// attacker-controlled, and a sparse file costs them nothing while an
+    /// up-front reservation of it aborts the process under `panic = "abort"`.
+    async fn read_no_follow(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 
-        let mut file = Self::open_no_follow(path).await?;
-        let cap = file.metadata().await.map(|m| m.len() as usize).unwrap_or(0);
-        let mut buf = Vec::with_capacity(cap);
-        file.read_to_end(&mut buf).await?;
+        let mut buf = Vec::new();
+        Self::open_no_follow(path)
+            .await?
+            .take(max + 1)
+            .read_to_end(&mut buf)
+            .await?;
+        if buf.len() as u64 > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "artifact exceeds the size limit",
+            ));
+        }
         Ok(buf)
     }
 
@@ -177,9 +231,18 @@ impl LocalArtifactStore {
     /// The `flush` is load-bearing, not hygiene: `tokio::fs::File` hands the
     /// write to a blocking task and reports its error only on a later poll, so
     /// dropping the handle after `write_all` discards a failed write entirely.
-    async fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    ///
+    /// Bounded here rather than at the caller so both writes are covered: a
+    /// sidecar past the read cap would store fine and never load again.
+    async fn write_new(path: &Path, data: &[u8], max: u64) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
+        if data.len() as u64 > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "artifact exceeds the size limit",
+            ));
+        }
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -196,16 +259,21 @@ impl ArtifactStore for LocalArtifactStore {
         let id = Uuid::new_v4().to_string();
         let (bytes_path, sidecar_path) = self.resolve_paths(scope, &id, true).await?;
 
-        Self::write_new(&bytes_path, data)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("write bytes failed: {e}")))?;
-
+        // Both writes are validated before either happens: failing the sidecar
+        // after the bytes are down would orphan a file no id can ever reach.
         let sidecar = Sidecar {
             mime_type: mime_type.to_string(),
         };
         let json = serde_json::to_vec(&sidecar)
             .map_err(|e| MindroidError::artifact(format!("serialize sidecar failed: {e}")))?;
-        Self::write_new(&sidecar_path, &json)
+        if data.len() as u64 > MAX_ARTIFACT_BYTES || json.len() as u64 > MAX_SIDECAR_BYTES {
+            return Err(MindroidError::artifact("artifact exceeds the size limit"));
+        }
+
+        Self::write_new(&bytes_path, data, MAX_ARTIFACT_BYTES)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("write bytes failed: {e}")))?;
+        Self::write_new(&sidecar_path, &json, MAX_SIDECAR_BYTES)
             .await
             .map_err(|e| MindroidError::artifact(format!("write sidecar failed: {e}")))?;
 
@@ -216,10 +284,10 @@ impl ArtifactStore for LocalArtifactStore {
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact> {
         let (bytes_path, sidecar_path) = self.resolve_paths(scope, id, false).await?;
 
-        let data = Self::read_no_follow(&bytes_path)
+        let data = Self::read_no_follow(&bytes_path, MAX_ARTIFACT_BYTES)
             .await
             .map_err(|e| MindroidError::artifact(format!("read artifact '{id}' failed: {e}")))?;
-        let json = Self::read_no_follow(&sidecar_path)
+        let json = Self::read_no_follow(&sidecar_path, MAX_SIDECAR_BYTES)
             .await
             .map_err(|e| MindroidError::artifact(format!("read sidecar for '{id}' failed: {e}")))?;
         let sidecar: Sidecar = serde_json::from_slice(&json)
@@ -298,6 +366,57 @@ mod tests {
         assert!(store.load("chan", "with\0null").await.is_err());
     }
 
+    /// Opening `NUL`/`COM1` reaches a device rather than a file. The verbatim
+    /// path from `canonicalize` sidesteps that today; the guard means the jail
+    /// does not silently depend on that.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reserved_device_names_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalArtifactStore::new(tmp.path());
+        store.save("chan", &[1], "image/png").await.unwrap();
+
+        for id in [
+            "NUL",
+            "nul",
+            "CON",
+            "COM1",
+            "LPT9",
+            "NUL.txt",
+            "CONIN$",
+            "NUL ",
+            "NUL.",
+            "NUL:$DATA",
+        ] {
+            let e = store.load("chan", id).await.unwrap_err();
+            assert!(
+                e.to_string().contains("reserved device name"),
+                "{id} must be rejected by the guard, got: {e}"
+            );
+        }
+        // Near-misses stay usable. The multi-byte ids are the regression: the
+        // guard used to slice by byte index and panicked on them.
+        for id in [
+            "COMET",
+            "NULL",
+            "CONSOLE",
+            "COM",
+            "LPT",
+            "COM0",
+            "LPT0",
+            "CON1",
+            "COM10",
+            "😀",
+            "éé",
+            "日本語",
+        ] {
+            assert!(
+                LocalArtifactStore::safe_component("id", id).is_ok(),
+                "{id} must be accepted"
+            );
+        }
+    }
+
     /// `C:evil` is not `is_absolute`, but joining it discards the base entirely,
     /// so an unvalidated id would escape the jail to the drive's working dir.
     #[cfg(windows)]
@@ -327,21 +446,51 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::fs::{symlink_dir, symlink_file};
 
+    /// Symlink creation needs a privilege many Windows machines lack; skip
+    /// there, fail on anything else. `MINDROID_REQUIRE_SYMLINKS` forbids the
+    /// skip — CI sets it, so a runner without the privilege fails loudly
+    /// instead of reporting green on tests that asserted nothing.
+    fn made_symlink(r: std::io::Result<()>) -> bool {
+        #[cfg(windows)]
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        match r {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                assert!(
+                    std::env::var_os("MINDROID_REQUIRE_SYMLINKS").is_none(),
+                    "symlink privilege is required here but absent: {e}"
+                );
+                eprintln!("skipping symlink test: {e}");
+                false
+            }
+            Err(e) => panic!("symlink creation failed unexpectedly: {e}"),
+        }
+    }
+
     /// The race-closing guarantee, exercised directly rather than through the
     /// `reject_symlink` pre-check: even handed a symlink, the open must refuse
     /// to follow it. This is what holds when a swap wins the race.
-    #[cfg_attr(not(unix), ignore = "creating symlinks needs privileges")]
     #[tokio::test]
     async fn read_no_follow_refuses_a_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("secret");
         std::fs::write(&target, b"top secret").unwrap();
         let link = tmp.path().join("link");
-        symlink_file(&target, &link).unwrap();
+        if !made_symlink(symlink_file(&target, &link)) {
+            return;
+        }
 
-        assert!(LocalArtifactStore::read_no_follow(&link).await.is_err());
+        assert!(
+            LocalArtifactStore::read_no_follow(&link, MAX_ARTIFACT_BYTES)
+                .await
+                .is_err()
+        );
         assert_eq!(
-            LocalArtifactStore::read_no_follow(&target).await.unwrap(),
+            LocalArtifactStore::read_no_follow(&target, MAX_ARTIFACT_BYTES)
+                .await
+                .unwrap(),
             b"top secret"
         );
     }
@@ -354,55 +503,132 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
 
         assert!(
-            LocalArtifactStore::write_new(&path, b"overwrite")
+            LocalArtifactStore::write_new(&path, b"overwrite", MAX_ARTIFACT_BYTES)
                 .await
                 .is_err()
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
     }
 
-    /// The write path needs a direct test: `tokio::fs::File` reports a failed
-    /// write only on a later poll, so without the flush this would pass while
-    /// silently dropping the bytes.
+    /// Smoke test only. It does not pin the flush: dropping the handle without
+    /// flushing still lands the bytes almost every time, so this passes either
+    /// way. `flush_surfaces_a_deferred_write_error` covers what the flush is
+    /// actually for.
     #[tokio::test]
     async fn write_new_persists_the_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("fresh");
 
-        LocalArtifactStore::write_new(&path, b"payload")
+        LocalArtifactStore::write_new(&path, b"payload", MAX_ARTIFACT_BYTES)
             .await
             .unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
+    /// The cap is exercised through the `max` parameter rather than a 64 MiB
+    /// fixture, so the boundary is pinned without the suite paying for it.
+    #[tokio::test]
+    async fn write_new_enforces_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let at_limit = tmp.path().join("at-limit");
+        LocalArtifactStore::write_new(&at_limit, b"1234", 4)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&at_limit).unwrap(), b"1234");
+
+        let over = tmp.path().join("over");
+        let e = LocalArtifactStore::write_new(&over, b"12345", 4)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("exceeds the size limit"), "got: {e}");
+        assert!(!over.exists(), "nothing may be left behind");
+    }
+
+    /// The sidecar is written from a caller-supplied mime type, so it needs the
+    /// same bound as the bytes — otherwise it stores and never loads again.
+    #[tokio::test]
+    async fn save_rejects_an_oversized_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalArtifactStore::new(tmp.path());
+
+        let huge_mime = "x".repeat(MAX_SIDECAR_BYTES as usize + 1);
+        let e = store
+            .save("chan", &[1, 2, 3], &huge_mime)
+            .await
+            .unwrap_err();
+
+        assert!(e.to_string().contains("exceeds the size limit"), "got: {e}");
+        // The id never escapes a failed save, so anything left behind is
+        // unreachable by `load` or `delete` — it must write nothing at all.
+        assert!(
+            std::fs::read_dir(tmp.path().join("chan"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a rejected save left a file behind"
+        );
+    }
+
+    /// Pins tokio's behaviour, not `write_new`'s use of it — deleting the
+    /// `flush` fails no test, because a deferred write failure cannot be
+    /// induced through `write_new` portably. This is the canary: `write_all`
+    /// reports success for a write that cannot succeed, and only `flush`
+    /// surfaces the error.
+    #[tokio::test]
+    async fn flush_surfaces_a_deferred_write_error() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("read-only-handle");
+        std::fs::write(&path, b"existing").unwrap();
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        assert!(
+            file.write_all(b"denied").await.is_ok(),
+            "tokio defers the write, so write_all reports success"
+        );
+        assert!(
+            file.flush().await.is_err(),
+            "flush must surface the deferred failure"
+        );
+    }
+
     /// `(base_dir, outside_dir, store)` where `<base>/evil` symlinks to `outside`,
-    /// which holds `secret` + `secret.json`.
-    fn symlinked_scope() -> (tempfile::TempDir, tempfile::TempDir, LocalArtifactStore) {
+    /// which holds `secret` + `secret.json`. `None` when symlinks are unavailable.
+    fn symlinked_scope() -> Option<(tempfile::TempDir, tempfile::TempDir, LocalArtifactStore)> {
         let base = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret"), b"top secret").unwrap();
         std::fs::write(outside.path().join("secret.json"), br#"{"mime_type":"x"}"#).unwrap();
-        symlink_dir(outside.path(), base.path().join("evil")).unwrap();
+        if !made_symlink(symlink_dir(outside.path(), base.path().join("evil"))) {
+            return None;
+        }
 
         let store = LocalArtifactStore::new(base.path());
-        (base, outside, store)
+        Some((base, outside, store))
     }
 
-    /// Ignored rather than compiled out where symlink creation needs privileges,
-    /// so the gap shows up as `ignored` instead of silently vanishing.
-    #[cfg_attr(not(unix), ignore = "creating symlinks needs privileges")]
     #[tokio::test]
     async fn symlinked_scope_load_is_rejected() {
-        let (_base, _outside, store) = symlinked_scope();
+        let Some((_base, _outside, store)) = symlinked_scope() else {
+            return;
+        };
         let res = store.load("evil", "secret").await;
         assert!(res.is_err(), "load through a symlinked scope must fail");
     }
 
-    #[cfg_attr(not(unix), ignore = "creating symlinks needs privileges")]
     #[tokio::test]
     async fn symlinked_scope_save_is_rejected() {
-        let (_base, outside, store) = symlinked_scope();
+        let Some((_base, outside, store)) = symlinked_scope() else {
+            return;
+        };
         let before = std::fs::read_dir(outside.path()).unwrap().count();
 
         assert!(store.save("evil", &[1, 2, 3], "image/png").await.is_err());
@@ -411,16 +637,16 @@ mod tests {
         assert_eq!(before, after, "save must not write outside the base");
     }
 
-    #[cfg_attr(not(unix), ignore = "creating symlinks needs privileges")]
     #[tokio::test]
     async fn symlinked_scope_delete_does_not_touch_outside() {
-        let (_base, outside, store) = symlinked_scope();
+        let Some((_base, outside, store)) = symlinked_scope() else {
+            return;
+        };
         assert!(store.delete("evil", "secret").await.is_err());
         assert!(outside.path().join("secret").exists());
         assert!(outside.path().join("secret.json").exists());
     }
 
-    #[cfg_attr(not(unix), ignore = "creating symlinks needs privileges")]
     #[tokio::test]
     async fn symlinked_artifact_file_load_is_rejected() {
         let base = tempfile::tempdir().unwrap();
@@ -430,7 +656,9 @@ mod tests {
 
         let dir = base.path().join("chan");
         std::fs::create_dir_all(&dir).unwrap();
-        symlink_file(&target, dir.join("art")).unwrap();
+        if !made_symlink(symlink_file(&target, dir.join("art"))) {
+            return;
+        }
         std::fs::write(dir.join("art.json"), br#"{"mime_type":"x"}"#).unwrap();
 
         let store = LocalArtifactStore::new(base.path());

@@ -29,3 +29,4 @@ that a future contributor (human or agent) would otherwise have to reverse-engin
 | [0003](0003-omnisession.md) | OmniSession as a separate execution model | Accepted |
 | [0004](0004-artifact-store.md) | ArtifactStore as a pure out-of-band media store | Accepted |
 | [0005](0005-tool-context.md) | Per-invocation `ToolContext` on `Tool::execute` | Accepted |
+| [0006](0006-artifact-path-jail.md) | Artifact path jail — lexical validation plus no-follow opens | Accepted |

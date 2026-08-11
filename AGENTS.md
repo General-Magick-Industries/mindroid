@@ -146,7 +146,7 @@ Use `MindroidError` variants (`Auth`, `Transport`, `Pipeline`, `Memory`, `Api`, 
 - **Feature gating is pervasive** — check `#[cfg(feature = "...")]` before touching impl modules; code compiles with default features only
 - **`pv_cobra` yanked** — Cobra VAD infra exists but the real crate is unavailable on crates.io; see `Cargo.toml` comment
 - **macOS builds work out of the box** — Linux needs `libasound2-dev` for `transport-audio`
-- **CI runs `--lib` tests only** — no integration or doc tests in CI (`cargo test --all-features --lib`)
+- **CI runs `--lib` tests only** — no integration or doc tests in CI (`cargo test --all-features --lib`), on ubuntu and windows. The artifact store's symlink tests skip themselves where the OS denies symlink creation, so a green local run does not mean they ran; set `MINDROID_REQUIRE_SYMLINKS=1` to turn that skip into a failure, as the Windows CI job does
 - **`NoMemory` / `NoObserver`** are the no-op defaults — don't create new empty impls
 
 ## Anti-Patterns

@@ -134,7 +134,7 @@ Built-in implementations:
 | Feature flag | Type | What it does |
 |---|---|---|
 | *(default)* | `NoArtifactStore` | No-op. Both `save` and `load` error — a fabricated id would discard the bytes and never load. |
-| `artifacts` | `LocalArtifactStore` | On-disk store, path-jailed under a base dir. Bytes + a JSON sidecar per `(scope, id)`. |
+| `artifacts` | `LocalArtifactStore` | On-disk store, path-jailed under a base dir. Bytes + a JSON sidecar per `(scope, id)`. Caps an artifact at 64 MiB and its sidecar at 64 KiB, and on Windows refuses ids that name a device (`NUL`, `COM1`, …) — see [ADR-0006](adr/0006-artifact-path-jail.md). |
 | `magickmind` | *(reserved)* | Remote backend; a user impl calling the artifact service. Placeholder today. |
 
 #### StoredArtifact
@@ -185,7 +185,9 @@ same store:
    became.
 3. **`GetArtifactTool`** (`get_artifact`) — the model calls it with an id;
    `ToolExecutorStage` resolves the bytes via the store's `load` and re-injects
-   them as a multimodal `Role::Tool` message the model can see.
+   them as a multimodal `Role::Tool` message the model can see. A round
+   re-attaches at most 8 artifacts, deduplicated — every one is held in memory
+   and base64-expanded into the request — and the message names any left out.
 
 Because a reference is just a `ContentPart::File` carrying an opaque id, swapping
 the storage backend (local → remote → S3 → encrypted) changes nothing downstream —

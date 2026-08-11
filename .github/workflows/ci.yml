@@ -150,3 +150,40 @@ jobs:
       - name: No Rust changes — skipping
         if: needs.changes.outputs.rust != 'true'
         run: echo "No Rust/manifest changes; clippy/build/test skipped."
+
+  # The path jail's Windows branches run nowhere else — ubuntu compiles out the
+  # `#[cfg(windows)]` code, and it is the security-relevant half. The symlink
+  # tests may skip themselves when the OS denies symlink creation, so the step
+  # below forbids that here: a runner without the privilege must fail, not pass
+  # having asserted nothing.
+  windows:
+    name: Windows Test
+    needs: changes
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - if: needs.changes.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      # The `#[cfg(windows)]` blocks are invisible to the ubuntu job's clippy.
+      - name: Clippy
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Test
+        if: needs.changes.outputs.rust == 'true'
+        # Forbids the symlink tests' self-skip: without this a runner lacking
+        # the privilege would report green having asserted nothing.
+        env:
+          MINDROID_REQUIRE_SYMLINKS: "1"
+        run: cargo test --all-features --lib
+
+      - name: No Rust changes — skipping
+        if: needs.changes.outputs.rust != 'true'
+        run: echo "No Rust/manifest changes; Windows tests skipped."

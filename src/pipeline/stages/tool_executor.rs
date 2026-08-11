@@ -281,6 +281,13 @@ impl ToolCallParser for XmlToolCallParser {
 /// Maximum number of tool-call → result rounds before giving up.
 const DEFAULT_MAX_ITERATIONS: usize = 20;
 
+/// Cap on artifacts re-attached in one round. The model chooses the count, and
+/// each is held in memory and base64-expanded into the request. Bounds a round,
+/// not a turn: `messages` accumulates across iterations, so the worst case is
+/// still this times [`DEFAULT_MAX_ITERATIONS`].
+#[cfg(feature = "artifacts")]
+const MAX_REINJECTED_ARTIFACTS: usize = 8;
+
 /// Prompt appended as a user message when `max_iterations` is reached, asking
 /// the LLM to summarise its findings rather than call more tools.
 const SUMMARY_PROMPT: &str = "You have gathered enough information from the tools. \
@@ -910,15 +917,41 @@ fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
 /// `Role::Tool` message carrying the text results AND any re-injected artifact
 /// images). When artifacts are disabled, this is just a text `Role::Tool` message.
 #[cfg(feature = "artifacts")]
+/// Reduce a round's requested ids to what will actually be re-attached,
+/// returning the ids left out. The model picks the count, and every artifact is
+/// held in memory at once before being base64-expanded into the request.
+#[cfg(feature = "artifacts")]
+fn plan_reinjection(load_ids: &mut Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    load_ids.retain(|id| seen.insert(id.clone()));
+    load_ids.split_off(load_ids.len().min(MAX_REINJECTED_ARTIFACTS))
+}
+
 async fn finalize_round_message(
     results_msg: String,
-    load_ids: Vec<String>,
+    mut load_ids: Vec<String>,
     artifacts: &ArtifactReinjection,
 ) -> LlmMessage {
     use crate::core::content::{ContentPart, ContentSource};
     use crate::models::Role;
 
+    let requested = load_ids.len();
+    let dropped = plan_reinjection(&mut load_ids);
+    if !dropped.is_empty() {
+        warn!(
+            "Re-attaching {MAX_REINJECTED_ARTIFACTS} of {requested} requested artifacts this round"
+        );
+    }
+
     let mut parts = vec![ContentPart::text(results_msg)];
+    // The results text already told the model each artifact loaded, so a silent
+    // drop would leave it describing images it cannot see.
+    if !dropped.is_empty() {
+        parts.push(ContentPart::text(format!(
+            "(only {MAX_REINJECTED_ARTIFACTS} artifacts were re-attached this round; not attached: {})",
+            dropped.join(", ")
+        )));
+    }
     if let Some(store) = &artifacts.store {
         for id in load_ids {
             match store.load(&artifacts.scope, &id).await {
@@ -1359,6 +1392,34 @@ Some text.
         use crate::core::content::ContentPart;
         use crate::models::Role;
         use std::sync::Arc;
+
+        /// Order matters: the model asked for these in sequence, and the ids it
+        /// keeps must be the first ones, not an arbitrary subset.
+        #[test]
+        fn reinjection_dedups_then_caps_in_order() {
+            let mut ids: Vec<String> = (0..12).map(|i| format!("id-{i}")).collect();
+            ids.insert(3, "id-0".into());
+            ids.push("id-1".into());
+
+            let dropped = plan_reinjection(&mut ids);
+
+            assert_eq!(ids.len(), MAX_REINJECTED_ARTIFACTS);
+            assert_eq!(ids[0], "id-0", "duplicates collapse to their first use");
+            assert_eq!(ids[1], "id-1");
+            assert_eq!(dropped.len(), 12 - MAX_REINJECTED_ARTIFACTS);
+            assert_eq!(dropped[0], format!("id-{MAX_REINJECTED_ARTIFACTS}"));
+        }
+
+        /// Under the cap nothing is dropped, and duplicates still collapse.
+        #[test]
+        fn reinjection_keeps_everything_under_the_cap() {
+            let mut ids = vec!["a".to_string(), "b".into(), "a".into()];
+
+            let dropped = plan_reinjection(&mut ids);
+
+            assert_eq!(ids, ["a", "b"]);
+            assert!(dropped.is_empty());
+        }
 
         #[test]
         fn id_read_by_name_only() {

@@ -82,17 +82,31 @@ built-in `LocalArtifactStore`.
 
 ### Fixed
 
+- **At most 8 artifacts are re-attached per tool round**, deduplicated. The
+  model chooses how many `get_artifact` calls a round makes and every result was
+  held in memory at once; a round asking for more now receives 8, and the
+  message says which ids were left out.
+- **`LocalArtifactStore` now bounds artifact size and rejects Windows device
+  names.** Reads and writes are capped at 64 MiB (the mime sidecar at 64 KiB),
+  and on Windows an id resolving to a device (`NUL`, `COM1`, …) is refused.
+  These are behaviour changes: an artifact larger than the cap no longer saves
+  or loads, and the device-name rule applies on Windows only, so a store
+  directory written on Linux can hold ids that Windows will not read back.
+  Previously the read was unbounded, so anyone able to plant a file in the
+  store's directories could drive an allocation failure, which aborts the
+  process.
 - **The local artifact store no longer follows a symlink at the artifact path,
   even under a race.** Reads open with `O_NOFOLLOW` (on Windows, the opened
   handle is checked for a reparse point) and writes use `create_new`, so the
   final path component that was validated is the one that is used. The prior
   stat-then-open check left a window in which an attacker able to write into
   the scope directory could swap in a symlink. Scoped deliberately: this covers
-  the final component only. Replacing the *scope directory* between validation
-  and open, a hardlink at the artifact path, and a FIFO there (which blocks the
-  read) are all still reachable by anyone who can write into the store's
-  directories — closing those needs `openat`-style traversal pinned to a
-  directory handle.
+  the final component only. Still reachable by anyone who can write into the
+  store's directories: replacing the *scope directory* between validation and
+  open, a hardlink at the artifact path, and a FIFO there — which blocks the
+  *open*, pinning a blocking-pool thread for good rather than merely stalling a
+  read. Closing those needs `openat`-style traversal pinned to a directory
+  handle.
 - **A model-supplied artifact id can no longer escape the store's base
   directory on Windows.** `LocalArtifactStore` rejected absolute paths, but a
   drive-relative component like `C:evil` is not absolute — and joining one
