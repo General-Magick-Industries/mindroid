@@ -9,7 +9,7 @@
 //! Responses are spoken aloud via TTS and persisted back to MagickMind.
 //!
 //! Run with:
-//!   cargo run --example magickmind_voice --features full -- \
+//!   cargo run -p mindroid-example-magickmind-voice --bin magickmind_voice -- \
 //!     --config examples/magickmind_voice/config.toml
 
 use std::sync::Arc;

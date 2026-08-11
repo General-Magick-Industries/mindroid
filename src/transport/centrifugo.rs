@@ -27,8 +27,23 @@ fn transport_err(msg: impl Into<String>) -> MindroidError {
 /// unencrypted socket any on-path observer can read and replay it (or inject
 /// a malicious refresh TTL). Require `wss://` unless the caller explicitly
 /// opts into insecure transport for local development.
+///
+/// The scheme is extracted and compared case-insensitively rather than
+/// prefix-matched: URL schemes are case-insensitive, so `"WS://host"`
+/// normalizes to `ws` while a `starts_with("ws://")` test would wave it
+/// through with a live token attached. An empty token needs no TLS, since
+/// there is nothing on the wire worth protecting.
 fn check_url_security(ws_url: &str, token: &str, allow_insecure: bool) -> Result<()> {
-    if ws_url.starts_with("ws://") && !token.is_empty() && !allow_insecure {
+    if token.is_empty() || allow_insecure {
+        return Ok(());
+    }
+
+    let scheme = ws_url
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .ok_or_else(|| transport_err(format!("invalid ws_url {ws_url}: missing scheme")))?;
+
+    if !scheme.eq_ignore_ascii_case("wss") {
         return Err(transport_err(format!(
             "refusing to send auth token over plaintext {ws_url}: use wss://, \
              or set transport allow_insecure = true for local development"
@@ -612,17 +627,30 @@ impl Transport for CentrifugoTransport {
     /// Cancel the listener and wait for it to unwind. Flipping a flag is not
     /// enough — the task overwrites it on reconnect, and its only other exit is
     /// a failed `tx.send`, which a quiet channel never triggers.
+    ///
+    /// Bounded at ~6s: 5s for a cooperative exit, then abort plus 1s to join. A
+    /// listener that never yields is abandoned rather than joined, so this can
+    /// return while such a task still runs.
     async fn disconnect(&mut self) -> Result<()> {
         self.cancel.cancel();
         self.connected.store(false, Ordering::SeqCst);
 
         let handle = self.listener.lock().unwrap().take();
-        if let Some(handle) = handle
-            && tokio::time::timeout(Duration::from_secs(5), handle)
+        if let Some(mut handle) = handle
+            && tokio::time::timeout(Duration::from_secs(5), &mut handle)
                 .await
                 .is_err()
         {
-            warn!("Centrifugo listener did not stop within 5s");
+            warn!("Centrifugo listener did not stop within 5s; aborting");
+            handle.abort();
+            // `abort` only lands at the task's next yield point, so bound the
+            // join too — a task wedged in synchronous code must not hang shutdown.
+            if tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .is_err()
+            {
+                warn!("Centrifugo listener did not unwind after abort; abandoning it");
+            }
         }
         Ok(())
     }
@@ -873,6 +901,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_uppercase_ws_scheme_with_token() {
+        assert!(check_url_security("WS://example.com/ws", "jwt-token", false).is_err());
+    }
+
+    #[test]
+    fn allows_uppercase_wss_scheme_with_token() {
+        assert!(check_url_security("WSS://example.com/ws", "jwt-token", false).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_ws_scheme_with_token() {
+        assert!(check_url_security("http://example.com/ws", "jwt-token", false).is_err());
+    }
+
+    #[test]
+    fn rejects_unparseable_url() {
+        assert!(check_url_security("not-a-url", "jwt-token", false).is_err());
+    }
+
+    #[test]
+    fn allow_insecure_still_permits_uppercase_ws() {
+        assert!(check_url_security("WS://localhost:8000/ws", "jwt-token", true).is_ok());
+    }
+
+    #[test]
     fn connect_cmd_service_user_uses_top_level_field() {
         let cmd = build_connect_cmd(
             1,
@@ -1000,6 +1053,45 @@ mod tests {
             start.elapsed()
         );
         assert!(!transport.is_connected());
+    }
+
+    /// A listener that ignores the cancellation token (never checks it, or is
+    /// stuck outside any `select!` on it) must still be stopped by `disconnect`:
+    /// on timeout the handle has to be aborted and joined, not dropped — dropping
+    /// an owned `JoinHandle` detaches the task rather than stopping it.
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_aborts_a_listener_that_ignores_cancellation() {
+        use std::sync::atomic::AtomicBool;
+
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
+        let mut transport = CentrifugoTransport::new("wss://example.com/ws", "agent", auth);
+
+        let stopped = Arc::new(AtomicBool::new(false));
+
+        struct StopGuard(Arc<AtomicBool>);
+        impl Drop for StopGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let guard_flag = Arc::clone(&stopped);
+        let handle = tokio::spawn(async move {
+            let _guard = StopGuard(guard_flag);
+            std::future::pending::<()>().await;
+        });
+
+        *transport.listener.lock().unwrap() = Some(handle);
+
+        transport
+            .disconnect()
+            .await
+            .expect("disconnect must abort a non-cooperative listener, not hang forever");
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "listener task must be aborted and joined (Drop must run), not detached"
+        );
     }
 
     /// `is_connected` must not report "disconnected" merely because a writer is

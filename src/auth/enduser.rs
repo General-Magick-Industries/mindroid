@@ -515,7 +515,9 @@ impl EndUserAuth {
 
         // No redirects: reqwest compares host and port without the scheme when
         // deciding whether to strip Authorization, so a same-host https -> http
-        // redirect would forward the credential in cleartext.
+        // redirect would forward the credential in cleartext. If the hardened
+        // builder can't be built, fail closed rather than falling back to
+        // reqwest's weaker defaults (redirects on, no timeouts).
         let builder = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
@@ -525,7 +527,10 @@ impl EndUserAuth {
         #[cfg(test)]
         let builder = builder.no_proxy();
 
-        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = builder.build().map_err(|e| MindroidError::Auth {
+            message: format!("failed to build the end-user auth HTTP client: {e}"),
+            source: Some(Box::new(e)),
+        })?;
 
         Ok(Self {
             base_url,
@@ -1645,6 +1650,25 @@ mod tests {
         assert!(EndUserAuth::try_new("http://gw.local", "t", None, false).is_err());
         assert!(EndUserAuth::try_new("http://gw.local", "t", None, true).is_ok());
         assert!(EndUserAuth::try_new("https://gw.local", "t", None, false).is_ok());
+    }
+
+    /// The hardened HTTP client builds for a valid base_url, and any rejected
+    /// base_url surfaces as a typed, propagated error rather than a panic or a
+    /// silently-weakened client. (`ClientBuilder::build()` itself has no
+    /// deterministic failure trigger from safe, cross-platform test code, so
+    /// this only exercises the error path reachable via `require_secure_url`;
+    /// that path and the `builder.build()` path both return through the same
+    /// `?` in `try_new`.)
+    #[test]
+    fn try_new_is_typed_ok_or_err() {
+        let ok = EndUserAuth::try_new("https://gw.local", "t", None, false);
+        assert!(ok.is_ok());
+
+        match EndUserAuth::try_new("not a url", "t", None, true) {
+            Err(MindroidError::Config { .. }) => {}
+            Err(other) => panic!("expected a typed Config error, got {other}"),
+            Ok(_) => panic!("expected an error for an unparseable base_url"),
+        }
     }
 
     /// Headers carry the rotated token, not the original.

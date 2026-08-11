@@ -25,7 +25,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (zero warnings 
 cargo fmt --all -- --check          # Format check
 ```
 
-**Workspace examples** build separately — each is its own crate under `examples/`.
+**Workspace examples** build separately — each is its own crate under `examples/`. Run one with `cargo run -p <package> --bin <bin> -- [args]` (not `cargo run --example`; `autoexamples = false` disables that form).
 
 ## Rust Edition & Toolchain
 
@@ -51,13 +51,10 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
 | `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
 | `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `AgentCredentials`, `auth.type = "enduser"` |
-| `magickmind-artifacts` | (includes `magickmind`) | `artifacts_magickmind` (panicking stub — see below) |
-| `full` | everything above **except `magickmind-artifacts`** | All types |
+| `full` | everything above | All types |
 
 Backend-specific code lives behind `magickmind`, not `persona` — enabling the
 persona system must not compile in a token client for one service.
-`magickmind-artifacts` is the narrower opt-in: its only item panics pending a
-backend endpoint, so it is excluded from `full` while `magickmind` is not.
 
 ## Architecture
 

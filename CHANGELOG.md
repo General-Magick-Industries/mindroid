@@ -75,12 +75,22 @@ Enabling the persona system no longer compiles in a token client for one service
 **Migration:** add `magickmind` to your feature list if you use any of the above.
 `full` includes it, so `--all-features` and `features = ["full"]` are unaffected.
 
-The panicking `artifacts_magickmind` stub moved to a narrower
-`magickmind-artifacts` flag, so `magickmind` itself is now part of `full` while
-the stub stays opt-in.
+This release ships no hosted artifact backend; `magickmind` covers end-user
+credentials and backend-routed tools only. Artifact storage is pluggable — use
+`artifacts_from_store` with any `ArtifactStore` implementation, such as the
+built-in `LocalArtifactStore`.
 
 ### Fixed
 
+- **A model-supplied artifact id can no longer escape the store's base
+  directory on Windows.** `LocalArtifactStore` rejected absolute paths, but a
+  drive-relative component like `C:evil` is not absolute — and joining one
+  discards the base it is joined onto, so the id resolved against that drive's
+  working directory instead. Since ids reach the store from `get_artifact`, this
+  was reachable by the model: an out-of-jail file-existence oracle, a bounded
+  read, and — through `delete`, which needs no sidecar and ignores errors —
+  arbitrary file deletion. Every path component must now be a single ordinary
+  component, and containment is re-checked after the join.
 - **An idle end-user agent no longer dies in its second hour.** The refresh tick
   was 80% of the token TTL while rotation only triggers inside the last 120s, so
   at the server's 3600s default the tick fired at 2880s with 720s remaining —
@@ -204,9 +214,7 @@ the stub stays opt-in.
 - `Runtime::run_until_cancelled` for cooperative shutdown.
 - `src/ingest/` — `Source` / `Encoder` / `MediaEncoder` / `Base64Source` /
   `ResolvedSource`, re-exported at the crate root.
-- `magickmind` feature gating the Magick Mind service integration, and
-  `magickmind-artifacts` gating the panicking remote-artifact stub (excluded
-  from `full`).
+- `magickmind` feature gating the Magick Mind service integration.
 - `ChannelNaming` / `ProxyChannelNaming` in `transport::centrifugo`, plus
   `CentrifugoTransport::with_channel_naming`.
 - Forward-compatible `expires_in` handling. The rotation response's lifetime is

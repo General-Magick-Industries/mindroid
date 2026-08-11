@@ -95,8 +95,7 @@ async fn main() -> mindroid::Result<()> {
 | `identity` | no | Cross-platform identity resolution |
 | `artifacts` | no | Out-of-band media storage (offload + on-demand re-injection) |
 | `magickmind` | no | Magick Mind service integration (end-user credentials, backend-routed tools) |
-| `magickmind-artifacts` | no | Remote artifact backend (stub — panics; excluded from `full`) |
-| `full` | no | All features except `magickmind-artifacts` |
+| `full` | no | All features |
 
 ## Configuration
 

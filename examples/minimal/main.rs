@@ -1,6 +1,6 @@
 //! Minimal Mindroid agent: stdio transport + Ollama local LLM.
 //!
-//! Run with: `cargo run --example minimal --features ollama,stdio,static-auth`
+//! Run with: `cargo run -p mindroid-example-minimal --bin minimal`
 //! Requires a running Ollama instance at http://localhost:11434
 
 use mindroid::Runtime;

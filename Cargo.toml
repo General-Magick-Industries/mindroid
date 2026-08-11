@@ -67,14 +67,10 @@ identity = []
 # Artifact storage (out-of-band media offload). Pulls in base64 so inline-image
 # encoding works without requiring the transport-ws feature (see llm_client).
 artifacts = ["llm-client", "dep:base64"]
-# Magick Mind service integration: end-user credentials, backend-routed tools,
-# and the remote artifact backend. Backend-specific — enabling `persona` should
-# not compile in a token client for one service.
+# Magick Mind service integration: end-user credentials and backend-routed
+# tools. Backend-specific — enabling `persona` should not compile in a token
+# client for one service.
 magickmind = ["artifacts", "persona", "dep:reqwest"]
-# The remote artifact backend alone. Blocked on the backend presigned-GET
-# download endpoint; `artifacts_magickmind` panics today, so this is
-# deliberately excluded from `full` while `magickmind` itself is not.
-magickmind-artifacts = ["magickmind"]
 # All features
 full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity", "artifacts", "magickmind"]
 

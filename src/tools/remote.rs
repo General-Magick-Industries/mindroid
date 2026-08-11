@@ -395,6 +395,25 @@ pub fn tool_result_call_id(framed: &str) -> Option<&str> {
     is_valid_call_id(id).then_some(id)
 }
 
+/// Validate an inbound envelope BEFORE it is correlated, yielding
+/// `(call_id, name)` only for a structurally complete one: exactly one
+/// `<tool_result` block, a matching `</tool_result>` terminator, and both
+/// attributes parseable.
+///
+/// Claiming an outstanding call is one-shot, so a truncated frame that reached
+/// the claim would consume the pending entry and kill the valid retry.
+pub fn validated_tool_result(framed: &str) -> Option<(&str, &str)> {
+    if framed.matches("<tool_result").count() != 1 {
+        return None;
+    }
+    let tag_start = framed.find("<tool_result")?;
+    let tag_end = tag_start + framed[tag_start..].find('>')?;
+    if framed[tag_end..].matches("</tool_result>").count() != 1 {
+        return None;
+    }
+    Some((tool_result_call_id(framed)?, tool_result_name(framed)?))
+}
+
 /// Strip the `call` attribute so the model never sees correlation plumbing.
 ///
 /// Every `<tool_result>` block is stripped, not just the first: a message
@@ -458,7 +477,7 @@ fn schema_is_bounded(value: &Value, depth: usize) -> bool {
 
 /// Names reach an XML attribute and the system prompt, so the charset must not
 /// be able to break out of either.
-fn is_valid_tool_name(name: &str) -> bool {
+pub(crate) fn is_valid_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -468,10 +487,25 @@ fn is_valid_tool_name(name: &str) -> bool {
 
 /// Stop a result closing `<tool_result>` and opening a tag the model would read
 /// as a second, fabricated execution.
-fn escape_markup(s: &str) -> String {
+pub(crate) fn escape_markup(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// The one builder for a locally-executed `<tool_result>` envelope. Tool output
+/// is attacker-reachable (shell stdout, fetched pages), so the body is escaped
+/// and the name validated before either lands in an attribute.
+pub(crate) fn tool_result_envelope(name: &str, result: &str) -> String {
+    let name = if is_valid_tool_name(name) {
+        name
+    } else {
+        "invalid"
+    };
+    format!(
+        "<tool_result name=\"{name}\">{}</tool_result>\n",
+        escape_markup(result)
+    )
 }
 
 fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
@@ -549,6 +583,33 @@ mod tests {
         let stripped = strip_call_attribute(&framed);
         assert!(!stripped.contains("call="), "{stripped}");
         assert!(stripped.contains("name=\"peek\""), "{stripped}");
+    }
+
+    #[test]
+    fn only_a_structurally_complete_envelope_validates() {
+        let complete = "<tool_result name=\"peek\" call=\"c1\">ok</tool_result>";
+        assert_eq!(validated_tool_result(complete), Some(("c1", "peek")));
+
+        // Truncated: no terminator.
+        assert_eq!(
+            validated_tool_result("<tool_result name=\"peek\" call=\"c1\">ok"),
+            None
+        );
+        // Truncated open tag.
+        assert_eq!(
+            validated_tool_result("<tool_result name=\"peek\" call=\"c1\""),
+            None
+        );
+        // More than one block.
+        assert_eq!(
+            validated_tool_result(&format!("{complete}\n{complete}")),
+            None
+        );
+        // Missing the correlation attribute.
+        assert_eq!(
+            validated_tool_result("<tool_result name=\"peek\">ok</tool_result>"),
+            None
+        );
     }
 
     /// Every block is stripped: leaving a later one intact leaks correlation

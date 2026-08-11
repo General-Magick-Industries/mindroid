@@ -20,6 +20,7 @@ artifact-agent-store/
 # AI tooling
 .claude/
 .omc/
+.omo/
 # AGENTS.md is intentionally committed — it is the shared, cross-tool source of
 # truth for agent + contributor guidance (see docs/adr/). CLAUDE.md imports it.
 

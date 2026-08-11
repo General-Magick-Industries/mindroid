@@ -16,7 +16,7 @@
 //!   6. MagickmindPersistence — save response to MagickMind
 //!
 //! Run with:
-//!   cargo run --example persona_agent --features full -- --config examples/persona_agent/dazael.toml
+//!   cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/dazael.toml
 
 use std::sync::Arc;
 

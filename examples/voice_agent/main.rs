@@ -9,13 +9,13 @@
 //! running, open it if not, and start playback — all via shell commands.
 //!
 //! Run with:
-//!   cargo run --example voice_agent --features full
+//!   cargo run -p mindroid-example-voice-agent --bin voice_agent
 //!
 //! Text mode (keyboard input):
-//!   cargo run --example voice_agent --features full -- --text
+//!   cargo run -p mindroid-example-voice-agent --bin voice_agent -- --text
 //!
 //! Custom config:
-//!   cargo run --example voice_agent --features full -- --config examples/voice_agent/config.toml
+//!   cargo run -p mindroid-example-voice-agent --bin voice_agent -- --config examples/voice_agent/config.toml
 //!
 //! See `examples/voice_agent/config.toml` for all configuration options.
 //! API keys can be set in the config or via environment variables:

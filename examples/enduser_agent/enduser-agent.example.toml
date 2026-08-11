@@ -2,7 +2,7 @@
 #
 # Copy to a git-ignored file (e.g. enduser-agent.local.toml) and fill in real
 # values before running:
-#   cargo run --example enduser_agent --features full -- --config ./enduser-agent.local.toml
+#   cargo run -p mindroid-example-enduser-agent --bin enduser_agent -- --config ./enduser-agent.local.toml
 #
 # auth.type = "enduser" makes the whole magickmind surface route to the
 # end-user API (connect proxy, user: channel, /v1/end-user/magickspaces/...).

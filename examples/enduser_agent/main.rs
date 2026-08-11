@@ -7,7 +7,7 @@
 //! Flow per message: fetch context → LLM → persist (fans out to participants).
 //!
 //! Run:
-//!   cargo run --example enduser_agent --features full -- --config ./enduser-agent.toml
+//!   cargo run -p mindroid-example-enduser-agent --bin enduser_agent -- --config ./enduser-agent.local.toml
 
 use std::sync::Arc;
 

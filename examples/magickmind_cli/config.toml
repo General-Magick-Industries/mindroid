@@ -1,5 +1,5 @@
 # MagickMind CLI configuration
-# Run with: cargo run --example magickmind_cli --features full -- --config examples/magickmind_cli/config.toml
+# Run with: cargo run -p mindroid-example-magickmind-cli --bin magickmind_cli -- --config examples/magickmind_cli/config.toml
 
 [agent]
 agent_id = "example-agent-id"      # MagickMind magickspace ID for this agent

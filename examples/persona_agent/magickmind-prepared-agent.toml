@@ -10,7 +10,7 @@
 # end-user token, see magickmind-prepared-enduser.toml.
 #
 # Run with:
-#   cargo run --example persona_agent --features full -- --config examples/persona_agent/magickmind-prepared-agent.toml
+#   cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/magickmind-prepared-agent.toml
 
 [agent]
 agent_id = "example-agent-id"

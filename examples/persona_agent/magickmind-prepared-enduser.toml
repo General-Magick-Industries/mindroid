@@ -10,7 +10,7 @@
 # here (the token carries it) but is kept for the @mention gate and persistence.
 #
 # Run with:
-#   cargo run --example persona_agent --features full -- --config examples/persona_agent/magickmind-prepared-enduser.toml
+#   cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/magickmind-prepared-enduser.toml
 
 [agent]
 agent_id = "example-agent-id"

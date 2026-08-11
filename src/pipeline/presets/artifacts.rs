@@ -20,8 +20,9 @@
 //!     .add_stage(PostProcessor);
 //! ```
 //!
-//! Swapping backends is a one-line change: `artifacts_local(..)` →
-//! `artifacts_magickmind(..)`.
+//! Swapping backends means implementing [`ArtifactStore`] for the new backend
+//! and passing it to [`artifacts_from_store`] — no change to the offload stage
+//! or the tool.
 
 use std::sync::Arc;
 
@@ -56,26 +57,6 @@ pub fn artifacts_from_store(
     scope: impl Into<String>,
 ) -> ArtifactSet {
     ArtifactManager::new(store).into_stage_and_tool(scope)
-}
-
-/// Build the artifact set backed by Magickmind's remote artifact service.
-///
-/// **Not yet available — panics.** The `MagickmindArtifactStore` impl is blocked
-/// on the backend download endpoint (`GET /v1/artifacts/{id}/download`, presigned
-/// GET), which is not implemented server-side yet. This entry point reserves the
-/// shape so swapping `artifacts_local` → `artifacts_magickmind` is a one-line
-/// change once the backend lands. Gated behind `magickmind-artifacts`, which is
-/// not part of `full` — enabling it opts into a hard panic at the call site.
-#[cfg(feature = "magickmind-artifacts")]
-pub fn artifacts_magickmind(
-    _base_url: impl Into<String>,
-    _auth: Arc<dyn crate::auth::Auth>,
-    _scope: impl Into<String>,
-) -> ArtifactSet {
-    unimplemented!(
-        "MagickmindArtifactStore is blocked on the backend presigned-GET download \
-         endpoint (GET /v1/artifacts/{{id}}/download). Use artifacts_local for now."
-    )
 }
 
 #[cfg(test)]

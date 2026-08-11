@@ -30,6 +30,7 @@ jobs:
               - "**/*.rs"
               - "Cargo.toml"
               - "Cargo.lock"
+              - "examples/*/Cargo.toml"
               - ".github/workflows/ci.yml"
 
   fmt:
@@ -133,6 +134,10 @@ jobs:
       - name: Build
         if: needs.changes.outputs.rust == 'true'
         run: cargo build --all-features
+
+      - name: Build examples
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo build --workspace
 
       - name: Test
         if: needs.changes.outputs.rust == 'true'
