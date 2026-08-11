@@ -913,10 +913,6 @@ fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Build the single tool-result message for a round (Defect 3: one multimodal
-/// `Role::Tool` message carrying the text results AND any re-injected artifact
-/// images). When artifacts are disabled, this is just a text `Role::Tool` message.
-#[cfg(feature = "artifacts")]
 /// Reduce a round's requested ids to what will actually be re-attached,
 /// returning the ids left out. The model picks the count, and every artifact is
 /// held in memory at once before being base64-expanded into the request.
@@ -927,6 +923,10 @@ fn plan_reinjection(load_ids: &mut Vec<String>) -> Vec<String> {
     load_ids.split_off(load_ids.len().min(MAX_REINJECTED_ARTIFACTS))
 }
 
+/// Build the single tool-result message for a round (Defect 3: one multimodal
+/// `Role::Tool` message carrying the text results AND any re-injected artifact
+/// images). When artifacts are disabled, this is just a text `Role::Tool` message.
+#[cfg(feature = "artifacts")]
 async fn finalize_round_message(
     results_msg: String,
     mut load_ids: Vec<String>,

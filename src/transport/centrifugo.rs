@@ -628,31 +628,42 @@ impl Transport for CentrifugoTransport {
     /// enough — the task overwrites it on reconnect, and its only other exit is
     /// a failed `tx.send`, which a quiet channel never triggers.
     ///
-    /// Bounded at ~6s: 5s for a cooperative exit, then abort plus 1s to join. A
-    /// listener that never yields is abandoned rather than joined, so this can
-    /// return while such a task still runs.
+    /// Bounded at ~6s: 5s for a cooperative exit, then abort plus 1s to join.
+    ///
+    /// A listener that outlives both is *not* abandoned — dropping a live
+    /// `JoinHandle` detaches the task, which ADR-0001 disallows. The handle
+    /// goes back on the transport and the call returns an error, so the
+    /// caller learns shutdown failed and a later `disconnect` can retry the
+    /// join rather than inheriting an untracked task.
     async fn disconnect(&mut self) -> Result<()> {
         self.cancel.cancel();
         self.connected.store(false, Ordering::SeqCst);
 
-        let handle = self.listener.lock().unwrap().take();
-        if let Some(mut handle) = handle
-            && tokio::time::timeout(Duration::from_secs(5), &mut handle)
-                .await
-                .is_err()
+        let Some(mut handle) = self.listener.lock().unwrap().take() else {
+            return Ok(());
+        };
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_ok()
         {
-            warn!("Centrifugo listener did not stop within 5s; aborting");
-            handle.abort();
-            // `abort` only lands at the task's next yield point, so bound the
-            // join too — a task wedged in synchronous code must not hang shutdown.
-            if tokio::time::timeout(Duration::from_secs(1), handle)
-                .await
-                .is_err()
-            {
-                warn!("Centrifugo listener did not unwind after abort; abandoning it");
-            }
+            return Ok(());
         }
-        Ok(())
+
+        warn!("Centrifugo listener did not stop within 5s; aborting");
+        handle.abort();
+        // `abort` only lands at the task's next yield point, so bound the join
+        // too — a task wedged in synchronous code must not hang shutdown.
+        if tokio::time::timeout(Duration::from_secs(1), &mut handle)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        *self.listener.lock().unwrap() = Some(handle);
+        Err(transport_err(
+            "Centrifugo listener did not stop; its handle is retained for a later disconnect",
+        ))
     }
 
     fn is_connected(&self) -> bool {
@@ -660,6 +671,21 @@ impl Transport for CentrifugoTransport {
     }
 
     async fn listen(&self, tx: mpsc::Sender<Message>) -> Result<()> {
+        // Refuse rather than overwrite: `disconnect` parks a listener it could
+        // not join here, and replacing it would drop a live handle — the detach
+        // ADR-0001 forbids, and the one that retention exists to prevent.
+        if self
+            .listener
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|prev| !prev.is_finished())
+        {
+            return Err(transport_err(
+                "a listener is already running; disconnect must succeed before listening again",
+            ));
+        }
+
         let ws_url = self.ws_url.clone();
         let agent_id = self.agent_id.clone();
         let identity = Arc::clone(&self.identity);
@@ -1096,10 +1122,11 @@ mod tests {
 
     /// The case `abort` alone cannot handle: a listener wedged in a blocking
     /// call never reaches a yield point, so the abort never lands and the join
-    /// would hang forever. `disconnect` must give up and return. Real time, no
-    /// pause — a paused clock would not reproduce a blocked thread.
+    /// would hang forever. `disconnect` must return, report the failure, and
+    /// keep the handle. Real time, no pause — a paused clock would not
+    /// reproduce a blocked thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnect_abandons_a_listener_wedged_in_blocking_code() {
+    async fn disconnect_reports_failure_for_a_wedged_listener() {
         let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
         let mut transport = CentrifugoTransport::new("wss://example.com/ws", "agent", auth);
 
@@ -1114,17 +1141,25 @@ mod tests {
         });
         *transport.listener.lock().unwrap() = Some(handle);
 
-        tokio::time::timeout(Duration::from_secs(15), transport.disconnect())
+        let outcome = tokio::time::timeout(Duration::from_secs(15), transport.disconnect())
             .await
-            .expect("disconnect must not hang")
-            .expect("disconnect must not error");
+            .expect("disconnect must not hang");
 
-        // The point of the bounded join: return without the listener, rather
-        // than outlast it. A timing bound alone would also pass if disconnect
-        // simply waited for the sleep.
+        // Bounded, so it returns rather than waiting the listener out — a
+        // timing bound alone would also pass if it simply waited for the sleep.
         assert!(
             !finished.load(Ordering::SeqCst),
-            "disconnect waited for the blocked listener instead of abandoning it"
+            "disconnect waited for the blocked listener"
+        );
+        // But bounded is not success: the task is still running, so reporting
+        // Ok would be a lie and dropping the handle would detach it (ADR-0001).
+        assert!(
+            outcome.is_err(),
+            "a listener that outlived the join must surface as a shutdown failure"
+        );
+        assert!(
+            transport.listener.lock().unwrap().is_some(),
+            "the handle must be retained, not discarded"
         );
     }
 

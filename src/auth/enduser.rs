@@ -85,7 +85,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::{Auth, MindroidError, Result};
@@ -135,6 +135,13 @@ const ROTATE_TIMEOUT: Duration = Duration::from_secs(20);
 /// and a token file commonly lives on a mount that can hang.
 const DELIVERY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to leave a stalled delivery path alone. Bounds the wedged reads
+/// a hung mount can accumulate: one per cooldown, not one per `get_token`.
+const DELIVERY_STALL_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// The file carries a single token; anything larger is not one.
+const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 /// Ceiling on retry spacing.
@@ -179,77 +186,68 @@ struct DeliveredToken {
     expires_in: Option<u64>,
 }
 
-/// Read a delivered credential, if the file holds one that differs from what we
-/// already have.
+/// Outcome of one look at the delivery file.
 ///
-/// Every failure here is a miss rather than an error: an absent file is the
-/// normal case, and a partial read is what a non-atomic writer produces. The
-/// caller then proceeds with whatever it already held — so a supervisor that
-/// writes nothing simply leaves the credential to die on its own terms, which is
-/// the correct outcome.
-/// Runs on a blocking thread under a deadline: `rotate_into` calls this while
-/// holding the async write lock, so a hung path (a stalled network mount) would
-/// otherwise park the worker thread and every concurrent `get_token` behind it.
-/// `ROTATE_TIMEOUT` covers only the HTTP call, not this.
-struct PendingDeliveryRead {
-    current: String,
-    handle: tokio::task::JoinHandle<Option<DeliveredToken>>,
+/// A `Miss` is the normal case, not an error: an absent file is expected, and a
+/// partial read is what a non-atomic writer produces. The caller keeps whatever
+/// it held — a supervisor that writes nothing leaves the credential to die on
+/// its own terms, which is correct.
+///
+/// `Stalled` is distinct because a path that hung once will hang again. The
+/// caller backs off from it rather than starting another read that nothing can
+/// cancel.
+enum DeliveryRead {
+    Adopted(DeliveredToken),
+    Miss,
+    Stalled,
 }
 
-type DeliveryRead = Arc<Mutex<Option<PendingDeliveryRead>>>;
-
-async fn read_delivered_async(
-    pending: &DeliveryRead,
-    path: &str,
-    current: &str,
-) -> Option<DeliveredToken> {
-    read_delivered_with_timeout(pending, path, current, DELIVERY_READ_TIMEOUT).await
+async fn read_delivered_async(path: &str, current: &str) -> DeliveryRead {
+    read_delivered_with_timeout(path, current, DELIVERY_READ_TIMEOUT).await
 }
 
-async fn read_delivered_with_timeout(
-    pending: &DeliveryRead,
-    path: &str,
-    current: &str,
-    timeout: Duration,
-) -> Option<DeliveredToken> {
-    let mut pending = pending.lock().await;
-    if pending.is_none() {
-        let (path, current) = (path.to_string(), current.to_string());
-        let snapshot = current.clone();
-        *pending = Some(PendingDeliveryRead {
-            current: snapshot,
-            handle: tokio::task::spawn_blocking(move || read_delivered(&path, &current)),
-        });
-    }
-    let read = pending.as_mut()?;
-    let same_generation = read.current == current;
-    let result = tokio::time::timeout(timeout, &mut read.handle).await;
-    match result {
-        Ok(Ok(delivered)) => {
-            pending.take();
-            same_generation.then_some(delivered).flatten()
-        }
+/// Deliberately `tokio::fs` rather than our own `spawn_blocking`: a `JoinHandle`
+/// this crate holds and then drops — when the auth or runtime goes away
+/// mid-read — detaches a task tokio cannot cancel, which ADR-0001 disallows.
+///
+/// Timing out does not cancel the underlying read either; nothing can. What it
+/// does is release this caller. `Stalled` then lets the caller stop re-reading,
+/// which is what bounds the wedged reads a hung path can accumulate.
+async fn read_delivered_with_timeout(path: &str, current: &str, timeout: Duration) -> DeliveryRead {
+    let read = async {
+        // Bounded: the file holds one token, and an unbounded read of an
+        // attacker- or accident-sized file is a memory hazard.
+        use tokio::io::AsyncReadExt;
+
+        let file = tokio::fs::File::open(path).await?;
+        let mut raw = String::new();
+        file.take(MAX_TOKEN_FILE_BYTES)
+            .read_to_string(&mut raw)
+            .await?;
+        Ok::<_, std::io::Error>(raw)
+    };
+
+    match tokio::time::timeout(timeout, read).await {
+        Ok(Ok(raw)) => match parse_delivered(&raw, path, current) {
+            Some(delivered) => DeliveryRead::Adopted(delivered),
+            None => DeliveryRead::Miss,
+        },
         Ok(Err(e)) => {
-            pending.take();
-            warn!("Delivered-token read panicked: {e}");
-            None
+            debug!("No delivered token at {path}: {e}");
+            DeliveryRead::Miss
         }
         Err(_) => {
             warn!(
-                "Delivered-token read exceeded {}s; proceeding without it",
-                DELIVERY_READ_TIMEOUT.as_secs()
+                "Delivered-token read at {path} exceeded {}s; backing off from it",
+                timeout.as_secs()
             );
-            None
+            DeliveryRead::Stalled
         }
     }
 }
 
-fn read_delivered(path: &str, current: &str) -> Option<DeliveredToken> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| debug!("No delivered token at {path}: {e}"))
-        .ok()?;
-
-    let delivered: DeliveredToken = serde_json::from_str(&raw)
+fn parse_delivered(raw: &str, path: &str, current: &str) -> Option<DeliveredToken> {
+    let delivered: DeliveredToken = serde_json::from_str(raw)
         .map_err(|e| warn!("Ignoring malformed token file {path}: {e}"))
         .ok()?;
 
@@ -420,6 +418,8 @@ struct AuthState {
     token: TokenState,
     fate: TokenFate,
     failure: FailureState,
+    /// Set when a delivery read times out; suppresses re-reads until then.
+    delivery_retry_after: Option<Instant>,
 }
 
 impl AuthState {
@@ -489,7 +489,6 @@ pub struct EndUserAuth {
     /// Path a control plane writes freshly minted credentials to, re-read on
     /// need. `None` disables the channel.
     token_file: Option<String>,
-    delivery_read: DeliveryRead,
 }
 
 impl EndUserAuth {
@@ -538,7 +537,6 @@ impl EndUserAuth {
             client,
             supervised: false,
             token_file: None,
-            delivery_read: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(AuthState {
                 token: TokenState {
                     token: token.into(),
@@ -546,6 +544,7 @@ impl EndUserAuth {
                 },
                 fate: TokenFate::Live,
                 failure: FailureState::default(),
+                delivery_retry_after: None,
             })),
         })
     }
@@ -728,24 +727,33 @@ impl EndUserAuth {
         // for. A miss (no file, unreadable, unchanged) falls through and the
         // credential dies on its own terms — the file is a chance to recover,
         // not a requirement.
+        let may_read = state.delivery_retry_after.is_none_or(|until| now >= until);
         if let Some(path) = &self.token_file
-            && let Some(delivered) =
-                read_delivered_async(&self.delivery_read, path, &state.token.token).await
+            && may_read
         {
-            info!("Adopting a delivered end-user token from {path}");
-            state.token = TokenState {
-                // `expires_at` first here: see DeliveredToken::expires_in.
-                expires_at: delivered
-                    .expires_at
-                    .as_deref()
-                    .and_then(|s| parse_expires_at(s, now))
-                    .or_else(|| delivered.expires_in.and_then(|s| checked_deadline(now, s)))
-                    .unwrap_or(now),
-                token: delivered.token,
-            };
-            state.fate = TokenFate::Live;
-            state.failure.record_success();
-            return Ok(state.token.token.clone());
+            match read_delivered_async(path, &state.token.token).await {
+                DeliveryRead::Stalled => {
+                    state.delivery_retry_after = Some(now + DELIVERY_STALL_COOLDOWN);
+                }
+                DeliveryRead::Miss => {}
+                DeliveryRead::Adopted(delivered) => {
+                    info!("Adopting a delivered end-user token from {path}");
+                    state.delivery_retry_after = None;
+                    state.token = TokenState {
+                        // `expires_at` first here: see DeliveredToken::expires_in.
+                        expires_at: delivered
+                            .expires_at
+                            .as_deref()
+                            .and_then(|s| parse_expires_at(s, now))
+                            .or_else(|| delivered.expires_in.and_then(|s| checked_deadline(now, s)))
+                            .unwrap_or(now),
+                        token: delivered.token,
+                    };
+                    state.fate = TokenFate::Live;
+                    state.failure.record_success();
+                    return Ok(state.token.token.clone());
+                }
+            }
         }
 
         if state.fate == TokenFate::Dead {
@@ -1226,55 +1234,22 @@ mod tests {
         assert_eq!(with_deadline(auth.get_token()).await.unwrap(), "held");
     }
 
-    #[tokio::test]
-    async fn a_timed_out_delivery_read_is_reused_instead_of_respawned() {
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let worker_barrier = barrier.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            worker_barrier.wait();
-            None
-        });
-        let task_id = handle.id();
-        let pending: DeliveryRead = Arc::new(Mutex::new(Some(PendingDeliveryRead {
-            current: "unused".to_string(),
-            handle,
-        })));
-
+    /// The generation check the retained-handle design used to need: a file
+    /// holding the token already in use is not a delivery.
+    #[test]
+    fn parse_delivered_ignores_a_token_already_held() {
         assert!(
-            read_delivered_with_timeout(&pending, "unused", "unused", Duration::from_millis(10),)
-                .await
-                .is_none()
+            parse_delivered(r#"{"token":"same"}"#, "path", "same").is_none(),
+            "re-adopting the current token would restart rotation for nothing"
         );
-        assert_eq!(pending.lock().await.as_ref().unwrap().handle.id(), task_id);
-
-        barrier.wait();
-        assert!(
-            read_delivered_with_timeout(&pending, "unused", "unused", Duration::from_secs(1))
-                .await
-                .is_none()
+        assert!(parse_delivered(r#"{"token":""}"#, "path", "other").is_none());
+        assert!(parse_delivered("not json", "path", "other").is_none());
+        assert_eq!(
+            parse_delivered(r#"{"token":"fresh"}"#, "path", "old")
+                .unwrap()
+                .token,
+            "fresh"
         );
-        assert!(pending.lock().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_completed_delivery_read_is_ignored_after_token_generation_changes() {
-        let handle = tokio::task::spawn_blocking(|| {
-            Some(DeliveredToken {
-                token: "delivered-for-old-generation".to_string(),
-                expires_at: None,
-                expires_in: None,
-            })
-        });
-        let pending: DeliveryRead = Arc::new(Mutex::new(Some(PendingDeliveryRead {
-            current: "old".to_string(),
-            handle,
-        })));
-
-        let delivered =
-            read_delivered_with_timeout(&pending, "unused", "new", Duration::from_secs(1)).await;
-
-        assert!(delivered.is_none());
-        assert!(pending.lock().await.is_none());
     }
 
     /// Re-delivering the same token must not look like a new credential.
