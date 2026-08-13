@@ -30,11 +30,24 @@ pub struct Runtime {
     pub(crate) routines: Vec<Box<dyn Routine>>,
     pub(crate) routine_handles: Vec<(CancellationToken, tokio::task::JoinHandle<()>)>,
     pub(crate) coordinator: Arc<crate::core::coordinator::PerKey<String>>,
+    pub(crate) health: crate::core::health::HealthReporter,
+    pub(crate) health_watcher: crate::core::health::HealthWatcher,
 }
 
 impl Runtime {
     pub fn builder() -> RuntimeBuilder {
         RuntimeBuilder::new()
+    }
+
+    /// Observe this runtime's liveness.
+    ///
+    /// `run` only distinguishes running from exited. This reports the state in
+    /// between — notably [`Health::Reconnecting`], where the process is alive
+    /// but cannot receive messages. Cheap to clone; hand one to a supervisor.
+    ///
+    /// [`Health::Reconnecting`]: crate::Health::Reconnecting
+    pub fn health(&self) -> crate::core::health::HealthWatcher {
+        self.health_watcher.clone()
     }
 
     /// Start the runtime main loop. Blocks until the transport closes.
@@ -55,9 +68,23 @@ impl Runtime {
     }
 
     async fn run_inner(&mut self, cancel: Option<CancellationToken>) -> Result<()> {
+        // Before connect, so a transport that reconnects in the background can
+        // publish its own transitions from the first attempt onward.
+        self.transport.set_health_reporter(self.health.clone());
+
         // Connect transport
-        self.transport.connect().await?;
+        if let Err(e) = self.transport.connect().await {
+            self.health.set(crate::core::health::Health::Stopped);
+            return Err(e);
+        }
         tracing::info!("Transport '{}' connected", self.transport.name());
+        // Only for a transport that finishes connecting in `connect`. One that
+        // connects lazily is still `Starting` here — `listen` has not run, so it
+        // could not have published anything — and announcing `Ready` for it is
+        // the false green light this whole mechanism exists to prevent.
+        if !self.transport.reports_own_health() {
+            self.health.set(crate::core::health::Health::Ready);
+        }
 
         // Notify observers
         for obs in self.observers.iter() {
@@ -68,7 +95,10 @@ impl Runtime {
         let (tx, mut rx) = mpsc::channel::<Message>(self.channel_buffer);
 
         // Start transport listening — feeds messages into tx
-        self.transport.listen(tx).await?;
+        if let Err(e) = self.transport.listen(tx).await {
+            self.health.set(crate::core::health::Health::Stopped);
+            return Err(e);
+        }
         tracing::info!("Listening for messages...");
 
         // Spawn routine tasks
@@ -260,7 +290,11 @@ impl Runtime {
         for obs in self.observers.iter() {
             obs.on_shutdown().await;
         }
-        self.transport.disconnect().await?;
+        let disconnected = self.transport.disconnect().await;
+        // Terminal either way: a failed disconnect still leaves the runtime
+        // stopped, and an observer waiting on `Ready` must not hang.
+        self.health.set(crate::core::health::Health::Stopped);
+        disconnected?;
         tracing::info!("Shutdown complete");
         Ok(())
     }
@@ -470,5 +504,206 @@ mod tests {
             .expect("clean exit");
 
         assert!(disconnected.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod health_wiring_tests {
+    use super::*;
+    use crate::core::health::{Health, HealthReporter};
+    use crate::models::Response;
+    use async_trait::async_trait;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Transport that fails to connect, to prove a failed start is observable
+    /// as `Stopped` rather than leaving watchers waiting on `Ready` forever.
+    struct DeadTransport {
+        got_reporter: StdArc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Transport for DeadTransport {
+        fn name(&self) -> &str {
+            "dead"
+        }
+        async fn connect(&mut self) -> Result<()> {
+            Err(crate::error::MindroidError::config("no route to host"))
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: mpsc::Sender<crate::models::Message>) -> Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _r: &Response) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+        fn set_health_reporter(&mut self, _r: HealthReporter) {
+            self.got_reporter.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn runtime_with(transport: Box<dyn Transport>) -> Runtime {
+        let (health, health_watcher) = HealthReporter::new();
+        Runtime {
+            transport,
+            pipeline: Arc::new(Pipeline::new()),
+            observers: Arc::new(Vec::new()),
+            agent_config: Arc::new(AgentConfig::default()),
+            handler: Box::new(|_ctx| Box::pin(async {})),
+            transport_sender: Arc::new(TransportSender::noop()),
+            channel_buffer: 1,
+            routines: Vec::new(),
+            routine_handles: Vec::new(),
+            coordinator: Arc::new(crate::core::coordinator::PerKey::new(
+                crate::core::strategy::RunStrategy::default(),
+            )),
+            health,
+            health_watcher,
+        }
+    }
+
+    /// Embedding N agents as N tokio tasks requires `Send`. A non-Send field
+    /// would break every embedding host at once, so pin it here.
+    #[test]
+    fn runtime_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Runtime>();
+        assert_send::<crate::core::health::HealthWatcher>();
+    }
+
+    #[tokio::test]
+    async fn starts_as_starting() {
+        let rt = runtime_with(Box::new(DeadTransport {
+            got_reporter: StdArc::new(AtomicBool::new(false)),
+        }));
+        assert_eq!(rt.health().get(), Health::Starting);
+    }
+
+    /// The runtime must hand its reporter to the transport before connecting,
+    /// or a reconnecting transport has nowhere to publish.
+    #[tokio::test]
+    async fn transport_receives_the_reporter_before_connect() {
+        let flag = StdArc::new(AtomicBool::new(false));
+        let mut rt = runtime_with(Box::new(DeadTransport {
+            got_reporter: flag.clone(),
+        }));
+        let _ = rt.run().await;
+        assert!(flag.load(Ordering::SeqCst), "reporter must reach transport");
+    }
+
+    /// A failed connect must be terminal, not an indefinite `Starting` — a
+    /// supervisor waiting on readiness would otherwise hang.
+    #[tokio::test]
+    async fn failed_connect_reports_stopped() {
+        let mut rt = runtime_with(Box::new(DeadTransport {
+            got_reporter: StdArc::new(AtomicBool::new(false)),
+        }));
+        let watcher = rt.health();
+        assert!(rt.run().await.is_err());
+        assert_eq!(watcher.get(), Health::Stopped);
+        assert!(watcher.get().is_terminal());
+    }
+
+    /// A transport that connects lazily — Centrifugo opens its socket in
+    /// `listen`, not `connect` — is not serving anything when `connect` returns.
+    /// The runtime announced `Ready` there anyway, so `wait_ready` succeeded
+    /// against an endpoint that had never been reached: the exact false green
+    /// light this mechanism exists to prevent.
+    #[derive(Default)]
+    struct LazyTransport {
+        /// Held so the runtime's receive loop stays alive; dropping the sender
+        /// closes the channel and shuts the runtime down before the assertion.
+        held: std::sync::Mutex<Option<mpsc::Sender<crate::models::Message>>>,
+    }
+
+    #[async_trait]
+    impl Transport for LazyTransport {
+        fn name(&self) -> &str {
+            "lazy"
+        }
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, tx: mpsc::Sender<crate::models::Message>) -> Result<()> {
+            *self.held.lock().unwrap() = Some(tx);
+            Ok(())
+        }
+        async fn send(&self, _r: &Response) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+        fn reports_own_health(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_self_reporting_transport_is_not_declared_ready_by_the_runtime() {
+        let mut rt = runtime_with(Box::new(LazyTransport::default()));
+        let watcher = rt.health();
+        let handle = tokio::spawn(async move { rt.run().await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            watcher.get(),
+            Health::Starting,
+            "the runtime must leave a self-reporting transport to publish its own Ready"
+        );
+        assert!(
+            !watcher.is_ready(),
+            "wait_ready must not succeed against a transport that never connected"
+        );
+        handle.abort();
+    }
+
+    /// The `connect` failure above gets an explicit `Stopped`; a `listen`
+    /// failure took a bare `?` and left the watcher on whatever it last held,
+    /// so a supervisor saw a green light for a runtime that had already exited.
+    struct ListenFailsTransport;
+
+    #[async_trait]
+    impl Transport for ListenFailsTransport {
+        fn name(&self) -> &str {
+            "listen-fails"
+        }
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: mpsc::Sender<crate::models::Message>) -> Result<()> {
+            Err(crate::error::MindroidError::config(
+                "a listener is already running",
+            ))
+        }
+        async fn send(&self, _r: &Response) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_listen_reports_stopped() {
+        let mut rt = runtime_with(Box::new(ListenFailsTransport));
+        let watcher = rt.health();
+        assert!(rt.run().await.is_err());
+        assert_eq!(
+            watcher.get(),
+            Health::Stopped,
+            "a runtime that never started listening must not report Ready"
+        );
     }
 }

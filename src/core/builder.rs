@@ -548,6 +548,7 @@ impl RuntimeBuilder {
         let transport_sender = self.transport_sender.unwrap_or_else(TransportSender::noop);
 
         let coordinator = Arc::new(crate::core::coordinator::PerKey::new(self.strategy));
+        let (health, health_watcher) = crate::core::health::HealthReporter::new();
 
         Ok(Runtime {
             transport,
@@ -560,6 +561,8 @@ impl RuntimeBuilder {
             routines: self.routines,
             routine_handles: Vec::new(),
             coordinator,
+            health,
+            health_watcher,
         })
     }
 }

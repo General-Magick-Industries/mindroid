@@ -152,6 +152,18 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// its legitimate rotation refused. 120s leaves half the budget free.
 const BACKOFF_MAX: Duration = Duration::from_secs(120);
 
+/// Consecutive 404s before the refresh route is judged genuinely absent.
+///
+/// A missing route cannot be waited out, so latching is right eventually — but
+/// latching on the *first* 404 kills an agent over a blue/green rollout or a
+/// typo'd `base_url`, which is the failure the 400 arm is explicitly written to
+/// avoid. Five attempts spans roughly ten minutes once backoff reaches its
+/// ceiling: long enough to outlast a deploy, far short of a token lifetime.
+///
+/// Retrying meanwhile costs nothing the budget cannot absorb — [`BACKOFF_MAX`]
+/// already caps the chain at about half the server's hourly allowance.
+const MISSING_ROUTE_GRACE: u32 = 5;
+
 /// Exponential backoff, capped. The refresh route is rate-limited per chain
 /// (60/hour default); burning that budget on an outage makes it permanent.
 fn backoff_delay(consecutive_failures: u32) -> Duration {
@@ -426,6 +438,11 @@ enum RotateFailure {
     Rejected(MindroidError),
     /// 429. The chain is intact — kept separate so it does not latch `Dead`.
     RateLimited(MindroidError),
+    /// A `404`. A route that is genuinely absent cannot be waited out, but a
+    /// wrong `base_url`, a misrouted ingress, and a gateway mid-rollout answer
+    /// the same way — and none of those is a verdict about the credential.
+    /// Retried for a grace window, then latched.
+    MissingRoute(MindroidError),
     /// Transport failure or 5xx: says nothing about the credential.
     Unavailable(MindroidError),
 }
@@ -440,6 +457,7 @@ impl RotateFailure {
             429 => Self::RateLimited(err),
             // 403 is the supervised bar; 401 covers expired/revoked/replayed.
             401 | 403 => Self::Rejected(err),
+            404 => Self::MissingRoute(err),
             // 400 is a malformed request — an over-cap `token_ttl_seconds`, say.
             // The credential may be perfectly good, so latching Dead here turns a
             // config typo into an agent that kills itself an hour after start and
@@ -451,7 +469,10 @@ impl RotateFailure {
 
     fn into_error(self) -> MindroidError {
         match self {
-            Self::Rejected(e) | Self::RateLimited(e) | Self::Unavailable(e) => e,
+            Self::Rejected(e)
+            | Self::RateLimited(e)
+            | Self::MissingRoute(e)
+            | Self::Unavailable(e) => e,
         }
     }
 }
@@ -461,6 +482,9 @@ struct FailureState {
     consecutive: u32,
     retry_after: Option<Instant>,
     last_error: Option<String>,
+    /// Consecutive 404s from the refresh route. Reset by any other outcome, so
+    /// a route that blinks does not accumulate toward the grace limit.
+    consecutive_missing_route: u32,
 }
 
 impl FailureState {
@@ -468,6 +492,7 @@ impl FailureState {
         self.consecutive = 0;
         self.retry_after = None;
         self.last_error = None;
+        self.consecutive_missing_route = 0;
     }
 
     fn record_failure(&mut self, now: Instant, err: &MindroidError) {
@@ -922,7 +947,21 @@ impl EndUserAuth {
                 Ok(resp.token)
             }
             Err(failure) => {
-                let terminal = matches!(failure, RotateFailure::Rejected(_));
+                let terminal = match &failure {
+                    RotateFailure::Rejected(_) => true,
+                    // A route that is really gone answers 404 every time; a
+                    // rollout or a typo'd host answers it for a while and then
+                    // stops. Only the persistent case is a verdict.
+                    RotateFailure::MissingRoute(_) => {
+                        state.failure.consecutive_missing_route =
+                            state.failure.consecutive_missing_route.saturating_add(1);
+                        state.failure.consecutive_missing_route >= MISSING_ROUTE_GRACE
+                    }
+                    _ => {
+                        state.failure.consecutive_missing_route = 0;
+                        false
+                    }
+                };
                 let err = failure.into_error();
                 if terminal {
                     // Latch, so later calls fail fast instead of re-presenting a
@@ -1668,6 +1707,75 @@ mod tests {
         );
     }
 
+    /// A deployment without the refresh route must fail loudly. Classified as an
+    /// outage, the agent would keep retrying and report healthy until its token
+    /// expired — alive but unable to renew.
+    #[tokio::test]
+    async fn a_single_missing_route_404_does_not_latch() {
+        let gw = spawn_gateway(vec![(404, r#"{"msg":"not found"}"#.into())], None).await;
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let auth = EndUserAuth::try_new(&gw.base_url, "original", Some(&expires), true).unwrap();
+
+        assert_eq!(
+            with_deadline(auth.get_token()).await.unwrap(),
+            "original",
+            "a usable token must still be served while the route is retried"
+        );
+        assert!(
+            !auth.is_terminal(),
+            "one 404 is a rollout or a typo'd base_url, not a verdict on the credential"
+        );
+    }
+
+    /// A route that is genuinely absent answers 404 every time, so the grace
+    /// window has to end. Pre-seeded to the last attempt rather than driving
+    /// five real backoffs, which would take ~15s of wall clock.
+    #[tokio::test]
+    async fn a_persistent_missing_route_latches_once_the_grace_window_ends() {
+        let gw = spawn_gateway(vec![(404, r#"{"msg":"not found"}"#.into())], None).await;
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let auth = EndUserAuth::try_new(&gw.base_url, "original", Some(&expires), true).unwrap();
+        auth.state.write().await.failure.consecutive_missing_route = MISSING_ROUTE_GRACE - 1;
+
+        let _ = with_deadline(auth.get_token()).await;
+        assert!(
+            auth.is_terminal(),
+            "a route that is still absent after the grace window cannot be waited out"
+        );
+    }
+
+    /// The counter is consecutive: a route that recovers must not leave the
+    /// agent one blip away from latching for the rest of its life.
+    #[tokio::test]
+    async fn a_recovered_route_clears_the_missing_route_count() {
+        let fresh = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let gw = spawn_gateway(
+            vec![
+                (404, r#"{"msg":"not found"}"#.into()),
+                (
+                    200,
+                    serde_json::json!({ "token": "rotated", "expires_at": fresh }).to_string(),
+                ),
+            ],
+            None,
+        )
+        .await;
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let auth = EndUserAuth::try_new(&gw.base_url, "original", Some(&expires), true).unwrap();
+
+        let _ = with_deadline(auth.get_token()).await;
+        assert_eq!(auth.state.read().await.failure.consecutive_missing_route, 1);
+
+        auth.state.write().await.failure.retry_after = None;
+        assert_eq!(with_deadline(auth.get_token()).await.unwrap(), "rotated");
+        assert_eq!(
+            auth.state.read().await.failure.consecutive_missing_route,
+            0,
+            "a success must reset the count"
+        );
+    }
+
+    /// A revoked chain (401) is equally terminal.
     #[tokio::test]
     async fn revoked_chain_is_terminal() {
         let gw = spawn_gateway(vec![(401, r#"{"msg":"invalid token"}"#.into())], None).await;

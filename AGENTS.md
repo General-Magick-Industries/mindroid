@@ -31,7 +31,9 @@ cargo fmt --all -- --check          # Format check
 
 - Edition: **2024** (Cargo.toml `edition = "2024"`)
 - Resolver: **3** (workspace-level)
-- Release profile: `opt-level = "z"`, thin LTO, `panic = "abort"`
+- Release profile: `opt-level = "z"`, thin LTO, `panic = "abort"` — this crate's own
+  binaries/examples only. Cargo ignores a dependency's profile, so an embedding host
+  picks its own (see [Embedding many runtimes](#embedding-many-runtimes-in-one-process))
 
 ## Feature Flags
 
@@ -138,6 +140,30 @@ Implement `PipelineStage` (or `StreamingStage` for streaming). Use `pipeline.add
 ### Error Handling
 
 Use `MindroidError` variants (`Auth`, `Transport`, `Pipeline`, `Memory`, `Api`, `Config`, `Other`). Return `mindroid::Result<T>`. `MindroidError::config("msg")` for config errors.
+
+### Embedding many runtimes in one process
+
+A control plane can run N agents as N tokio tasks in one process: build a
+`MindroidConfig` per agent, `Runtime::from_config_with_auth(cfg, auth)`, then
+`tokio::spawn(rt.run_until_cancelled(token))`. The SDK supports this — no global
+singletons, no library-level `tracing_subscriber` init, `Runtime` is `Send`.
+
+Four things the SDK does **not** do for you; the host owns them:
+
+1. **Build each config in code.** Never `MindroidConfig::resolve*` per agent — those
+   read CLI args and env, which are process-wide and assume one agent per process.
+   `merge_toml` layers a per-agent delta onto a shared base.
+2. **Per-agent credentials.** `from_config_with_auth` injects an `Auth` per runtime;
+   config-derived auth would be shared. Same reasoning as (1).
+3. **Per-agent tracing spans.** One subscriber interleaves every agent's logs.
+4. **`panic = "unwind"` + `catch_unwind` per task.** With `abort`, one agent's panic
+   takes the whole host down. Cargo ignores this crate's profile when it's a
+   dependency, so this is the host's choice to make.
+
+`run_until_cancelled(token)` is the stop path — it disconnects the transport and
+cancels routines, unlike `handle.abort()`, which drops mid-await. `Runtime::health()`
+reports `Starting`/`Ready`/`Reconnecting`/`Stopped` so a supervisor can tell a working
+agent from one that is alive but cannot receive.
 
 ## Gotchas
 
