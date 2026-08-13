@@ -221,7 +221,7 @@ impl PipelineStage for EpisodeIngestStage {
 
         let is_group = ctx.message.channel_type == ChannelType::Group;
         let msg = EpisodeMessage {
-            magickspace_id: &ctx.message.channel_id,
+            magickspace_id: ctx.message.conversation_id(),
             sender_id: &ctx.message.sender_id,
             message: &ctx.message.content,
             message_id: &ctx.message.id,
@@ -289,7 +289,7 @@ impl PipelineStage for EpisodeReplyIngestStage {
         let reply_id = format!("{}:reply", ctx.message.id);
         let is_group = ctx.message.channel_type == ChannelType::Group;
         let msg = EpisodeMessage {
-            magickspace_id: &ctx.message.channel_id,
+            magickspace_id: ctx.message.conversation_id(),
             // The agent is the sender of its own reply.
             sender_id: &ctx.agent_config.agent_id,
             message: reply,

@@ -233,8 +233,12 @@ impl DeliveryReader {
             .name("mindroid-token-delivery".into())
             .spawn(move || {
                 while let Ok(request) = rx.recv() {
-                    // The caller may have timed out and dropped its receiver
-                    // long ago; the read still had to run to completion.
+                    // Skip requests whose caller already timed out. On a path
+                    // that recovers after wedging, the backlog is entirely
+                    // abandoned reads, and serving them delays the live one.
+                    if request.reply.is_closed() {
+                        continue;
+                    }
                     let _ = request.reply.send(read_capped(&request.path));
                 }
             })?;

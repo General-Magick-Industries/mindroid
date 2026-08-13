@@ -367,7 +367,7 @@ impl ContextProvider for MagickmindContext {
     }
 
     async fn fetch(&self, message: &crate::models::Message) -> Result<Vec<LlmMessage>> {
-        let magickspace_id = &message.channel_id;
+        let magickspace_id = message.conversation_id();
         if magickspace_id.is_empty() {
             debug!("MagickmindContext: no channel_id, skipping");
             return Ok(Vec::new());
@@ -458,7 +458,7 @@ impl PipelineStage for MagickmindPersistence {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        let magickspace_id = &ctx.message.channel_id;
+        let magickspace_id = ctx.message.conversation_id();
         if magickspace_id.is_empty() {
             debug!("MagickmindPersistence: no magickspace_id in message, skipping save");
             return Ok(());

@@ -199,6 +199,19 @@ built-in `LocalArtifactStore`.
 
 ### Changed
 
+- **`Transport::disconnect` can now return `Err`, and `Runtime::shutdown`
+  propagates it.** A listener that survives both a cooperative stop and an abort
+  is reported as a shutdown failure with its handle retained, rather than
+  silently detached. Embedders that ignored `disconnect`'s result now get an
+  error they must handle; treat it as "shutdown did not complete", not as a
+  reason to retry immediately.
+- **`tool_result_name` and `tool_result_call_id` reject tags they previously
+  parsed.** Both now return `None` for an open tag carrying an unknown attribute
+  or a duplicate `name`/`call`, instead of returning the first match. A frame
+  like `<tool_result name="peek" evil="x">` no longer yields `Some("peek")`.
+  This closes a path where an attribute invisible to validation reached the
+  model; downstream callers relying on the looser behavior must handle `None`.
+
 - `Auth` gains `is_terminal()` (defaulting `false`) so a caller can distinguish
   a retryable failure from a dead credential, plus `kind()` (defaulting
   `ServiceUser`) and `note_rejection()` (defaulting to a no-op). All three are
@@ -223,6 +236,16 @@ built-in `LocalArtifactStore`.
 
 ### Added
 
+- **`Message::conversation_id()`** — the backend conversation a message belongs
+  to, separate from `channel_id`. A Magick Mind delivery channel names a
+  *subscriber* (`user:{id}#{id}`), not a conversation, so the magickspace
+  travels in the envelope and is carried in `metadata["magickspace_id"]`.
+  `channel_id` stays the *delivery* scope, derived from the subscribed channel
+  and therefore trusted: it keys the artifact store, local history, and
+  per-channel call correlation, none of which consult a server. Use
+  `conversation_id()` only where the value is handed to a service that
+  re-authorizes the caller against it — never as a local scope or a path
+  component. See `ArtifactStore`'s contract and ADR-0004.
 - **Artifact storage** (`artifacts` feature) — `ArtifactStore` trait,
   `LocalArtifactStore` (path-jailed on-disk), `ArtifactOffload` stage, and
   `GetArtifactTool`. Moves media out of conversation history after the model

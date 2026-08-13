@@ -101,6 +101,27 @@ impl Message {
             Some(&self.sender_id)
         }
     }
+
+    /// Backend conversation this message belongs to, for services that key on
+    /// one — the MagickMind magickspace.
+    ///
+    /// Distinct from [`channel_id`](Self::channel_id), and deliberately so.
+    /// `channel_id` is the *delivery* scope: a transport derives it from the
+    /// subscribed channel, so it is trusted, and it keys the artifact store,
+    /// local history, and per-channel call correlation. This one is publisher-
+    /// supplied, because a delivery channel names a subscriber rather than a
+    /// conversation (`user:{id}#{id}`) and the conversation only travels in the
+    /// envelope.
+    ///
+    /// Use it ONLY where the value is handed to a server that re-authorizes the
+    /// caller against it. Never as a local scope or a path component.
+    pub fn conversation_id(&self) -> &str {
+        self.metadata
+            .get("magickspace_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&self.channel_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

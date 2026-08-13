@@ -245,14 +245,19 @@ pub struct CentrifugoTransport {
     listener: std::sync::Mutex<Listener>,
 }
 
-/// Lifecycle of the spawned listener, held under one mutex so that starting and
-/// stopping are each a single transition.
+/// Lifecycle of the spawned listener.
 ///
-/// `Option<JoinHandle>` cannot express "stopping": `disconnect` has to release
-/// the lock to await the join, and a `listen` racing that window sees no
-/// listener, starts a second one, and then has its handle overwritten by the
-/// handle `disconnect` parks on failure — a live task detached, which ADR-0001
-/// disallows.
+/// There is deliberately no `Stopping` state. `disconnect` must release the lock
+/// to await the join, and marking the slot across that await is not drop-safe:
+/// if the `disconnect` future is cancelled mid-await — a `select!` or a
+/// `timeout` around it — the handle drops as a local, detaching a live task
+/// (ADR-0001) and stranding the slot in a state no later `listen` can leave.
+/// Taking the handle instead leaves `Idle`, which recovers.
+///
+/// A `listen` racing a `disconnect` is separately excluded by the trait:
+/// `disconnect` takes `&mut self` and `listen` takes `&self`, and `Runtime` owns
+/// the transport outright. Concurrent `listen`s are the reachable race, and
+/// holding this lock across check-spawn-store is what closes it.
 enum Listener {
     Idle,
     Running {
@@ -262,7 +267,6 @@ enum Listener {
         /// task that exits on its first poll.
         cancel: CancellationToken,
     },
-    Stopping,
 }
 
 impl CentrifugoTransport {
@@ -523,30 +527,31 @@ fn parse_push(text: &str, subscribed_channel: &str) -> Option<Message> {
         return None;
     };
 
-    // `channel_id` is the conversation this turn belongs to, so it comes from the
-    // payload, with the subscribed channel only as a fallback.
+    // `channel_id` is the *delivery* scope and comes from the subscribed channel,
+    // never the payload: it keys the artifact store, local history, and per-channel
+    // call correlation, none of which consult a server. A publisher that could set
+    // it would pick its own artifact scope — see `ArtifactStore`'s contract.
     //
-    // It cannot come from the channel: every Magick Mind delivery channel names a
-    // *subscriber* rather than a conversation — `user:{id}#{id}` for an end user,
-    // `personal:{id}#{sub}` for a service user — because the part after `#` is
-    // Centrifugo's subscribe ACL. Taking the channel name would address every
-    // magickspace call to a conversation that does not exist, so context prep and
-    // episodic ingest both 404 and the turn aborts before reaching the LLM.
-    //
-    // Preferring the payload does not widen access. Bifrost fans a message out to
-    // each participant's own channel and names the magickspace in the envelope,
-    // and every read against that magickspace re-checks participation server-side,
-    // so a forged id answers 403 rather than another conversation.
-    let channel_id = outer
+    // The conversation is a separate axis and does travel in the envelope, because
+    // every Magick Mind delivery channel names a *subscriber* rather than a
+    // conversation — `user:{id}#{id}` for an end user, `personal:{id}#{sub}` for a
+    // service user, since the part after `#` is Centrifugo's subscribe ACL. It
+    // rides in metadata, where `Message::conversation_id` reads it, so the stages
+    // that hand it to a server that re-authorizes them get the right value while
+    // the local scope stays trusted.
+    let mut msg = Message::new(content, sender_id, channel.clone()).with_id(id);
+    msg.platform = Some("centrifugo".into());
+    if let Some(magickspace) = outer
         .get("magickspace_id")
         .or_else(|| inner.get("magickspace_id"))
-        .or_else(|| inner.get("channel_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&channel)
-        .to_string();
-
-    let mut msg = Message::new(content, sender_id, channel_id).with_id(id);
-    msg.platform = Some("centrifugo".into());
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+    {
+        msg.metadata.insert(
+            "magickspace_id".into(),
+            serde_json::Value::String(magickspace.to_string()),
+        );
+    }
     if let Some(authenticated_sender) = push
         .get("pub")
         .and_then(|publication| publication.get("info"))
@@ -656,23 +661,13 @@ impl Transport for CentrifugoTransport {
     async fn disconnect(&mut self) -> Result<()> {
         self.connected.store(false, Ordering::SeqCst);
 
-        // Claim the stop in one transition, so nothing can start a listener into
-        // the gap opened by awaiting the join below.
-        let (mut handle, cancel) = {
-            let mut slot = self.listener.lock().unwrap();
-            match std::mem::replace(&mut *slot, Listener::Stopping) {
-                Listener::Running { handle, cancel } => (handle, cancel),
-                Listener::Idle => {
-                    *slot = Listener::Idle;
-                    return Ok(());
-                }
-                Listener::Stopping => {
-                    *slot = Listener::Stopping;
-                    return Err(transport_err(
-                        "a disconnect is already in progress for this transport",
-                    ));
-                }
-            }
+        // Take the handle rather than marking the slot: everything below is
+        // `await`ed, and a cancelled `disconnect` future must not leave the
+        // transport in a state a later `listen` cannot recover from.
+        let Listener::Running { mut handle, cancel } =
+            std::mem::replace(&mut *self.listener.lock().unwrap(), Listener::Idle)
+        else {
+            return Ok(());
         };
         cancel.cancel();
 
@@ -716,11 +711,6 @@ impl Transport for CentrifugoTransport {
             Listener::Running { handle, .. } if !handle.is_finished() => {
                 return Err(transport_err(
                     "a listener is already running; disconnect must succeed before listening again",
-                ));
-            }
-            Listener::Stopping => {
-                return Err(transport_err(
-                    "a listener is still shutting down; listen again once disconnect returns",
                 ));
             }
             _ => {}
@@ -1254,25 +1244,40 @@ mod tests {
         transport.disconnect().await.expect("clean disconnect");
     }
 
-    /// A `listen` racing a `disconnect` must not slot a second listener into the
-    /// window where `disconnect` has released the lock to await the join — the
-    /// parked handle would then overwrite it and detach a live task.
-    #[tokio::test]
-    async fn listen_is_refused_while_a_disconnect_is_in_flight() {
+    /// `disconnect` awaits the join, so its future can be dropped mid-await by
+    /// any `select!` or `timeout` around it. Marking the slot across that await
+    /// stranded the transport: the handle dropped as a local — detaching a live
+    /// task, which ADR-0001 forbids — and no later `listen` could recover. The
+    /// transport must be usable again after a cancelled `disconnect`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_disconnect_leaves_the_transport_usable() {
         let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
-        let transport = CentrifugoTransport::new("wss://example.com/ws", "agent", auth);
+        let mut transport = CentrifugoTransport::new("ws://127.0.0.1:1/ws", "agent", auth)
+            .with_allow_insecure(true);
 
-        *transport.listener.lock().unwrap() = Listener::Stopping;
+        // A listener that ignores cancellation, so disconnect is provably still
+        // awaiting the join when its future is dropped. A cooperative one exits
+        // in microseconds and never reaches the state under test.
+        let handle = tokio::spawn(std::future::pending::<()>());
+        *transport.listener.lock().unwrap() = Listener::Running {
+            handle,
+            cancel: CancellationToken::new(),
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), transport.disconnect())
+                .await
+                .is_err(),
+            "the disconnect must still be in flight when its future is dropped"
+        );
 
         let (tx, _rx) = mpsc::channel(8);
-        assert!(
-            transport.listen(tx).await.is_err(),
-            "a listener must not be installed over one that is still stopping"
-        );
-        assert!(
-            matches!(*transport.listener.lock().unwrap(), Listener::Stopping),
-            "the refused start must not have disturbed the in-flight stop"
-        );
+        transport
+            .listen(tx)
+            .await
+            .expect("a cancelled disconnect must not brick the transport");
+
+        transport.disconnect().await.expect("clean disconnect");
     }
 
     /// Each listener owns its cancellation token. Sharing one per transport
@@ -1369,42 +1374,51 @@ mod tests {
         assert!(parse_push(&frame, "user:a1#a1").is_none());
     }
 
-    /// Bifrost fans a magickspace message out to each participant's own channel,
-    /// so the channel names the subscriber and only the envelope names the
-    /// conversation. Reading the channel instead addresses every subsequent
-    /// magickspace call to something that is not a magickspace.
+    /// `channel_id` is the artifact scope, the local history key, and the
+    /// per-channel call-correlation key — none of which consult a server. A
+    /// publisher that could set it would pick its own artifact scope. This is
+    /// the guard for `ArtifactStore`'s "never from user-supplied input".
     #[test]
-    fn the_conversation_comes_from_the_envelope_not_the_delivery_channel() {
+    fn a_payload_cannot_choose_its_own_scope() {
         let frame = push(
             "user:a1#a1",
             serde_json::json!({
                 "content": "hi",
                 "sender_id": "u1",
-                "magickspace_id": "ms-1",
+                "magickspace_id": "someone-elses-space",
             }),
         );
         let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
-        assert_eq!(msg.channel_id, "ms-1");
+        assert_eq!(
+            msg.channel_id, "user:a1#a1",
+            "scope must come from the subscribed channel, not the payload"
+        );
     }
 
-    /// The service-user channel carries the same distinction, so the fix cannot
-    /// be special-cased to `user:` channels.
+    /// Bifrost fans a magickspace message out to each participant's own channel,
+    /// so the channel names the subscriber and only the envelope names the
+    /// conversation. The conversation therefore has to survive — on the axis
+    /// that is handed to a server which re-authorizes the caller, not on the
+    /// local scope.
     #[test]
-    fn a_service_user_push_also_takes_its_conversation_from_the_envelope() {
-        let frame = push(
-            "personal:a1#svc",
-            serde_json::json!({
-                "content": "hi",
-                "sender_id": "u1",
-                "magickspace_id": "ms-1",
-            }),
-        );
-        let msg = parse_push(&frame, "personal:a1#svc").expect("message is still delivered");
-        assert_eq!(msg.channel_id, "ms-1");
+    fn the_conversation_comes_from_the_envelope_not_the_delivery_channel() {
+        for channel in ["user:a1#a1", "personal:a1#svc"] {
+            let frame = push(
+                channel,
+                serde_json::json!({
+                    "content": "hi",
+                    "sender_id": "u1",
+                    "magickspace_id": "ms-1",
+                }),
+            );
+            let msg = parse_push(&frame, channel).expect("message is still delivered");
+            assert_eq!(msg.conversation_id(), "ms-1", "channel {channel}");
+            assert_eq!(msg.channel_id, channel, "the local scope stays trusted");
+        }
     }
 
     /// A transport with no notion of magickspaces (mindroid-voice publishes to
-    /// the same channel) still needs a scope to route the turn.
+    /// the same channel) still needs a conversation to route the turn.
     #[test]
     fn an_envelope_without_a_magickspace_falls_back_to_the_channel() {
         let frame = push(
@@ -1412,7 +1426,26 @@ mod tests {
             serde_json::json!({ "content": "hi", "sender_id": "u1" }),
         );
         let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
-        assert_eq!(msg.channel_id, "user:a1#a1");
+        assert_eq!(msg.conversation_id(), "user:a1#a1");
+    }
+
+    /// An empty id is `Some("")`, not `None`, so a naive `unwrap_or` never fires
+    /// and every such turn collapses into one shared bucket.
+    #[test]
+    fn a_blank_magickspace_falls_back_rather_than_collapsing_the_namespace() {
+        for blank in ["", "   ", "	"] {
+            let frame = push(
+                "user:a1#a1",
+                serde_json::json!({
+                    "content": "hi",
+                    "sender_id": "u1",
+                    "magickspace_id": blank,
+                }),
+            );
+            let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
+            assert_eq!(msg.conversation_id(), "user:a1#a1", "blank {blank:?}");
+            assert_eq!(msg.channel_id, "user:a1#a1");
+        }
     }
 
     #[test]
