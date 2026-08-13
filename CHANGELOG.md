@@ -199,13 +199,15 @@ built-in `LocalArtifactStore`.
 
 ### Changed
 
-- **A `404` on the token-refresh route is now terminal, not retried.** A missing
-  route cannot be waited out, and retrying one left the agent alive but unable
-  to renew — reporting healthy right up until its token quietly expired. Note
-  the trade: a wrong `auth.base_url`, a misrouted ingress, or a gateway 404
-  during a rollout now latches the credential dead rather than recovering when
-  the route returns. The latch is clearable out of band by delivering a
-  replacement credential (`auth.token_file` or `replace_token`).
+- **A persistent `404` on the token-refresh route is now terminal.** A route
+  that is genuinely absent cannot be waited out, and retrying one forever left
+  the agent alive but unable to renew — reporting healthy right up until its
+  token quietly expired. It latches only after five consecutive 404s, roughly
+  ten minutes once backoff reaches its ceiling: a wrong `auth.base_url` still
+  fails fast, while a blue/green rollout or a restarted ingress recovers
+  instead of killing the agent. Any other outcome resets the count. Unchanged:
+  `401`/`403` latch on the first response, because those are verdicts about the
+  credential; a missing route is not.
 - **`Transport::disconnect` can now return `Err`, and `Runtime::shutdown`
   propagates it.** A listener that survives both a cooperative stop and an abort
   is reported as a shutdown failure with its handle retained, rather than
