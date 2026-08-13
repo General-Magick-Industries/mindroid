@@ -199,6 +199,13 @@ built-in `LocalArtifactStore`.
 
 ### Changed
 
+- **A `404` on the token-refresh route is now terminal, not retried.** A missing
+  route cannot be waited out, and retrying one left the agent alive but unable
+  to renew — reporting healthy right up until its token quietly expired. Note
+  the trade: a wrong `auth.base_url`, a misrouted ingress, or a gateway 404
+  during a rollout now latches the credential dead rather than recovering when
+  the route returns. The latch is clearable out of band by delivering a
+  replacement credential (`auth.token_file` or `replace_token`).
 - **`Transport::disconnect` can now return `Err`, and `Runtime::shutdown`
   propagates it.** A listener that survives both a cooperative stop and an abort
   is reported as a shutdown failure with its handle retained, rather than
@@ -236,6 +243,18 @@ built-in `LocalArtifactStore`.
 
 ### Added
 
+- **Observable runtime health** — `Health` (`Starting`/`Ready`/`Reconnecting`/
+  `Stopped`), `HealthReporter`, `HealthWatcher`, and `Runtime::health()`. `run`
+  only distinguishes running from exited; this reports the state in between, so
+  a supervisor can tell a working agent from one that is alive but reconnecting
+  and answering nothing. `Stopped` latches — a retained listener cannot walk a
+  terminal runtime back to `Ready`.
+- **`Transport::set_health_reporter`** (defaulted no-op) and
+  **`Transport::reports_own_health`** (defaulted `false`). Both are defaulted,
+  so existing implementations need no changes. Override `reports_own_health` to
+  `true` if your transport establishes its connection in `listen` rather than
+  `connect` — otherwise the runtime reports `Ready` as soon as `connect`
+  returns, which for such a transport is before anything is connected.
 - **`Message::conversation_id()`** — the backend conversation a message belongs
   to, separate from `channel_id`. A Magick Mind delivery channel names a
   *subscriber* (`user:{id}#{id}`), not a conversation, so the magickspace

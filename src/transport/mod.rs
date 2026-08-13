@@ -47,4 +47,18 @@ pub trait Transport: Send + Sync + 'static {
     /// [`Health::Reconnecting`]: crate::Health::Reconnecting
     /// [`Health::Ready`]: crate::Health::Ready
     fn set_health_reporter(&mut self, _reporter: crate::core::health::HealthReporter) {}
+
+    /// Whether this transport publishes its own [`Health`] transitions.
+    ///
+    /// The runtime reports `Ready` itself once `connect` succeeds, which is only
+    /// true for a transport that finishes connecting there. One that connects
+    /// lazily — Centrifugo opens its socket in `listen`, not `connect` — must
+    /// return `true`, or the runtime announces `Ready` for a transport that has
+    /// not reached its endpoint and a supervisor waits on a green light that
+    /// never meant anything.
+    ///
+    /// [`Health`]: crate::Health
+    fn reports_own_health(&self) -> bool {
+        false
+    }
 }

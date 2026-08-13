@@ -310,6 +310,8 @@ pub trait Transport: Send + Sync + 'static {
     fn is_connected(&self) -> bool;
     async fn send_typing(&self, _channel_id: &str) -> Result<()> { Ok(()) }
     async fn health_check(&self) -> bool { self.is_connected() }
+    fn set_health_reporter(&mut self, _reporter: HealthReporter) {}
+    fn reports_own_health(&self) -> bool { false }
 }
 ```
 
@@ -325,6 +327,8 @@ pub trait Transport: Send + Sync + 'static {
 | `is_connected()` | `fn(&self) -> bool` | True if currently connected (used by runtime health checks) |
 | `send_typing()` | `async fn(&self, _channel_id: &str) -> Result<()>` | Optional: send "typing..." indicator. Default: no-op. |
 | `health_check()` | `async fn(&self) -> bool` | Optional: check transport health. Default: calls `is_connected()`. |
+| `set_health_reporter()` | `fn(&mut self, reporter: HealthReporter)` | Optional: receive a sink for `Health` transitions. Called before `connect()`. Default: no-op. |
+| `reports_own_health()` | `fn(&self) -> bool` | Optional: `true` if the transport publishes its own `Health`. Default `false`, which lets the runtime report `Ready` once `connect()` succeeds. Return `true` when the connection is established in `listen()` rather than `connect()`, or the runtime reports `Ready` before anything is connected. |
 
 **Implementation notes:**
 

@@ -709,6 +709,12 @@ impl Transport for CentrifugoTransport {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// The socket is opened in `listen`, not `connect`, so the runtime must not
+    /// call this transport `Ready` on a successful `connect`.
+    fn reports_own_health(&self) -> bool {
+        true
+    }
+
     async fn listen(&self, tx: mpsc::Sender<Message>) -> Result<()> {
         // Checked, spawned, and installed under one lock. Releasing it between
         // the check and the store lets concurrent callers all pass the check and
@@ -741,7 +747,10 @@ impl Transport for CentrifugoTransport {
             const MAX_BACKOFF: Duration = Duration::from_secs(30);
             let mut cmd_id: u32 = 3; // 1=connect, 2=subscribe, 3+ for refresh
 
-            loop {
+            // Labelled so the exits inside the connected loop below converge on
+            // the single `Stopped` publish at the end rather than returning past
+            // it — a listener that returned early left health latched at `Ready`.
+            'listener: loop {
                 if cancel.is_cancelled() {
                     info!("Centrifugo listener cancelled");
                     break;
@@ -785,8 +794,7 @@ impl Transport for CentrifugoTransport {
                                 _ = cancel.cancelled() => {
                                     info!("Centrifugo listener cancelled; closing socket");
                                     let _ = sink.close().await;
-                                    connected.store(false, Ordering::SeqCst);
-                                    return;
+                                    break 'listener;
                                 }
                                 frame = stream.next() => {
                                     match frame {
@@ -812,8 +820,7 @@ impl Transport for CentrifugoTransport {
                                                 if let Some(message) = parse_push(line, &subscribed_channel) {
                                                     if tx.send(message).await.is_err() {
                                                         warn!("Message receiver dropped, stopping listen loop");
-                                                        connected.store(false, Ordering::SeqCst);
-                                                        return;
+                                                        break 'listener;
                                                     }
                                                 } else {
                                                     debug!("Ignoring non-push frame: {line}");
@@ -930,10 +937,10 @@ impl Transport for CentrifugoTransport {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
 
+            // Every exit converges here, so this is the one place that decides
+            // what a stopped listener reports. It is not coming back, and
+            // `Reconnecting` would be a lie a supervisor waits on forever.
             connected.store(false, Ordering::SeqCst);
-            // The loop only exits on cancellation or a terminal credential —
-            // either way this listener is not coming back, so `Reconnecting`
-            // would be a lie a supervisor waits on forever.
             if let Some(h) = &health {
                 h.set(crate::core::health::Health::Stopped);
             }
@@ -1358,6 +1365,76 @@ mod tests {
         // Reconnecting — that is a state a supervisor waits on forever.
         transport.disconnect().await.unwrap();
         assert_eq!(watcher.get(), crate::core::health::Health::Stopped);
+    }
+
+    /// Build an unsigned JWT with the given `sub` — `extract_jwt_sub` never
+    /// verifies the signature.
+    fn fake_jwt(sub: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"sub\":\"{sub}\"}}"));
+        format!("{header}.{payload}.sig")
+    }
+
+    /// Minimal Centrifugo: replies success to `connect` then `subscribe`, then
+    /// holds the socket open. Enough to drive the listener into its *connected*
+    /// inner loop, which is the state the backoff-only tests never reach.
+    async fn spawn_fake_centrifugo() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut stream) = ws.split();
+            let _ = stream.next().await;
+            let _ = sink
+                .send(WsMessage::Text(r#"{"id":1,"connect":{}}"#.to_string()))
+                .await;
+            let _ = stream.next().await;
+            let _ = sink
+                .send(WsMessage::Text(r#"{"id":2,"subscribe":{}}"#.to_string()))
+                .await;
+            while let Some(Ok(_)) = stream.next().await {}
+        });
+        format!("ws://{addr}/connection/websocket")
+    }
+
+    /// Cancelling a listener that is *connected* exits through a different path
+    /// than cancelling one in reconnect backoff. That path used to `return` past
+    /// the `Stopped` publish, so a torn-down agent stayed `Ready` forever and a
+    /// supervisor believed it could still receive. The backoff-only test above
+    /// passes either way, which is why this shipped.
+    #[tokio::test]
+    async fn disconnect_from_the_connected_state_publishes_stopped() {
+        let url = spawn_fake_centrifugo().await;
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(fake_jwt("agent")));
+        let mut transport = CentrifugoTransport::new(&url, "agent", auth).with_allow_insecure(true);
+
+        let (reporter, mut watcher) = crate::core::health::HealthReporter::new();
+        transport.set_health_reporter(reporter);
+
+        let (tx, _rx) = mpsc::channel(8);
+        transport.listen(tx).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while watcher.get() != crate::core::health::Health::Ready {
+                watcher.changed().await;
+            }
+        })
+        .await
+        .expect("the fake server must bring the listener to Ready");
+
+        transport.disconnect().await.expect("clean disconnect");
+
+        assert_eq!(
+            watcher.get(),
+            crate::core::health::Health::Stopped,
+            "a listener cancelled while connected must still report a terminal state"
+        );
     }
 
     /// `is_connected` must not report "disconnected" merely because a writer is

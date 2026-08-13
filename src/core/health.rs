@@ -60,9 +60,15 @@ impl HealthReporter {
 
     /// Publish a state. Sends only on change, so a reconnect loop hammering
     /// `Reconnecting` doesn't wake every observer on each attempt.
+    ///
+    /// `Stopped` latches. `disconnect` can time out and retain a live listener,
+    /// which then keeps publishing from a runtime that has already returned —
+    /// so without this a supervisor sees a terminal agent go `Ready` again, and
+    /// [`wait_ready`](HealthWatcher::wait_ready) loses the terminal short-circuit
+    /// it relies on.
     pub fn set(&self, health: Health) {
         self.tx.send_if_modified(|current| {
-            if *current == health {
+            if *current == health || current.is_terminal() {
                 false
             } else {
                 *current = health;
@@ -106,7 +112,9 @@ impl HealthWatcher {
     /// Returns the state observed at timeout, so a caller can report whether it
     /// was still connecting or stuck reconnecting.
     pub async fn wait_ready(&mut self, timeout: Duration) -> std::result::Result<(), Health> {
-        let deadline = Instant::now() + timeout;
+        // `Instant + Duration` panics on overflow, and `panic = "abort"` makes
+        // `wait_ready(Duration::MAX)` — a plausible "wait forever" — a process kill.
+        let deadline = Instant::now().checked_add(timeout);
         loop {
             let current = self.get();
             if current.is_ready() {
@@ -115,7 +123,11 @@ impl HealthWatcher {
             if current.is_terminal() {
                 return Err(current);
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = match deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                // The deadline overflowed the clock, so it is unreachable.
+                None => Duration::MAX,
+            };
             if remaining.is_zero() {
                 return Err(current);
             }
