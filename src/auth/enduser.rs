@@ -202,48 +202,111 @@ enum DeliveryRead {
     Stalled,
 }
 
-async fn read_delivered_async(path: &str, current: &str) -> DeliveryRead {
-    read_delivered_with_timeout(path, current, DELIVERY_READ_TIMEOUT).await
+struct ReadRequest {
+    path: String,
+    reply: tokio::sync::oneshot::Sender<std::io::Result<String>>,
 }
 
-/// Deliberately `tokio::fs` rather than our own `spawn_blocking`: a `JoinHandle`
-/// this crate holds and then drops — when the auth or runtime goes away
-/// mid-read — detaches a task tokio cannot cancel, which ADR-0001 disallows.
+/// Serves delivery-file reads from one OS thread this credential owns.
 ///
-/// Timing out does not cancel the underlying read either; nothing can. What it
-/// does is release this caller. `Stalled` then lets the caller stop re-reading,
-/// which is what bounds the wedged reads a hung path can accumulate.
-async fn read_delivered_with_timeout(path: &str, current: &str, timeout: Duration) -> DeliveryRead {
-    let read = async {
-        // Bounded: the file holds one token, and an unbounded read of an
-        // attacker- or accident-sized file is a memory hazard.
-        use tokio::io::AsyncReadExt;
+/// Neither `tokio::fs` nor `spawn_blocking` can be used here. Both run the read
+/// on tokio's blocking pool, and no timeout, abort, or cancellation token
+/// reaches a thread already blocked inside a `read` syscall on a hung mount.
+/// Tokio waits for that pool when the runtime is dropped, so a single stalled
+/// delivery read pins runtime — and therefore process — shutdown indefinitely.
+///
+/// A thread outside the runtime cannot pin it: tokio does not know the thread
+/// exists, and the process does not wait for a detached thread past `main`.
+/// Exactly one exists per credential however many reads stall, so a wedged path
+/// costs one thread total rather than one per attempt. The thread exits on its
+/// own once the sender drops and any in-flight read returns.
+struct DeliveryReader {
+    /// `std::sync::mpsc::Sender` is `Send` but not `Sync`; the credential is
+    /// shared, so the handle needs a lock. Sending never blocks.
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<ReadRequest>>,
+}
 
-        let file = tokio::fs::File::open(path).await?;
-        let mut raw = String::new();
-        file.take(MAX_TOKEN_FILE_BYTES)
-            .read_to_string(&mut raw)
-            .await?;
-        Ok::<_, std::io::Error>(raw)
-    };
+impl DeliveryReader {
+    fn spawn() -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<ReadRequest>();
+        std::thread::Builder::new()
+            .name("mindroid-token-delivery".into())
+            .spawn(move || {
+                while let Ok(request) = rx.recv() {
+                    // The caller may have timed out and dropped its receiver
+                    // long ago; the read still had to run to completion.
+                    let _ = request.reply.send(read_capped(&request.path));
+                }
+            })?;
+        Ok(Self {
+            tx: std::sync::Mutex::new(tx),
+        })
+    }
 
-    match tokio::time::timeout(timeout, read).await {
-        Ok(Ok(raw)) => match parse_delivered(&raw, path, current) {
-            Some(delivered) => DeliveryRead::Adopted(delivered),
-            None => DeliveryRead::Miss,
-        },
-        Ok(Err(e)) => {
-            debug!("No delivered token at {path}: {e}");
-            DeliveryRead::Miss
+    /// Timing out releases this caller; it does not cancel the read, and
+    /// nothing can. `Stalled` then lets the caller stop re-reading, which is
+    /// what bounds how much work a hung path can queue behind the thread.
+    async fn read(&self, path: &str, current: &str, timeout: Duration) -> DeliveryRead {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let request = ReadRequest {
+            path: path.to_string(),
+            reply,
+        };
+        if self
+            .tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .send(request)
+            .is_err()
+        {
+            warn!("Delivered-token reader thread is gone; backing off from {path}");
+            return DeliveryRead::Stalled;
         }
-        Err(_) => {
-            warn!(
-                "Delivered-token read at {path} exceeded {}s; backing off from it",
-                timeout.as_secs()
-            );
-            DeliveryRead::Stalled
+
+        match tokio::time::timeout(timeout, response).await {
+            Ok(Ok(Ok(raw))) => match parse_delivered(&raw, path, current) {
+                Some(delivered) => DeliveryRead::Adopted(delivered),
+                None => DeliveryRead::Miss,
+            },
+            Ok(Ok(Err(e))) => {
+                debug!("No usable delivered token at {path}: {e}");
+                DeliveryRead::Miss
+            }
+            Ok(Err(_)) => {
+                warn!("Delivered-token reader dropped the reply for {path}");
+                DeliveryRead::Stalled
+            }
+            Err(_) => {
+                warn!(
+                    "Delivered-token read at {path} exceeded {}s; backing off from it",
+                    timeout.as_secs()
+                );
+                DeliveryRead::Stalled
+            }
         }
     }
+}
+
+/// Rejects — never truncates — a file over the cap.
+///
+/// `take(MAX)` yields a valid prefix, so a file one byte over the limit whose
+/// first `MAX` bytes happen to parse was adopted as a delivered credential on
+/// the strength of content its writer never terminated. Reading one byte past
+/// the cap is what distinguishes "at the limit" from "over it".
+fn read_capped(path: &str) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let mut raw = String::new();
+    file.take(MAX_TOKEN_FILE_BYTES + 1)
+        .read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_TOKEN_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("delivered-token file exceeds {MAX_TOKEN_FILE_BYTES} bytes"),
+        ));
+    }
+    Ok(raw)
 }
 
 fn parse_delivered(raw: &str, path: &str, current: &str) -> Option<DeliveredToken> {
@@ -489,6 +552,8 @@ pub struct EndUserAuth {
     /// Path a control plane writes freshly minted credentials to, re-read on
     /// need. `None` disables the channel.
     token_file: Option<String>,
+    /// Present exactly when `token_file` is.
+    delivery_reader: Option<DeliveryReader>,
 }
 
 impl EndUserAuth {
@@ -537,6 +602,7 @@ impl EndUserAuth {
             client,
             supervised: false,
             token_file: None,
+            delivery_reader: None,
             state: Arc::new(RwLock::new(AuthState {
                 token: TokenState {
                     token: token.into(),
@@ -580,8 +646,20 @@ impl EndUserAuth {
     /// Read on need — before a rotation, and whenever the credential is terminal
     /// — so nothing is stat-ed on the healthy path. The file is never written by
     /// this type.
+    /// Reads run on a dedicated thread (see [`DeliveryReader`]). If that thread
+    /// cannot be spawned the channel stays disabled rather than falling back to
+    /// a runtime-blocking read.
     pub fn with_token_file(mut self, path: impl Into<String>) -> Self {
-        self.token_file = Some(path.into());
+        let path = path.into();
+        match DeliveryReader::spawn() {
+            Ok(reader) => {
+                self.token_file = Some(path);
+                self.delivery_reader = Some(reader);
+            }
+            Err(e) => {
+                warn!("Could not start the delivered-token reader for {path}: {e}");
+            }
+        }
         self
     }
 
@@ -728,10 +806,16 @@ impl EndUserAuth {
         // credential dies on its own terms — the file is a chance to recover,
         // not a requirement.
         let may_read = state.delivery_retry_after.is_none_or(|until| now >= until);
-        if let Some(path) = &self.token_file
+        if let Some((path, reader)) = self
+            .token_file
+            .as_deref()
+            .zip(self.delivery_reader.as_ref())
             && may_read
         {
-            match read_delivered_async(path, &state.token.token).await {
+            match reader
+                .read(path, &state.token.token, DELIVERY_READ_TIMEOUT)
+                .await
+            {
                 DeliveryRead::Stalled => {
                     state.delivery_retry_after = Some(now + DELIVERY_STALL_COOLDOWN);
                 }
@@ -1171,6 +1255,81 @@ mod tests {
         )
         .unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    /// `take(MAX)` produces a valid prefix, so an oversized file whose first
+    /// `MAX` bytes happen to parse was adopted as a credential on content its
+    /// writer never terminated. Over the cap must fail, at the cap must pass.
+    #[tokio::test]
+    async fn an_oversized_token_file_is_rejected_rather_than_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("token.json");
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+
+        let mut body =
+            serde_json::json!({ "token": "delivered", "expires_at": expires }).to_string();
+        body.push_str(&" ".repeat(MAX_TOKEN_FILE_BYTES as usize + 1 - body.len()));
+        std::fs::write(&path, &body).unwrap();
+
+        let path = path.to_string_lossy().to_string();
+        let reader = DeliveryReader::spawn().unwrap();
+        assert!(
+            matches!(
+                reader.read(&path, "current", DELIVERY_READ_TIMEOUT).await,
+                DeliveryRead::Miss
+            ),
+            "a file one byte over the cap must not be adopted from its prefix"
+        );
+
+        std::fs::write(&path, &body[..MAX_TOKEN_FILE_BYTES as usize]).unwrap();
+        assert!(
+            matches!(
+                reader.read(&path, "current", DELIVERY_READ_TIMEOUT).await,
+                DeliveryRead::Adopted(_)
+            ),
+            "a file exactly at the cap is still a delivery"
+        );
+    }
+
+    /// The lifecycle blocker this reader exists for. On the blocking pool a read
+    /// that never returns also blocks runtime destruction, so a hung mount takes
+    /// the whole process down with it. Unix-only: a FIFO with no writer is the
+    /// portable stand-in for a wedged `open`.
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_delivery_read_cannot_pin_runtime_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("token.fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .is_ok_and(|s| s.success()),
+            "mkfifo is required for this test"
+        );
+        let fifo = fifo.to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let reader = DeliveryReader::spawn().unwrap();
+            assert!(
+                matches!(
+                    reader
+                        .read(&fifo, "current", Duration::from_millis(500))
+                        .await,
+                    DeliveryRead::Stalled
+                ),
+                "the caller must be released even though the read never returns"
+            );
+        });
+
+        let start = std::time::Instant::now();
+        drop(runtime);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a read nothing can cancel must not hold runtime shutdown (took {:?})",
+            start.elapsed()
+        );
     }
 
     /// The cross-process delivery channel: a control plane writes the mint

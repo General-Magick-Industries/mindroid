@@ -242,10 +242,27 @@ pub struct CentrifugoTransport {
     naming: Arc<dyn ChannelNaming>,
     connected: Arc<Connected>,
     allow_insecure: bool,
-    /// Cancels the spawned listener. `disconnect` triggers it and awaits the
-    /// handle, so a cancelled agent leaves no socket or subscription behind.
-    cancel: CancellationToken,
-    listener: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    listener: std::sync::Mutex<Listener>,
+}
+
+/// Lifecycle of the spawned listener, held under one mutex so that starting and
+/// stopping are each a single transition.
+///
+/// `Option<JoinHandle>` cannot express "stopping": `disconnect` has to release
+/// the lock to await the join, and a `listen` racing that window sees no
+/// listener, starts a second one, and then has its handle overwritten by the
+/// handle `disconnect` parks on failure — a live task detached, which ADR-0001
+/// disallows.
+enum Listener {
+    Idle,
+    Running {
+        handle: tokio::task::JoinHandle<()>,
+        /// Per-listener, not per-transport: a token cancelled by `disconnect`
+        /// stays cancelled, so a shared one makes every later `listen` return a
+        /// task that exits on its first poll.
+        cancel: CancellationToken,
+    },
+    Stopping,
 }
 
 impl CentrifugoTransport {
@@ -258,8 +275,7 @@ impl CentrifugoTransport {
             naming: Arc::new(ProxyChannelNaming),
             connected: Arc::new(Connected::new(false)),
             allow_insecure: false,
-            cancel: CancellationToken::new(),
-            listener: std::sync::Mutex::new(None),
+            listener: std::sync::Mutex::new(Listener::Idle),
         }
     }
 
@@ -636,16 +652,33 @@ impl Transport for CentrifugoTransport {
     /// caller learns shutdown failed and a later `disconnect` can retry the
     /// join rather than inheriting an untracked task.
     async fn disconnect(&mut self) -> Result<()> {
-        self.cancel.cancel();
         self.connected.store(false, Ordering::SeqCst);
 
-        let Some(mut handle) = self.listener.lock().unwrap().take() else {
-            return Ok(());
+        // Claim the stop in one transition, so nothing can start a listener into
+        // the gap opened by awaiting the join below.
+        let (mut handle, cancel) = {
+            let mut slot = self.listener.lock().unwrap();
+            match std::mem::replace(&mut *slot, Listener::Stopping) {
+                Listener::Running { handle, cancel } => (handle, cancel),
+                Listener::Idle => {
+                    *slot = Listener::Idle;
+                    return Ok(());
+                }
+                Listener::Stopping => {
+                    *slot = Listener::Stopping;
+                    return Err(transport_err(
+                        "a disconnect is already in progress for this transport",
+                    ));
+                }
+            }
         };
+        cancel.cancel();
+
         if tokio::time::timeout(Duration::from_secs(5), &mut handle)
             .await
             .is_ok()
         {
+            *self.listener.lock().unwrap() = Listener::Idle;
             return Ok(());
         }
 
@@ -657,10 +690,11 @@ impl Transport for CentrifugoTransport {
             .await
             .is_ok()
         {
+            *self.listener.lock().unwrap() = Listener::Idle;
             return Ok(());
         }
 
-        *self.listener.lock().unwrap() = Some(handle);
+        *self.listener.lock().unwrap() = Listener::Running { handle, cancel };
         Err(transport_err(
             "Centrifugo listener did not stop; its handle is retained for a later disconnect",
         ))
@@ -671,21 +705,26 @@ impl Transport for CentrifugoTransport {
     }
 
     async fn listen(&self, tx: mpsc::Sender<Message>) -> Result<()> {
-        // Refuse rather than overwrite: `disconnect` parks a listener it could
-        // not join here, and replacing it would drop a live handle — the detach
-        // ADR-0001 forbids, and the one that retention exists to prevent.
-        if self
-            .listener
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|prev| !prev.is_finished())
-        {
-            return Err(transport_err(
-                "a listener is already running; disconnect must succeed before listening again",
-            ));
+        // Checked, spawned, and installed under one lock. Releasing it between
+        // the check and the store lets concurrent callers all pass the check and
+        // then overwrite each other's live handles — the detach ADR-0001 forbids,
+        // and the one `disconnect`'s handle retention exists to prevent.
+        let mut slot = self.listener.lock().unwrap();
+        match &*slot {
+            Listener::Running { handle, .. } if !handle.is_finished() => {
+                return Err(transport_err(
+                    "a listener is already running; disconnect must succeed before listening again",
+                ));
+            }
+            Listener::Stopping => {
+                return Err(transport_err(
+                    "a listener is still shutting down; listen again once disconnect returns",
+                ));
+            }
+            _ => {}
         }
 
+        let cancel = CancellationToken::new();
         let ws_url = self.ws_url.clone();
         let agent_id = self.agent_id.clone();
         let identity = Arc::clone(&self.identity);
@@ -693,9 +732,10 @@ impl Transport for CentrifugoTransport {
         let naming = Arc::clone(&self.naming);
         let connected = Arc::clone(&self.connected);
         let allow_insecure = self.allow_insecure;
-        let cancel = self.cancel.clone();
+        let cancel_for_task = cancel.clone();
 
         let handle = tokio::spawn(async move {
+            let cancel = cancel_for_task;
             let mut backoff = Duration::from_secs(1);
             const MAX_BACKOFF: Duration = Duration::from_secs(30);
             let mut cmd_id: u32 = 3; // 1=connect, 2=subscribe, 3+ for refresh
@@ -880,7 +920,7 @@ impl Transport for CentrifugoTransport {
             connected.store(false, Ordering::SeqCst);
         });
 
-        *self.listener.lock().unwrap() = Some(handle);
+        *slot = Listener::Running { handle, cancel };
         Ok(())
     }
 
@@ -1107,7 +1147,10 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        *transport.listener.lock().unwrap() = Some(handle);
+        *transport.listener.lock().unwrap() = Listener::Running {
+            handle,
+            cancel: CancellationToken::new(),
+        };
 
         transport
             .disconnect()
@@ -1139,7 +1182,10 @@ mod tests {
             std::thread::sleep(Duration::from_secs(7));
             flag.store(true, Ordering::SeqCst);
         });
-        *transport.listener.lock().unwrap() = Some(handle);
+        *transport.listener.lock().unwrap() = Listener::Running {
+            handle,
+            cancel: CancellationToken::new(),
+        };
 
         let outcome = tokio::time::timeout(Duration::from_secs(15), transport.disconnect())
             .await
@@ -1158,9 +1204,99 @@ mod tests {
             "a listener that outlived the join must surface as a shutdown failure"
         );
         assert!(
-            transport.listener.lock().unwrap().is_some(),
+            matches!(
+                *transport.listener.lock().unwrap(),
+                Listener::Running { .. }
+            ),
             "the handle must be retained, not discarded"
         );
+    }
+
+    /// Installing a listener has to be one transition. Checking the slot,
+    /// releasing the lock, spawning, and only then storing let every concurrent
+    /// caller pass the check and overwrite the others' live handles — a detached
+    /// task per loser, which ADR-0001 forbids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_listens_install_exactly_one_listener() {
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
+        let transport = Arc::new(
+            CentrifugoTransport::new("ws://127.0.0.1:1/ws", "agent", auth)
+                .with_allow_insecure(true),
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut starts = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let transport = Arc::clone(&transport);
+            let barrier = Arc::clone(&barrier);
+            let (tx, rx) = mpsc::channel(8);
+            starts.spawn(async move {
+                barrier.wait().await;
+                let outcome = transport.listen(tx).await;
+                drop(rx);
+                outcome.is_ok()
+            });
+        }
+
+        let mut installed = 0;
+        while let Some(outcome) = starts.join_next().await {
+            installed += usize::from(outcome.unwrap());
+        }
+        assert_eq!(
+            installed, 1,
+            "{installed} callers installed a listener; every extra one detached the handle it replaced"
+        );
+
+        let mut transport =
+            Arc::try_unwrap(transport).unwrap_or_else(|_| unreachable!("all starts have joined"));
+        transport.disconnect().await.expect("clean disconnect");
+    }
+
+    /// A `listen` racing a `disconnect` must not slot a second listener into the
+    /// window where `disconnect` has released the lock to await the join — the
+    /// parked handle would then overwrite it and detach a live task.
+    #[tokio::test]
+    async fn listen_is_refused_while_a_disconnect_is_in_flight() {
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
+        let transport = CentrifugoTransport::new("wss://example.com/ws", "agent", auth);
+
+        *transport.listener.lock().unwrap() = Listener::Stopping;
+
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(
+            transport.listen(tx).await.is_err(),
+            "a listener must not be installed over one that is still stopping"
+        );
+        assert!(
+            matches!(*transport.listener.lock().unwrap(), Listener::Stopping),
+            "the refused start must not have disturbed the in-flight stop"
+        );
+    }
+
+    /// Each listener owns its cancellation token. Sharing one per transport
+    /// leaves it cancelled after the first `disconnect`, so every later `listen`
+    /// hands back a task that exits on its first poll and reports success.
+    #[tokio::test]
+    async fn a_listener_started_after_a_disconnect_is_not_born_cancelled() {
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(""));
+        let mut transport = CentrifugoTransport::new("ws://127.0.0.1:1/ws", "agent", auth)
+            .with_allow_insecure(true);
+
+        let (tx, _rx) = mpsc::channel(8);
+        transport.listen(tx).await.unwrap();
+        transport.disconnect().await.expect("clean disconnect");
+
+        let (tx, _rx2) = mpsc::channel(8);
+        transport.listen(tx).await.expect("relisten");
+
+        // Long enough for a token-cancelled loop to break out and finish.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            matches!(&*transport.listener.lock().unwrap(), Listener::Running { handle, .. } if !handle.is_finished()),
+            "the relistened task must still be running, not cancelled before its first poll"
+        );
+
+        transport.disconnect().await.expect("clean disconnect");
     }
 
     /// `is_connected` must not report "disconnected" merely because a writer is
