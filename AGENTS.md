@@ -65,10 +65,14 @@ Runtime (core/runtime.rs)
 ├── Transport  → mpsc → MessageContext → Pipeline → respond()
 ├── Auth       → token/headers for authed subsystems
 ├── Memory     → save/get/clear history
-├── Observer   → lifecycle hooks (on_start, on_message, on_error, …)
+├── Observer   → lifecycle hooks (on_start, on_message, on_error, …) — edge-triggered
+├── Health     → current liveness for a supervisor (Runtime::health) — level-triggered
 ├── Routines   → background poll/act loops (reminders, etc.)
 └── Pipeline   → ordered stages, at most ONE StreamingStage
 ```
+
+`Observer` reports that something *happened*; `Health` reports what the state *is* right
+now, which is what an out-of-process supervisor needs. See ADR-0007.
 
 For real-time bidirectional audio, `OmniSession` runs alongside `Pipeline` as a separate model (see ADR-0003).
 
