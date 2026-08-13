@@ -523,25 +523,27 @@ fn parse_push(text: &str, subscribed_channel: &str) -> Option<Message> {
         return None;
     };
 
-    // `channel_id` becomes the artifact scope, a trust boundary — so it comes from
-    // the subscribed channel, never the payload.
-    let channel_id = match outer
+    // `channel_id` is the conversation this turn belongs to, so it comes from the
+    // payload, with the subscribed channel only as a fallback.
+    //
+    // It cannot come from the channel: every Magick Mind delivery channel names a
+    // *subscriber* rather than a conversation — `user:{id}#{id}` for an end user,
+    // `personal:{id}#{sub}` for a service user — because the part after `#` is
+    // Centrifugo's subscribe ACL. Taking the channel name would address every
+    // magickspace call to a conversation that does not exist, so context prep and
+    // episodic ingest both 404 and the turn aborts before reaching the LLM.
+    //
+    // Preferring the payload does not widen access. Bifrost fans a message out to
+    // each participant's own channel and names the magickspace in the envelope,
+    // and every read against that magickspace re-checks participation server-side,
+    // so a forged id answers 403 rather than another conversation.
+    let channel_id = outer
         .get("magickspace_id")
         .or_else(|| inner.get("magickspace_id"))
         .or_else(|| inner.get("channel_id"))
         .and_then(|v| v.as_str())
-    {
-        Some(claimed) if claimed != channel => {
-            warn!(
-                claimed = %claimed,
-                actual = %channel,
-                "Push claims a different channel id than the one it arrived on; \
-                 using the actual channel"
-            );
-            channel.clone()
-        }
-        _ => channel.clone(),
-    };
+        .unwrap_or(&channel)
+        .to_string();
 
     let mut msg = Message::new(content, sender_id, channel_id).with_id(id);
     msg.platform = Some("centrifugo".into());
@@ -1367,23 +1369,50 @@ mod tests {
         assert!(parse_push(&frame, "user:a1#a1").is_none());
     }
 
-    /// `channel_id` becomes the artifact scope, so a payload must not be able to
-    /// name a different one and read another conversation's artifacts.
+    /// Bifrost fans a magickspace message out to each participant's own channel,
+    /// so the channel names the subscriber and only the envelope names the
+    /// conversation. Reading the channel instead addresses every subsequent
+    /// magickspace call to something that is not a magickspace.
     #[test]
-    fn a_payload_cannot_choose_its_own_scope() {
+    fn the_conversation_comes_from_the_envelope_not_the_delivery_channel() {
         let frame = push(
             "user:a1#a1",
             serde_json::json!({
                 "content": "hi",
                 "sender_id": "u1",
-                "magickspace_id": "someone-elses-space",
+                "magickspace_id": "ms-1",
             }),
         );
         let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
-        assert_eq!(
-            msg.channel_id, "user:a1#a1",
-            "scope must come from the subscribed channel, not the payload"
+        assert_eq!(msg.channel_id, "ms-1");
+    }
+
+    /// The service-user channel carries the same distinction, so the fix cannot
+    /// be special-cased to `user:` channels.
+    #[test]
+    fn a_service_user_push_also_takes_its_conversation_from_the_envelope() {
+        let frame = push(
+            "personal:a1#svc",
+            serde_json::json!({
+                "content": "hi",
+                "sender_id": "u1",
+                "magickspace_id": "ms-1",
+            }),
         );
+        let msg = parse_push(&frame, "personal:a1#svc").expect("message is still delivered");
+        assert_eq!(msg.channel_id, "ms-1");
+    }
+
+    /// A transport with no notion of magickspaces (mindroid-voice publishes to
+    /// the same channel) still needs a scope to route the turn.
+    #[test]
+    fn an_envelope_without_a_magickspace_falls_back_to_the_channel() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({ "content": "hi", "sender_id": "u1" }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
+        assert_eq!(msg.channel_id, "user:a1#a1");
     }
 
     #[test]
