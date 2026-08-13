@@ -391,8 +391,15 @@ fn convert_context_response(
 ) -> Vec<LlmMessage> {
     let mut messages = Vec::new();
 
-    // Chat history: split into proper roles so the LLM recognizes its own responses.
-    for item in &resp.chat_history {
+    // Chat history: split into proper roles so the LLM recognizes its own
+    // responses, and reversed on the way in.
+    //
+    // Context prepare orders newest-first, because that is how it takes the
+    // latest N under a limit. An LLM reads a transcript as chronological, so
+    // passing that order through puts the oldest turn last and inverts the
+    // conversation: asked what a user said most recently, the model answers with
+    // the oldest thing it can see.
+    for item in resp.chat_history.iter().rev() {
         if let Some(id) = self_id
             && item.sent_by_user_id == id
         {
@@ -525,6 +532,30 @@ pub fn magickmind_ollama_pipeline(
 mod tests {
     use super::*;
     use crate::auth::static_id::StaticAuth;
+
+    /// Context prepare answers newest-first. Passed through unchanged, the model
+    /// reads the transcript upside down and answers "what did I say most
+    /// recently" with the oldest turn it can see.
+    #[test]
+    fn chat_history_is_injected_oldest_first() {
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"chat_history":[
+                {"sent_by_user_id":"u1","content":"newest"},
+                {"sent_by_user_id":"a1","content":"middle"},
+                {"sent_by_user_id":"u1","content":"oldest"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let messages = convert_context_response(resp, Some("a1"));
+        let rendered: Vec<String> = messages.iter().map(|m| m.text()).collect();
+
+        assert_eq!(
+            rendered,
+            vec!["[u1]: oldest", "middle", "[u1]: newest"],
+            "history must read oldest to newest, with the agent's own turn as assistant"
+        );
+    }
 
     #[test]
     fn credentialed_presets_reject_plaintext_gateways() {
