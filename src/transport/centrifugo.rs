@@ -242,6 +242,7 @@ pub struct CentrifugoTransport {
     naming: Arc<dyn ChannelNaming>,
     connected: Arc<Connected>,
     allow_insecure: bool,
+    trust_fanout_sender: bool,
     listener: std::sync::Mutex<Listener>,
     /// Set by the runtime before connect, so the reconnect loop can publish
     /// transitions from the first attempt onward.
@@ -282,6 +283,7 @@ impl CentrifugoTransport {
             naming: Arc::new(ProxyChannelNaming),
             connected: Arc::new(Connected::new(false)),
             allow_insecure: false,
+            trust_fanout_sender: false,
             listener: std::sync::Mutex::new(Listener::Idle),
             health: None,
         }
@@ -306,6 +308,15 @@ impl CentrifugoTransport {
     /// Permit sending the auth token over plaintext `ws://` (local development only).
     pub fn with_allow_insecure(mut self, allow_insecure: bool) -> Self {
         self.allow_insecure = allow_insecure;
+        self
+    }
+
+    /// Trust the payload's `sent_by_user_id` as the authenticated sender on
+    /// pushes that carry no publication `info`. See
+    /// [`TransportConfig::trust_server_fanout_sender`](crate::config::TransportConfig::trust_server_fanout_sender)
+    /// for when this is sound; a present `info.user` always wins over the payload.
+    pub fn with_trust_fanout_sender(mut self, trust: bool) -> Self {
+        self.trust_fanout_sender = trust;
         self
     }
 }
@@ -461,7 +472,7 @@ fn content_derived_id(channel: &str, payload: &serde_json::Value) -> String {
     format!("centrifugo-{:016x}", h.finish())
 }
 
-fn parse_push(text: &str, subscribed_channel: &str) -> Option<Message> {
+fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -> Option<Message> {
     let val: serde_json::Value = serde_json::from_str(text).ok()?;
     let push = val.get("push")?;
     let channel = push.get("channel")?.as_str()?.to_string();
@@ -566,6 +577,17 @@ fn parse_push(text: &str, subscribed_channel: &str) -> Option<Message> {
         msg.metadata.insert(
             "authenticated_sender_id".into(),
             serde_json::Value::String(authenticated_sender.to_string()),
+        );
+    } else if trust_fanout_sender && !msg.sender_id.is_empty() {
+        // Server-API publishes carry no `info` — Centrifugo stamps it only on
+        // client-connection publications. When the deployment opts in (every
+        // writer on this channel is a key-holding server whose payload sender
+        // is pre-verified, e.g. the Bifrost fan-out), the payload's sender IS
+        // the authenticated one. A present `info.user` always wins above: a
+        // client publication must not name its own identity via the payload.
+        msg.metadata.insert(
+            "authenticated_sender_id".into(),
+            serde_json::Value::String(msg.sender_id.clone()),
         );
     }
     attach_image_metadata(&mut msg, inner);
@@ -738,6 +760,7 @@ impl Transport for CentrifugoTransport {
         let naming = Arc::clone(&self.naming);
         let connected = Arc::clone(&self.connected);
         let allow_insecure = self.allow_insecure;
+        let trust_fanout_sender = self.trust_fanout_sender;
         let cancel_for_task = cancel.clone();
         let health = self.health.clone();
 
@@ -817,7 +840,7 @@ impl Transport for CentrifugoTransport {
                                                     continue;
                                                 }
 
-                                                if let Some(message) = parse_push(line, &subscribed_channel) {
+                                                if let Some(message) = parse_push(line, &subscribed_channel, trust_fanout_sender) {
                                                     if tx.send(message).await.is_err() {
                                                         warn!("Message receiver dropped, stopping listen loop");
                                                         break 'listener;
@@ -1470,7 +1493,7 @@ mod tests {
     fn a_push_with_no_sender_is_dropped() {
         let frame = push("user:a1#a1", serde_json::json!({ "content": "hi" }));
         assert!(
-            parse_push(&frame, "user:a1#a1").is_none(),
+            parse_push(&frame, "user:a1#a1", false).is_none(),
             "an unattributable message must not be delivered"
         );
     }
@@ -1481,8 +1504,8 @@ mod tests {
     #[test]
     fn an_id_less_push_dedupes_across_identical_redeliveries() {
         let data = serde_json::json!({ "content": "hi", "sender_id": "u1" });
-        let a = parse_push(&push("user:a1#a1", data.clone()), "user:a1#a1").unwrap();
-        let b = parse_push(&push("user:a1#a1", data), "user:a1#a1").unwrap();
+        let a = parse_push(&push("user:a1#a1", data.clone()), "user:a1#a1", false).unwrap();
+        let b = parse_push(&push("user:a1#a1", data), "user:a1#a1", false).unwrap();
         assert_eq!(a.id, b.id, "identical payloads must produce the same id");
 
         let other = parse_push(
@@ -1491,6 +1514,7 @@ mod tests {
                 serde_json::json!({ "content": "different", "sender_id": "u1" }),
             ),
             "user:a1#a1",
+            false,
         )
         .unwrap();
         assert_ne!(a.id, other.id, "different payloads must not collide");
@@ -1502,7 +1526,7 @@ mod tests {
             "user:someone-else#x",
             serde_json::json!({ "content": "hi", "sender_id": "u1" }),
         );
-        assert!(parse_push(&frame, "user:a1#a1").is_none());
+        assert!(parse_push(&frame, "user:a1#a1", false).is_none());
     }
 
     /// `channel_id` is the artifact scope, the local history key, and the
@@ -1519,7 +1543,7 @@ mod tests {
                 "magickspace_id": "someone-elses-space",
             }),
         );
-        let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("message is still delivered");
         assert_eq!(
             msg.channel_id, "user:a1#a1",
             "scope must come from the subscribed channel, not the payload"
@@ -1542,7 +1566,7 @@ mod tests {
                     "magickspace_id": "ms-1",
                 }),
             );
-            let msg = parse_push(&frame, channel).expect("message is still delivered");
+            let msg = parse_push(&frame, channel, false).expect("message is still delivered");
             assert_eq!(msg.conversation_id(), "ms-1", "channel {channel}");
             assert_eq!(msg.channel_id, channel, "the local scope stays trusted");
         }
@@ -1556,7 +1580,7 @@ mod tests {
             "user:a1#a1",
             serde_json::json!({ "content": "hi", "sender_id": "u1" }),
         );
-        let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("message is still delivered");
         assert_eq!(msg.conversation_id(), "user:a1#a1");
     }
 
@@ -1573,7 +1597,7 @@ mod tests {
                     "magickspace_id": blank,
                 }),
             );
-            let msg = parse_push(&frame, "user:a1#a1").expect("message is still delivered");
+            let msg = parse_push(&frame, "user:a1#a1", false).expect("message is still delivered");
             assert_eq!(msg.conversation_id(), "user:a1#a1", "blank {blank:?}");
             assert_eq!(msg.channel_id, "user:a1#a1");
         }
@@ -1585,7 +1609,7 @@ mod tests {
             "user:a1#a1",
             serde_json::json!({ "id": "m-7", "content": "hello", "sender_id": "u1" }),
         );
-        let msg = parse_push(&frame, "user:a1#a1").expect("valid push");
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
         assert_eq!(msg.id, "m-7");
         assert_eq!(msg.sender_id, "u1");
         assert_eq!(msg.content, "hello");
@@ -1603,9 +1627,49 @@ mod tests {
             }
         })
         .to_string();
-        let msg = parse_push(&frame, "user:a1#a1").unwrap();
+        let msg = parse_push(&frame, "user:a1#a1", false).unwrap();
 
         assert_eq!(msg.sender_id, "payload-user");
+        assert_eq!(msg.trusted_sender_id(), Some("authenticated-user"));
+    }
+
+    /// Server-API fan-out publishes (Bifrost) carry no `pub.info`, so without
+    /// the opt-in every fan-out message is unauthenticated and the whole
+    /// remote-tool protocol (manifest accept, call correlation) is inert.
+    #[test]
+    fn fanout_trust_adopts_the_payload_sender_when_no_info_is_present() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({ "content": "hi", "sent_by_user_id": "u1" }),
+        );
+
+        let trusted = parse_push(&frame, "user:a1#a1", true).unwrap();
+        assert_eq!(trusted.trusted_sender_id(), Some("u1"));
+
+        let strict = parse_push(&frame, "user:a1#a1", false).unwrap();
+        assert_eq!(
+            strict.trusted_sender_id(),
+            None,
+            "without the opt-in an info-less push stays unauthenticated"
+        );
+    }
+
+    /// A client publication's stamped identity must not be overridable by its
+    /// payload — `info.user` wins even with the fan-out opt-in enabled.
+    #[test]
+    fn fanout_trust_never_overrides_a_stamped_publication_identity() {
+        let frame = serde_json::json!({
+            "push": {
+                "channel": "user:a1#a1",
+                "pub": {
+                    "info": { "user": "authenticated-user" },
+                    "data": { "content": "hello", "sender_id": "payload-user" }
+                }
+            }
+        })
+        .to_string();
+
+        let msg = parse_push(&frame, "user:a1#a1", true).unwrap();
         assert_eq!(msg.trusted_sender_id(), Some("authenticated-user"));
     }
 

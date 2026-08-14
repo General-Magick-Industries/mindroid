@@ -211,6 +211,17 @@ pub struct TransportConfig {
     /// Production deployments must use `wss://`.
     #[serde(default)]
     pub allow_insecure: bool,
+    /// Trust the payload's `sent_by_user_id` as the authenticated sender when a
+    /// push carries no publication `info` (a server-API publish; Centrifugo only
+    /// stamps `info` on client-connection publications).
+    ///
+    /// Enable ONLY where everything publishing to this agent's inbound channel
+    /// is a trusted server holding the Centrifugo API key (the Magick Mind
+    /// fan-out: Bifrost verifies the sender before publishing). On a deployment
+    /// where clients publish directly, leave this off — a client payload could
+    /// otherwise name any sender and gain that identity's tool/manifest trust.
+    #[serde(default)]
+    pub trust_server_fanout_sender: bool,
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 }

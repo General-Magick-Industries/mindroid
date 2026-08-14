@@ -144,7 +144,8 @@ pub(crate) fn build_transport(
             Ok(Box::new(
                 crate::transport::centrifugo::CentrifugoTransport::new(url, agent_id, auth.clone())
                     .with_credential_kind(kind)
-                    .with_allow_insecure(config.transport.allow_insecure),
+                    .with_allow_insecure(config.transport.allow_insecure)
+                    .with_trust_fanout_sender(config.transport.trust_server_fanout_sender),
             ))
         }
 
