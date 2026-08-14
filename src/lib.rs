@@ -67,7 +67,7 @@ pub use observer::{NoObserver, Observer};
 #[cfg(feature = "persona")]
 pub use persona::{
     ConversationHistory, MagickmindPersonaClient, MagickmindPersonaStage, PersonaContextBuilder,
-    PersonaId, PersonaProvider,
+    PersonaId, PersonaProvider, RuntimeAffectSnapshot, RuntimeAffectState, RuntimeStateEnvelope,
 };
 pub use pipeline::combinators::{ApprovalStage, BranchStage, RetryStage, RouteFn, RouterStage};
 pub use pipeline::context::{ContextPreparer, ContextProvider, PrepareOutcome, ProviderWarning};

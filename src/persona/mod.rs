@@ -5,6 +5,7 @@ mod magickmind_agent_stage;
 mod magickmind_stage;
 pub mod models;
 mod provider;
+mod runtime_state;
 mod stage;
 
 pub use client::MagickmindPersonaClient;
@@ -15,6 +16,7 @@ pub use models::{
     EffectivePersonalityResponse, EffectiveSources, EffectiveTrait, PersonaSchema, TraitValue,
 };
 pub use provider::PersonaProvider;
+pub use runtime_state::{RuntimeAffectSnapshot, RuntimeAffectState, RuntimeStateEnvelope};
 pub use stage::PersonaContextBuilder;
 
 use crate::core::context::Context;
@@ -77,9 +79,53 @@ pub(crate) fn assemble_llm_messages(
         .map(|h| h.0.as_slice())
         .unwrap_or(fallback_history);
 
+    let runtime_prompt = ctx
+        .get::<RuntimeAffectSnapshot>()
+        .map(|affect| format!("{system_prompt}\n\n{}", affect.prompt_instruction()));
+
     let mut messages = Vec::with_capacity(history.len() + 2);
-    messages.push(LlmMessage::system(system_prompt));
+    messages.push(LlmMessage::system(
+        runtime_prompt.as_deref().unwrap_or(system_prompt),
+    ));
     messages.extend_from_slice(history);
     messages.push(LlmMessage::user(user_text(ctx)));
     messages
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::AgentConfig;
+    use crate::models::Message;
+
+    #[test]
+    fn runtime_affect_is_appended_to_the_stable_persona_prompt() {
+        let message = Arc::new(Message::new("hello", "user-1", "channel-1"));
+        let mut ctx = Context::new(message, Arc::new(AgentConfig::default()));
+        ctx.set_ext(RuntimeAffectSnapshot {
+            pleasure: 0.25,
+            arousal: -0.5,
+            dominance: 0.75,
+            state_version: 8,
+        });
+
+        let messages = assemble_llm_messages(&ctx, "You are Aria.", &[]);
+        let system = messages[0].text();
+        assert!(system.starts_with("You are Aria."));
+        assert!(system.contains("Current temporary affect (PAD)"));
+        assert!(system.contains("pleasure=+0.250"));
+        assert!(system.contains("arousal=-0.500"));
+        assert!(system.contains("dominance=+0.750"));
+    }
+
+    #[test]
+    fn persona_prompt_is_unchanged_without_runtime_affect() {
+        let message = Arc::new(Message::new("hello", "user-1", "channel-1"));
+        let ctx = Context::new(message, Arc::new(AgentConfig::default()));
+
+        let messages = assemble_llm_messages(&ctx, "You are Aria.", &[]);
+        assert_eq!(messages[0].text(), "You are Aria.");
+    }
 }

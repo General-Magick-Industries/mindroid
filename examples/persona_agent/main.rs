@@ -310,6 +310,13 @@ async fn main() -> anyhow::Result<()> {
                 // stage splices between the system prompt and the user message.
                 pctx.reset_output();
                 pctx.set_ext(ConversationHistory(history));
+                // reset_output clears run-scoped extensions, including the
+                // affect returned by inbound ingest. Rehydrate it from the
+                // stage's per-agent/per-user last-good cache so the persona
+                // stage can express the current locally decayed snapshot.
+                if let Some(ingest) = &inbound_ingest {
+                    ingest.apply_runtime_state(&mut pctx).await;
+                }
 
                 match ctx.run_with_context(&respond, &mut pctx).await {
                     Ok(None) => {
