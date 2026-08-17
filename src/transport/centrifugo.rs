@@ -556,16 +556,21 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     // the local scope stays trusted.
     let mut msg = Message::new(content, sender_id, channel.clone()).with_id(id);
     msg.platform = Some("centrifugo".into());
-    if let Some(magickspace) = outer
-        .get("magickspace_id")
-        .or_else(|| inner.get("magickspace_id"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-    {
-        msg.metadata.insert(
-            "magickspace_id".into(),
-            serde_json::Value::String(magickspace.to_string()),
-        );
+    // Conversation-scope facts the backend stamps on the payload; absent on
+    // older backends and non-magickmind publishers, so each copies only when
+    // present. sent_by_user_name is display data (the verified identity is
+    // authenticated_sender_id below); magickspace_type is PRIVATE|GROUP, read
+    // by hosts that gate replies per space.
+    for key in ["magickspace_id", "sent_by_user_name", "magickspace_type"] {
+        if let Some(value) = outer
+            .get(key)
+            .or_else(|| inner.get(key))
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            msg.metadata
+                .insert(key.into(), serde_json::Value::String(value.to_string()));
+        }
     }
     if let Some(authenticated_sender) = push
         .get("pub")
@@ -1601,6 +1606,49 @@ mod tests {
             assert_eq!(msg.conversation_id(), "user:a1#a1", "blank {blank:?}");
             assert_eq!(msg.channel_id, "user:a1#a1");
         }
+    }
+
+    /// The backend stamps display and gating facts on the envelope; both ride
+    /// metadata untouched, and blanks are dropped like a blank magickspace.
+    #[test]
+    fn sender_name_and_space_type_ride_the_metadata() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({
+                "content": "hi",
+                "sender_id": "u1",
+                "sent_by_user_name": "Alice",
+                "magickspace_type": "GROUP",
+            }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+        assert_eq!(
+            msg.metadata
+                .get("sent_by_user_name")
+                .and_then(|v| v.as_str()),
+            Some("Alice")
+        );
+        assert_eq!(
+            msg.metadata
+                .get("magickspace_type")
+                .and_then(|v| v.as_str()),
+            Some("GROUP")
+        );
+    }
+
+    #[test]
+    fn blank_or_absent_name_and_type_leave_no_metadata() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({
+                "content": "hi",
+                "sender_id": "u1",
+                "sent_by_user_name": "   ",
+            }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+        assert!(!msg.metadata.contains_key("sent_by_user_name"));
+        assert!(!msg.metadata.contains_key("magickspace_type"));
     }
 
     #[test]

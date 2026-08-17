@@ -69,7 +69,21 @@ struct ChatHistoryItem {
     #[serde(default)]
     sent_by_user_id: String,
     #[serde(default)]
+    sent_by_user_name: String,
+    #[serde(default)]
     content: String,
+}
+
+impl ChatHistoryItem {
+    // Display attribution only -- the backend joins it best-effort, so an
+    // empty name falls back to the id rather than an unattributed line.
+    fn speaker(&self) -> &str {
+        if self.sent_by_user_name.is_empty() {
+            &self.sent_by_user_id
+        } else {
+            &self.sent_by_user_name
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -410,7 +424,8 @@ fn convert_context_response(
         // Other participants → user role with sender attribution
         messages.push(LlmMessage::user(format!(
             "[{}]: {}",
-            item.sent_by_user_id, item.content
+            item.speaker(),
+            item.content
         )));
     }
 
@@ -555,6 +570,26 @@ mod tests {
             vec!["[u1]: oldest", "middle", "[u1]: newest"],
             "history must read oldest to newest, with the agent's own turn as assistant"
         );
+    }
+
+    /// Names are display attribution joined best-effort by the backend: a
+    /// carried name replaces the raw id, an absent one falls back to it, and
+    /// the agent's own turns stay unattributed assistant messages.
+    #[test]
+    fn sender_names_replace_ids_when_the_backend_supplies_them() {
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"chat_history":[
+                {"sent_by_user_id":"a1","sent_by_user_name":"Tesla","content":"reply"},
+                {"sent_by_user_id":"u2","content":"unnamed"},
+                {"sent_by_user_id":"u1","sent_by_user_name":"Alice","content":"hi"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let messages = convert_context_response(resp, Some("a1"));
+        let rendered: Vec<String> = messages.iter().map(|m| m.text()).collect();
+
+        assert_eq!(rendered, vec!["[Alice]: hi", "[u2]: unnamed", "reply"]);
     }
 
     #[test]
