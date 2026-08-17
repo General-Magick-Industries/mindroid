@@ -80,6 +80,59 @@ pub(crate) fn assemble_llm_messages(
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(LlmMessage::system(system_prompt));
     messages.extend_from_slice(history);
-    messages.push(LlmMessage::user(user_text(ctx)));
+
+    // Attribute the live turn the same way rendered history is attributed
+    // (`[Name]: text`), so the model knows who it is replying to. Tool-result
+    // frames are machine output, not speech — they stay unprefixed.
+    let text = user_text(ctx);
+    let attributed = ctx
+        .message
+        .metadata
+        .get("sent_by_user_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !text.trim_start().starts_with("<tool_result"))
+        .map(|name| format!("[{name}]: {text}"));
+    messages.push(LlmMessage::user(attributed.as_deref().unwrap_or(text)));
     messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentConfig;
+    use crate::models::Message;
+    use std::sync::Arc;
+
+    fn ctx_with(content: &str, name: Option<&str>) -> Context {
+        let mut msg = Message::new(content, "u1", "chan");
+        if let Some(n) = name {
+            msg.metadata.insert(
+                "sent_by_user_name".into(),
+                serde_json::Value::String(n.into()),
+            );
+        }
+        Context::new(Arc::new(msg), Arc::new(AgentConfig::default()))
+    }
+
+    #[test]
+    fn live_turn_is_attributed_when_the_fanout_names_the_sender() {
+        let messages = assemble_llm_messages(&ctx_with("hello", Some(" Turtle ")), "sys", &[]);
+        assert_eq!(messages[1].text(), "[Turtle]: hello");
+    }
+
+    #[test]
+    fn unnamed_turns_stay_raw() {
+        let messages = assemble_llm_messages(&ctx_with("hello", None), "sys", &[]);
+        assert_eq!(messages[1].text(), "hello");
+    }
+
+    /// Machine frames are not speech; attributing one would corrupt the
+    /// envelope the executor's history expects.
+    #[test]
+    fn tool_result_frames_stay_unprefixed() {
+        let framed = "<tool_result id=\"1\">ok</tool_result>";
+        let messages = assemble_llm_messages(&ctx_with(framed, Some("Turtle")), "sys", &[]);
+        assert_eq!(messages[1].text(), framed);
+    }
 }

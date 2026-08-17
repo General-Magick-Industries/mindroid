@@ -432,6 +432,23 @@ fn convert_context_response(
     // Knowledge and documents → system context
     let mut context_parts = Vec::new();
 
+    // The `[Name]:` prefixes above are a convention this function invents, so
+    // the model must be told what they mean — without this, small models treat
+    // the name as message text and still claim not to know who is speaking.
+    if resp
+        .chat_history
+        .iter()
+        .any(|item| !item.sent_by_user_name.is_empty())
+    {
+        context_parts.push(
+            "Attribution: each conversation message is prefixed with its sender's \
+             display name in square brackets, like `[Alice]: hello`. The bracketed \
+             name is who wrote that message — use it to know who is speaking and \
+             to answer questions about names or who said what."
+                .to_string(),
+        );
+    }
+
     if !resp.fetcher.is_empty() {
         context_parts.push(format!("Relevant knowledge:\n{}", resp.fetcher));
     }
@@ -589,7 +606,26 @@ mod tests {
         let messages = convert_context_response(resp, Some("a1"));
         let rendered: Vec<String> = messages.iter().map(|m| m.text()).collect();
 
-        assert_eq!(rendered, vec!["[Alice]: hi", "[u2]: unnamed", "reply"]);
+        assert_eq!(rendered[..3], ["[Alice]: hi", "[u2]: unnamed", "reply"]);
+        assert!(
+            rendered[3].contains("Attribution:"),
+            "carried names must come with the convention explained, or small \
+             models read the prefix as message text: {:?}",
+            rendered[3]
+        );
+    }
+
+    /// A history with no names carries no attribution note — there is no
+    /// convention to explain.
+    #[test]
+    fn unnamed_history_gets_no_attribution_note() {
+        let resp: PrepareContextResponse =
+            serde_json::from_str(r#"{"chat_history":[{"sent_by_user_id":"u1","content":"hi"}]}"#)
+                .unwrap();
+
+        let messages = convert_context_response(resp, None);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "[u1]: hi");
     }
 
     #[test]
