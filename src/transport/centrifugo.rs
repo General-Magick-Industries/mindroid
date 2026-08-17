@@ -572,6 +572,17 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
                 .insert(key.into(), serde_json::Value::String(value.to_string()));
         }
     }
+    // The sender's per-turn tool manifest, stamped by the backend on the
+    // fan-out payload alone (never in chat history). PerTurnToolsStage reads
+    // this key; validation and bounds happen there.
+    if let Some(tools) = inner
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .filter(|tools| !tools.is_empty())
+    {
+        msg.metadata
+            .insert("tools".into(), serde_json::Value::Array(tools.clone()));
+    }
     if let Some(authenticated_sender) = push
         .get("pub")
         .and_then(|publication| publication.get("info"))
@@ -1649,6 +1660,35 @@ mod tests {
         let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
         assert!(!msg.metadata.contains_key("sent_by_user_name"));
         assert!(!msg.metadata.contains_key("magickspace_type"));
+    }
+
+    #[test]
+    fn per_message_tools_ride_the_metadata_and_empty_ones_are_dropped() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({
+                "content": "whats the time",
+                "sender_id": "u1",
+                "tools": [{"name": "get_local_time", "schema": {"type": "object"}}],
+            }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+        let tools = msg
+            .metadata
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array in metadata");
+        assert_eq!(
+            tools[0].get("name").and_then(|v| v.as_str()),
+            Some("get_local_time")
+        );
+
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({ "content": "hi", "sender_id": "u1", "tools": [] }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+        assert!(!msg.metadata.contains_key("tools"));
     }
 
     #[test]
