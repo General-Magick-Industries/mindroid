@@ -27,9 +27,24 @@ use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
 /// Clone any [`ToolContext`] a prior stage put in run scope, then overlay
 /// channel/sender from the message.
+///
+/// `channel_id` carries the workspace id [`ToolContext`] documents, not the
+/// raw delivery channel: on Centrifugo the message's `channel_id` is the
+/// subscription channel (`user:<id>#<id>`) while the workspace lives in the
+/// `magickspace_id` metadata the transport stamps — scoping tools by the
+/// delivery channel silently empties every workspace-keyed lookup (episodic
+/// search, artifact scoping). Transports without the metadata (stdio) keep
+/// using the channel, which is the conversation scope there.
 fn tool_context_for(ctx: &Context) -> ToolContext {
     let mut tc = ctx.get_run::<ToolContext>().cloned().unwrap_or_default();
-    tc.channel_id = ctx.message.channel_id.clone();
+    tc.channel_id = ctx
+        .message
+        .metadata
+        .get("magickspace_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| ctx.message.channel_id.clone());
     tc.sender_id = ctx.message.sender_id.clone();
     tc
 }
@@ -1162,6 +1177,41 @@ mod tests {
             Arc::new(crate::models::Message::new(content, "client", "chan1")),
             Arc::new(crate::config::AgentConfig::default()),
         )
+    }
+
+    /// The fan-out regression this guards: on Centrifugo the message's
+    /// channel_id is the subscription channel, so a tool scoped by it searches
+    /// a workspace that does not exist and silently comes back empty.
+    #[test]
+    fn tool_context_prefers_the_stamped_workspace_over_the_delivery_channel() {
+        let mut msg = crate::models::Message::new("hi", "sender-1", "user:a1#a1");
+        msg.metadata
+            .insert("magickspace_id".into(), serde_json::json!("ms-1"));
+        let ctx = Context::new(
+            Arc::new(msg),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        let tc = tool_context_for(&ctx);
+        assert_eq!(tc.channel_id, "ms-1");
+        assert_eq!(tc.sender_id, "sender-1");
+    }
+
+    #[test]
+    fn tool_context_falls_back_to_the_channel_without_workspace_metadata() {
+        let tc = tool_context_for(&gate_ctx("hi"));
+        assert_eq!(tc.channel_id, "chan1");
+    }
+
+    #[test]
+    fn tool_context_ignores_a_blank_workspace_stamp() {
+        let mut msg = crate::models::Message::new("hi", "sender-1", "chan1");
+        msg.metadata
+            .insert("magickspace_id".into(), serde_json::json!(""));
+        let ctx = Context::new(
+            Arc::new(msg),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        assert_eq!(tool_context_for(&ctx).channel_id, "chan1");
     }
 
     #[tokio::test]
