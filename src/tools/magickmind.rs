@@ -87,7 +87,11 @@ impl Tool for EpisodicMemoryTool {
 
     fn description(&self) -> &str {
         "Search your episodic memory for past conversations relevant to a query. \
-         Returns summarized episodes (topic, what happened, what worked, what to avoid)."
+         Returns summarized episodes (topic, what happened, what worked, what to avoid). \
+         By default only this conversation's memories are searched; disable \
+         filter_by_session to search across all your conversations, and enable \
+         filter_by_sender to only see memories from conversations the current \
+         speaker took part in."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -95,7 +99,15 @@ impl Tool for EpisodicMemoryTool {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "What to search memory for." },
-                "limit": { "type": "integer", "description": "Max episodes (optional)." }
+                "limit": { "type": "integer", "description": "Max episodes (optional)." },
+                "filter_by_session": {
+                    "type": "boolean",
+                    "description": "Restrict to the current conversation space (default true)."
+                },
+                "filter_by_sender": {
+                    "type": "boolean",
+                    "description": "Restrict to conversations the current speaker took part in (default false)."
+                }
             },
             "required": ["query"]
         })
@@ -115,9 +127,7 @@ impl Tool for EpisodicMemoryTool {
 
         let url = self.search_url(creds.credential_kind);
         let mut params: Vec<(&str, String)> = vec![("q", query.to_string())];
-        if !ctx.channel_id.is_empty() {
-            params.push(("mindspace_id", ctx.channel_id.clone()));
-        }
+        params.extend(scope_params(&args, ctx));
         if let Some(limit) = args["limit"].as_i64() {
             params.push(("limit", limit.to_string()));
         }
@@ -157,6 +167,31 @@ impl Tool for EpisodicMemoryTool {
     }
 }
 
+/// Scope filters for the search. The model chooses only WHETHER to filter;
+/// the values come from the trusted per-message context, never from args
+/// (ADR-0005) — so it cannot search another space or as another speaker.
+/// The mindspace-scoped route reads `participant_id`; the cross-space route
+/// reads `user_id`, hence the key switch.
+fn scope_params(args: &Value, ctx: &ToolContext) -> Vec<(&'static str, String)> {
+    let by_session = args["filter_by_session"].as_bool().unwrap_or(true);
+    let by_sender = args["filter_by_sender"].as_bool().unwrap_or(false);
+    let session_scoped = by_session && !ctx.channel_id.is_empty();
+
+    let mut params = Vec::new();
+    if session_scoped {
+        params.push(("mindspace_id", ctx.channel_id.clone()));
+    }
+    if by_sender && !ctx.sender_id.is_empty() {
+        let key = if session_scoped {
+            "participant_id"
+        } else {
+            "user_id"
+        };
+        params.push((key, ctx.sender_id.clone()));
+    }
+    params
+}
+
 #[derive(serde::Deserialize)]
 struct SearchResponse {
     #[serde(default)]
@@ -187,5 +222,68 @@ mod tests {
             tool.search_url(CredentialKind::ServiceUser),
             "https://api.example.com/v1/episodes/search"
         );
+    }
+
+    fn ctx_with(channel: &str, sender: &str) -> ToolContext {
+        ToolContext {
+            channel_id: channel.into(),
+            sender_id: sender.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scope_defaults_to_the_current_session_only() {
+        let params = scope_params(&json!({"query": "q"}), &ctx_with("ms-1", "user-1"));
+        assert_eq!(params, vec![("mindspace_id", "ms-1".to_string())]);
+    }
+
+    #[test]
+    fn sender_filter_rides_the_session_scope_as_participant() {
+        let params = scope_params(
+            &json!({"filter_by_sender": true}),
+            &ctx_with("ms-1", "user-1"),
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("mindspace_id", "ms-1".to_string()),
+                ("participant_id", "user-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_session_sender_filter_uses_the_user_lens() {
+        let params = scope_params(
+            &json!({"filter_by_session": false, "filter_by_sender": true}),
+            &ctx_with("ms-1", "user-1"),
+        );
+        assert_eq!(params, vec![("user_id", "user-1".to_string())]);
+    }
+
+    /// The values never come from args: a model naming ids gets them ignored.
+    #[test]
+    fn model_supplied_identities_are_ignored() {
+        let params = scope_params(
+            &json!({"filter_by_sender": true, "participant_id": "victim", "mindspace_id": "other"}),
+            &ctx_with("ms-1", "user-1"),
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("mindspace_id", "ms-1".to_string()),
+                ("participant_id", "user-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_context_values_add_no_filters() {
+        let params = scope_params(
+            &json!({"filter_by_session": true, "filter_by_sender": true}),
+            &ctx_with("", ""),
+        );
+        assert!(params.is_empty());
     }
 }
