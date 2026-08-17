@@ -149,19 +149,6 @@ impl ToolsManifest {
         serde_json::from_value(serde_json::json!({ "tools": tools })).ok()
     }
 
-    /// Build a manifest from a transport-metadata `tools` array (the fan-out
-    /// payload's per-message manifest). Same bounds as the envelope forms.
-    pub fn from_metadata_value(tools: &Value) -> Option<Self> {
-        if !tools.is_array() {
-            return None;
-        }
-        if tools.to_string().len() > MAX_MANIFEST_BYTES {
-            tracing::warn!("Dropping metadata tools that exceed the size limit");
-            return None;
-        }
-        serde_json::from_value(json!({ "tools": tools.clone() })).ok()
-    }
-
     /// Build a [`RemoteTool`] per entry, dropping invalid names. Names and
     /// descriptions reach the system prompt, so both are validated.
     pub fn build_tools(self) -> Vec<RemoteTool> {
@@ -307,15 +294,7 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        // Transport metadata wins: the backend stamps it from the sender's
-        // authenticated send, where content-embedded tools are self-declared.
-        let manifest = ctx
-            .message
-            .metadata
-            .get("tools")
-            .and_then(ToolsManifest::from_metadata_value)
-            .or_else(|| ToolsManifest::per_turn_from_message(&ctx.message.content));
-        if let Some(manifest) = manifest {
+        if let Some(manifest) = ToolsManifest::per_turn_from_message(&ctx.message.content) {
             let tools: Vec<Arc<dyn Tool>> = manifest
                 .build_tools_for(ctx.message.trusted_sender_id())
                 .into_iter()
@@ -911,43 +890,6 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "peek");
         assert!(tools[0].is_remote());
-    }
-
-    #[test]
-    fn metadata_tools_parse_with_the_same_bounds() {
-        let tools = json!([{"name":"peek","description":"look","schema":{"type":"object"}}]);
-        let m = ToolsManifest::from_metadata_value(&tools).expect("valid array");
-        assert_eq!(m.build_tools().len(), 1);
-
-        assert!(ToolsManifest::from_metadata_value(&json!("not an array")).is_none());
-        let big = json!([{"name":"x","description":"y".repeat(MAX_MANIFEST_BYTES)}]);
-        assert!(ToolsManifest::from_metadata_value(&big).is_none());
-    }
-
-    /// Metadata tools are the fan-out-stamped manifest; they must win over any
-    /// tools the message body self-declares.
-    #[tokio::test]
-    async fn per_turn_stage_prefers_transport_metadata_tools() {
-        let mut message = crate::models::Message::new(
-            r#"{"content":"hi","tools":[{"name":"body_tool"}]}"#,
-            "u1",
-            "channel",
-        );
-        message.metadata.insert(
-            "tools".into(),
-            json!([{"name":"stamped_tool","schema":{"type":"object"}}]),
-        );
-        let mut ctx = Context::new(
-            Arc::new(message),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
-
-        PerTurnToolsStage.process(&mut ctx).await.unwrap();
-
-        let tools = ctx.get::<PerTurnTools>().expect("per-turn tools set").0;
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "stamped_tool");
-        assert!(!ctx.halted, "a real turn must keep flowing");
     }
 
     #[test]
