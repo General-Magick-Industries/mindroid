@@ -135,20 +135,6 @@ impl ToolsManifest {
         serde_json::from_value(v.get("payload")?.clone()).ok()
     }
 
-    /// Parse a message that carries per-turn tools ALONGSIDE its content:
-    /// `{"type":"chat","content":"…","tools":[…]}`. Unlike a `tools_manifest`
-    /// (which persists), these apply to THIS message only. Returns `None` if the
-    /// message has no `tools` array.
-    pub fn per_turn_from_message(content: &str) -> Option<Self> {
-        if content.len() > MAX_MANIFEST_BYTES {
-            tracing::warn!("Dropping per-turn tools that exceed the size limit");
-            return None;
-        }
-        let v: Value = serde_json::from_str(content).ok()?;
-        let tools = v.get("tools")?.clone();
-        serde_json::from_value(serde_json::json!({ "tools": tools })).ok()
-    }
-
     /// Build a manifest from a transport-metadata `tools` array (the fan-out
     /// payload's per-message manifest). Same bounds as the envelope forms.
     pub fn from_metadata_value(tools: &Value) -> Option<Self> {
@@ -201,6 +187,9 @@ pub struct PerTurnTools(pub Vec<std::sync::Arc<dyn Tool>>);
 /// keeps [`ManifestStage`] from parsing every inbound body, and stops a message
 /// that merely quotes manifest JSON from being treated as one.
 pub const TOOL_MANIFEST_MESSAGE_TYPE: &str = "TOOL_MANIFEST";
+
+/// The message type a client declares when returning a tool result.
+pub const TOOL_RESPONSE_MESSAGE_TYPE: &str = "TOOL_RESPONSE";
 
 fn is_manifest_message(ctx: &Context) -> bool {
     ctx.message
@@ -332,14 +321,11 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        // Transport metadata wins: the backend stamps it from the sender's
-        // authenticated send, where content-embedded tools are self-declared.
-        // Presence decides, not parseability — falling back on an invalid
-        // stamped manifest would hand the turn to the self-declared one.
-        let manifest = match ctx.message.metadata.get("tools") {
-            Some(stamped) => ToolsManifest::from_metadata_value(stamped),
-            None => ToolsManifest::per_turn_from_message(&ctx.message.content),
-        };
+        let manifest = ctx
+            .message
+            .metadata
+            .get("tools")
+            .and_then(ToolsManifest::from_metadata_value);
         if let Some(manifest) = manifest {
             let tools: Vec<Arc<dyn Tool>> = manifest
                 .build_tools_for(ctx.message.trusted_sender_id())
@@ -927,18 +913,6 @@ mod tests {
     }
 
     #[test]
-    fn per_turn_parses_tools_alongside_content() {
-        let msg = r#"{"content":"hi","tools":[
-            {"name":"peek","description":"look","schema":{"type":"object"}}
-        ]}"#;
-        let m = ToolsManifest::per_turn_from_message(msg).expect("has tools");
-        let tools = m.build_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "peek");
-        assert!(tools[0].is_remote());
-    }
-
-    #[test]
     fn metadata_tools_parse_with_the_same_bounds() {
         let tools = json!([{"name":"peek","description":"look","schema":{"type":"object"}}]);
         let m = ToolsManifest::from_metadata_value(&tools).expect("valid array");
@@ -973,41 +947,6 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "stamped_tool");
         assert!(!ctx.halted, "a real turn must keep flowing");
-    }
-
-    /// A stamped manifest that fails to parse must not hand the turn to the
-    /// self-declared tools in the message body.
-    #[tokio::test]
-    async fn an_invalid_stamped_manifest_does_not_fall_back_to_body_tools() {
-        for stamped in [
-            json!([{"noname": 1}]),
-            json!("not an array"),
-            json!([{"name":"x","description":"y".repeat(MAX_MANIFEST_BYTES)}]),
-        ] {
-            let mut message = crate::models::Message::new(
-                r#"{"content":"hi","tools":[{"name":"body_tool","schema":{"type":"object"}}]}"#,
-                "u1",
-                "channel",
-            );
-            message.metadata.insert("tools".into(), stamped);
-            let mut ctx = Context::new(
-                Arc::new(message),
-                Arc::new(crate::config::AgentConfig::default()),
-            );
-
-            PerTurnToolsStage.process(&mut ctx).await.unwrap();
-
-            assert!(
-                ctx.get::<PerTurnTools>().is_none(),
-                "an invalid stamped manifest yields no tools"
-            );
-        }
-    }
-
-    #[test]
-    fn per_turn_none_when_no_tools() {
-        assert!(ToolsManifest::per_turn_from_message(r#"{"content":"hi"}"#).is_none());
-        assert!(ToolsManifest::per_turn_from_message("plain text").is_none());
     }
 
     #[test]
@@ -1102,15 +1041,6 @@ mod tests {
             }],
         };
         assert!(manifest.build_tools().is_empty());
-    }
-
-    #[test]
-    fn oversized_per_turn_tools_are_rejected_before_parsing() {
-        let message = format!(
-            "{{\"content\":\"hi\",\"tools\":[],\"padding\":\"{}\"}}",
-            "x".repeat(MAX_MANIFEST_BYTES)
-        );
-        assert!(ToolsManifest::per_turn_from_message(&message).is_none());
     }
 
     #[tokio::test]

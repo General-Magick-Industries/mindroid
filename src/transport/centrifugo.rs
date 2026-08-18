@@ -507,21 +507,31 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
         .map(|s| s.to_string())
         .unwrap_or_else(|| content_derived_id(&channel, outer));
 
-    // A client tool result arrives as {type:"tool_result",payload:{…}} in the
-    // envelope; rewrite it into the <tool_result> form the LLM history expects.
-    let content = if let Some(framed) =
-        crate::tools::remote::normalize_tool_result(&outer.to_string())
+    let declared_type = outer
+        .get("message_type")
+        .or_else(|| inner.get("message_type"))
+        .and_then(serde_json::Value::as_str);
+
+    let plain = inner
+        .get("content")
+        .or_else(|| inner.get("text"))
+        .or_else(|| inner.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // A tool result is what the sender DECLARES it to be: a body that merely
+    // looks like one is ordinary conversation. Rewrite a declared result into
+    // the <tool_result> form the LLM history expects. The envelope may be the
+    // published object itself or, on a magickspace message, the chat item's
+    // content string.
+    let content = if declared_type == Some(crate::tools::remote::TOOL_RESPONSE_MESSAGE_TYPE) {
+        crate::tools::remote::normalize_tool_result(&plain)
+            .or_else(|| crate::tools::remote::normalize_tool_result(&outer.to_string()))
             .or_else(|| crate::tools::remote::normalize_tool_result(&inner.to_string()))
-    {
-        framed
+            .unwrap_or(plain)
     } else {
-        inner
-            .get("content")
-            .or_else(|| inner.get("text"))
-            .or_else(|| inner.get("message"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
+        plain
     };
 
     // A missing sender is fatal: the self-echo guard compares `sender_id` to the
@@ -1674,6 +1684,49 @@ mod tests {
         let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
         assert!(!msg.metadata.contains_key("sent_by_user_name"));
         assert!(!msg.metadata.contains_key("magickspace_type"));
+    }
+
+    #[test]
+    fn a_declared_tool_result_is_framed_and_an_undeclared_one_is_not() {
+        let envelope = serde_json::json!({
+            "type": "tool_result",
+            "payload": {"tool_call_id": "c1", "name": "peek", "content": "ok"},
+        })
+        .to_string();
+
+        let msg = parse_push(
+            &push(
+                "user:a1#a1",
+                serde_json::json!({
+                    "sender_id": "u1",
+                    "content": envelope,
+                    "message_type": "TOOL_RESPONSE",
+                }),
+            ),
+            "user:a1#a1",
+            false,
+        )
+        .expect("push");
+        assert!(
+            msg.content.starts_with("<tool_result"),
+            "a declared result is framed: {}",
+            msg.content
+        );
+
+        let msg = parse_push(
+            &push(
+                "user:a1#a1",
+                serde_json::json!({ "sender_id": "u1", "content": envelope }),
+            ),
+            "user:a1#a1",
+            false,
+        )
+        .expect("push");
+        assert!(
+            !msg.content.starts_with("<tool_result"),
+            "quoting a result is not returning one: {}",
+            msg.content
+        );
     }
 
     #[test]
