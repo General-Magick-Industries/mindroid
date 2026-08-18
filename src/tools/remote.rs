@@ -155,7 +155,7 @@ impl ToolsManifest {
         if !tools.is_array() {
             return None;
         }
-        if tools.to_string().len() > MAX_MANIFEST_BYTES {
+        if serde_json::to_vec(tools).is_ok_and(|encoded| encoded.len() > MAX_MANIFEST_BYTES) {
             tracing::warn!("Dropping metadata tools that exceed the size limit");
             return None;
         }
@@ -292,12 +292,18 @@ impl crate::pipeline::PipelineStage for ManifestStage {
 /// does NOT touch the persistent registry; the tools apply to this turn only.
 /// The tool executor merges them onto its snapshot. Place before the executor.
 ///
+/// Tools may also arrive stamped on the transport's message metadata (the
+/// fan-out payload's `tools` array), which is the preferred source.
+///
 /// # Trust
 ///
-/// Scoped to one turn, but still reaches the system prompt for it — so on a
-/// multi-party channel any participant can declare tools. Names and descriptions
-/// are validated, and `plus_tools` cannot displace a registered tool, but the
-/// declaration itself is unauthenticated.
+/// Metadata tools are stamped by the backend from the sender's authenticated
+/// send and take precedence; a metadata `tools` key that is present but invalid
+/// yields no tools rather than deferring to the content-embedded form. The
+/// content-embedded form is self-declared and unauthenticated — on a
+/// multi-party channel any participant can supply it. Either way the tools are
+/// scoped to one turn, names and descriptions are validated, and `plus_tools`
+/// cannot displace a registered tool.
 pub struct PerTurnToolsStage;
 
 #[async_trait]
@@ -309,12 +315,12 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         // Transport metadata wins: the backend stamps it from the sender's
         // authenticated send, where content-embedded tools are self-declared.
-        let manifest = ctx
-            .message
-            .metadata
-            .get("tools")
-            .and_then(ToolsManifest::from_metadata_value)
-            .or_else(|| ToolsManifest::per_turn_from_message(&ctx.message.content));
+        // Presence decides, not parseability — falling back on an invalid
+        // stamped manifest would hand the turn to the self-declared one.
+        let manifest = match ctx.message.metadata.get("tools") {
+            Some(stamped) => ToolsManifest::from_metadata_value(stamped),
+            None => ToolsManifest::per_turn_from_message(&ctx.message.content),
+        };
         if let Some(manifest) = manifest {
             let tools: Vec<Arc<dyn Tool>> = manifest
                 .build_tools_for(ctx.message.trusted_sender_id())
@@ -593,7 +599,7 @@ const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 1024;
 
 /// Flatten to one bounded line — newlines let an entry forge prompt structure.
-fn sanitize_description(s: &str) -> String {
+pub(crate) fn sanitize_description(s: &str) -> String {
     let flattened: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -948,6 +954,35 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "stamped_tool");
         assert!(!ctx.halted, "a real turn must keep flowing");
+    }
+
+    /// A stamped manifest that fails to parse must not hand the turn to the
+    /// self-declared tools in the message body.
+    #[tokio::test]
+    async fn an_invalid_stamped_manifest_does_not_fall_back_to_body_tools() {
+        for stamped in [
+            json!([{"noname": 1}]),
+            json!("not an array"),
+            json!([{"name":"x","description":"y".repeat(MAX_MANIFEST_BYTES)}]),
+        ] {
+            let mut message = crate::models::Message::new(
+                r#"{"content":"hi","tools":[{"name":"body_tool","schema":{"type":"object"}}]}"#,
+                "u1",
+                "channel",
+            );
+            message.metadata.insert("tools".into(), stamped);
+            let mut ctx = Context::new(
+                Arc::new(message),
+                Arc::new(crate::config::AgentConfig::default()),
+            );
+
+            PerTurnToolsStage.process(&mut ctx).await.unwrap();
+
+            assert!(
+                ctx.get::<PerTurnTools>().is_none(),
+                "an invalid stamped manifest yields no tools"
+            );
+        }
     }
 
     #[test]
