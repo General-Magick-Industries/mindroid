@@ -561,7 +561,12 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     // present. sent_by_user_name is display data (the verified identity is
     // authenticated_sender_id below); magickspace_type is PRIVATE|GROUP, read
     // by hosts that gate replies per space.
-    for key in ["magickspace_id", "sent_by_user_name", "magickspace_type"] {
+    for key in [
+        "magickspace_id",
+        "sent_by_user_name",
+        "magickspace_type",
+        "message_type",
+    ] {
         if let Some(value) = outer
             .get(key)
             .or_else(|| inner.get(key))
