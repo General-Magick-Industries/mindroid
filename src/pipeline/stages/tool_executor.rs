@@ -366,7 +366,7 @@ impl ToolExecutorStage {
     }
 
     /// Build with a [`DynamicRegistry`] whose tools can be swapped at runtime
-    /// (e.g. by [`ManifestStage`](crate::tools::ManifestStage)).
+    /// (e.g. on reconnect).
     pub fn with_dynamic_registry(client: LlmClient, registry: DynamicRegistry) -> Self {
         Self {
             client,

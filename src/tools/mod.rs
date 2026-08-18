@@ -17,9 +17,7 @@ pub use magickmind::{AgentCredentials, AgentCredentialsStage, EpisodicMemoryTool
 pub use open::OpenTool;
 pub use registry::{DynamicRegistry, ToolRegistry};
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
-pub use remote::{
-    ManifestStage, ManifestTool, PerTurnTools, PerTurnToolsStage, RemoteTool, ToolsManifest,
-};
+pub use remote::{ManifestTool, PerTurnTools, PerTurnToolsStage, RemoteTool, ToolsManifest};
 pub use shell::ShellTool;
 
 use async_trait::async_trait;

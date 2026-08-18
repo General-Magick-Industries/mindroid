@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{DynamicRegistry, Tool, ToolContext};
+use super::{Tool, ToolContext};
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 
@@ -121,34 +121,6 @@ pub struct ToolsManifest {
 }
 
 impl ToolsManifest {
-    /// Parse a `{"type":"tools_manifest","payload":{"tools":[…]}}` envelope.
-    /// Returns `None` if `content` is not a manifest envelope.
-    pub fn from_envelope(content: &str) -> Option<Self> {
-        if content.len() > MAX_MANIFEST_BYTES {
-            tracing::warn!("Dropping tools_manifest that exceeds the size limit");
-            return None;
-        }
-        let v: Value = serde_json::from_str(content).ok()?;
-        if v.get("type")?.as_str()? != "tools_manifest" {
-            return None;
-        }
-        serde_json::from_value(v.get("payload")?.clone()).ok()
-    }
-
-    /// Parse a message that carries per-turn tools ALONGSIDE its content:
-    /// `{"type":"chat","content":"…","tools":[…]}`. Unlike a `tools_manifest`
-    /// (which persists), these apply to THIS message only. Returns `None` if the
-    /// message has no `tools` array.
-    pub fn per_turn_from_message(content: &str) -> Option<Self> {
-        if content.len() > MAX_MANIFEST_BYTES {
-            tracing::warn!("Dropping per-turn tools that exceed the size limit");
-            return None;
-        }
-        let v: Value = serde_json::from_str(content).ok()?;
-        let tools = v.get("tools")?.clone();
-        serde_json::from_value(serde_json::json!({ "tools": tools })).ok()
-    }
-
     /// Build a manifest from a transport-metadata `tools` array (the fan-out
     /// payload's per-message manifest). Same bounds as the envelope forms.
     pub fn from_metadata_value(tools: &Value) -> Option<Self> {
@@ -197,113 +169,18 @@ impl ToolsManifest {
 #[derive(Clone)]
 pub struct PerTurnTools(pub Vec<std::sync::Arc<dyn Tool>>);
 
-/// Pipeline stage that applies a client's [`ToolsManifest`] to a
-/// [`DynamicRegistry`]. When an inbound message is a `tools_manifest` envelope,
-/// it rebuilds the registry (keeping built-in local tools, replacing the remote
-/// set) and halts the pipeline — the manifest is control traffic, not a turn for
-/// the LLM. Place it before the tool executor.
+/// Pipeline stage that extracts the PER-TURN tools the transport stamped on this
+/// message (the fan-out payload's `tools` array) into the run scope as
+/// [`PerTurnTools`]. It does NOT halt — the message is a real turn — and touches
+/// no persistent registry; the tools apply to this turn only. The tool executor
+/// merges them onto its snapshot. Place it before the executor.
 ///
 /// # Trust
 ///
-/// **On a multi-party channel this grants every participant write access to the
-/// tool registry**, and the swap outlives the turn. Use
-/// [`trust_sender`](Self::trust_sender) to restrict it. Entries colliding with a
-/// local tool name are always rejected.
-pub struct ManifestStage {
-    registry: DynamicRegistry,
-    trusted_sender: Option<String>,
-}
-
-impl ManifestStage {
-    pub fn new(registry: DynamicRegistry) -> Self {
-        Self {
-            registry,
-            trusted_sender: None,
-        }
-    }
-
-    /// Only honour manifests from this sender id. Strongly recommended on any
-    /// channel with more than one writer.
-    pub fn trust_sender(mut self, sender_id: impl Into<String>) -> Self {
-        self.trusted_sender = Some(sender_id.into());
-        self
-    }
-}
-
-#[async_trait]
-impl crate::pipeline::PipelineStage for ManifestStage {
-    fn name(&self) -> &str {
-        "Manifest"
-    }
-
-    async fn process(&self, ctx: &mut Context) -> Result<()> {
-        if let Some(manifest) = ToolsManifest::from_envelope(&ctx.message.content) {
-            let Some(authenticated_sender) = ctx.message.trusted_sender_id() else {
-                tracing::warn!("Ignoring tools_manifest without an authenticated sender");
-                ctx.halted = true;
-                return Ok(());
-            };
-            if let Some(trusted) = &self.trusted_sender
-                && authenticated_sender != trusted
-            {
-                tracing::warn!("Ignoring tools_manifest from an untrusted sender");
-                ctx.halted = true;
-                return Ok(());
-            }
-
-            let snapshot = self.registry.load();
-            // A manifest entry may not shadow a local tool: `system_prompt` renders
-            // every tool while `get` returns the first name match, so a duplicate
-            // would describe one tool to the model and dispatch to another.
-            let local: std::collections::HashSet<&str> = snapshot
-                .tools()
-                .iter()
-                .filter(|t| !t.is_remote())
-                .map(|t| t.name())
-                .collect();
-
-            let remote: Vec<Arc<dyn Tool>> = manifest
-                .build_tools_for(Some(authenticated_sender))
-                .into_iter()
-                .filter(|t| {
-                    let clash = local.contains(t.name());
-                    if clash {
-                        tracing::warn!(
-                            name = %t.name(),
-                            "Rejecting manifest tool that collides with a local tool"
-                        );
-                    }
-                    !clash
-                })
-                .map(|t| Arc::new(t) as Arc<dyn Tool>)
-                .collect();
-
-            let updated = snapshot.with_remote_tools(remote);
-            self.registry.store(updated);
-            ctx.halted = true;
-        }
-        Ok(())
-    }
-}
-
-/// Pipeline stage that extracts PER-TURN tools a message carries alongside its
-/// text (`{"content":"…","tools":[…]}`) into the run scope as [`PerTurnTools`].
-/// Unlike [`ManifestStage`], it does NOT halt — the message is a real turn — and
-/// does NOT touch the persistent registry; the tools apply to this turn only.
-/// The tool executor merges them onto its snapshot. Place before the executor.
-///
-/// Tools may also arrive stamped on the transport's message metadata (the
-/// fan-out payload's `tools` array), which is the preferred source.
-///
-/// # Trust
-///
-/// Metadata tools are stamped by the backend from the sender's authenticated
-/// send and take precedence; a metadata `tools` key that is present but invalid
-/// yields no tools rather than deferring to the content-embedded form. The
-/// content-embedded form is self-declared and unauthenticated — on a
-/// multi-party channel any participant can supply it. Either way the tools are
-/// scoped to one turn, names and descriptions are validated, and `plus_tools`
-/// cannot displace a registered tool.
+/// The manifest comes from transport metadata, which the backend stamps from the
+/// sender's authenticated send — never from message content, which any
+/// participant on a multi-party channel can write. Names and descriptions are
+/// validated, and `plus_tools` cannot displace a registered tool.
 pub struct PerTurnToolsStage;
 
 #[async_trait]
@@ -313,14 +190,11 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        // Transport metadata wins: the backend stamps it from the sender's
-        // authenticated send, where content-embedded tools are self-declared.
-        // Presence decides, not parseability — falling back on an invalid
-        // stamped manifest would hand the turn to the self-declared one.
-        let manifest = match ctx.message.metadata.get("tools") {
-            Some(stamped) => ToolsManifest::from_metadata_value(stamped),
-            None => ToolsManifest::per_turn_from_message(&ctx.message.content),
-        };
+        let manifest = ctx
+            .message
+            .metadata
+            .get("tools")
+            .and_then(ToolsManifest::from_metadata_value);
         if let Some(manifest) = manifest {
             let tools: Vec<Arc<dyn Tool>> = manifest
                 .build_tools_for(ctx.message.trusted_sender_id())
@@ -908,18 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn per_turn_parses_tools_alongside_content() {
-        let msg = r#"{"content":"hi","tools":[
-            {"name":"peek","description":"look","schema":{"type":"object"}}
-        ]}"#;
-        let m = ToolsManifest::per_turn_from_message(msg).expect("has tools");
-        let tools = m.build_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "peek");
-        assert!(tools[0].is_remote());
-    }
-
-    #[test]
     fn metadata_tools_parse_with_the_same_bounds() {
         let tools = json!([{"name":"peek","description":"look","schema":{"type":"object"}}]);
         let m = ToolsManifest::from_metadata_value(&tools).expect("valid array");
@@ -933,7 +795,7 @@ mod tests {
     /// Metadata tools are the fan-out-stamped manifest; they must win over any
     /// tools the message body self-declares.
     #[tokio::test]
-    async fn per_turn_stage_prefers_transport_metadata_tools() {
+    async fn per_turn_stage_reads_stamped_tools_and_ignores_body_tools() {
         let mut message = crate::models::Message::new(
             r#"{"content":"hi","tools":[{"name":"body_tool"}]}"#,
             "u1",
@@ -954,41 +816,21 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "stamped_tool");
         assert!(!ctx.halted, "a real turn must keep flowing");
-    }
 
-    /// A stamped manifest that fails to parse must not hand the turn to the
-    /// self-declared tools in the message body.
-    #[tokio::test]
-    async fn an_invalid_stamped_manifest_does_not_fall_back_to_body_tools() {
-        for stamped in [
-            json!([{"noname": 1}]),
-            json!("not an array"),
-            json!([{"name":"x","description":"y".repeat(MAX_MANIFEST_BYTES)}]),
-        ] {
-            let mut message = crate::models::Message::new(
-                r#"{"content":"hi","tools":[{"name":"body_tool","schema":{"type":"object"}}]}"#,
-                "u1",
-                "channel",
-            );
-            message.metadata.insert("tools".into(), stamped);
-            let mut ctx = Context::new(
-                Arc::new(message),
-                Arc::new(crate::config::AgentConfig::default()),
-            );
-
-            PerTurnToolsStage.process(&mut ctx).await.unwrap();
-
-            assert!(
-                ctx.get::<PerTurnTools>().is_none(),
-                "an invalid stamped manifest yields no tools"
-            );
-        }
-    }
-
-    #[test]
-    fn per_turn_none_when_no_tools() {
-        assert!(ToolsManifest::per_turn_from_message(r#"{"content":"hi"}"#).is_none());
-        assert!(ToolsManifest::per_turn_from_message("plain text").is_none());
+        let unstamped = crate::models::Message::new(
+            r#"{"content":"hi","tools":[{"name":"body_tool"}]}"#,
+            "u1",
+            "channel",
+        );
+        let mut ctx = Context::new(
+            Arc::new(unstamped),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        PerTurnToolsStage.process(&mut ctx).await.unwrap();
+        assert!(
+            ctx.get::<PerTurnTools>().is_none(),
+            "self-declared body tools are not a source"
+        );
     }
 
     #[test]
@@ -1044,33 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_parses_and_builds_tools() {
-        let env = r#"{"type":"tools_manifest","payload":{"tools":[
-            {"name":"attack","description":"hit it","schema":{"type":"object"}},
-            {"name":"move_to"}
-        ]}}"#;
-        let manifest = ToolsManifest::from_envelope(env).expect("parses");
-        let tools = manifest.build_tools();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name(), "attack");
-        assert!(tools[0].is_remote());
-        assert_eq!(tools[1].name(), "move_to"); // schema defaulted
-    }
-
-    #[test]
-    fn manifest_rejects_non_manifest() {
-        assert!(ToolsManifest::from_envelope(r#"{"type":"chat_message"}"#).is_none());
-        assert!(ToolsManifest::from_envelope("not json").is_none());
-    }
-
-    #[test]
-    fn manifest_size_and_schema_depth_are_bounded() {
-        let huge = format!(
-            "{{\"type\":\"tools_manifest\",\"payload\":{{\"tools\":[]}},\"padding\":\"{}\"}}",
-            "x".repeat(MAX_MANIFEST_BYTES)
-        );
-        assert!(ToolsManifest::from_envelope(&huge).is_none());
-
+    fn schema_depth_is_bounded() {
         let mut schema = serde_json::json!({"type": "string"});
         for _ in 0..=MAX_SCHEMA_DEPTH {
             schema = serde_json::json!({"items": schema});
@@ -1083,62 +899,6 @@ mod tests {
             }],
         };
         assert!(manifest.build_tools().is_empty());
-    }
-
-    #[test]
-    fn oversized_per_turn_tools_are_rejected_before_parsing() {
-        let message = format!(
-            "{{\"content\":\"hi\",\"tools\":[],\"padding\":\"{}\"}}",
-            "x".repeat(MAX_MANIFEST_BYTES)
-        );
-        assert!(ToolsManifest::per_turn_from_message(&message).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_persistent_manifest_requires_authenticated_transport_identity() {
-        let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
-        let stage = ManifestStage::new(registry.clone());
-        let mut message = crate::models::Message::new(
-            r#"{"type":"tools_manifest","payload":{"tools":[{"name":"remote"}]}}"#,
-            "payload-user",
-            "channel",
-        );
-        message.platform = Some("centrifugo".into());
-        let mut ctx = Context::new(
-            Arc::new(message),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
-
-        stage.process(&mut ctx).await.unwrap();
-
-        assert!(ctx.halted);
-        assert!(registry.load().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_persistent_manifest_binds_tools_to_its_authenticated_publisher() {
-        let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
-        let stage = ManifestStage::new(registry.clone());
-        let mut message = crate::models::Message::new(
-            r#"{"type":"tools_manifest","payload":{"tools":[{"name":"remote"}]}}"#,
-            "payload-user",
-            "channel",
-        );
-        message.platform = Some("centrifugo".into());
-        message.metadata.insert(
-            "authenticated_sender_id".into(),
-            serde_json::Value::String("robot".into()),
-        );
-        let mut ctx = Context::new(
-            Arc::new(message),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
-
-        stage.process(&mut ctx).await.unwrap();
-
-        let snapshot = registry.load();
-        let tool = snapshot.get("remote").unwrap();
-        assert_eq!(tool.remote_executor_id(), Some("robot"));
     }
 
     #[test]
