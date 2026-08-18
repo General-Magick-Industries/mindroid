@@ -186,10 +186,15 @@ pub struct PerTurnTools(pub Vec<std::sync::Arc<dyn Tool>>);
 /// The message type a client declares when advertising tools. Dispatching on it
 /// keeps [`ManifestStage`] from parsing every inbound body, and stops a message
 /// that merely quotes manifest JSON from being treated as one.
+///
+/// These values are the sender's, not ours: the backend constrains the field to
+/// a fixed set (`TEXT`, `VOICE_TRANSCRIPTION`, `TOOL_CALL`, `TOOL_RESULT`,
+/// `TOOL_MANIFEST`) and rejects a send outside it, so a value that drifts from
+/// that set is never delivered rather than merely unrecognized.
 pub const TOOL_MANIFEST_MESSAGE_TYPE: &str = "TOOL_MANIFEST";
 
 /// The message type a client declares when returning a tool result.
-pub const TOOL_RESPONSE_MESSAGE_TYPE: &str = "TOOL_RESPONSE";
+pub const TOOL_RESULT_MESSAGE_TYPE: &str = "TOOL_RESULT";
 
 fn is_manifest_message(ctx: &Context) -> bool {
     ctx.message

@@ -525,7 +525,7 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     // the <tool_result> form the LLM history expects. The envelope may be the
     // published object itself or, on a magickspace message, the chat item's
     // content string.
-    let content = if declared_type == Some(crate::tools::remote::TOOL_RESPONSE_MESSAGE_TYPE) {
+    let content = if declared_type == Some(crate::tools::remote::TOOL_RESULT_MESSAGE_TYPE) {
         crate::tools::remote::normalize_tool_result(&plain)
             .or_else(|| crate::tools::remote::normalize_tool_result(&outer.to_string()))
             .or_else(|| crate::tools::remote::normalize_tool_result(&inner.to_string()))
@@ -1700,7 +1700,7 @@ mod tests {
                 serde_json::json!({
                     "sender_id": "u1",
                     "content": envelope,
-                    "message_type": "TOOL_RESPONSE",
+                    "message_type": "TOOL_RESULT",
                 }),
             ),
             "user:a1#a1",

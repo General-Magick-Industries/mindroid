@@ -3,11 +3,28 @@
 use async_trait::async_trait;
 
 use crate::runtime::TransportSend;
+use crate::tools::remote;
 use crate::{ChannelType, Message, MessageType, Response, Result, SenderType, Transport};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// The control-traffic type a stdin line declares, if any.
+///
+/// The stages dispatch on a `message_type` the sender declares, which a chat
+/// backend stamps out of band. Stdin has no such channel, so the envelope's own
+/// `type` field is the declaration — sound here because the only writer is the
+/// local operator, not a third party whose quoted JSON could be mistaken for
+/// control traffic.
+fn declared_message_type(line: &str) -> Option<&'static str> {
+    let envelope: serde_json::Value = serde_json::from_str(line).ok()?;
+    match envelope.get("type")?.as_str()? {
+        "tools_manifest" => Some(remote::TOOL_MANIFEST_MESSAGE_TYPE),
+        "tool_result" => Some(remote::TOOL_RESULT_MESSAGE_TYPE),
+        _ => None,
+    }
+}
 
 pub struct StdioTransport {
     connected: bool,
@@ -56,9 +73,19 @@ impl Transport for StdioTransport {
 
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!("StdioTransport received line: {}", line);
-                // A client tool result may arrive as a {type:"tool_result",…}
-                // envelope; rewrite it into the <tool_result> history form.
-                let content = crate::tools::remote::normalize_tool_result(&line).unwrap_or(line);
+                let declared = declared_message_type(&line);
+                let content = if declared == Some(remote::TOOL_RESULT_MESSAGE_TYPE) {
+                    remote::normalize_tool_result(&line).unwrap_or(line)
+                } else {
+                    line
+                };
+                let mut metadata = std::collections::HashMap::new();
+                if let Some(declared) = declared {
+                    metadata.insert(
+                        "message_type".to_string(),
+                        serde_json::Value::String(declared.to_string()),
+                    );
+                }
                 let message = Message {
                     id: Uuid::new_v4().to_string(),
                     content,
@@ -68,7 +95,7 @@ impl Transport for StdioTransport {
                     channel_type: ChannelType::Direct,
                     message_type: MessageType::Text,
                     timestamp: Utc::now(),
-                    metadata: Default::default(),
+                    metadata,
                     platform: Some("stdio".into()),
                 };
                 if tx.send(message).await.is_err() {
@@ -102,5 +129,35 @@ impl TransportSend for StdioSender {
     async fn send(&self, response: &Response) -> Result<Option<String>> {
         println!("{}", response.content);
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelopes_declare_their_control_type() {
+        assert_eq!(
+            declared_message_type(r#"{"type":"tools_manifest","payload":{"tools":[]}}"#),
+            Some(remote::TOOL_MANIFEST_MESSAGE_TYPE)
+        );
+        assert_eq!(
+            declared_message_type(r#"{"type":"tool_result","payload":{"name":"peek"}}"#),
+            Some(remote::TOOL_RESULT_MESSAGE_TYPE)
+        );
+    }
+
+    #[test]
+    fn ordinary_lines_declare_nothing() {
+        for line in [
+            "what's the time",
+            r#"{"type":"chat","content":"hi"}"#,
+            r#"{"content":"hi"}"#,
+            "{not json",
+            "",
+        ] {
+            assert_eq!(declared_message_type(line), None, "{line}");
+        }
     }
 }
