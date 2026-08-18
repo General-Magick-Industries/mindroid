@@ -193,8 +193,17 @@ impl EpisodeIngestStage {
         self.scope == IngestScope::Addressed
     }
 
-    /// Whether this message is in scope for ingest.
-    fn in_scope(&self, ctx: &Context) -> bool {
+    /// Whether this message should be ingested at all.
+    ///
+    /// Being control traffic is a property of the message, so it is checked
+    /// before scope — a manifest is not an episode on any scope setting.
+    fn should_ingest(&self, ctx: &Context) -> bool {
+        // Control traffic is protocol, not something anyone said. A manifest or
+        // a tool result is not an episode, and topic detection would otherwise
+        // mint micro-episodes from them.
+        if ctx.message.message_type.is_control() {
+            return false;
+        }
         match self.scope {
             // Addressed is enforced by call-site placement, not here: at this
             // point nothing has evaluated whether the agent was addressed.
@@ -211,10 +220,10 @@ impl PipelineStage for EpisodeIngestStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        if !self.in_scope(ctx) {
+        if !self.should_ingest(ctx) {
             debug!(
-                "EpisodeIngestStage: {} out of scope for {:?}, not ingesting",
-                ctx.message.id, self.scope
+                "EpisodeIngestStage: not ingesting {} ({:?}, scope {:?})",
+                ctx.message.id, ctx.message.message_type, self.scope
             );
             return Ok(());
         }
@@ -328,7 +337,7 @@ mod tests {
     use super::*;
     use crate::auth::static_id::StaticAuth;
     use crate::config::AgentConfig;
-    use crate::models::Message;
+    use crate::models::{Message, MessageType};
 
     fn client(credential_kind: CredentialKind) -> EpisodeClient {
         EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), credential_kind)
@@ -470,12 +479,71 @@ mod tests {
         assert!(!s.runs_after_gate());
 
         let (group_ctx, _) = failing_ctx("hi");
-        assert!(!s.in_scope(&group_ctx), "group traffic is out of scope");
+        assert!(
+            !s.should_ingest(&group_ctx),
+            "group traffic is out of scope"
+        );
 
         let mut direct = Message::new("hi", "user-1", "space-1");
         direct.channel_type = ChannelType::Direct;
         let direct_ctx = Context::new(Arc::new(direct), group_ctx.agent_config.clone());
-        assert!(s.in_scope(&direct_ctx), "direct traffic is in scope");
+        assert!(s.should_ingest(&direct_ctx), "direct traffic is in scope");
+    }
+
+    /// Control traffic is refused on EVERY scope, including the permissive one:
+    /// being protocol is a property of the message, not a question of scope.
+    ///
+    /// Tested through the predicate rather than `process`, because ingest is
+    /// best-effort — a skipped ingest and a failed one both return `Ok(())`, so
+    /// asserting on the return value would pass with no filter at all.
+    #[test]
+    fn control_traffic_is_never_ingested() {
+        for scope in [
+            IngestScope::All,
+            IngestScope::Addressed,
+            IngestScope::DirectOnly,
+        ] {
+            let s = EpisodeIngestStage::new(
+                "https://x",
+                Arc::new(StaticAuth::new("t")),
+                CredentialKind::EndUser,
+            )
+            .with_scope(scope);
+
+            for message_type in [
+                MessageType::ToolManifest,
+                MessageType::ToolResult,
+                MessageType::ToolCall,
+            ] {
+                let mut msg = Message::new("hi", "user-1", "space-1");
+                msg.channel_type = ChannelType::Direct;
+                msg.message_type = message_type.clone();
+                let ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+
+                assert!(
+                    !s.should_ingest(&ctx),
+                    "{message_type:?} must not be ingested under {scope:?}"
+                );
+            }
+        }
+    }
+
+    /// The counterpart: an ordinary turn on the same channel still ingests, so
+    /// the filter above cannot be passing for an unrelated reason.
+    #[test]
+    fn an_ordinary_turn_is_still_ingested() {
+        let s = EpisodeIngestStage::new(
+            "https://x",
+            Arc::new(StaticAuth::new("t")),
+            CredentialKind::EndUser,
+        )
+        .with_scope(IngestScope::DirectOnly);
+
+        let mut msg = Message::new("hi", "user-1", "space-1");
+        msg.channel_type = ChannelType::Direct;
+        let ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+
+        assert!(s.should_ingest(&ctx));
     }
 
     /// A group message under DirectOnly must not reach the network at all.
@@ -491,7 +559,7 @@ mod tests {
         // The URL is unreachable, so an attempted send would still return Ok
         // (best-effort) — what this pins is the early return before that.
         assert!(s.process(&mut ctx).await.is_ok());
-        assert!(!s.in_scope(&ctx));
+        assert!(!s.should_ingest(&ctx));
     }
 
     #[test]

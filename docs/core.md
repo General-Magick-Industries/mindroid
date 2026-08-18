@@ -99,7 +99,7 @@ Represents an incoming message from a transport (user, API, webhook, etc.).
 - `sender_type: SenderType` — Origin type: User, Agent, System (default: User)
 - `channel_id: String` — Where it came from (chat room ID, webhook source, etc.)
 - `channel_type: ChannelType` — Channel kind: Direct, Group, Broadcast (default: Direct)
-- `message_type: MessageType` — Content type: Text, Command, System, Image, Audio (default: Text)
+- `message_type: MessageType` — What the message is: Text, Command, System, Image, Audio, ToolCall, ToolResult, ToolManifest (default: Text)
 - `timestamp: DateTime<Utc>` — When it was sent (auto-set to now)
 - `metadata: HashMap<String, serde_json::Value>` — Transport-specific data (attachments, user info, etc.)
 
@@ -260,9 +260,10 @@ Typically set by a Processor stage and included in `StreamEvent::Complete`.
 
 Three simple enums representing message classifications. All serialize to snake_case and have `#[default]` on the first variant.
 
-**MessageType** — What the message contains:
+**MessageType** — What the message is:
 ```rust
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MessageType {
     #[default]
     Text,    // Plain text
@@ -270,8 +271,20 @@ pub enum MessageType {
     System,  // System message
     Image,   // Image attachment
     Audio,   // Audio attachment
+    // Tool-protocol traffic, declared by the sender rather than inferred
+    // from the message body. See `MessageType::from_wire` / `is_control`.
+    ToolCall,
+    ToolResult,
+    ToolManifest,
 }
 ```
+
+`MessageType::from_wire(&str)` maps a sender-declared wire value onto the tool
+variants, accepting either case (`TOOL_RESULT` and `tool_result` both map), and
+returns `None` for a plain conversational turn so a caller keeps its default.
+`is_control()` is true for the three tool variants.
+
+The enum is `#[non_exhaustive]`: match on it with a wildcard arm.
 
 **SenderType** — Who sent it:
 ```rust

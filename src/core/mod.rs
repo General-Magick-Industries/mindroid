@@ -20,6 +20,7 @@ pub mod models;
     feature = "speech"
 ))]
 pub(crate) mod net;
+pub(crate) mod prompt_text;
 pub mod routine;
 pub mod runtime;
 pub mod strategy;
