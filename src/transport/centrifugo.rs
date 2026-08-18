@@ -12,6 +12,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::core::models::{CONTEXT_METADATA_KEY, TOOLS_METADATA_KEY};
 use crate::{Auth, Message, MessageType, MindroidError, Response, Result, Transport};
 
 fn transport_err(msg: impl Into<String>) -> MindroidError {
@@ -572,10 +573,7 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     // stamps them on the broadcast and never persists them, so they reach the
     // agent without entering chat history or episodic memory. Copied verbatim;
     // the stages that read them own the validation.
-    for key in [
-        crate::tools::remote::TOOLS_METADATA_KEY,
-        crate::tools::remote::CONTEXT_METADATA_KEY,
-    ] {
+    for key in [TOOLS_METADATA_KEY, CONTEXT_METADATA_KEY] {
         if let Some(value) = outer.get(key).or_else(|| inner.get(key))
             && !value.is_null()
         {

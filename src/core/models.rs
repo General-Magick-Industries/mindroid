@@ -18,8 +18,15 @@ pub enum CredentialKind {
 #[deprecated(since = "0.0.2-a.1", note = "renamed to `CredentialKind`")]
 pub type PersonaCaller = CredentialKind;
 
+/// [`Message::metadata`] key a transport stamps the sender's tool manifest under.
+pub const TOOLS_METADATA_KEY: &str = "tools";
+
+/// [`Message::metadata`] key a transport stamps the sender's per-turn context under.
+pub const CONTEXT_METADATA_KEY: &str = "context";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageType {
     #[default]
     Text,

@@ -6,6 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This crate is pre-1.0: breaking changes may land in any release, and are always
 listed under **Breaking Changes** with a migration note.
 
+## [Unreleased]
+
+### Breaking Changes
+
+#### 1. Tool-protocol traffic is declared, not sniffed
+
+Tool manifests, per-turn tools and tool results were located by parsing
+`Message::content` as JSON. Dispatch now comes from the sender-declared
+`Message::message_type` plus transport metadata, so a participant on a
+multi-party channel can no longer rewrite an agent's tool registry by quoting a
+manifest envelope into what they say.
+
+`ToolsManifest::from_envelope` and `ToolsManifest::per_turn_from_message` are
+removed:
+
+```rust
+// before — parsed the message body
+ToolsManifest::from_envelope(&msg.content)
+ToolsManifest::per_turn_from_message(&msg.content)
+// after — reads what the transport stamped
+ToolsManifest::declared_manifest(&msg) // for a declared TOOL_MANIFEST
+ToolsManifest::from_metadata(&msg)     // for per-turn tools on an ordinary turn
+```
+
+Transports must stamp `tools` and `context` into `Message::metadata` under
+`TOOLS_METADATA_KEY` / `CONTEXT_METADATA_KEY` and set `message_type`. The
+bundled Centrifugo and stdio transports already do.
+
+#### 2. `normalize_tool_result` no longer self-dispatches
+
+It no longer decides whether a body *is* a tool result; the caller dispatches on
+`MessageType::ToolResult` first. It accepts the fields bare or in the historical
+`{type, payload}` wrapper.
+
+#### 3. `MessageType` gained variants and is now `#[non_exhaustive]`
+
+`ToolCall`, `ToolResult` and `ToolManifest` were added. Exhaustive matches need a
+wildcard arm; the attribute means this is the last release in which adding a
+variant breaks you.
+
+### Added
+
+- `MessageType::from_wire` and `MessageType::is_control`.
+- `TOOLS_METADATA_KEY` / `CONTEXT_METADATA_KEY` in `core::models`.
+- Per-turn `context` renders as a sanitized, bounded system block on the turn it
+  rides, gated on an authenticated sender.
+
+### Fixed
+
+- `PerTurnToolsStage` now requires an authenticated sender, matching
+  `ManifestStage`. Previously an unnameable publisher's tool names and
+  descriptions reached the turn's system prompt.
+
 ## [0.0.2-a.1] — 2026-08-06
 
 The "v2" release. Four breaking API changes, plus one silent behavior change —

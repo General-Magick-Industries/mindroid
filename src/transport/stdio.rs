@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use std::collections::HashMap;
 
+use crate::core::models::{CONTEXT_METADATA_KEY, TOOLS_METADATA_KEY};
 use crate::runtime::TransportSend;
 use crate::tools::remote;
 use crate::{ChannelType, Message, MessageType, Response, Result, SenderType, Transport};
@@ -46,18 +47,15 @@ fn declare(line: String) -> Declared {
     // A manifest envelope nests its tools under `payload`; a chat line carries
     // per-turn tools and context at the top level. Both land on the same keys
     // the Centrifugo fan-out uses, which is what lets the stages read one place.
-    let tools = match declared {
-        Some(MessageType::ToolManifest) => envelope.get("payload").and_then(|p| p.get("tools")),
-        _ => envelope.get(remote::TOOLS_METADATA_KEY),
-    };
+    let tools = envelope
+        .get("payload")
+        .and_then(|p| p.get(TOOLS_METADATA_KEY))
+        .or_else(|| envelope.get(TOOLS_METADATA_KEY));
     if let Some(tools) = tools.filter(|v| !v.is_null()) {
-        metadata.insert(remote::TOOLS_METADATA_KEY.to_string(), tools.clone());
+        metadata.insert(TOOLS_METADATA_KEY.to_string(), tools.clone());
     }
-    if let Some(context) = envelope
-        .get(remote::CONTEXT_METADATA_KEY)
-        .filter(|v| !v.is_null())
-    {
-        metadata.insert(remote::CONTEXT_METADATA_KEY.to_string(), context.clone());
+    if let Some(context) = envelope.get(CONTEXT_METADATA_KEY).filter(|v| !v.is_null()) {
+        metadata.insert(CONTEXT_METADATA_KEY.to_string(), context.clone());
     }
 
     let Some(message_type) = declared else {
@@ -212,7 +210,24 @@ mod tests {
             r#"{"type":"tools_manifest","payload":{"tools":[{"name":"peek"}]}}"#.to_string(),
         );
         assert_eq!(d.message_type, MessageType::ToolManifest);
-        assert_eq!(d.metadata[remote::TOOLS_METADATA_KEY][0]["name"], "peek");
+        assert_eq!(d.metadata[TOOLS_METADATA_KEY][0]["name"], "peek");
+    }
+
+    /// The flat shape matches what the Centrifugo fan-out sends, so a hand-typed
+    /// manifest works whether or not the operator nests it under `payload`.
+    #[test]
+    fn a_manifest_is_accepted_flat_or_nested() {
+        for line in [
+            r#"{"type":"tools_manifest","payload":{"tools":[{"name":"peek"}]}}"#,
+            r#"{"type":"tool_manifest","tools":[{"name":"peek"}]}"#,
+        ] {
+            let d = declare(line.to_string());
+            assert_eq!(d.message_type, MessageType::ToolManifest);
+            assert_eq!(
+                d.metadata[TOOLS_METADATA_KEY][0]["name"], "peek",
+                "for {line}"
+            );
+        }
     }
 
     #[test]
@@ -227,11 +242,8 @@ mod tests {
         );
         assert_eq!(d.message_type, MessageType::Text);
         assert_eq!(d.content, "whats the time");
-        assert_eq!(d.metadata[remote::TOOLS_METADATA_KEY][0]["name"], "peek");
-        assert_eq!(
-            d.metadata[remote::CONTEXT_METADATA_KEY]["page"],
-            "/spaces/1"
-        );
+        assert_eq!(d.metadata[TOOLS_METADATA_KEY][0]["name"], "peek");
+        assert_eq!(d.metadata[CONTEXT_METADATA_KEY]["page"], "/spaces/1");
     }
 
     #[test]

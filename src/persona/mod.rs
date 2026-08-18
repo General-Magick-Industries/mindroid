@@ -18,6 +18,8 @@ pub use provider::PersonaProvider;
 pub use stage::PersonaContextBuilder;
 
 use crate::core::context::Context;
+use crate::core::models::CONTEXT_METADATA_KEY;
+use crate::core::prompt_text::{escape_markup, sanitize_line};
 use crate::models::{LlmMessage, SenderType};
 
 /// Per-request conversation history stored in the pipeline [`Context`].
@@ -77,7 +79,7 @@ pub(crate) fn assemble_llm_messages(
         .map(|h| h.0.as_slice())
         .unwrap_or(fallback_history);
 
-    let mut messages = Vec::with_capacity(history.len() + 2);
+    let mut messages = Vec::with_capacity(history.len() + 3);
     messages.push(LlmMessage::system(system_prompt));
     messages.extend_from_slice(history);
 
@@ -114,7 +116,7 @@ const TURN_CONTEXT_HEADER: &str = "Context the sender supplied with this message
 /// prompt, so it gets the treatment manifest tool descriptions get: a newline
 /// would otherwise forge further entries, and markup a tool result.
 fn sanitize_context_text(s: &str) -> String {
-    crate::tools::remote::escape_markup(&crate::tools::remote::sanitize_description(s))
+    escape_markup(&sanitize_line(s))
 }
 
 /// Render the sender's per-turn context as a system block, or `None` when they
@@ -129,7 +131,7 @@ fn turn_context_block(ctx: &Context) -> Option<String> {
     let entries = ctx
         .message
         .metadata
-        .get(crate::tools::remote::CONTEXT_METADATA_KEY)?
+        .get(CONTEXT_METADATA_KEY)?
         .as_object()?;
     let mut pairs: Vec<_> = entries.iter().collect();
     pairs.sort_by_key(|(key, _)| *key);
@@ -171,8 +173,7 @@ mod tests {
 
     fn ctx_with_context(entries: serde_json::Value) -> Context {
         let mut msg = Message::new("whats the time", "u1", "chan");
-        msg.metadata
-            .insert(crate::tools::remote::CONTEXT_METADATA_KEY.into(), entries);
+        msg.metadata.insert(CONTEXT_METADATA_KEY.into(), entries);
         Context::new(Arc::new(msg), Arc::new(AgentConfig::default()))
     }
 
@@ -224,6 +225,10 @@ mod tests {
             "the value stayed one entry: {block}"
         );
         assert!(!block.contains("<tool_result"), "forged frame: {block}");
+        assert!(
+            block.contains("&lt;tool_result"),
+            "the value must survive escaped, not be dropped: {block}"
+        );
     }
 
     /// A publisher the transport cannot name does not get to steer the prompt.
@@ -232,7 +237,7 @@ mod tests {
         let mut msg = Message::new("whats the time", "u1", "chan");
         msg.platform = Some("centrifugo".into());
         msg.metadata.insert(
-            crate::tools::remote::CONTEXT_METADATA_KEY.into(),
+            CONTEXT_METADATA_KEY.into(),
             serde_json::json!({"page": "/spaces/1"}),
         );
         let ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
@@ -241,9 +246,25 @@ mod tests {
     }
 
     #[test]
-    fn the_rendered_context_block_is_bounded() {
+    fn the_entry_count_is_capped() {
         let entries: serde_json::Map<String, serde_json::Value> = (0..MAX_TURN_CONTEXT_ENTRIES * 2)
-            .map(|i| (format!("k{i:03}"), serde_json::json!("v".repeat(64))))
+            .map(|i| (format!("k{i:03}"), serde_json::json!("v".repeat(16))))
+            .collect();
+        let ctx = ctx_with_context(serde_json::Value::Object(entries));
+        let block = assemble_llm_messages(&ctx, "sys", &[])[1]
+            .text()
+            .to_string();
+
+        assert_eq!(block.lines().count() - 1, MAX_TURN_CONTEXT_ENTRIES);
+        assert!(block.len() <= MAX_TURN_CONTEXT_BYTES);
+    }
+
+    /// Drives the BYTE budget rather than the entry cap: a few multi-KB values
+    /// trip the budget long before 32 entries do.
+    #[test]
+    fn the_byte_budget_binds_before_the_entry_cap() {
+        let entries: serde_json::Map<String, serde_json::Value> = (0..8)
+            .map(|i| (format!("k{i}"), serde_json::json!("v".repeat(2048))))
             .collect();
         let ctx = ctx_with_context(serde_json::Value::Object(entries));
         let block = assemble_llm_messages(&ctx, "sys", &[])[1]
@@ -251,15 +272,50 @@ mod tests {
             .to_string();
 
         assert!(block.len() <= MAX_TURN_CONTEXT_BYTES, "len {}", block.len());
+        let rendered = block.lines().count() - 1;
         assert!(
-            block
-                .matches(
-                    "
-- "
-                )
-                .count()
-                <= MAX_TURN_CONTEXT_ENTRIES
+            rendered < 8,
+            "the byte budget bound first, not the entry cap"
         );
+        assert!(rendered > 0, "some entries still land");
+    }
+
+    /// An entry too large for the remaining budget is SKIPPED, not a stop —
+    /// the bug a `break` in that loop would reintroduce.
+    #[test]
+    fn an_entry_that_does_not_fit_does_not_stop_the_ones_after_it() {
+        let ctx = ctx_with_context(serde_json::json!({
+            "a_huge": "v".repeat(MAX_TURN_CONTEXT_BYTES),
+            "z_small": "landed",
+        }));
+        let block = assemble_llm_messages(&ctx, "sys", &[])[1]
+            .text()
+            .to_string();
+
+        assert!(
+            block.contains("- z_small: landed"),
+            "a later small entry must still land: {block}"
+        );
+    }
+
+    /// The positive counterpart to the unauthenticated case below.
+    #[test]
+    fn context_from_an_authenticated_centrifugo_sender_renders() {
+        let mut msg = Message::new("whats the time", "u1", "chan");
+        msg.platform = Some("centrifugo".into());
+        msg.metadata.insert(
+            "authenticated_sender_id".into(),
+            serde_json::Value::String("robot".into()),
+        );
+        msg.metadata.insert(
+            CONTEXT_METADATA_KEY.into(),
+            serde_json::json!({"page": "/spaces/1"}),
+        );
+        let ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+
+        let messages = assemble_llm_messages(&ctx, "sys", &[]);
+        assert_eq!(messages.len(), 3);
+        assert!(messages[1].text().contains("- page: /spaces/1"));
     }
 
     fn ctx_with(content: &str, name: Option<&str>) -> Context {

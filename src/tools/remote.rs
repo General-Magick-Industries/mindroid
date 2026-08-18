@@ -7,18 +7,15 @@ use serde_json::{Value, json};
 
 use super::{DynamicRegistry, Tool, ToolContext};
 use crate::core::context::Context;
+use crate::core::models::TOOLS_METADATA_KEY;
+use crate::core::prompt_text::{escape_markup, sanitize_line};
 use crate::error::{MindroidError, Result};
-
-/// Metadata key a transport stamps the sender's tool manifest under.
-pub const TOOLS_METADATA_KEY: &str = "tools";
-
-/// Metadata key a transport stamps the sender's per-turn context under.
-pub const CONTEXT_METADATA_KEY: &str = "context";
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_TOOLS: usize = 64;
 const MAX_SCHEMA_BYTES: usize = 16 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 16;
+const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 
 /// A tool the runtime does not execute — it declares the tool to the LLM and,
 /// when called, [`ToolExecutorStage`] emits the call as the pipeline response
@@ -118,6 +115,26 @@ fn empty_object_schema() -> Value {
     json!({ "type": "object", "properties": {} })
 }
 
+/// Serialized byte length, counted without building the serialized form.
+fn encoded_len(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
 /// The set of tools a client advertises over the transport, so the agent's
 /// registry is built at runtime instead of hardcoded. The transport analogue of
 /// the robot repo's `describe` capability manifest.
@@ -127,7 +144,8 @@ pub struct ToolsManifest {
 }
 
 impl ToolsManifest {
-    /// Read the tool manifest a transport stamped on the message.
+    /// Read the tools a transport stamped on the message, or `None` when it
+    /// stamped none or stamped something unusable.
     ///
     /// The manifest rides delivery metadata, never the message body: a chat
     /// backend fans it out beside the turn's text, so a participant cannot
@@ -135,14 +153,31 @@ impl ToolsManifest {
     /// no metadata channel of their own (stdio) map their envelope into the
     /// same key, so this is the single parse point either way.
     pub fn from_metadata(message: &crate::Message) -> Option<Self> {
-        let tools = message.metadata.get(TOOLS_METADATA_KEY)?;
+        Self::parse(message.metadata.get(TOOLS_METADATA_KEY)?)
+    }
+
+    /// Read the manifest of a message whose sender declared
+    /// [`MessageType::ToolManifest`](crate::MessageType::ToolManifest).
+    ///
+    /// Absent tools metadata is an EMPTY manifest rather than a missing one:
+    /// the declared type already carries the sender's intent, and a backend
+    /// that omits an empty array (`serde`'s `omitempty` and its equivalents)
+    /// would otherwise leave a client unable to revoke what it advertised.
+    /// Unusable metadata still yields `None`, so a malformed manifest cannot
+    /// clear a good one.
+    pub fn declared_manifest(message: &crate::Message) -> Option<Self> {
+        match message.metadata.get(TOOLS_METADATA_KEY) {
+            None => Some(Self { tools: Vec::new() }),
+            Some(tools) => Self::parse(tools),
+        }
+    }
+
+    fn parse(tools: &Value) -> Option<Self> {
         if !tools.is_array() {
             tracing::warn!("Ignoring non-array tools metadata");
             return None;
         }
-        // Bounded before parsing: the cap exists to stop a hostile publisher
-        // from making the agent allocate, which a post-parse check would not.
-        if tools.to_string().len() > MAX_MANIFEST_BYTES {
+        if encoded_len(tools) > MAX_MANIFEST_BYTES {
             tracing::warn!("Dropping tools metadata that exceeds the size limit");
             return None;
         }
@@ -167,8 +202,7 @@ impl ToolsManifest {
                 ok
             })
             .map(|t| {
-                let tool =
-                    RemoteTool::new(t.name, sanitize_description(&t.description)).schema(t.schema);
+                let tool = RemoteTool::new(t.name, sanitize_line(&t.description)).schema(t.schema);
                 match executor_id {
                     Some(executor_id) => tool.executor_id(executor_id),
                     None => tool,
@@ -240,8 +274,8 @@ impl crate::pipeline::PipelineStage for ManifestStage {
                 tracing::warn!("Ignoring tool manifest from an untrusted sender");
                 return Ok(());
             }
-            let Some(manifest) = ToolsManifest::from_metadata(&ctx.message) else {
-                tracing::warn!("Ignoring tool manifest that declared no tools metadata");
+            let Some(manifest) = ToolsManifest::declared_manifest(&ctx.message) else {
+                tracing::warn!("Ignoring tool manifest whose tools metadata was unusable");
                 return Ok(());
             };
 
@@ -287,10 +321,11 @@ impl crate::pipeline::PipelineStage for ManifestStage {
 ///
 /// # Trust
 ///
-/// Scoped to one turn, but still reaches the system prompt for it — so on a
-/// multi-party channel any participant can declare tools. Names and descriptions
-/// are validated, and `plus_tools` cannot displace a registered tool, but the
-/// declaration itself is unauthenticated.
+/// Requires an authenticated sender, as [`ManifestStage`] does: the tools reach
+/// the system prompt for the turn, so a publisher the transport cannot name does
+/// not get to write them. Names and descriptions are validated and `plus_tools`
+/// cannot displace a registered tool, but ANY authenticated participant on a
+/// multi-party channel can still declare tools for their own turn.
 pub struct PerTurnToolsStage;
 
 #[async_trait]
@@ -303,9 +338,12 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
         if ctx.message.message_type.is_control() {
             return Ok(());
         }
+        let Some(authenticated_sender) = ctx.message.trusted_sender_id() else {
+            return Ok(());
+        };
         if let Some(manifest) = ToolsManifest::from_metadata(&ctx.message) {
             let tools: Vec<Arc<dyn Tool>> = manifest
-                .build_tools_for(ctx.message.trusted_sender_id())
+                .build_tools_for(Some(authenticated_sender))
                 .into_iter()
                 .map(|t| Arc::new(t) as Arc<dyn Tool>)
                 .collect();
@@ -342,8 +380,8 @@ impl crate::pipeline::PipelineStage for PerTurnToolsStage {
 /// reaches the model without passing that stage is uncorrelated.
 pub fn normalize_tool_result(content: &str) -> Option<String> {
     let v: Value = serde_json::from_str(content).ok()?;
-    if let Some(declared) = v.get("type").and_then(Value::as_str)
-        && declared != "tool_result"
+    if v.get("type")
+        .is_some_and(|t| t.as_str() != Some("tool_result"))
     {
         return None;
     }
@@ -582,17 +620,6 @@ fn is_valid_call_id(id: &str) -> bool {
 const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 
 /// Upper bound on a manifest-supplied tool description.
-const MAX_DESCRIPTION_BYTES: usize = 1024;
-
-/// Flatten to one bounded line — newlines let an entry forge prompt structure.
-pub(crate) fn sanitize_description(s: &str) -> String {
-    let flattened: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    truncate_on_char_boundary(flattened.trim(), MAX_DESCRIPTION_BYTES).to_string()
-}
-
 fn schema_is_bounded(value: &Value, depth: usize) -> bool {
     if depth > MAX_SCHEMA_DEPTH
         || serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() > MAX_SCHEMA_BYTES)
@@ -606,7 +633,7 @@ fn schema_is_bounded(value: &Value, depth: usize) -> bool {
         Value::Array(values) => {
             values.len() <= 64 && values.iter().all(|v| schema_is_bounded(v, depth + 1))
         }
-        Value::String(s) => s.len() <= MAX_DESCRIPTION_BYTES && !s.chars().any(char::is_control),
+        Value::String(s) => s.len() <= MAX_SCHEMA_STRING_BYTES && !s.chars().any(char::is_control),
         _ => true,
     }
 }
@@ -619,14 +646,6 @@ pub(crate) fn is_valid_tool_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-/// Stop a result closing `<tool_result>` and opening a tag the model would read
-/// as a second, fabricated execution.
-pub(crate) fn escape_markup(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// The one builder for a locally-executed `<tool_result>` envelope. Tool output
@@ -644,7 +663,7 @@ pub(crate) fn tool_result_envelope(name: &str, result: &str) -> String {
     )
 }
 
-fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -982,6 +1001,11 @@ mod tests {
             normalize_tool_result(r#"{"type":"chat_message","payload":{}}"#),
             None
         );
+        assert_eq!(
+            normalize_tool_result(r#"{"type":5,"name":"get_time","content":"3pm"}"#),
+            None,
+            "a non-string type is a declaration we cannot read, not an absent one"
+        );
     }
 
     #[test]
@@ -1056,6 +1080,123 @@ mod tests {
         PerTurnToolsStage.process(&mut ctx).await.unwrap();
 
         assert!(ctx.get_run::<PerTurnTools>().is_none());
+    }
+
+    fn authenticated_manifest_message(tools: Option<Value>) -> crate::models::Message {
+        let mut message = crate::models::Message::new("advertising tools", "u1", "channel");
+        message.message_type = crate::MessageType::ToolManifest;
+        message.platform = Some("centrifugo".into());
+        message.metadata.insert(
+            "authenticated_sender_id".into(),
+            Value::String("robot".into()),
+        );
+        if let Some(tools) = tools {
+            message.metadata.insert(TOOLS_METADATA_KEY.into(), tools);
+        }
+        message
+    }
+
+    async fn apply(stage: &ManifestStage, message: crate::models::Message) {
+        let mut ctx = Context::new(
+            Arc::new(message),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        stage.process(&mut ctx).await.unwrap();
+    }
+
+    /// A backend that omits an empty array (Go's `omitempty` and friends) sends
+    /// a revocation as a TOOL_MANIFEST with no tools key at all. Treating that
+    /// as "no manifest" would leave the client unable to withdraw its tools.
+    #[tokio::test]
+    async fn a_declared_manifest_with_no_tools_revokes_the_previous_one() {
+        let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
+        let stage = ManifestStage::new(registry.clone());
+
+        apply(
+            &stage,
+            authenticated_manifest_message(Some(json!([{"name": "remote"}]))),
+        )
+        .await;
+        assert!(registry.load().get("remote").is_some(), "installed");
+
+        apply(&stage, authenticated_manifest_message(None)).await;
+        assert!(
+            registry.load().get("remote").is_none(),
+            "absent tools revokes"
+        );
+
+        apply(
+            &stage,
+            authenticated_manifest_message(Some(json!([{"name": "remote"}]))),
+        )
+        .await;
+        apply(&stage, authenticated_manifest_message(Some(json!([])))).await;
+        assert!(
+            registry.load().get("remote").is_none(),
+            "empty array revokes"
+        );
+    }
+
+    /// Revocation must not be reachable by sending garbage: a manifest that
+    /// cannot be read leaves the previous one standing.
+    #[tokio::test]
+    async fn unusable_tools_metadata_does_not_revoke() {
+        for tools in [
+            json!("not an array"),
+            json!({"name": "x"}),
+            json!([{"nope": 1}]),
+        ] {
+            let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
+            let stage = ManifestStage::new(registry.clone());
+
+            apply(
+                &stage,
+                authenticated_manifest_message(Some(json!([{"name": "remote"}]))),
+            )
+            .await;
+            apply(&stage, authenticated_manifest_message(Some(tools.clone()))).await;
+
+            assert!(
+                registry.load().get("remote").is_some(),
+                "malformed {tools} must not clear a good manifest"
+            );
+        }
+    }
+
+    /// Per-turn tools reach the system prompt, so they carry the same
+    /// authenticated-sender requirement the persistent manifest does.
+    #[tokio::test]
+    async fn per_turn_tools_require_an_authenticated_sender() {
+        let mut message = message_with_tools(json!([{"name": "peek"}]));
+        message.platform = Some("centrifugo".into());
+        let mut ctx = Context::new(
+            Arc::new(message),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        PerTurnToolsStage.process(&mut ctx).await.unwrap();
+
+        assert!(ctx.get_run::<PerTurnTools>().is_none());
+    }
+
+    #[tokio::test]
+    async fn per_turn_tools_from_an_authenticated_sender_are_bound_to_it() {
+        let mut message = message_with_tools(json!([{"name": "peek"}]));
+        message.platform = Some("centrifugo".into());
+        message.metadata.insert(
+            "authenticated_sender_id".into(),
+            Value::String("robot".into()),
+        );
+        let mut ctx = Context::new(
+            Arc::new(message),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        PerTurnToolsStage.process(&mut ctx).await.unwrap();
+
+        let tools = ctx.get_run::<PerTurnTools>().expect("lifted").0.clone();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].remote_executor_id(), Some("robot"));
     }
 
     #[tokio::test]
