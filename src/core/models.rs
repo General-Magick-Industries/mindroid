@@ -27,6 +27,34 @@ pub enum MessageType {
     System,
     Image,
     Audio,
+    ToolCall,
+    ToolResult,
+    ToolManifest,
+}
+
+impl MessageType {
+    /// Map a `message_type` a sender declared on the wire.
+    ///
+    /// Returns `None` for a plain conversational turn (`TEXT`,
+    /// `VOICE_TRANSCRIPTION`) and for anything unrecognized, so a caller keeps
+    /// its default rather than inventing a type it cannot dispatch on.
+    ///
+    /// Accepts either case: the MagickMind backend stamps `TOOL_RESULT` while a
+    /// stdio envelope names itself `tool_result`. `tools_manifest` is the
+    /// envelope's historical spelling of `TOOL_MANIFEST`.
+    pub fn from_wire(declared: &str) -> Option<Self> {
+        match declared.trim().to_ascii_uppercase().as_str() {
+            "TOOL_CALL" => Some(Self::ToolCall),
+            "TOOL_RESULT" => Some(Self::ToolResult),
+            "TOOL_MANIFEST" | "TOOLS_MANIFEST" => Some(Self::ToolManifest),
+            _ => None,
+        }
+    }
+
+    /// Whether this is protocol traffic rather than a conversational turn.
+    pub fn is_control(&self) -> bool {
+        matches!(self, Self::ToolCall | Self::ToolResult | Self::ToolManifest)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
