@@ -280,21 +280,33 @@ mod tests {
         assert!(rendered > 0, "some entries still land");
     }
 
-    /// An entry too large for the remaining budget is SKIPPED, not a stop —
-    /// the bug a `break` in that loop would reintroduce.
+    /// An entry that does not fit is SKIPPED, not a stop — the bug a `break` in
+    /// that loop would reintroduce.
+    ///
+    /// Values are capped at 1 KB by `sanitize_line`, so no single entry can
+    /// exhaust the budget: it takes several to leave a later short one facing a
+    /// full budget. Seeding one huge entry would prove nothing, since it fits.
     #[test]
     fn an_entry_that_does_not_fit_does_not_stop_the_ones_after_it() {
-        let ctx = ctx_with_context(serde_json::json!({
-            "a_huge": "v".repeat(MAX_TURN_CONTEXT_BYTES),
-            "z_small": "landed",
-        }));
+        let mut entries = serde_json::Map::new();
+        for i in 0..9 {
+            entries.insert(format!("a_{i:02}"), serde_json::json!("v".repeat(1024)));
+        }
+        entries.insert("z_small".into(), serde_json::json!("landed"));
+
+        let ctx = ctx_with_context(serde_json::Value::Object(entries));
         let block = assemble_llm_messages(&ctx, "sys", &[])[1]
             .text()
             .to_string();
 
+        let rendered = block.lines().count() - 1;
+        assert!(
+            rendered < 10,
+            "the budget must actually run out: {rendered} rendered"
+        );
         assert!(
             block.contains("- z_small: landed"),
-            "a later small entry must still land: {block}"
+            "a later small entry must still land after a dropped one: {block}"
         );
     }
 

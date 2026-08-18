@@ -58,6 +58,19 @@ variant breaks you.
 - `PerTurnToolsStage` now requires an authenticated sender, matching
   `ManifestStage`. Previously an unnameable publisher's tool names and
   descriptions reached the turn's system prompt.
+- Manifest revocation. A backend that omits an empty array (`omitempty` and its
+  equivalents) sends a withdrawal as `TOOL_MANIFEST` with no `tools` key;
+  that now clears the remote set. Unusable metadata still refuses to clear, so
+  garbage cannot be used to revoke. Embedders stamping metadata themselves
+  should send an absent or empty `tools` to revoke.
+- `EpisodeIngestStage` refuses control traffic on every `IngestScope`. A tool
+  manifest or result is not an episode, and topic detection would otherwise
+  mint micro-episodes from protocol traffic.
+- Manifest tool descriptions are now markup-escaped as well as flattened, so a
+  description cannot forge a `<tool_result>` frame in the system prompt. Text
+  reaching the prompt also has Unicode separator, bidi, zero-width and tag
+  characters folded — the tag block encodes an invisible ASCII alphabet that
+  `char::is_control` does not cover.
 
 ## [0.0.2-a.1] — 2026-08-06
 

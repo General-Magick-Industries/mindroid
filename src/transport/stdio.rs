@@ -44,9 +44,9 @@ fn declare(line: String) -> Declared {
         .and_then(MessageType::from_wire);
 
     let mut metadata = HashMap::new();
-    // A manifest envelope nests its tools under `payload`; a chat line carries
-    // per-turn tools and context at the top level. Both land on the same keys
-    // the Centrifugo fan-out uses, which is what lets the stages read one place.
+    // Tools are accepted nested under `payload` or at the top level, whatever
+    // the declared type: an operator types either shape by hand. Both land on
+    // the keys the Centrifugo fan-out uses, so the stages read one place.
     let tools = envelope
         .get("payload")
         .and_then(|p| p.get(TOOLS_METADATA_KEY))

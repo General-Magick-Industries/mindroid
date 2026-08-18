@@ -4,53 +4,83 @@ const MAX_LINE_BYTES: usize = 1024;
 
 /// Flatten untrusted text to one bounded line.
 ///
-/// Beyond `char::is_control` (category Cc) this also folds the separator,
-/// bidi and zero-width formatting characters, which a model may render as a
-/// line break and which would otherwise let a value forge further entries.
+/// Folds every character a model may read as structure but a human reviewing a
+/// log will not see: the C0/C1 controls `char::is_control` covers, plus the
+/// separator, bidi, zero-width and tag characters it does not. The tag block in
+/// particular encodes a full invisible ASCII alphabet.
 pub(crate) fn sanitize_line(s: &str) -> String {
     let flattened: String = s
         .chars()
         .map(|c| if is_layout_control(c) { ' ' } else { c })
         .collect();
-    crate::tools::remote::truncate_on_char_boundary(flattened.trim(), MAX_LINE_BYTES).to_string()
+    truncate_on_char_boundary(flattened.trim(), MAX_LINE_BYTES).to_string()
 }
 
 fn is_layout_control(c: char) -> bool {
     c.is_control()
         || matches!(c,
-            '\u{2028}' | '\u{2029}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}' | '\u{feff}')
+            '\u{061c}' | '\u{180e}' | '\u{2028}' | '\u{2029}' | '\u{feff}'
+            | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Escape the markup the runtime uses to frame trusted tool output.
 ///
-/// `"` is deliberately left alone: every marker this guards is anchored to a
-/// tag, so content cannot reach an attribute position by quoting.
+/// `"` is deliberately left alone: no caller interpolates into an attribute
+/// position, so content cannot reach one by quoting.
 pub(crate) fn escape_markup(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
+/// Truncate to at most `max_bytes`, never splitting a character.
+pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Asserts on the output directly. A `lines().count()` assertion would be
+    /// vacuous here: `str::lines` splits only on `\n` and `\r\n`, so it cannot
+    /// tell a folded U+2028 from an unfolded one.
     #[test]
-    fn newlines_and_unicode_separators_are_flattened() {
+    fn every_invisible_control_is_folded_to_a_space() {
         for raw in [
             "a\nb",
-            "a\r\nb",
+            "a\u{061c}b",
+            "a\u{180e}b",
             "a\u{2028}b",
             "a\u{2029}b",
             "a\u{200b}b",
+            "a\u{200f}b",
             "a\u{202e}b",
+            "a\u{2060}b",
+            "a\u{2064}b",
+            "a\u{2066}b",
+            "a\u{206f}b",
             "a\u{feff}b",
+            "a\u{fff9}b",
+            "a\u{e0041}b",
+            "a\u{e007f}b",
         ] {
-            let out = sanitize_line(raw);
-            assert_eq!(out.lines().count(), 1, "still one line: {out:?}");
-            assert!(!out.contains('\u{2028}'), "separator survived: {out:?}");
+            assert_eq!(sanitize_line(raw), "a b", "not folded: {raw:?}");
         }
+    }
+
+    #[test]
+    fn ordinary_text_is_left_alone() {
+        assert_eq!(sanitize_line("  hello world  "), "hello world");
+        assert_eq!(sanitize_line("naïve — “quoted”"), "naïve — “quoted”");
     }
 
     #[test]
@@ -65,5 +95,13 @@ mod tests {
     fn a_line_is_length_capped_on_a_char_boundary() {
         let out = sanitize_line(&"é".repeat(MAX_LINE_BYTES));
         assert!(out.len() <= MAX_LINE_BYTES);
+        assert!(out.chars().all(|c| c == 'é'), "split a character: {out:?}");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        assert_eq!(truncate_on_char_boundary("é", 1), "");
+        assert_eq!(truncate_on_char_boundary("aé", 2), "a");
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
     }
 }
