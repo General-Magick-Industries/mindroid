@@ -93,8 +93,50 @@ pub(crate) fn assemble_llm_messages(
         .map(str::trim)
         .filter(|name| !name.is_empty() && !text.trim_start().starts_with("<tool_result"))
         .map(|name| format!("[{name}]: {text}"));
+    if let Some(block) = turn_context_block(ctx) {
+        messages.push(LlmMessage::system(block));
+    }
     messages.push(LlmMessage::user(attributed.as_deref().unwrap_or(text)));
     messages
+}
+
+/// Truncation budget for per-turn context. The backend already bounds each
+/// entry, but the product of its limits still exceeds what belongs in a prompt.
+const MAX_TURN_CONTEXT_BYTES: usize = 8192;
+
+/// Render the sender's per-turn context as a system block, or `None` when they
+/// supplied none. Keys are sorted so the same context yields the same prompt.
+fn turn_context_block(ctx: &Context) -> Option<String> {
+    let entries = ctx.message.metadata.get("context")?.as_object()?;
+    let mut keys: Vec<&String> = entries.keys().collect();
+    keys.sort();
+
+    let mut rendered = Vec::new();
+    let mut budget = MAX_TURN_CONTEXT_BYTES;
+    for key in keys {
+        let Some(value) = entries[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        let line = format!("- {key}: {value}");
+        if line.len() > budget {
+            tracing::warn!("Dropping per-turn context entries past the size budget");
+            break;
+        }
+        budget -= line.len();
+        rendered.push(line);
+    }
+
+    (!rendered.is_empty()).then(|| {
+        format!(
+            "Context the sender supplied with this message. It describes their \
+             current situation, not something they said:\n{}",
+            rendered.join("\n")
+        )
+    })
 }
 
 #[cfg(test)]
@@ -134,5 +176,52 @@ mod tests {
         let framed = "<tool_result id=\"1\">ok</tool_result>";
         let messages = assemble_llm_messages(&ctx_with(framed, Some("Turtle")), "sys", &[]);
         assert_eq!(messages[1].text(), framed);
+    }
+
+    fn ctx_with_context(entries: serde_json::Value) -> Context {
+        let mut msg = Message::new("whats the time", "u1", "chan");
+        msg.metadata.insert("context".into(), entries);
+        Context::new(Arc::new(msg), Arc::new(AgentConfig::default()))
+    }
+
+    #[test]
+    fn per_turn_context_rides_a_system_block_before_the_user_turn() {
+        let ctx = ctx_with_context(serde_json::json!({"page": "/spaces/1", "device": "laptop"}));
+        let messages = assemble_llm_messages(&ctx, "sys", &[]);
+
+        assert_eq!(messages.len(), 3);
+        let block = messages[1].text().to_string();
+        assert!(
+            block.find("- device: laptop") < block.find("- page: /spaces/1"),
+            "entries render in sorted order: {block}"
+        );
+        assert_eq!(messages[2].text(), "whats the time");
+    }
+
+    #[test]
+    fn empty_and_absent_context_add_no_block() {
+        for entries in [
+            serde_json::json!({}),
+            serde_json::json!({"page": "   "}),
+            serde_json::json!("not an object"),
+        ] {
+            let messages = assemble_llm_messages(&ctx_with_context(entries), "sys", &[]);
+            assert_eq!(messages.len(), 2, "no system block belongs here");
+        }
+    }
+
+    #[test]
+    fn oversized_context_is_truncated_not_dropped() {
+        let ctx = ctx_with_context(serde_json::json!({
+            "a_small": "keep",
+            "b_huge": "x".repeat(MAX_TURN_CONTEXT_BYTES),
+        }));
+        let block = assemble_llm_messages(&ctx, "sys", &[])[1]
+            .text()
+            .to_string();
+
+        assert!(block.contains("- a_small: keep"));
+        assert!(!block.contains("b_huge"));
+        assert!(block.len() <= MAX_TURN_CONTEXT_BYTES + 200);
     }
 }
