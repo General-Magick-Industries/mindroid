@@ -48,6 +48,7 @@ variant breaks you.
 
 ### Added
 
+- `RecallTimeWindowTool` (`recall_time_window`): recalls episodes in a date window, for questions about *when* rather than *what*. Requires an end-user credential.
 - `MessageType::from_wire` and `MessageType::is_control`.
 - `TOOLS_METADATA_KEY` / `CONTEXT_METADATA_KEY` in `core::models`.
 - Per-turn `context` renders as a sanitized, bounded system block on the turn it

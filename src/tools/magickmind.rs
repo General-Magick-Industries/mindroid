@@ -198,9 +198,232 @@ struct SearchResponse {
     memory_content: String,
 }
 
+/// Recalls episodes in a date window. Search ranks by relevance and cannot
+/// filter on time -- no timestamp is indexed -- so a window is a separate call.
+pub struct RecallTimeWindowTool {
+    base_url: String,
+    allow_insecure: bool,
+}
+
+impl RecallTimeWindowTool {
+    const HTTP_TIMEOUT_SECS: u64 = 10;
+
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            allow_insecure: false,
+        }
+    }
+
+    /// Permit sending auth headers over plaintext `http://` (local dev only).
+    pub fn with_allow_insecure(mut self, allow_insecure: bool) -> Self {
+        self.allow_insecure = allow_insecure;
+        self
+    }
+
+    /// End-user route only: the window is scoped to the token subject, so there
+    /// is no owner for a caller to name.
+    fn range_url(&self) -> String {
+        format!("{}/v1/end-user/episodes/range", self.base_url)
+    }
+}
+
+#[async_trait]
+impl Tool for RecallTimeWindowTool {
+    fn name(&self) -> &str {
+        "recall_time_window"
+    }
+
+    fn description(&self) -> &str {
+        "Recall what happened in a span of time, e.g. yesterday, last week, or a \n         specific date range. Use this instead of search_episodic_memory whenever \n         the question is about WHEN something happened rather than what it was \n         about -- memory search ranks by relevance and cannot filter by time. \n         Returns the episodes in the window, newest first."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "date_start": {
+                    "type": "string",
+                    "description": "First day of the window, inclusive, as YYYY-MM-DD."
+                },
+                "date_end": {
+                    "type": "string",
+                    "description": "Last day of the window, inclusive, as YYYY-MM-DD."
+                },
+                "limit": { "type": "integer", "description": "Max episodes (optional)." },
+                "filter_by_session": {
+                    "type": "boolean",
+                    "description": "Restrict to the current conversation space (default true)."
+                }
+            },
+            "required": ["date_start", "date_end"]
+        })
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        let creds = ctx.get::<AgentCredentials>().ok_or_else(|| {
+            MindroidError::config("recall_time_window needs AgentCredentials in ToolContext")
+        })?;
+
+        if creds.credential_kind != CredentialKind::EndUser {
+            return Err(MindroidError::config(
+                "recall_time_window requires an end-user credential; the range route has no service-user form",
+            ));
+        }
+
+        let date_start = args["date_start"].as_str().unwrap_or("").trim();
+        let date_end = args["date_end"].as_str().unwrap_or("").trim();
+        if date_start.is_empty() || date_end.is_empty() {
+            return Err(MindroidError::config(
+                "date_start and date_end are required, as YYYY-MM-DD",
+            ));
+        }
+
+        require_secure_url(&self.base_url, self.allow_insecure, "allow_insecure")?;
+
+        let mut params: Vec<(&str, String)> = vec![
+            ("date_start", date_start.to_string()),
+            ("date_end", date_end.to_string()),
+        ];
+        params.extend(session_param(&args, ctx));
+        if let Some(limit) = args["limit"].as_i64().filter(|n| *n > 0) {
+            params.push(("limit", limit.to_string()));
+        }
+
+        let headers = crate::auth::build_auth_header_map(creds.auth.as_ref()).await?;
+        let resp = secure_json_client(Duration::from_secs(Self::HTTP_TIMEOUT_SECS))
+            .get(self.range_url())
+            .headers(headers)
+            .query(&params)
+            .send()
+            .await
+            .map_err(|e| MindroidError::Api {
+                message: e.to_string(),
+                status_code: None,
+            })?;
+
+        let status = resp.status();
+        crate::core::net::note_auth_status(creds.auth.as_ref(), status);
+        if !status.is_success() {
+            let text = error_excerpt(&resp.text().await.unwrap_or_default());
+            return Err(MindroidError::Api {
+                message: format!("episode window lookup failed: {text}"),
+                status_code: Some(status.as_u16()),
+            });
+        }
+
+        let body: RangeResponse = resp.json().await.map_err(|e| MindroidError::Api {
+            message: format!("failed to parse episode window response: {e}"),
+            status_code: None,
+        })?;
+
+        Ok(render_episodes(&body.data))
+    }
+}
+
+/// Scope for the window. The model chooses only WHETHER to narrow to the current
+/// space; the id comes from the trusted per-message context, never from args
+/// (ADR-0005), so it cannot aim recall at another space.
+fn session_param(args: &Value, ctx: &ToolContext) -> Option<(&'static str, String)> {
+    let by_session = args["filter_by_session"].as_bool().unwrap_or(true);
+    (by_session && !ctx.channel_id.is_empty()).then(|| ("mindspace_id", ctx.channel_id.clone()))
+}
+
+fn render_episodes(episodes: &[Episode]) -> String {
+    if episodes.is_empty() {
+        return "No episodes in that window.".to_string();
+    }
+    episodes
+        .iter()
+        .map(|e| {
+            format!(
+                "Topic: {}\nSubtopics: {}\nSummary: {}",
+                e.topic,
+                e.subtopics.join(", "),
+                e.summarized_conversation
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct RangeResponse {
+    #[serde(default)]
+    data: Vec<Episode>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct Episode {
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    subtopics: Vec<String>,
+    #[serde(default)]
+    summarized_conversation: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_url_is_end_user_only() {
+        let tool = RecallTimeWindowTool::new("https://api.example.com/");
+        assert_eq!(
+            tool.range_url(),
+            "https://api.example.com/v1/end-user/episodes/range"
+        );
+    }
+
+    #[test]
+    fn render_episodes_reports_an_empty_window() {
+        assert_eq!(render_episodes(&[]), "No episodes in that window.");
+    }
+
+    #[test]
+    fn render_episodes_keeps_topic_subtopics_and_summary() {
+        let rendered = render_episodes(&[Episode {
+            topic: "Garden planning".into(),
+            subtopics: vec!["tomatoes".into(), "watering".into()],
+            summarized_conversation: "Agreed to start seedlings indoors.".into(),
+        }]);
+        assert_eq!(
+            rendered,
+            "Topic: Garden planning
+Subtopics: tomatoes, watering
+Summary: Agreed to start seedlings indoors."
+        );
+    }
+
+    // ADR-0005: the model picks WHETHER to scope, never WHERE. A refactor that
+    // read the space from args would silently widen recall to another space.
+    #[test]
+    fn window_scope_ignores_a_model_supplied_space() {
+        let ctx = ctx_with("ms-1", "sender-1");
+        let got = session_param(
+            &json!({"mindspace_id": "other-space", "channel_id": "other-space"}),
+            &ctx,
+        );
+        assert_eq!(got, Some(("mindspace_id", "ms-1".to_string())));
+    }
+
+    #[test]
+    fn window_scope_can_be_widened_but_never_redirected() {
+        let ctx = ctx_with("ms-1", "sender-1");
+        assert_eq!(
+            session_param(
+                &json!({"filter_by_session": false, "mindspace_id": "other"}),
+                &ctx
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn window_scope_is_omitted_without_a_channel() {
+        assert_eq!(session_param(&json!({}), &ctx_with("", "sender-1")), None);
+    }
 
     #[test]
     fn search_url_routes_by_credential_kind() {

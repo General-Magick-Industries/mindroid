@@ -52,7 +52,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
 | `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
-| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `AgentCredentials`, `auth.type = "enduser"` |
+| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"` |
 | `full` | everything above | All types |
 
 Backend-specific code lives behind `magickmind`, not `persona` — enabling the
