@@ -13,7 +13,10 @@ pub use delegation::DelegationTool;
 #[cfg(feature = "artifacts")]
 pub use get_artifact::{GET_ARTIFACT_TOOL, GetArtifactTool};
 #[cfg(feature = "magickmind")]
-pub use magickmind::{AgentCredentials, AgentCredentialsStage, EpisodicMemoryTool};
+pub use magickmind::{
+    AgentCredentials, AgentCredentialsStage, EpisodicMemoryTool, RecallTimeWindowTool,
+    WebSearchTool,
+};
 pub use open::OpenTool;
 pub use registry::{DynamicRegistry, ToolRegistry};
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
