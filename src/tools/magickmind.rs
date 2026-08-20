@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{NaiveDate, TimeDelta, Utc};
 use serde_json::{Value, json};
 
 use crate::auth::Auth;
@@ -198,14 +199,14 @@ struct SearchResponse {
     memory_content: String,
 }
 
-// ── RecallTimeWindowTool ────────────────────────────────────────────────────
-
 /// Recalls episodes in a date window. Search ranks by relevance and cannot
 /// filter on time -- no timestamp is indexed -- so a window is a separate call.
 pub struct RecallTimeWindowTool {
     base_url: String,
     allow_insecure: bool,
 }
+
+const DATE_FORMAT: &str = "%Y-%m-%d";
 
 impl RecallTimeWindowTool {
     const HTTP_TIMEOUT_SECS: u64 = 10;
@@ -237,24 +238,22 @@ impl Tool for RecallTimeWindowTool {
     }
 
     fn description(&self) -> &str {
-        "Recall what happened in a span of time, e.g. yesterday, last week, or a \
-         specific date range. Use this instead of search_episodic_memory whenever \
-         the question is about WHEN something happened rather than what it was \
-         about -- memory search ranks by relevance and cannot filter by date. \
-         Returns the episodes in the window, newest first."
+        "Recall what happened in a recent span of time, e.g. yesterday, the last \n         week, or the week before last. Use this instead of search_episodic_memory \n         whenever the question is about WHEN something happened rather than what it \n         was about -- memory search ranks by relevance and cannot filter by time. \n         The window is given in days back from now: yesterday is from 1 to 1, the \n         last week is from 7 to 0, the week before last is from 14 to 7. \n         Returns the episodes in the window, newest first."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "date_start": {
-                    "type": "string",
-                    "description": "First day of the window, inclusive, as YYYY-MM-DD."
+                "from_days_ago": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Start of the window, in days back from today. 7 = a week ago."
                 },
-                "date_end": {
-                    "type": "string",
-                    "description": "Last day of the window, inclusive, as YYYY-MM-DD."
+                "to_days_ago": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "End of the window, in days back from today. Omit for today."
                 },
                 "limit": { "type": "integer", "description": "Max episodes (optional)." },
                 "filter_by_session": {
@@ -262,7 +261,7 @@ impl Tool for RecallTimeWindowTool {
                     "description": "Restrict to the current conversation space (default true)."
                 }
             },
-            "required": ["date_start", "date_end"]
+            "required": ["from_days_ago"]
         })
     }
 
@@ -271,26 +270,20 @@ impl Tool for RecallTimeWindowTool {
             MindroidError::config("recall_time_window needs AgentCredentials in ToolContext")
         })?;
 
-        let date_start = args["date_start"].as_str().unwrap_or("").trim();
-        let date_end = args["date_end"].as_str().unwrap_or("").trim();
-        if date_start.is_empty() || date_end.is_empty() {
+        if creds.credential_kind != CredentialKind::EndUser {
             return Err(MindroidError::config(
-                "date_start and date_end are required, as YYYY-MM-DD",
+                "recall_time_window requires an end-user credential; the range route has no service-user form",
             ));
         }
 
+        let (date_start, date_end) = window_from_args(&args, Utc::now().date_naive())?;
+
         require_secure_url(&self.base_url, self.allow_insecure, "allow_insecure")?;
 
-        let mut params: Vec<(&str, String)> = vec![
-            ("date_start", date_start.to_string()),
-            ("date_end", date_end.to_string()),
-        ];
-        // Scope comes from the trusted per-message context, never from args
-        // (ADR-0005), so the model cannot read another space's window.
-        if args["filter_by_session"].as_bool().unwrap_or(true) && !ctx.channel_id.is_empty() {
-            params.push(("mindspace_id", ctx.channel_id.clone()));
-        }
-        if let Some(limit) = args["limit"].as_i64() {
+        let mut params: Vec<(&str, String)> =
+            vec![("date_start", date_start), ("date_end", date_end)];
+        params.extend(session_param(&args, ctx));
+        if let Some(limit) = args["limit"].as_i64().filter(|n| *n > 0) {
             params.push(("limit", limit.to_string()));
         }
 
@@ -325,7 +318,48 @@ impl Tool for RecallTimeWindowTool {
     }
 }
 
-fn render_episodes(episodes: &[EpisodeSchema]) -> String {
+/// Scope for the window. The model chooses only WHETHER to narrow to the current
+/// space; the id comes from the trusted per-message context, never from args
+/// (ADR-0005), so it cannot aim recall at another space.
+fn session_param(args: &Value, ctx: &ToolContext) -> Option<(&'static str, String)> {
+    let by_session = args["filter_by_session"].as_bool().unwrap_or(true);
+    (by_session && !ctx.channel_id.is_empty()).then(|| ("mindspace_id", ctx.channel_id.clone()))
+}
+
+/// Turns the model's relative offsets into the absolute window the API wants.
+/// The model never sees or supplies a date: it has no reliable notion of today,
+/// so letting it name one produces a plausible window from its training cutoff
+/// and an empty result that reads as "nothing happened".
+fn window_from_args(args: &Value, today: NaiveDate) -> Result<(String, String)> {
+    let from = args["from_days_ago"].as_i64().ok_or_else(|| {
+        MindroidError::config("from_days_ago is required, as a whole number of days")
+    })?;
+    let to = args["to_days_ago"].as_i64().unwrap_or(0);
+    if from < 0 || to < 0 {
+        return Err(MindroidError::config(
+            "day offsets count backwards from today and cannot be negative",
+        ));
+    }
+    if to > from {
+        return Err(MindroidError::config(
+            "to_days_ago must not be further back than from_days_ago",
+        ));
+    }
+
+    let start = today
+        .checked_sub_signed(TimeDelta::days(from))
+        .ok_or_else(|| MindroidError::config("from_days_ago is too far in the past"))?;
+    let end = today
+        .checked_sub_signed(TimeDelta::days(to))
+        .ok_or_else(|| MindroidError::config("to_days_ago is too far in the past"))?;
+
+    Ok((
+        start.format(DATE_FORMAT).to_string(),
+        end.format(DATE_FORMAT).to_string(),
+    ))
+}
+
+fn render_episodes(episodes: &[Episode]) -> String {
     if episodes.is_empty() {
         return "No episodes in that window.".to_string();
     }
@@ -343,14 +377,14 @@ fn render_episodes(episodes: &[EpisodeSchema]) -> String {
         .join("\n\n")
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct RangeResponse {
     #[serde(default)]
-    data: Vec<EpisodeSchema>,
+    data: Vec<Episode>,
 }
 
-#[derive(serde::Deserialize)]
-struct EpisodeSchema {
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct Episode {
     #[serde(default)]
     topic: String,
     #[serde(default)]
@@ -379,14 +413,111 @@ mod tests {
 
     #[test]
     fn render_episodes_keeps_topic_subtopics_and_summary() {
-        let rendered = render_episodes(&[EpisodeSchema {
-            topic: "Billing migration".into(),
-            subtopics: vec!["Lago".into(), "wallets".into()],
-            summarized_conversation: "Agreed the gate stays custom.".into(),
+        let rendered = render_episodes(&[Episode {
+            topic: "Garden planning".into(),
+            subtopics: vec!["tomatoes".into(), "watering".into()],
+            summarized_conversation: "Agreed to start seedlings indoors.".into(),
         }]);
-        assert!(rendered.contains("Billing migration"));
-        assert!(rendered.contains("Lago, wallets"));
-        assert!(rendered.contains("Agreed the gate stays custom."));
+        assert_eq!(
+            rendered,
+            "Topic: Garden planning
+Subtopics: tomatoes, watering
+Summary: Agreed to start seedlings indoors."
+        );
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
+
+    #[test]
+    fn window_counts_backwards_from_today() {
+        let (start, end) =
+            window_from_args(&json!({"from_days_ago": 7}), day(2026, 8, 20)).unwrap();
+        assert_eq!((start.as_str(), end.as_str()), ("2026-08-13", "2026-08-20"));
+    }
+
+    #[test]
+    fn window_supports_a_span_that_does_not_reach_today() {
+        let (start, end) = window_from_args(
+            &json!({"from_days_ago": 14, "to_days_ago": 7}),
+            day(2026, 8, 20),
+        )
+        .unwrap();
+        assert_eq!((start.as_str(), end.as_str()), ("2026-08-06", "2026-08-13"));
+    }
+
+    #[test]
+    fn window_of_one_day_is_that_day() {
+        let (start, end) = window_from_args(
+            &json!({"from_days_ago": 1, "to_days_ago": 1}),
+            day(2026, 8, 20),
+        )
+        .unwrap();
+        assert_eq!((start.as_str(), end.as_str()), ("2026-08-19", "2026-08-19"));
+    }
+
+    #[test]
+    fn window_crosses_a_month_boundary() {
+        let (start, _) = window_from_args(&json!({"from_days_ago": 5}), day(2026, 3, 2)).unwrap();
+        assert_eq!(start, "2026-02-25");
+    }
+
+    #[test]
+    fn window_rejects_a_reversed_or_negative_span() {
+        for bad in [
+            json!({"from_days_ago": 3, "to_days_ago": 10}),
+            json!({"from_days_ago": -1}),
+            json!({"from_days_ago": 3, "to_days_ago": -1}),
+        ] {
+            assert!(
+                window_from_args(&bad, day(2026, 8, 20)).is_err(),
+                "accepted {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_requires_the_start_offset() {
+        for missing in [
+            json!({}),
+            json!({"to_days_ago": 3}),
+            json!({"from_days_ago": "7"}),
+        ] {
+            assert!(
+                window_from_args(&missing, day(2026, 8, 20)).is_err(),
+                "accepted {missing}"
+            );
+        }
+    }
+
+    // ADR-0005: the model picks WHETHER to scope, never WHERE. A refactor that
+    // read the space from args would silently widen recall to another space.
+    #[test]
+    fn window_scope_ignores_a_model_supplied_space() {
+        let ctx = ctx_with("ms-1", "sender-1");
+        let got = session_param(
+            &json!({"mindspace_id": "other-space", "channel_id": "other-space"}),
+            &ctx,
+        );
+        assert_eq!(got, Some(("mindspace_id", "ms-1".to_string())));
+    }
+
+    #[test]
+    fn window_scope_can_be_widened_but_never_redirected() {
+        let ctx = ctx_with("ms-1", "sender-1");
+        assert_eq!(
+            session_param(
+                &json!({"filter_by_session": false, "mindspace_id": "other"}),
+                &ctx
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn window_scope_is_omitted_without_a_channel() {
+        assert_eq!(session_param(&json!({}), &ctx_with("", "sender-1")), None);
     }
 
     #[test]
