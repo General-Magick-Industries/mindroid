@@ -15,7 +15,6 @@ pub use get_artifact::{GET_ARTIFACT_TOOL, GetArtifactTool};
 #[cfg(feature = "magickmind")]
 pub use magickmind::{
     AgentCredentials, AgentCredentialsStage, EpisodicMemoryTool, RecallTimeWindowTool,
-    WebSearchTool,
 };
 pub use open::OpenTool;
 pub use registry::{DynamicRegistry, ToolRegistry};
