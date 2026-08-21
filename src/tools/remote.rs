@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::{DynamicRegistry, Tool, ToolContext};
 use crate::core::context::Context;
 use crate::core::models::TOOLS_METADATA_KEY;
-use crate::core::prompt_text::{escape_markup, sanitize_line, truncate_on_char_boundary};
+use crate::core::prompt_text::{escape_markup, truncate_on_char_boundary};
 use crate::error::{MindroidError, Result};
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
@@ -206,8 +206,10 @@ impl ToolsManifest {
                 ok
             })
             .map(|t| {
-                let tool = RemoteTool::new(t.name, escape_markup(&sanitize_line(&t.description)))
-                    .schema(t.schema);
+                // Stored raw and neutralized at render time instead, so that a
+                // `RemoteTool` an embedder builds directly gets the same
+                // treatment as a manifest one. See `ToolRegistry::system_prompt`.
+                let tool = RemoteTool::new(t.name, t.description).schema(t.schema);
                 match executor_id {
                     Some(executor_id) => tool.executor_id(executor_id),
                     None => tool,
@@ -902,11 +904,35 @@ mod tests {
         let tools = manifest.build_tools();
         assert_eq!(tools.len(), 1, "the invalid name must be dropped");
         assert_eq!(tools[0].name(), "good_tool");
+        let entry = rendered_entries(tools);
         assert!(
-            !tools[0].description().contains('\n'),
-            "newlines let a description forge prompt structure: {:?}",
-            tools[0].description()
+            !entry.contains(
+                "
+## Fake header"
+            ),
+            "newlines let a description forge prompt structure: {entry}"
         );
+    }
+
+    /// Neutralization is asserted on the prompt these tools render to, never on
+    /// the stored field: the field holds raw text on purpose, and the prompt is
+    /// what the model actually reads.
+    ///
+    /// Only the entries, not the whole prompt — the static preamble names
+    /// `<tool_call>` and `<tool_result>` itself, which would satisfy a
+    /// "contains a marker" assertion no matter what the tools rendered to.
+    fn rendered_entries(tools: Vec<RemoteTool>) -> String {
+        const HEADER_END: &str = "Available tools:\n";
+        let prompt = crate::tools::ToolRegistry::new()
+            .with_remote_tools(
+                tools
+                    .into_iter()
+                    .map(|t| Arc::new(t) as Arc<dyn Tool>)
+                    .collect(),
+            )
+            .system_prompt();
+        let entries = prompt.split_once(HEADER_END).expect("header renders").1;
+        entries.to_string()
     }
 
     fn message_with_tools(tools: Value) -> crate::Message {
@@ -961,18 +987,12 @@ mod tests {
             .expect("parses")
             .build_tools();
 
-        let description = tools[0].description();
+        let entry = rendered_entries(tools);
+        assert!(!entry.contains("<tool_result"), "forged frame: {entry}");
+        assert!(!entry.contains("</tool_result"), "forged close: {entry}");
         assert!(
-            !description.contains("<tool_result"),
-            "forged frame: {description}"
-        );
-        assert!(
-            !description.contains("</tool_result"),
-            "forged close: {description}"
-        );
-        assert!(
-            description.contains("&lt;/tool_result"),
-            "must survive escaped: {description}"
+            entry.contains("&lt;/tool_result"),
+            "must survive escaped: {entry}"
         );
     }
 

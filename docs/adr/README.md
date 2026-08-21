@@ -31,3 +31,4 @@ that a future contributor (human or agent) would otherwise have to reverse-engin
 | [0005](0005-tool-context.md) | Per-invocation `ToolContext` on `Tool::execute` | Accepted |
 | [0006](0006-artifact-path-jail.md) | Artifact path jail — lexical validation plus no-follow opens | Accepted |
 | [0007](0007-runtime-health.md) | Runtime health is a level-triggered `watch` sink, not a callback | Accepted |
+| [0008](0008-pipeline-admission.md) | The pipeline refuses unconsumable control traffic before any stage runs | Accepted |

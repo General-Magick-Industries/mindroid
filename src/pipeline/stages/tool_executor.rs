@@ -198,7 +198,7 @@ impl PendingRemoteCalls {
 /// one whatever its body turned out to be, so a body that failed to normalize
 /// cannot slip the gate by no longer looking like a result. The markup test
 /// stays for the transports and tests that frame a result without declaring one.
-pub(crate) fn declares_tool_result(ctx: &Context) -> bool {
+fn declares_tool_result(ctx: &Context) -> bool {
     ctx.message.message_type == crate::MessageType::ToolResult
         || ctx.message.content.contains("<tool_result")
 }

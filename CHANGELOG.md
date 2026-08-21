@@ -86,9 +86,24 @@ variant breaks you.
 - The client-advertised half of the tool system prompt is capped at 32 KiB of
   *rendered* text, after sanitization and escaping. The manifest's 64 KiB cap
   counts wire JSON, and escaping expands it — repeated `&` renders at 5x — so a
-  nominal 64 KiB manifest could render roughly 320 KiB of prompt. A remote
-  tool's schema text is escaped at the same point; only its description was
-  escaped before, leaving parameter descriptions able to forge a frame.
+  nominal 64 KiB manifest could render roughly 320 KiB of prompt.
+- Neutralizing a remote tool's text moved from `ToolsManifest::build_tools_for`
+  to the render in `ToolRegistry::system_prompt`, and now covers the name,
+  description, schema property keys and their descriptions. Escaping at build
+  time only protected tools that arrived through a manifest: a `RemoteTool` an
+  embedder constructs directly reached the prompt raw, so a description could
+  forge a `<tool_result>` frame. Schema text was never escaped on either path,
+  and schema *keys* are bounded only here — `schema_is_bounded` walks values.
+  `RemoteTool::description()` now returns the raw text it was given; the prompt
+  is where the escaping happens.
+- Replayed chat history and the sender's display name are escaped where they
+  enter the prompt (`magickmind_context` and the persona live-turn prefix).
+  Both are publisher-controlled, and history persists in the backend even when
+  the live turn was refused — so an ordinary `TEXT` message carrying
+  `<tool_result>` markup came back as a forged frame on the agent's next turn,
+  bypassing every declared-type check above. History content keeps its newlines
+  (real turns are multi-line); speakers and names are flattened, since a
+  newline there forges a further `[Name]:` turn.
 
 ## [0.0.2-a.1] — 2026-08-06
 

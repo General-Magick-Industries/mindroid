@@ -284,6 +284,13 @@ variants, accepting either case (`TOOL_RESULT` and `tool_result` both map), and
 returns `None` for a plain conversational turn so a caller keeps its default.
 `is_control()` is true for the three tool variants.
 
+`Pipeline::run` / `run_streaming` refuse an inbound `ToolCall` outright, and a
+`ToolResult` whose body is not one complete `<tool_result>` envelope, before any
+stage runs — neither has a consumer, so left alone they reach the LLM as
+ordinary user content. `ToolManifest` is NOT refused: `ManifestStage` is its
+consumer, and no bundled preset wires that stage, so an embedder dispatching on
+manifests must wire it. See ADR-0008.
+
 The enum is `#[non_exhaustive]`: match on it with a wildcard arm.
 
 **SenderType** — Who sent it:

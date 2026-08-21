@@ -12,10 +12,13 @@ use std::fmt;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::MessageType;
 use crate::core::context::Context;
 use crate::core::events::PipelineEvent;
 use crate::error::Result;
 use crate::models::StreamEvent;
+use crate::pipeline::extensions::CorrelatedRemoteResult;
+use crate::tools::remote::validated_tool_result;
 
 /// Backward-compatible alias for [`crate::core::context::Context`].
 pub type PipelineContext = crate::core::context::Context;
@@ -55,16 +58,40 @@ enum StageEntry {
 ///
 /// So the refusal lives here rather than in a stage: a pipeline that omits the
 /// gate, or orders it after context building, must not thereby become the
-/// permissive one. `TOOL_MANIFEST` is not listed — it has a consumer
-/// ([`ManifestStage`](crate::tools::ManifestStage)), which halts on every path
-/// including the ones it rejects.
-fn unconsumable_control(message: &crate::Message) -> Option<&'static str> {
-    match message.message_type {
-        crate::MessageType::ToolCall => {
+/// permissive one. This is a deliberate exception to ADR-0000's rule that
+/// control flow composes from stages — see `docs/adr/0008-pipeline-admission.md`
+/// for the alternatives weighed.
+///
+/// # What this does NOT enforce
+///
+/// Of normalize / authenticate / validate / correlate, only the first two are
+/// checkable here. Authenticating a sender and claiming an outstanding call
+/// need [`PendingRemoteCalls`], which is stage state a `Pipeline` cannot see, so
+/// a well-formed but *unsolicited* result still depends on
+/// [`RemoteResultGate`](crate::pipeline::stages::RemoteResultGate) being wired.
+/// This narrows the hole; it does not make a gate-less pipeline safe.
+///
+/// `TOOL_MANIFEST` is likewise not refused, and for a weaker reason than the
+/// others: refusing it here would stop [`ManifestStage`](crate::tools::ManifestStage)
+/// from ever running, since that stage IS the consumer. No bundled preset wires
+/// it, so an embedder that dispatches on `TOOL_MANIFEST` must wire it — left
+/// unwired, a manifest body reaches the LLM as an ordinary turn. That is no
+/// more than the same sender could say as `TEXT`, and `PerTurnToolsStage` skips
+/// control traffic, so no tool injection follows.
+///
+/// [`PendingRemoteCalls`]: crate::pipeline::stages::PendingRemoteCalls
+fn unconsumable_control(ctx: &Context) -> Option<&'static str> {
+    match ctx.message.message_type {
+        MessageType::ToolCall => {
             Some("an inbound tool_call, which the runtime issues and never executes")
         }
-        crate::MessageType::ToolResult
-            if crate::tools::remote::validated_tool_result(&message.content).is_none() =>
+        // A gate that already claimed this result strips the `call` attribute,
+        // which by design no longer validates. Re-entering the pipeline over
+        // the same context (BranchStage, RouterStage, run_with_context) must
+        // not then refuse the result it just correlated.
+        MessageType::ToolResult
+            if ctx.get_run::<CorrelatedRemoteResult>().is_none()
+                && validated_tool_result(&ctx.message.content).is_none() =>
         {
             Some("a declared tool_result whose body is not one complete envelope")
         }
@@ -110,8 +137,8 @@ impl Pipeline {
     pub async fn run(&self, ctx: &mut Context) -> Result<Option<String>> {
         let pipeline_start = Instant::now();
         info!("Pipeline::run starting ({} stages)", self.stages.len());
-        if let Some(reason) = unconsumable_control(&ctx.message) {
-            warn!("Refusing {reason}");
+        if let Some(reason) = unconsumable_control(ctx) {
+            warn!(channel = %ctx.message.channel_id, "Refusing {reason}");
             ctx.halted = true;
             return Ok(None);
         }
@@ -240,8 +267,8 @@ impl Pipeline {
             let pipeline_start = Instant::now();
             let total_stages = self.stages.len();
             info!("Pipeline::run_streaming starting ({total_stages} stages)");
-            if let Some(reason) = unconsumable_control(&ctx.message) {
-                warn!("Refusing {reason}");
+            if let Some(reason) = unconsumable_control(ctx) {
+                warn!(channel = %ctx.message.channel_id, "Refusing {reason}");
                 ctx.halted = true;
                 return;
             }
@@ -520,6 +547,10 @@ mod tests {
         Arc::new(msg)
     }
 
+    /// Whether the stage ran, on the sync path and the streaming path. Both
+    /// halves also assert the rest of the refusal contract — halted, no
+    /// response, and no stray `StreamEvent` — so a refusal cannot pass by
+    /// merely skipping the stage.
     async fn stages_ran(message: Arc<Message>) -> (bool, bool) {
         let called = Arc::new(AtomicBool::new(false));
         let pipeline = Pipeline::new().add_stage(RecorderStage {
@@ -527,16 +558,29 @@ mod tests {
         });
 
         let mut ctx = Context::new(message.clone(), Arc::new(AgentConfig::default()));
-        pipeline.run(&mut ctx).await.unwrap();
+        let response = pipeline.run(&mut ctx).await.unwrap();
         let ran = called.load(Ordering::SeqCst);
+        if !ran {
+            assert!(ctx.halted, "a refused message must halt the pipeline");
+            assert_eq!(response, None, "a refused message must produce no response");
+        }
 
         called.store(false, Ordering::SeqCst);
         let mut streaming_ctx = Context::new(message, Arc::new(AgentConfig::default()));
-        let mut stream = pipeline.run_streaming(&mut streaming_ctx);
-        while stream.next().await.is_some() {}
-        drop(stream);
+        let mut events = 0usize;
+        {
+            let mut stream = pipeline.run_streaming(&mut streaming_ctx);
+            while stream.next().await.is_some() {
+                events += 1;
+            }
+        }
+        let streamed = called.load(Ordering::SeqCst);
+        if !streamed {
+            assert!(streaming_ctx.halted, "the streaming path must halt too");
+            assert_eq!(events, 0, "a refusal must not yield a StreamEvent");
+        }
 
-        (ran, called.load(Ordering::SeqCst))
+        (ran, streamed)
     }
 
     /// An inbound tool_call has no consumer anywhere in the pipeline, so left
@@ -593,5 +637,58 @@ mod tests {
 
         assert!(ran);
         assert!(streamed);
+    }
+
+    /// A manifest must NOT be refused here — `ManifestStage` is its consumer, so
+    /// refusing it at the entrance would stop the tools ever being installed.
+    #[tokio::test]
+    async fn a_tool_manifest_still_reaches_the_stages() {
+        let (ran, streamed) =
+            stages_ran(control_message(crate::MessageType::ToolManifest, "")).await;
+
+        assert!(ran, "refusing a manifest would break ManifestStage");
+        assert!(streamed);
+    }
+
+    /// `RemoteResultGate` strips the `call` attribute once it has claimed a
+    /// result, which by design no longer validates. A nested run over the same
+    /// context — what `BranchStage` and `RouterStage` do — must not then refuse
+    /// the very result the gate just correlated.
+    #[tokio::test]
+    async fn a_correlated_result_survives_re_entering_the_pipeline() {
+        let called = Arc::new(AtomicBool::new(false));
+        let inner = Pipeline::new().add_stage(RecorderStage {
+            called: called.clone(),
+        });
+
+        let mut ctx = Context::new(
+            control_message(
+                crate::MessageType::ToolResult,
+                "<tool_result name=\"take_photo\">a cat</tool_result>",
+            ),
+            Arc::new(AgentConfig::default()),
+        );
+        ctx.set(CorrelatedRemoteResult);
+
+        inner.run(&mut ctx).await.unwrap();
+
+        assert!(
+            called.load(Ordering::SeqCst),
+            "a claimed result must survive a nested Pipeline::run"
+        );
+        assert!(!ctx.halted);
+    }
+
+    /// The counterpart: without the claim, the same stripped body is refused —
+    /// so the exemption above keys on the gate's decision, not on the shape.
+    #[tokio::test]
+    async fn the_same_body_is_refused_without_the_claim() {
+        let (ran, _) = stages_ran(control_message(
+            crate::MessageType::ToolResult,
+            "<tool_result name=\"take_photo\">a cat</tool_result>",
+        ))
+        .await;
+
+        assert!(!ran, "an unclaimed stripped body must still be refused");
     }
 }
