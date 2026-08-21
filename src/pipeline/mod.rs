@@ -64,7 +64,7 @@ enum StageEntry {
 ///
 /// # What this does NOT enforce
 ///
-/// Of normalize / authenticate / validate / correlate, only the first two are
+/// Of normalize / validate / authenticate / correlate, only the first two are
 /// checkable here. Authenticating a sender and claiming an outstanding call
 /// need [`PendingRemoteCalls`], which is stage state a `Pipeline` cannot see, so
 /// a well-formed but *unsolicited* result still depends on
@@ -80,6 +80,11 @@ enum StageEntry {
 /// control traffic, so no tool injection follows.
 ///
 /// [`PendingRemoteCalls`]: crate::pipeline::stages::PendingRemoteCalls
+fn claimed_this_message(ctx: &Context) -> bool {
+    ctx.get_run::<CorrelatedRemoteResult>()
+        .is_some_and(|claim| claim.0 == ctx.message.id)
+}
+
 fn unconsumable_control(ctx: &Context) -> Option<&'static str> {
     match ctx.message.message_type {
         MessageType::ToolCall => {
@@ -89,8 +94,13 @@ fn unconsumable_control(ctx: &Context) -> Option<&'static str> {
         // which by design no longer validates. Re-entering the pipeline over
         // the same context (BranchStage, RouterStage, run_with_context) must
         // not then refuse the result it just correlated.
+        //
+        // The claim is matched against the message id, not merely present:
+        // run scope is cleared only by `Context::reset_output`, so an embedder
+        // reusing one Context across turns would otherwise carry one genuine
+        // claim forward and exempt every later declared result.
         MessageType::ToolResult
-            if ctx.get_run::<CorrelatedRemoteResult>().is_none()
+            if !claimed_this_message(ctx)
                 && validated_tool_result(&ctx.message.content).is_none() =>
         {
             Some("a declared tool_result whose body is not one complete envelope")
@@ -661,14 +671,12 @@ mod tests {
             called: called.clone(),
         });
 
-        let mut ctx = Context::new(
-            control_message(
-                crate::MessageType::ToolResult,
-                "<tool_result name=\"take_photo\">a cat</tool_result>",
-            ),
-            Arc::new(AgentConfig::default()),
+        let message = control_message(
+            crate::MessageType::ToolResult,
+            "<tool_result name=\"take_photo\">a cat</tool_result>",
         );
-        ctx.set(CorrelatedRemoteResult);
+        let mut ctx = Context::new(message.clone(), Arc::new(AgentConfig::default()));
+        ctx.set(CorrelatedRemoteResult(message.id.clone()));
 
         inner.run(&mut ctx).await.unwrap();
 
@@ -677,18 +685,56 @@ mod tests {
             "a claimed result must survive a nested Pipeline::run"
         );
         assert!(!ctx.halted);
+
+        called.store(false, Ordering::SeqCst);
+        let mut streaming_ctx = Context::new(message.clone(), Arc::new(AgentConfig::default()));
+        streaming_ctx.set(CorrelatedRemoteResult(message.id.clone()));
+        {
+            let mut stream = inner.run_streaming(&mut streaming_ctx);
+            while stream.next().await.is_some() {}
+        }
+        assert!(
+            called.load(Ordering::SeqCst),
+            "the streaming path duplicates the exemption and must honour it too"
+        );
+    }
+
+    /// The claim names the message it was granted for. Run scope outlives one
+    /// `Pipeline::run`, so presence alone would let a single genuine claim
+    /// exempt every later declared result on a reused Context.
+    #[tokio::test]
+    async fn a_claim_for_another_message_does_not_exempt_this_one() {
+        let called = Arc::new(AtomicBool::new(false));
+        let pipeline = Pipeline::new().add_stage(RecorderStage {
+            called: called.clone(),
+        });
+
+        let mut ctx = Context::new(
+            control_message(crate::MessageType::ToolResult, "anything at all"),
+            Arc::new(AgentConfig::default()),
+        );
+        ctx.set(CorrelatedRemoteResult("a-different-message".into()));
+
+        pipeline.run(&mut ctx).await.unwrap();
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "a stale claim must not exempt an unrelated message"
+        );
+        assert!(ctx.halted);
     }
 
     /// The counterpart: without the claim, the same stripped body is refused —
     /// so the exemption above keys on the gate's decision, not on the shape.
     #[tokio::test]
     async fn the_same_body_is_refused_without_the_claim() {
-        let (ran, _) = stages_ran(control_message(
+        let (ran, streamed) = stages_ran(control_message(
             crate::MessageType::ToolResult,
             "<tool_result name=\"take_photo\">a cat</tool_result>",
         ))
         .await;
 
         assert!(!ran, "an unclaimed stripped body must still be refused");
+        assert!(!streamed, "nor on the streaming path");
     }
 }

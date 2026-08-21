@@ -89,8 +89,8 @@ pub(crate) fn assemble_llm_messages(
     let text = user_text(ctx);
     let attributed = ctx
         .message
-        .metadata
-        .get("sent_by_user_name")
+        .trusted_sender_id()
+        .and(ctx.message.metadata.get("sent_by_user_name"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty() && !text.trim_start().starts_with("<tool_result"))

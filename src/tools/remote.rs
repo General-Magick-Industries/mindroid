@@ -36,6 +36,15 @@ const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 /// [`result_gate`](crate::pipeline::stages::ToolExecutorStage::result_gate) can
 /// additionally reject results before context-building stages run.
 ///
+/// # Trust
+///
+/// [`description`](Tool::description) and the schema hold whatever text they
+/// were given, unescaped — a manifest's are publisher-supplied. Neutralizing
+/// happens where they reach the prompt, so anything else rendering them owes
+/// itself the same treatment.
+///
+/// # Reliability (continued)
+///
 /// Still unguarded: a call the client never answers has no timeout, so the
 /// conversation stays truncated. Its pending entry expires after 5 minutes, but
 /// no retry resumes the turn. See `docs/design/remote-tool-reliability.md`.
@@ -188,8 +197,15 @@ impl ToolsManifest {
         serde_json::from_value(json!({ "tools": tools.clone() })).ok()
     }
 
-    /// Build a [`RemoteTool`] per entry, dropping invalid names. Names and
-    /// descriptions reach the system prompt, so both are validated.
+    /// Build a [`RemoteTool`] per entry, dropping any whose name is invalid or
+    /// whose schema is unbounded.
+    ///
+    /// Descriptions and schema text are stored RAW and neutralized where they
+    /// enter the prompt, in [`ToolRegistry::system_prompt`]. Do not escape here:
+    /// a tool built without a manifest would then be the only unescaped one, and
+    /// escaping in both places yields `&amp;amp;`.
+    ///
+    /// [`ToolRegistry::system_prompt`]: crate::tools::ToolRegistry::system_prompt
     pub fn build_tools(self) -> Vec<RemoteTool> {
         self.build_tools_for(None)
     }
@@ -885,7 +901,7 @@ mod tests {
     /// Names and descriptions land in the system prompt, so a manifest entry
     /// must not be able to forge prompt structure.
     #[test]
-    fn manifest_rejects_invalid_names_and_flattens_descriptions() {
+    fn manifest_rejects_invalid_names_and_the_render_flattens_descriptions() {
         let manifest = ToolsManifest {
             tools: vec![
                 ManifestTool {

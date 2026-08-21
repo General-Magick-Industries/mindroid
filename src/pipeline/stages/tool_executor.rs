@@ -270,7 +270,9 @@ impl PipelineStage for RemoteResultGate {
                 ctx.message.content.clone(),
             )];
         }
-        ctx.set(crate::pipeline::extensions::CorrelatedRemoteResult);
+        ctx.set(crate::pipeline::extensions::CorrelatedRemoteResult(
+            ctx.message.id.clone(),
+        ));
         debug!(tool = %expected, "Correlated an outstanding remote tool result");
         Ok(())
     }

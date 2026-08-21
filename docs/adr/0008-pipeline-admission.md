@@ -73,7 +73,7 @@ Scope of the exception, deliberately narrow: only message types the SDK itself
 defines as protocol traffic, only where the SDK can prove nothing downstream
 consumes them. It is not a licence to put policy in the engine.
 
-## Alternatives rejected
+## Alternatives considered
 
 - **A `ControlTrafficGate` stage every preset installs.** The honest ADR-0000
   answer, and it fails on the facts: the presets that would install it
@@ -110,6 +110,10 @@ consumes them. It is not a licence to put policy in the engine.
   `Pipeline` cannot see, so a well-formed but *unsolicited* result still depends
   on `RemoteResultGate` being wired. This narrows the hole; it does not make a
   gate-less pipeline safe.
+- `RetryStage` calls `Context::reset_output`, which clears run scope while
+  leaving the gate's already-stripped body in place. A correlated result inside
+  a retried sub-pipeline is therefore refused on the retry. Fails closed, and
+  narrow enough to leave to a follow-up.
 - An embedder whose agent legitimately *is* a tool executor can no longer
   receive inbound `TOOL_CALL` through a `Pipeline`. No such consumer exists
   today (the spawner already discards them). If one appears, it needs a

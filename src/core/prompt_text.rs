@@ -24,6 +24,30 @@ fn is_layout_control(c: char) -> bool {
             | '\u{2066}'..='\u{206f}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
 }
 
+/// Cap on one replayed history item or knowledge block.
+pub(crate) const MAX_BLOCK_BYTES: usize = 8 * 1024;
+
+/// Flatten untrusted text that is allowed to stay multi-line.
+///
+/// [`sanitize_line`]'s counterpart for prose — a chat turn or a retrieved
+/// memory is legitimately several lines, and folding them would mangle real
+/// content. Everything else it folds still folds: a newline is visible to
+/// anyone reading the log, a U+E0000 tag character is not, so preserving one
+/// is no reason to preserve the other.
+pub(crate) fn sanitize_block(s: &str) -> String {
+    let folded: String = s
+        .chars()
+        .map(|c| {
+            if c == '\n' || !is_layout_control(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    truncate_on_char_boundary(&folded, MAX_BLOCK_BYTES).to_string()
+}
+
 /// Escape the markup the runtime uses to frame trusted tool output.
 ///
 /// `"` is deliberately left alone: no caller interpolates into an attribute
@@ -75,6 +99,30 @@ mod tests {
         ] {
             assert_eq!(sanitize_line(raw), "a b", "not folded: {raw:?}");
         }
+    }
+
+    /// The whole point of the split: prose keeps its line breaks, and every
+    /// character a reader cannot see is still folded.
+    #[test]
+    fn a_block_keeps_newlines_and_folds_everything_else() {
+        assert_eq!(sanitize_block("a\nb"), "a\nb");
+        for raw in [
+            "a\u{2028}b",
+            "a\u{200b}b",
+            "a\u{202e}b",
+            "a\u{e0041}b",
+            "a\u{feff}b",
+            "a\rb",
+        ] {
+            assert_eq!(sanitize_block(raw), "a b", "not folded: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_block_is_length_capped_on_a_char_boundary() {
+        let out = sanitize_block(&"é".repeat(MAX_BLOCK_BYTES));
+        assert!(out.len() <= MAX_BLOCK_BYTES);
+        assert!(out.chars().all(|c| c == 'é'), "split a character: {out:?}");
     }
 
     #[test]
