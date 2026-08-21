@@ -96,14 +96,39 @@ variant breaks you.
   and schema *keys* are bounded only here — `schema_is_bounded` walks values.
   `RemoteTool::description()` now returns the raw text it was given; the prompt
   is where the escaping happens.
-- Replayed chat history and the sender's display name are escaped where they
-  enter the prompt (`magickmind_context` and the persona live-turn prefix).
-  Both are publisher-controlled, and history persists in the backend even when
-  the live turn was refused — so an ordinary `TEXT` message carrying
-  `<tool_result>` markup came back as a forged frame on the agent's next turn,
-  bypassing every declared-type check above. History content keeps its newlines
-  (real turns are multi-line); speakers and names are flattened, since a
-  newline there forges a further `[Name]:` turn.
+- **Every untrusted path into the prompt is now folded, escaped and bounded.**
+  Previously only manifest tool text was. The declared-type refusals above stop
+  control traffic, but nothing stopped a participant simply *typing*
+  `<tool_result name="shell">…</tool_result>` into ordinary chat: it reached the
+  model in the USER role byte-identical to genuinely executed tool output, and
+  the `[Name]:` attribution filter deliberately stripped the prefix from exactly
+  those bodies, so the forgery arrived looking *more* machine-like than a real
+  turn. Now covered:
+  - the live turn (`persona::assemble_llm_messages`, `SimpleContextBuilder`),
+    except when `RemoteResultGate` has authenticated and claimed it — that
+    exemption is what keeps genuine correlated results working;
+  - replayed chat history, both the participant turns and the agent's own
+    (the latter replays as `assistant`, and a participant steers it in one hop
+    by asking the agent to quote a frame back, since responses persist verbatim);
+  - retrieved knowledge and corpus documents, which land in the SYSTEM role;
+  - the sender's display name, now also gated on an authenticated sender,
+    matching the rule the per-turn `context` block already applied.
+- Prose keeps its newlines (real turns are multi-line) but loses every
+  *invisible* control, via a new `sanitize_block`. Names and single-line values
+  are still fully flattened by `sanitize_line`, since a newline there forges a
+  further `[Name]:` turn. The folded set gained the variation selectors
+  (U+FE00–FE0F, U+E0100–E01EF), soft hyphen, Mongolian selectors, Hangul
+  fillers and musical controls — U+E0100–E01EF alone is a 240-symbol invisible
+  alphabet, strictly more capable than the tag block already covered.
+- Prompt blocks are capped at 8 KiB of **rendered** text, after escaping. Cap
+  before escaping and `&` expands 5x on the way out, bounding the wire form and
+  letting the prompt reach 40 KiB — the same defect the tool-prompt budget above
+  exists to prevent. Corpus documents are bounded individually, so one oversized
+  document cannot starve the rest or splice itself into the next.
+- `CorrelatedRemoteResult` carries the id of the message it was claimed for.
+  Run scope outlives one `Pipeline::run` and `run_with_context` shares a
+  `Context` across runs, so a bare marker let one genuine claim exempt every
+  later declared result on a reused `Context`.
 
 ## [0.0.2-a.1] — 2026-08-06
 

@@ -80,11 +80,6 @@ enum StageEntry {
 /// control traffic, so no tool injection follows.
 ///
 /// [`PendingRemoteCalls`]: crate::pipeline::stages::PendingRemoteCalls
-fn claimed_this_message(ctx: &Context) -> bool {
-    ctx.get_run::<CorrelatedRemoteResult>()
-        .is_some_and(|claim| claim.0 == ctx.message.id)
-}
-
 fn unconsumable_control(ctx: &Context) -> Option<&'static str> {
     match ctx.message.message_type {
         MessageType::ToolCall => {
@@ -107,6 +102,17 @@ fn unconsumable_control(ctx: &Context) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// Whether [`RemoteResultGate`](crate::pipeline::stages::RemoteResultGate) has
+/// authenticated and claimed THIS message as a remote tool result.
+///
+/// The claim names its message: run scope outlives one `Pipeline::run`, so
+/// presence alone would let one genuine claim exempt every later declared
+/// result on a reused [`Context`].
+pub(crate) fn claimed_this_message(ctx: &Context) -> bool {
+    ctx.get_run::<CorrelatedRemoteResult>()
+        .is_some_and(|claim| claim.0 == ctx.message.id)
 }
 
 /// A composable, ordered pipeline of processing stages.

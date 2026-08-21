@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::core::context::Context;
-use crate::core::prompt_text::{escape_markup, sanitize_block, sanitize_line};
+use crate::core::prompt_text::{escape_markup, neutralize_block, sanitize_line};
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
@@ -423,9 +423,7 @@ fn convert_context_response(
             // participant steers it in one hop by asking the agent to quote a
             // frame back. `MagickmindPersistence` saves the response verbatim,
             // so it returns here as the model's own apparent tool execution.
-            messages.push(LlmMessage::assistant(escape_markup(&sanitize_block(
-                &item.content,
-            ))));
+            messages.push(LlmMessage::assistant(neutralize_block(&item.content)));
             continue;
         }
         // Other participants → user role with sender attribution.
@@ -441,7 +439,7 @@ fn convert_context_response(
         messages.push(LlmMessage::user(format!(
             "[{}]: {}",
             escape_markup(&sanitize_line(item.speaker())),
-            escape_markup(&sanitize_block(&item.content))
+            neutralize_block(&item.content)
         )));
     }
 
@@ -465,23 +463,31 @@ fn convert_context_response(
         );
     }
 
-    // Retrieved knowledge is derived from what participants published, so it is
-    // untrusted text arriving in the SYSTEM role — the one the model weights
-    // above user turns. Escaped and capped like everything else that gets
-    // there; uncapped, a large retrieval also exhausts the context window
-    // mid-turn, which is an API error rather than degradation.
+    // Retrieval output reaches the SYSTEM role — the one the model weights above
+    // user turns — and its sources are participant-authored, so it is untrusted
+    // however the backend assembles it. `fetcher` is retired backend-side today
+    // and `corpus` is not yet populated; both are guarded now so neither arrives
+    // unescaped when they are. Uncapped, a large retrieval also exhausts the
+    // context window mid-turn, which is an API error rather than degradation.
     if !resp.fetcher.is_empty() {
         context_parts.push(format!(
             "Relevant knowledge:\n{}",
-            escape_markup(&sanitize_block(&resp.fetcher))
+            neutralize_block(&resp.fetcher)
         ));
     }
 
     if !resp.corpus.is_empty() {
-        let corpus_text: Vec<&str> = resp.corpus.iter().map(|c| c.content.as_str()).collect();
+        // Bounded per document, not over the join: one oversized document would
+        // otherwise consume the whole budget and silently drop every later one,
+        // and a cut landing inside the separator would splice two documents.
+        let corpus_text: Vec<String> = resp
+            .corpus
+            .iter()
+            .map(|c| neutralize_block(&c.content))
+            .collect();
         context_parts.push(format!(
             "Reference documents:\n{}",
-            escape_markup(&sanitize_block(&corpus_text.join("\n---\n")))
+            corpus_text.join("\n---\n")
         ));
     }
 
@@ -674,16 +680,19 @@ mod tests {
         assert_eq!(system.matches("&lt;tool_result").count(), 2, "{system}");
     }
 
+    /// Filled with `&`, not `x`: `x` escapes to itself, so an `x` payload
+    /// cannot tell a cap applied before escaping from one applied after.
     #[test]
     fn an_oversized_knowledge_block_is_capped() {
-        let huge = "x".repeat(64 * 1024);
+        let huge = "&".repeat(64 * 1024);
         let resp: PrepareContextResponse =
             serde_json::from_str(&format!(r#"{{"fetcher":"{huge}"}}"#)).unwrap();
 
         let rendered = convert_context_response(resp, Some("a1"))[0].text().len();
 
+        // Slack is the fixed header wrapper, nothing more.
         assert!(
-            rendered <= crate::core::prompt_text::MAX_BLOCK_BYTES + 1024,
+            rendered <= crate::core::prompt_text::MAX_BLOCK_BYTES + 128,
             "unbounded knowledge block: {rendered} bytes"
         );
     }

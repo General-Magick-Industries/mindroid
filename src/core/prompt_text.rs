@@ -19,9 +19,13 @@ pub(crate) fn sanitize_line(s: &str) -> String {
 fn is_layout_control(c: char) -> bool {
     c.is_control()
         || matches!(c,
-            '\u{061c}' | '\u{180e}' | '\u{2028}' | '\u{2029}' | '\u{feff}'
-            | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
+            '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}'
+            | '\u{17b5}' | '\u{3164}' | '\u{feff}' | '\u{ffa0}'
+            | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{2028}' | '\u{2029}'
+            | '\u{fe00}'..='\u{fe0f}' | '\u{fff9}'..='\u{fffb}'
+            | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}')
 }
 
 /// Cap on one replayed history item or knowledge block.
@@ -46,6 +50,29 @@ pub(crate) fn sanitize_block(s: &str) -> String {
         })
         .collect();
     truncate_on_char_boundary(&folded, MAX_BLOCK_BYTES).to_string()
+}
+
+/// Fold, escape, and bound one block of untrusted prose for the prompt.
+///
+/// The cap is applied to the ESCAPED text, which is the only form whose size is
+/// the model's problem: `escape_markup` turns `&` into `&amp;`, so capping
+/// first bounds the wire form at 8 KiB and lets the rendered form reach 40 —
+/// the same mistake [`ToolRegistry::system_prompt`] exists to avoid.
+///
+/// Truncation trims back off a half-written entity, so the tail cannot end in
+/// `&am`.
+///
+/// [`ToolRegistry::system_prompt`]: crate::tools::ToolRegistry::system_prompt
+pub(crate) fn neutralize_block(s: &str) -> String {
+    let escaped = escape_markup(&sanitize_block(s));
+    if escaped.len() <= MAX_BLOCK_BYTES {
+        return escaped;
+    }
+    let cut = truncate_on_char_boundary(&escaped, MAX_BLOCK_BYTES);
+    match cut.rfind('&') {
+        Some(amp) if !cut[amp..].contains(';') => cut[..amp].to_string(),
+        _ => cut.to_string(),
+    }
 }
 
 /// Escape the markup the runtime uses to frame trusted tool output.
@@ -96,6 +123,18 @@ mod tests {
             "a\u{fff9}b",
             "a\u{e0041}b",
             "a\u{e007f}b",
+            "a\u{00ad}b",
+            "a\u{034f}b",
+            "a\u{115f}b",
+            "a\u{17b4}b",
+            "a\u{180b}b",
+            "a\u{3164}b",
+            "a\u{fe00}b",
+            "a\u{fe0f}b",
+            "a\u{ffa0}b",
+            "a\u{1d173}b",
+            "a\u{e0100}b",
+            "a\u{e01ef}b",
         ] {
             assert_eq!(sanitize_line(raw), "a b", "not folded: {raw:?}");
         }
@@ -113,9 +152,28 @@ mod tests {
             "a\u{e0041}b",
             "a\u{feff}b",
             "a\rb",
+            "a\u{fe0f}b",
+            "a\u{e0100}b",
+            "a\u{00ad}b",
         ] {
             assert_eq!(sanitize_block(raw), "a b", "not folded: {raw:?}");
         }
+    }
+
+    /// The bug this ordering exists to prevent: cap-then-escape bounds the wire
+    /// form and lets the rendered form reach 5x. An `x`-filled test cannot see
+    /// it, because `x` escapes to itself.
+    #[test]
+    fn a_block_is_bounded_after_escaping_not_before() {
+        let out = neutralize_block(&"&".repeat(MAX_BLOCK_BYTES));
+
+        assert!(
+            out.len() <= MAX_BLOCK_BYTES,
+            "escape expansion escaped the cap: {} bytes",
+            out.len()
+        );
+        assert!(out.starts_with("&amp;"), "{out}");
+        assert!(out.ends_with(';'), "dangling entity in: {out:?}");
     }
 
     #[test]

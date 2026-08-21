@@ -113,6 +113,14 @@ impl PipelineStage for SimpleContextBuilder {
         #[cfg(not(feature = "transport-audio"))]
         let user_text = &ctx.message.content;
 
+        // Same rule as the persona builder: a turn nothing has authenticated
+        // and claimed is a participant talking, and must not be able to arrive
+        // shaped like executed tool output.
+        let user_text = if crate::pipeline::claimed_this_message(ctx) {
+            user_text.to_string()
+        } else {
+            crate::core::prompt_text::neutralize_block(user_text)
+        };
         messages.push(LlmMessage::user(user_text));
         let current_user = messages.len() - 1;
 
