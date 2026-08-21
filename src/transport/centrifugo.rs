@@ -527,8 +527,10 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
 
     let content = if declared_type == Some(MessageType::ToolResult) {
         // Rewrite into the <tool_result> form the LLM history expects. An
-        // unparseable body keeps its text rather than vanishing, so a
-        // malformed result is visible instead of silently dropped.
+        // unparseable body keeps its text rather than vanishing, so a malformed
+        // result is visible instead of silently dropped; it stays declared
+        // TOOL_RESULT, and the pipeline refuses it rather than treating that
+        // raw body as a turn.
         crate::tools::remote::normalize_tool_result(&body).unwrap_or(body)
     } else {
         body

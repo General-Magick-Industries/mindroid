@@ -72,6 +72,23 @@ variant breaks you.
   reaching the prompt also has Unicode separator, bidi, zero-width and tag
   characters folded — the tag block encodes an invisible ASCII alphabet that
   `char::is_control` does not cover.
+- Control traffic with no consumer is refused by `Pipeline` itself, before any
+  stage runs. An inbound `TOOL_CALL` has no inbound consumer — the runtime
+  issues calls and never executes one — and a declared `TOOL_RESULT` whose body
+  is not one complete `<tool_result>` envelope can no longer walk past the
+  correlation gate as an ordinary turn. Both previously reached the LLM as user
+  content. A pipeline that omits `RemoteResultGate`, or orders it after context
+  building, no longer becomes the permissive one.
+- `RemoteResultGate` and `ToolExecutorStage` now activate on the declared
+  `MessageType::ToolResult` as well as on `<tool_result>` markup. Correlation
+  keyed on markup alone, so a result whose body failed to normalize kept its
+  raw body and slipped the gate by no longer looking like a result.
+- The client-advertised half of the tool system prompt is capped at 32 KiB of
+  *rendered* text, after sanitization and escaping. The manifest's 64 KiB cap
+  counts wire JSON, and escaping expands it — repeated `&` renders at 5x — so a
+  nominal 64 KiB manifest could render roughly 320 KiB of prompt. A remote
+  tool's schema text is escaped at the same point; only its description was
+  escaped before, leaving parameter descriptions able to forge a frame.
 
 ## [0.0.2-a.1] — 2026-08-06
 
