@@ -105,8 +105,11 @@ impl OmniSession {
                             // Raw bytes → i16 (little-endian, as produced by CPAL).
                             let i16_samples: Vec<i16> = chunk
                                 .data
-                                .chunks_exact(2)
-                                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .copied()
+                                .map(i16::from_le_bytes)
                                 .collect();
                             // f32 copy for AudioFrontend::process.
                             let f32_samples: Vec<f32> = i16_samples
