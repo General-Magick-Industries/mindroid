@@ -12,6 +12,7 @@ These are load-bearing. If a change touches one, read the linked ADR in `docs/ad
 - **Concurrency = structured.** Prefer `JoinSet` / `select!` / `CancellationToken` over detached `tokio::spawn`. Fan-out collects results; it never shares `&mut Context` across tasks. → `docs/adr/0001-concurrency.md`
 - **Observability = middleware, never a mutable observer registry.** Cross-cutting concerns wrap traits (tower-style) or ride the `PipelineEvent` / callback stream. → `docs/adr/0002-observability.md`
 - **OmniSession is a separate execution model**, not an extended `Pipeline`. → `docs/adr/0003-omnisession.md`
+- **Control traffic with no consumer never becomes prompt text.** `Pipeline` refuses it at the entrance, before any stage runs — the one sanctioned deviation from "control flow composes from stages". → `docs/adr/0008-pipeline-admission.md`
 - **Accept traits, return structs.** Every subsystem is a swappable trait; keep them small and object-safe.
 
 See `docs/adr/README.md` for the full index. ADRs hold the *why* + rejected alternatives; this file holds the *operational* rules.
@@ -98,6 +99,12 @@ Stages execute sequentially. Typical order:
 5. **PostProcessor** — transforms final response
 
 Set `ctx.halted = true` to stop the pipeline early from any stage.
+
+**Before stage 1**, `Pipeline` refuses inbound control traffic no stage can
+consume — a `TOOL_CALL`, or a `TOOL_RESULT` that is not one complete
+`<tool_result>` envelope. It halts with no response and no `PipelineEvent`.
+This is deliberate admission control, not a stage; see ADR-0008 before changing
+it.
 
 ### Combinators
 

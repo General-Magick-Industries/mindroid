@@ -32,7 +32,11 @@ pub struct CurrentUserMessage(pub usize);
 
 pub(crate) struct PersistedUserTurn(pub String);
 
-pub(crate) struct CorrelatedRemoteResult;
+/// Set by `RemoteResultGate` after it authenticates and claims a remote tool
+/// result, carrying the id of the message it claimed. Readers must compare that
+/// id: run scope outlives a single `Pipeline::run`, so presence alone would let
+/// one genuine claim exempt a later, unrelated message.
+pub(crate) struct CorrelatedRemoteResult(pub(crate) String);
 
 /// A single binary attachment (image, audio, video, or arbitrary file) to send
 /// to the LLM, stored in [`PipelineContext`] extensions as part of [`FileInputs`].
