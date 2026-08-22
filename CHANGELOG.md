@@ -65,6 +65,10 @@ let corpora = prepared.corpora;   // Vec<CorpusCatalogEntry> {id, name, descript
 and `CorpusCatalogEntry` are `#[non_exhaustive]`: read the fields, don't
 destructure.
 
+`MagickmindContextConfig` also gained the `include_corpus_catalog` field, so a
+struct-literal construction without `..Default::default()` no longer compiles —
+add the field (or the `..Default::default()` tail).
+
 ### Added
 
 - Context prepare now parses the `corpora` catalog (the space's bound knowledge
