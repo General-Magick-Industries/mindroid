@@ -244,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(&ctx.agent_config.agent_id),
                     )
                     .await
+                    .map(|prepared| prepared.messages)
                     .unwrap_or_else(|e| {
                         tracing::warn!("MagickMind context load failed: {e}");
                         Vec::new()

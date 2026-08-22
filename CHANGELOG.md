@@ -46,8 +46,39 @@ It no longer decides whether a body *is* a tool result; the caller dispatches on
 wildcard arm; the attribute means this is the last release in which adding a
 variant breaks you.
 
+#### 4. `MagickmindClient::prepare_context` returns `PreparedContext`
+
+It returned the context messages bare, which left no way to hand the parsed
+corpus catalog to the embedding application. It now returns
+`PreparedContext { messages, corpora }`:
+
+```rust
+// before
+let messages = client.prepare_context(...).await?;
+// after
+let prepared = client.prepare_context(...).await?;
+let messages = prepared.messages; // prompt-ready, as before
+let corpora = prepared.corpora;   // Vec<CorpusCatalogEntry> {id, name, description}
+```
+
+`MagickmindContext` (the `ContextProvider`) is unchanged. `PreparedContext`
+and `CorpusCatalogEntry` are `#[non_exhaustive]`: read the fields, don't
+destructure.
+
+`MagickmindContextConfig` also gained the `include_corpus_catalog` field, so a
+struct-literal construction without `..Default::default()` no longer compiles —
+add the field (or the `..Default::default()` tail).
+
 ### Added
 
+- Context prepare now parses the `corpora` catalog (the space's bound knowledge
+  bases). The parsed entries — id-less ones dropped, capped at 64 — are exposed
+  on `PreparedContext::corpora` for tool wiring; the field deserializes to empty
+  when the backend omits it. With the new
+  `MagickmindContextConfig::include_corpus_catalog` (default off, since the
+  block tells the model to use a corpus-query tool only the embedder can
+  register), a sanitized system block lists each entry's id, name and
+  description so the model knows what that tool can reach.
 - `RecallTimeWindowTool` (`recall_time_window`): recalls episodes in a date window, for questions about *when* rather than *what*. Requires an end-user credential.
 - `MessageType::from_wire` and `MessageType::is_control`.
 - `TOOLS_METADATA_KEY` / `CONTEXT_METADATA_KEY` in `core::models`.
