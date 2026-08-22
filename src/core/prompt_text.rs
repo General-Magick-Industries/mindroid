@@ -64,11 +64,20 @@ pub(crate) fn sanitize_block(s: &str) -> String {
 ///
 /// [`ToolRegistry::system_prompt`]: crate::tools::ToolRegistry::system_prompt
 pub(crate) fn neutralize_block(s: &str) -> String {
-    let escaped = escape_markup(&sanitize_block(s));
-    if escaped.len() <= MAX_BLOCK_BYTES {
+    cap_escaped(escape_markup(&sanitize_block(s)), MAX_BLOCK_BYTES)
+}
+
+/// [`neutralize_block`]'s counterpart for line-positioned fields: flatten to
+/// one line, escape, and cap the ESCAPED form — same ordering, same reason.
+pub(crate) fn neutralize_line(s: &str) -> String {
+    cap_escaped(escape_markup(&sanitize_line(s)), MAX_LINE_BYTES)
+}
+
+fn cap_escaped(escaped: String, max_bytes: usize) -> String {
+    if escaped.len() <= max_bytes {
         return escaped;
     }
-    let cut = truncate_on_char_boundary(&escaped, MAX_BLOCK_BYTES);
+    let cut = truncate_on_char_boundary(&escaped, max_bytes);
     match cut.rfind('&') {
         Some(amp) if !cut[amp..].contains(';') => cut[..amp].to_string(),
         _ => cut.to_string(),
@@ -169,6 +178,21 @@ mod tests {
 
         assert!(
             out.len() <= MAX_BLOCK_BYTES,
+            "escape expansion escaped the cap: {} bytes",
+            out.len()
+        );
+        assert!(out.starts_with("&amp;"), "{out}");
+        assert!(out.ends_with(';'), "dangling entity in: {out:?}");
+    }
+
+    /// Same ordering bug as the block variant: an `x`-filled test cannot see
+    /// a cap applied before escaping, because `x` escapes to itself.
+    #[test]
+    fn a_line_is_bounded_after_escaping_not_before() {
+        let out = neutralize_line(&"&".repeat(MAX_LINE_BYTES));
+
+        assert!(
+            out.len() <= MAX_LINE_BYTES,
             "escape expansion escaped the cap: {} bytes",
             out.len()
         );

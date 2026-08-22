@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::core::context::Context;
-use crate::core::prompt_text::{escape_markup, neutralize_block, sanitize_line};
+use crate::core::prompt_text::{escape_markup, neutralize_block, neutralize_line, sanitize_line};
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
@@ -96,14 +96,17 @@ struct CorpusItem {
 }
 
 /// One knowledge base bound to the magickspace, from the context-prepare
-/// catalog.
+/// catalog. Exists so an embedding application can wire a corpus-query tool:
+/// `id` is the valid-id set, `name`/`description` the display text.
 ///
-/// Values are as parsed off the wire: `name` and `description` are
-/// participant-authored, so sanitize them before rendering into any prompt.
-/// The catalog system block built by [`MagickmindClient::prepare_context`]
-/// already does; this struct exists so an embedding application can wire a
-/// corpus-query tool (the valid id set and display text).
+/// Values are as parsed off the wire. A tool must resolve a model-supplied id
+/// by exact byte equality against `id` — never sanitized, prefix, or fuzzy
+/// comparison, which an id crafted to render like another entry's would
+/// mis-route. `name` and `description` are participant-authored: treat them as
+/// untrusted display text and never render them into a prompt unescaped (the
+/// catalog block built by [`MagickmindClient::prepare_context`] already does).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct CorpusCatalogEntry {
     #[serde(default)]
     pub id: String,
@@ -115,6 +118,7 @@ pub struct CorpusCatalogEntry {
 
 /// Result of [`MagickmindClient::prepare_context`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PreparedContext {
     /// Prompt-ready context: chat history plus a sanitized system block for
     /// retrieved knowledge and the corpus catalog.
@@ -272,7 +276,11 @@ impl MagickmindClient {
             status_code: None,
         })?;
 
-        Ok(convert_context_response(parsed, exclude_sender))
+        Ok(convert_context_response(
+            parsed,
+            exclude_sender,
+            config.include_corpus_catalog,
+        ))
     }
 
     pub async fn save_message(
@@ -344,6 +352,14 @@ pub struct MagickmindContextConfig {
     pub include_pelican: bool,
     /// Include corpus (semantic document search) in context.
     pub include_corpus: bool,
+    /// Render the corpus catalog (the space's bound knowledge bases) as a
+    /// system block telling the model what its corpus tool can query.
+    ///
+    /// Off by default: the block instructs the model to use a corpus-query
+    /// tool, which mindroid does not ship — enable it only when the embedding
+    /// application registers one. [`PreparedContext::corpora`] is populated
+    /// regardless of this flag.
+    pub include_corpus_catalog: bool,
 }
 
 impl Default for MagickmindContextConfig {
@@ -353,6 +369,7 @@ impl Default for MagickmindContextConfig {
             include_chat_history: true,
             include_pelican: true,
             include_corpus: false,
+            include_corpus_catalog: false,
         }
     }
 }
@@ -434,10 +451,21 @@ impl ContextProvider for MagickmindContext {
     }
 }
 
+/// Backend cap is 64 entries; enforced here too so a misbehaving backend
+/// cannot spend the whole context window on catalog lines.
+const MAX_CATALOG_ENTRIES: usize = 64;
+
 fn convert_context_response(
-    resp: PrepareContextResponse,
+    mut resp: PrepareContextResponse,
     self_id: Option<&str>,
+    include_corpus_catalog: bool,
 ) -> PreparedContext {
+    // An id-less entry cannot be queried, so it is dropped once, up front —
+    // filtering at render time only would desync the block from the exposed
+    // catalog.
+    resp.corpora.retain(|c| !c.id.is_empty());
+    resp.corpora.truncate(MAX_CATALOG_ENTRIES);
+
     let mut messages = Vec::new();
 
     // Chat history: split into proper roles so the LLM recognizes its own
@@ -510,7 +538,7 @@ fn convert_context_response(
         ));
     }
 
-    if !resp.corpora.is_empty() {
+    if include_corpus_catalog && !resp.corpora.is_empty() {
         // The catalog is line-oriented — one entry per line — so every field is
         // flattened, not just escaped: a newline inside a description would
         // otherwise start a fresh `- id — name:` line and forge an entry whose
@@ -523,9 +551,9 @@ fn convert_context_response(
             .map(|c| {
                 format!(
                     "- {} — {}: {}",
-                    escape_markup(&sanitize_line(&c.id)),
-                    escape_markup(&sanitize_line(&c.name)),
-                    escape_markup(&sanitize_line(&c.description)),
+                    neutralize_line(&c.id),
+                    neutralize_line(&c.name),
+                    neutralize_line(&c.description),
                 )
             })
             .collect();
@@ -671,7 +699,7 @@ mod tests {
         )
         .unwrap();
 
-        let messages = convert_context_response(resp, Some("a1")).messages;
+        let messages = convert_context_response(resp, Some("a1"), true).messages;
         let rendered: Vec<String> = messages.iter().map(|m| m.text()).collect();
 
         assert_eq!(
@@ -694,7 +722,7 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = convert_context_response(resp, Some("a1")).messages[0].text();
+        let rendered = convert_context_response(resp, Some("a1"), true).messages[0].text();
 
         assert!(
             !rendered.contains("<tool_result"),
@@ -717,7 +745,7 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = convert_context_response(resp, Some("a1")).messages[0].text();
+        let rendered = convert_context_response(resp, Some("a1"), true).messages[0].text();
 
         assert!(
             !rendered.contains("<tool_result"),
@@ -736,7 +764,7 @@ mod tests {
         )
         .unwrap();
 
-        let system = convert_context_response(resp, Some("a1")).messages[0].text();
+        let system = convert_context_response(resp, Some("a1"), true).messages[0].text();
 
         assert!(!system.contains("<tool_result"), "{system}");
         assert_eq!(system.matches("&lt;tool_result").count(), 2, "{system}");
@@ -750,7 +778,7 @@ mod tests {
         let resp: PrepareContextResponse =
             serde_json::from_str(&format!(r#"{{"fetcher":"{huge}"}}"#)).unwrap();
 
-        let rendered = convert_context_response(resp, Some("a1")).messages[0]
+        let rendered = convert_context_response(resp, Some("a1"), true).messages[0]
             .text()
             .len();
 
@@ -777,7 +805,7 @@ mod tests {
             content: "one\ntwo\u{e0041}\u{202e}".into(),
         });
 
-        let rendered = convert_context_response(resp, Some("a1")).messages[0].text();
+        let rendered = convert_context_response(resp, Some("a1"), true).messages[0].text();
 
         assert!(
             rendered.contains("one\ntwo"),
@@ -801,7 +829,7 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = convert_context_response(resp, Some("a1")).messages[0].text();
+        let rendered = convert_context_response(resp, Some("a1"), true).messages[0].text();
 
         assert!(
             rendered.starts_with("[Mallory Admin]:"),
@@ -827,7 +855,7 @@ mod tests {
         )
         .unwrap();
 
-        let messages = convert_context_response(resp, Some("a1")).messages;
+        let messages = convert_context_response(resp, Some("a1"), true).messages;
         let rendered: Vec<String> = messages.iter().map(|m| m.text()).collect();
 
         assert_eq!(rendered[..3], ["[Alice]: hi", "[u2]: unnamed", "reply"]);
@@ -847,7 +875,7 @@ mod tests {
             serde_json::from_str(r#"{"chat_history":[{"sent_by_user_id":"u1","content":"hi"}]}"#)
                 .unwrap();
 
-        let messages = convert_context_response(resp, None).messages;
+        let messages = convert_context_response(resp, None, true).messages;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text(), "[u1]: hi");
     }
@@ -860,7 +888,7 @@ mod tests {
             serde_json::from_str(r#"{"chat_history":[{"sent_by_user_id":"u1","content":"hi"}]}"#)
                 .unwrap();
 
-        let prepared = convert_context_response(resp, None);
+        let prepared = convert_context_response(resp, None, true);
 
         assert!(prepared.corpora.is_empty());
         assert!(
@@ -872,8 +900,10 @@ mod tests {
         );
     }
 
+    /// The block is what tells the model which ids its corpus tool accepts, so
+    /// every entry must render, in order, on its own line.
     #[test]
-    fn the_catalog_renders_one_line_per_entry_and_is_exposed() {
+    fn the_catalog_renders_one_line_per_entry() {
         let resp: PrepareContextResponse = serde_json::from_str(
             r#"{"corpora":[
                 {"id":"c-1","name":"Handbook","description":"Company policies"},
@@ -882,8 +912,7 @@ mod tests {
         )
         .unwrap();
 
-        let prepared = convert_context_response(resp, None);
-        let system = prepared.messages[0].text();
+        let system = convert_context_response(resp, None, true).messages[0].text();
 
         assert!(
             system.contains("Knowledge corpora available to you"),
@@ -897,10 +926,67 @@ mod tests {
             system.contains("- c-2 — Runbooks: Ops procedures"),
             "{system}"
         );
+    }
+
+    /// The embedding application wires its corpus tool from the parsed catalog
+    /// — the valid-id set must reach it verbatim, not via the rendered block.
+    #[test]
+    fn the_parsed_catalog_reaches_the_caller() {
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"corpora":[
+                {"id":"c-1","name":"Handbook","description":"Company policies"},
+                {"id":"c-2","name":"Runbooks","description":"Ops procedures"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let prepared = convert_context_response(resp, None, true);
 
         let ids: Vec<&str> = prepared.corpora.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["c-1", "c-2"], "parsed catalog must reach the caller");
+        assert_eq!(ids, ["c-1", "c-2"]);
         assert_eq!(prepared.corpora[0].description, "Company policies");
+    }
+
+    /// The block instructs the model to use a corpus tool, which only the
+    /// embedding application can register — so it renders only on opt-in,
+    /// while the parsed catalog is always exposed for that wiring.
+    #[test]
+    fn the_catalog_block_is_gated_but_the_parsed_catalog_is_not() {
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"corpora":[{"id":"c-1","name":"Handbook","description":"Policies"}]}"#,
+        )
+        .unwrap();
+
+        let prepared = convert_context_response(resp, None, false);
+
+        assert!(
+            prepared.messages.is_empty(),
+            "no opt-in, no block: {:?}",
+            prepared.messages.first().map(|m| m.text())
+        );
+        assert_eq!(prepared.corpora.len(), 1, "exposure must not be gated");
+    }
+
+    /// An entry without an id cannot be queried, so it must vanish from both
+    /// the rendered block and the exposed catalog — dropping it from only one
+    /// would desync the ids the model sees from the ids the tool accepts.
+    #[test]
+    fn an_id_less_entry_is_neither_rendered_nor_exposed() {
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"corpora":[
+                {"name":"Ghost","description":"no id"},
+                {"id":"c-1","name":"Handbook","description":"Policies"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let prepared = convert_context_response(resp, None, true);
+        let system = prepared.messages[0].text();
+
+        assert!(!system.contains("Ghost"), "{system}");
+        assert!(system.contains("- c-1 — Handbook: Policies"), "{system}");
+        assert_eq!(prepared.corpora.len(), 1);
+        assert_eq!(prepared.corpora[0].id, "c-1");
     }
 
     /// Descriptions are participant-authored and land in the SYSTEM role. The
@@ -916,7 +1002,7 @@ mod tests {
         )
         .unwrap();
 
-        let system = convert_context_response(resp, None).messages[0].text();
+        let system = convert_context_response(resp, None, true).messages[0].text();
 
         assert!(!system.contains("<tool_result"), "{system}");
         assert!(system.contains("&lt;tool_result"), "{system}");

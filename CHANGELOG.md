@@ -61,15 +61,20 @@ let messages = prepared.messages; // prompt-ready, as before
 let corpora = prepared.corpora;   // Vec<CorpusCatalogEntry> {id, name, description}
 ```
 
-`MagickmindContext` (the `ContextProvider`) is unchanged.
+`MagickmindContext` (the `ContextProvider`) is unchanged. `PreparedContext`
+and `CorpusCatalogEntry` are `#[non_exhaustive]`: read the fields, don't
+destructure.
 
 ### Added
 
 - Context prepare now parses the `corpora` catalog (the space's bound knowledge
-  bases) and injects a sanitized system block listing each entry's id, name and
-  description, so the model knows what a corpus-query tool can reach. The parsed
-  entries are exposed on `PreparedContext::corpora` for tool wiring; the field
-  deserializes to empty when the backend omits it.
+  bases). The parsed entries — id-less ones dropped, capped at 64 — are exposed
+  on `PreparedContext::corpora` for tool wiring; the field deserializes to empty
+  when the backend omits it. With the new
+  `MagickmindContextConfig::include_corpus_catalog` (default off, since the
+  block tells the model to use a corpus-query tool only the embedder can
+  register), a sanitized system block lists each entry's id, name and
+  description so the model knows what that tool can reach.
 - `RecallTimeWindowTool` (`recall_time_window`): recalls episodes in a date window, for questions about *when* rather than *what*. Requires an end-user credential.
 - `MessageType::from_wire` and `MessageType::is_control`.
 - `TOOLS_METADATA_KEY` / `CONTEXT_METADATA_KEY` in `core::models`.
