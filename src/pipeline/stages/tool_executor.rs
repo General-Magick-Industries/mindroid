@@ -638,7 +638,7 @@ impl StreamingStage for ToolExecutorStage {
                         None => format!("Error: unknown tool '{name}'"),
                     };
 
-                    tracing::info!("ToolExecutorStage: tool '{}' executed → {} bytes: {:?}", name, result.len(), truncate_str(&result, 120));
+                    tracing::debug!("ToolExecutorStage: tool '{}' executed → {} bytes: {:?}", name, result.len(), truncate_str(&result, 120));
 
                     yield StreamEvent::ToolResult {
                         name: name.clone(),
@@ -908,7 +908,7 @@ async fn run_tool_loop(
             };
             // Same line the streaming path logs — this fallback is what hosts
             // without a streaming consumer actually run, and it was silent.
-            tracing::info!(
+            tracing::debug!(
                 "ToolExecutorStage: tool '{}' executed → {} bytes: {:?}",
                 name,
                 result.len(),
