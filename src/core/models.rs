@@ -24,6 +24,11 @@ pub const TOOLS_METADATA_KEY: &str = "tools";
 /// [`Message::metadata`] key a transport stamps the sender's per-turn context under.
 pub const CONTEXT_METADATA_KEY: &str = "context";
 
+/// [`Message::metadata`] key a transport stamps the sender's declared wire
+/// `message_type` under, verbatim. Kept even when it maps to no [`MessageType`]
+/// variant, so a host can dispatch on vocabulary this crate defers on.
+pub const DECLARED_TYPE_METADATA_KEY: &str = "declared_message_type";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
