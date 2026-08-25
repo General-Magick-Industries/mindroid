@@ -12,7 +12,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::core::models::{CONTEXT_METADATA_KEY, TOOLS_METADATA_KEY};
+use crate::core::models::{CONTEXT_METADATA_KEY, DECLARED_TYPE_METADATA_KEY, TOOLS_METADATA_KEY};
 use crate::{Auth, Message, MessageType, MindroidError, Response, Result, Transport};
 
 fn transport_err(msg: impl Into<String>) -> MindroidError {
@@ -511,11 +511,13 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     // The backend declares what a message IS on the payload's message_type; the
     // body is never inspected to decide. A publisher on this channel can quote
     // any JSON it likes into what it says, so body shape cannot be a signal.
-    let declared_type = outer
+    let declared_wire_type = outer
         .get("message_type")
         .or_else(|| inner.get("message_type"))
         .and_then(serde_json::Value::as_str)
-        .and_then(MessageType::from_wire);
+        .map(str::trim)
+        .filter(|declared| !declared.is_empty());
+    let declared_type = declared_wire_type.and_then(MessageType::from_wire);
 
     let body = inner
         .get("content")
@@ -570,6 +572,15 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     msg.platform = Some("centrifugo".into());
     if let Some(declared_type) = declared_type {
         msg.message_type = declared_type;
+    }
+    // Verbatim as well as mapped: `from_wire` defers vocabulary it cannot
+    // dispatch on, and dropping the string would leave the host unable to
+    // either (e.g. backend-only types like turn signals).
+    if let Some(declared) = declared_wire_type {
+        msg.metadata.insert(
+            DECLARED_TYPE_METADATA_KEY.into(),
+            serde_json::Value::String(declared.to_string()),
+        );
     }
     // Per-turn tools and context ride the fan-out payload only — the backend
     // stamps them on the broadcast and never persists them, so they reach the
@@ -1572,6 +1583,28 @@ mod tests {
             let msg = parse_push(&frame, "user:a1#a1", false).expect("delivered");
             assert_eq!(msg.message_type, expected, "for {declared}");
         }
+    }
+
+    /// The declared string survives verbatim even when `from_wire` defers it,
+    /// so a host can drop backend-only vocabulary (e.g. turn signals) itself.
+    #[test]
+    fn the_declared_wire_type_rides_the_metadata_verbatim() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({
+                "content": "", "sender_id": "u1", "message_type": "SIGNAL_START",
+            }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("delivered");
+        assert_eq!(msg.message_type, MessageType::Text);
+        assert_eq!(msg.metadata["declared_message_type"], "SIGNAL_START");
+
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({ "content": "hi", "sender_id": "u1" }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("delivered");
+        assert!(!msg.metadata.contains_key("declared_message_type"));
     }
 
     /// A tool result is un-framed only because the sender declared it one.
