@@ -38,8 +38,6 @@ struct PrepareContextRequest<'a> {
     pelican: Option<PelicanParams<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     corpus: Option<CorpusParams<'a>>,
-    // Skipped when empty so the wire shape is unchanged for callers without
-    // extra ids — older backends never see an unknown field.
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     catalog_corpus_ids: &'a [String],
 }
@@ -365,12 +363,8 @@ pub struct MagickmindContextConfig {
     /// application registers one. [`PreparedContext::corpora`] is populated
     /// regardless of this flag.
     pub include_corpus_catalog: bool,
-    /// Additional corpus ids to resolve into the catalog beside the space's
-    /// own — e.g. ids granted to this agent at activation. Sent with every
-    /// prepare (the catalog changes per space, these ids do not); the backend
-    /// resolves them tenant-scoped, so an unknown or cross-tenant id
-    /// contributes nothing. Empty (the default) leaves the wire shape
-    /// unchanged.
+    /// Extra corpus ids to resolve into the catalog beside the space's own,
+    /// e.g. ids granted to this agent at activation.
     pub catalog_corpus_ids: Vec<String>,
 }
 
