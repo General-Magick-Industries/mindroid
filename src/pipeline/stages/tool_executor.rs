@@ -906,6 +906,14 @@ async fn run_tool_loop(
                     .unwrap_or_else(|e| format!("Error: {e}")),
                 None => format!("Error: unknown tool '{name}'"),
             };
+            // Same line the streaming path logs — this fallback is what hosts
+            // without a streaming consumer actually run, and it was silent.
+            tracing::info!(
+                "ToolExecutorStage: tool '{}' executed → {} bytes: {:?}",
+                name,
+                result.len(),
+                truncate_str(&result, 120)
+            );
             results_msg.push_str(&crate::tools::remote::tool_result_envelope(&name, &result));
         }
         #[cfg(feature = "artifacts")]

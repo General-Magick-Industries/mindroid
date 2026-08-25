@@ -38,6 +38,8 @@ struct PrepareContextRequest<'a> {
     pelican: Option<PelicanParams<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     corpus: Option<CorpusParams<'a>>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    catalog_corpus_ids: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -236,6 +238,7 @@ impl MagickmindClient {
             } else {
                 None
             },
+            catalog_corpus_ids: &config.catalog_corpus_ids,
         };
 
         if let Some(key) = &self.api_key {
@@ -360,6 +363,9 @@ pub struct MagickmindContextConfig {
     /// application registers one. [`PreparedContext::corpora`] is populated
     /// regardless of this flag.
     pub include_corpus_catalog: bool,
+    /// Extra corpus ids to resolve into the catalog beside the space's own,
+    /// e.g. ids granted to this agent at activation.
+    pub catalog_corpus_ids: Vec<String>,
 }
 
 impl Default for MagickmindContextConfig {
@@ -370,6 +376,7 @@ impl Default for MagickmindContextConfig {
             include_pelican: true,
             include_corpus: false,
             include_corpus_catalog: false,
+            catalog_corpus_ids: Vec::new(),
         }
     }
 }
@@ -684,6 +691,40 @@ pub fn magickmind_ollama_pipeline(
 mod tests {
     use super::*;
     use crate::auth::static_id::StaticAuth;
+
+    /// The extra catalog ids ride the prepare request only when some exist:
+    /// absent, the wire shape must be byte-identical to what older backends
+    /// already accept.
+    #[test]
+    fn catalog_corpus_ids_are_serialized_only_when_present() {
+        let empty: Vec<String> = Vec::new();
+        let body = serde_json::to_value(PrepareContextRequest {
+            participant_id: "a1",
+            chat_history: None,
+            pelican: None,
+            corpus: None,
+            catalog_corpus_ids: &empty,
+        })
+        .unwrap();
+        assert!(
+            body.get("catalog_corpus_ids").is_none(),
+            "empty ids must not appear on the wire: {body}"
+        );
+
+        let ids = vec!["c-1".to_string(), "c-2".to_string()];
+        let body = serde_json::to_value(PrepareContextRequest {
+            participant_id: "a1",
+            chat_history: None,
+            pelican: None,
+            corpus: None,
+            catalog_corpus_ids: &ids,
+        })
+        .unwrap();
+        assert_eq!(
+            body["catalog_corpus_ids"],
+            serde_json::json!(["c-1", "c-2"])
+        );
+    }
 
     /// Context prepare answers newest-first. Passed through unchanged, the model
     /// reads the transcript upside down and answers "what did I say most
