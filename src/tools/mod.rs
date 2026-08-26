@@ -1,3 +1,5 @@
+#[cfg(all(feature = "magickmind", feature = "llm-hosted"))]
+pub mod corpus;
 pub mod delegation;
 #[cfg(feature = "artifacts")]
 pub mod get_artifact;
@@ -8,7 +10,10 @@ mod registry;
 pub mod reminder;
 pub mod remote;
 pub mod shell;
+pub mod untrusted;
 
+#[cfg(all(feature = "magickmind", feature = "llm-hosted"))]
+pub use corpus::{CorpusCatalog, CorpusTool};
 pub use delegation::DelegationTool;
 #[cfg(feature = "artifacts")]
 pub use get_artifact::{GET_ARTIFACT_TOOL, GetArtifactTool};
@@ -23,6 +28,7 @@ pub use remote::{
     ManifestStage, ManifestTool, PerTurnTools, PerTurnToolsStage, RemoteTool, ToolsManifest,
 };
 pub use shell::ShellTool;
+pub use untrusted::wrap_untrusted;
 
 use async_trait::async_trait;
 use std::collections::HashMap;
