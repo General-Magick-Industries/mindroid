@@ -13,7 +13,7 @@ use crate::models::{LlmMessage, Role, StreamEvent};
 use crate::pipeline::{PipelineStage, StreamingStage};
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -35,7 +35,7 @@ use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 /// delivery channel silently empties every workspace-keyed lookup (episodic
 /// search, artifact scoping). Transports without the metadata (stdio) keep
 /// using the channel, which is the conversation scope there.
-fn tool_context_for(ctx: &Context) -> ToolContext {
+pub(crate) fn tool_context_for(ctx: &Context) -> ToolContext {
     let mut tc = ctx.get_run::<ToolContext>().cloned().unwrap_or_default();
     tc.channel_id = ctx
         .message
@@ -53,7 +53,7 @@ fn tool_context_for(ctx: &Context) -> ToolContext {
 /// message carried (placed in run scope by
 /// [`PerTurnToolsStage`](crate::tools::PerTurnToolsStage)). Per-turn tools apply
 /// to this turn only — they live in run scope, which clears when the turn ends.
-fn registry_for_turn(ctx: &Context, registry: &DynamicRegistry) -> Arc<ToolRegistry> {
+pub(crate) fn registry_for_turn(ctx: &Context, registry: &DynamicRegistry) -> Arc<ToolRegistry> {
     let snapshot = registry.load();
     match ctx.get_run::<crate::tools::PerTurnTools>() {
         Some(per_turn) if !per_turn.0.is_empty() => {
@@ -63,7 +63,7 @@ fn registry_for_turn(ctx: &Context, registry: &DynamicRegistry) -> Arc<ToolRegis
     }
 }
 
-fn remote_executor_for(
+pub(crate) fn remote_executor_for(
     registry: &ToolRegistry,
     name: &str,
     requester: Option<&str>,
@@ -94,7 +94,11 @@ fn acknowledgment(response_text: &str) -> String {
 /// Mirrors the `{type, payload}` wire shape used elsewhere; `tool_call_id`
 /// correlates the client's returning result. `ack` is any prose the model wrote
 /// alongside the call, for the client to surface while it executes.
-fn frame_remote_call(name: &str, args: &serde_json::Value, ack: &str) -> (String, String) {
+pub(crate) fn frame_remote_call(
+    name: &str,
+    args: &serde_json::Value,
+    ack: &str,
+) -> (String, String) {
     let id = uuid::Uuid::new_v4().to_string();
     let framed = serde_json::json!({
         "type": "tool_call",
@@ -136,7 +140,7 @@ const PENDING_TTL: Duration = Duration::from_secs(300);
 const MAX_PENDING_PER_CHANNEL: usize = 32;
 
 impl PendingRemoteCalls {
-    fn record_for(&self, channel: &str, sender: Option<&str>, id: &str, name: &str) {
+    pub(crate) fn record_for(&self, channel: &str, sender: Option<&str>, id: &str, name: &str) {
         let Some(sender) = sender else {
             warn!("Remote tool call is not correlatable without an authenticated sender");
             return;
@@ -198,7 +202,7 @@ impl PendingRemoteCalls {
 /// one whatever its body turned out to be, so a body that failed to normalize
 /// cannot slip the gate by no longer looking like a result. The markup test
 /// stays for the transports and tests that frame a result without declaring one.
-fn declares_tool_result(ctx: &Context) -> bool {
+pub(crate) fn declares_tool_result(ctx: &Context) -> bool {
     ctx.message.message_type == crate::MessageType::ToolResult
         || ctx.message.content.contains("<tool_result")
 }
@@ -218,6 +222,14 @@ fn declares_tool_result(ctx: &Context) -> bool {
 /// before context-building stages run.
 pub struct RemoteResultGate {
     pending: PendingRemoteCalls,
+}
+
+impl RemoteResultGate {
+    /// Build a gate over an executor's outstanding-call set — for executor
+    /// stages living outside this module (e.g. `ToolExecutorJsonStage`).
+    pub(crate) fn with_pending(pending: PendingRemoteCalls) -> Self {
+        Self { pending }
+    }
 }
 
 #[async_trait]
@@ -307,7 +319,7 @@ impl ToolCallParser for XmlToolCallParser {
 }
 
 /// Maximum number of tool-call → result rounds before giving up.
-const DEFAULT_MAX_ITERATIONS: usize = 20;
+pub(crate) const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 /// Cap on artifacts re-attached in one round. The model chooses the count, and
 /// each is held in memory and base64-expanded into the request. Bounds a round,
@@ -318,7 +330,7 @@ const MAX_REINJECTED_ARTIFACTS: usize = 8;
 
 /// Prompt appended as a user message when `max_iterations` is reached, asking
 /// the LLM to summarise its findings rather than call more tools.
-const SUMMARY_PROMPT: &str = "You have gathered enough information from the tools. \
+pub(crate) const SUMMARY_PROMPT: &str = "You have gathered enough information from the tools. \
     Please summarize your findings and answer the original question concisely.";
 
 /// A streaming pipeline stage that gives the LLM access to local computer tools.

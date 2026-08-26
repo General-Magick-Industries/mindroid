@@ -38,6 +38,9 @@ pub mod transport;
 #[cfg(feature = "llm-client")]
 pub mod llm_client;
 
+#[cfg(feature = "llm-client")]
+pub mod llm_tools_client;
+
 #[cfg(feature = "persona")]
 pub mod episode;
 #[cfg(feature = "persona")]

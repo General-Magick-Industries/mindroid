@@ -279,7 +279,7 @@ impl LlmClient {
         req_max.or(self.config.default_max_tokens)
     }
 
-    fn convert_messages(messages: &[LlmMessage]) -> Vec<ChatCompletionRequestMessage> {
+    pub(crate) fn convert_messages(messages: &[LlmMessage]) -> Vec<ChatCompletionRequestMessage> {
         messages
             .iter()
             .filter_map(|msg| {
