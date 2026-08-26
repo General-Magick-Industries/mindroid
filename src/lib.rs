@@ -17,7 +17,9 @@ pub use skills::{
 
 pub mod tools;
 #[cfg(feature = "llm-client")]
-pub use pipeline::stages::{ParsedToolCall, ToolCallParser, ToolExecutorStage, XmlToolCallParser};
+pub use pipeline::stages::{
+    ParsedToolCall, ToolCallParser, ToolExecutorJsonStage, ToolExecutorStage, XmlToolCallParser,
+};
 pub use tools::{
     DelegationTool, OpenTool, ReminderRoutine, ReminderStore, RemoteTool, SetReminderTool,
     ShellTool, Tool, ToolContext, ToolRegistry, new_reminder_store,
