@@ -28,6 +28,7 @@ members = [
     "examples/coordinator_demo",
     "examples/remote_tool",
     "examples/artifact_agent",
+    "examples/corpus_probe",
 ]
 resolver = "3"
 
