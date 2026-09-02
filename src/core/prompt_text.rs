@@ -16,7 +16,7 @@ pub(crate) fn sanitize_line(s: &str) -> String {
     truncate_on_char_boundary(flattened.trim(), MAX_LINE_BYTES).to_string()
 }
 
-fn is_layout_control(c: char) -> bool {
+pub(crate) fn is_layout_control(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}'

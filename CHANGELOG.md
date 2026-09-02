@@ -76,8 +76,11 @@ add the field (or the `..Default::default()` tail).
   for native tool calling mangle the prompt-XML format, and an unparseable call
   falls through as the final answer, so tool syntax reaches the user. The XML
   stage remains the default in every preset; swap deliberately, and only on an
-  endpoint that speaks native tools. Remote-tool wire contract, correlation gate
-  and artifact re-injection all match the XML stage.
+  endpoint that speaks native tools — notably NOT Cortex, whose ReasonService is
+  deliberately not an OpenAI drop-in and cannot carry a tool result back. Remote-
+  tool wire contract and correlation gate match the XML stage; artifacts are
+  re-attached as a follow-up `user` turn, since the `tool` role carries text
+  alone.
 - `CorpusTool` (`query_corpus`) plus `CorpusCatalog` — knowledge-corpus
   retrieval over the end-user query route, behind `magickmind` + `llm-hosted`.
   The model-chosen `corpus_id` must match the turn's catalog or an

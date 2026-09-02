@@ -153,9 +153,18 @@ model:
 | `ToolExecutorJsonStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
 
 Both re-attach artifact bytes and clear the same remote-call correlation gate.
-They differ in event timing: the XML stage yields `ToolCall`/`ToolResult` live,
+Two differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
 mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
-events replay once the loop ends.
+events replay once the loop ends; and the JSON stage re-attaches artifacts as a
+follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
+role carries text alone.
+
+**The JSON stage cannot run against Cortex.** Cortex's ReasonService is
+deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and no
+`tool_call_id`, so a tool result cannot travel back and the round-trip this stage
+needs does not exist on that path. Use it only against an endpoint that speaks
+OpenAI function calling directly (LiteLLM, vLLM, OpenAI). On the MagickMind
+inference path, keep `ToolExecutorStage`.
 
 `ToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling

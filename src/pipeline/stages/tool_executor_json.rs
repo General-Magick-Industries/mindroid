@@ -331,13 +331,27 @@ impl ToolExecutorJsonStage {
             } else {
                 serde_json::from_str::<serde_json::Value>(&call.arguments)
             };
+            // Abandoning the remote dispatch must still answer EVERY id the
+            // assistant turn declared, or the provider rejects the next round.
             let args = match args {
                 Ok(args) => args,
                 Err(e) => {
-                    messages.push(tool_turn(
-                        &call.id,
-                        format!("Error: invalid arguments JSON: {e}"),
-                    )?);
+                    for other in &outcome.tool_calls {
+                        let result = if other.id == call.id {
+                            format!("Error: invalid arguments JSON: {e}")
+                        } else {
+                            execute_local(registry, tool_ctx, other).await
+                        };
+                        events.push(StreamEvent::ToolCall {
+                            name: other.name.clone(),
+                            arguments: other.arguments.clone(),
+                        });
+                        events.push(StreamEvent::ToolResult {
+                            name: other.name.clone(),
+                            result: result.clone(),
+                        });
+                        messages.push(tool_turn(&other.id, result)?);
+                    }
                     return Ok(Round {
                         outcome: RoundOutcome::Continue,
                         events,
@@ -511,6 +525,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Serve `replies` in order, draining each request body first — replying
+    /// before the client finishes writing resets the connection under load.
+    /// Returns the request bodies so a test can assert on what was replayed.
+    fn serve_completions(
+        listener: tokio::net::TcpListener,
+        replies: Vec<String>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut bodies = Vec::new();
+            for reply in replies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_string)
+                            })
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if body.len() >= len {
+                            bodies.push(body.to_string());
+                            break;
+                        }
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{reply}",
+                    reply.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.ok();
+                sock.shutdown().await.ok();
+            }
+            bodies
+        })
+    }
+
     fn call(id: &str, name: &str, arguments: &str) -> NativeToolCall {
         NativeToolCall {
             id: id.into(),
@@ -557,6 +620,66 @@ mod tests {
         )
         .await;
         assert!(out.starts_with("Error: invalid arguments JSON"), "{out}");
+    }
+
+    /// An assistant turn declaring N tool_calls must be followed by N tool
+    /// responses; a provider rejects the round otherwise, killing the turn.
+    /// The stub asserts that invariant on the SECOND request, which is the one
+    /// that would 400 in production.
+    #[tokio::test]
+    async fn a_malformed_remote_call_still_answers_every_declared_id() {
+        fn completion(message: serde_json::Value) -> String {
+            json!({
+                "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
+            })
+            .to_string()
+        }
+
+        let first = completion(json!({
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call-remote", "type": "function",
+                 "function": {"name": "take_photo", "arguments": "{not json"}},
+                {"id": "call-local", "type": "function",
+                 "function": {"name": "nope", "arguments": "{}"}}
+            ]
+        }));
+        let second = completion(json!({"role": "assistant", "content": "done"}));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(listener, vec![first, second]);
+
+        let client = ToolsLlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = ToolExecutorJsonStage::new(client, Arc::new(registry)).with_max_iterations(2);
+
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        stage.process(&mut ctx).await.unwrap();
+
+        let bodies = server.await.unwrap();
+        let replayed: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        let messages = replayed["messages"].as_array().unwrap();
+
+        let declared = messages
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .map(Vec::len)
+            .sum::<usize>();
+        let answered = messages.iter().filter(|m| m["role"] == "tool").count();
+        assert_eq!(
+            declared, answered,
+            "every declared tool_call_id must have a tool response: {messages:#?}"
+        );
+        assert_eq!(declared, 2, "the round declared two calls");
     }
 
     #[tokio::test]
@@ -606,8 +729,6 @@ mod tests {
     /// channel silently strands every remote call on Centrifugo.
     #[tokio::test]
     async fn a_recorded_remote_call_is_claimable_under_a_workspace_stamp() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let body = json!({
             "id": "c", "object": "chat.completion", "created": 0, "model": "m",
             "choices": [{
@@ -627,22 +748,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut req = Vec::new();
-            let mut buf = [0u8; 2048];
-            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = sock.read(&mut buf).await.unwrap();
-                assert!(n > 0, "client closed before completing the headers");
-                req.extend_from_slice(&buf[..n]);
-            }
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            sock.write_all(resp.as_bytes()).await.unwrap();
-            sock.shutdown().await.ok();
-        });
+        let server = serve_completions(listener, vec![body]);
 
         let client = ToolsLlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
             "http://{addr}/v1"
@@ -668,6 +774,7 @@ mod tests {
         );
 
         stage.process(&mut ctx).await.unwrap();
+        server.await.unwrap();
         let framed: serde_json::Value =
             serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
                 .expect("the response is the tool_call envelope");
