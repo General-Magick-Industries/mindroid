@@ -42,7 +42,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 
 | Flag | Pulls in | Key types unlocked |
 |------|----------|--------------------|
-| `llm-client` | `async-openai`, `reqwest` | `GenericLlmProcessor`, `ToolExecutorStage` |
+| `llm-client` | `async-openai`, `reqwest` | `GenericLlmProcessor`, `ToolExecutorStage`, `ToolExecutorJsonStage`, `ToolsLlmClient` |
 | `llm-local` | (includes `llm-client`) | `ollama_pipeline` preset |
 | `llm-hosted` | (includes `llm-client`) | `magickmind_pipeline` preset |
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
@@ -53,7 +53,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
 | `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
-| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"` |
+| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"`; with `llm-hosted`: `CorpusTool`, `CorpusCatalog` |
 | `full` | everything above | All types |
 
 Backend-specific code lives behind `magickmind`, not `persona` — enabling the
@@ -130,7 +130,7 @@ Use `Runtime::from_config(config)?` when you need `auth_arc()` before `build()` 
 
 ### Adding a New Tool
 
-Implement `Tool` trait → register in `ToolRegistry` → `ToolExecutorStage` picks it up automatically. Schema is JSON Schema for arguments.
+Implement `Tool` trait → register in `ToolRegistry` → whichever executor stage the pipeline runs picks it up automatically. Schema is JSON Schema for arguments.
 
 ```rust
 async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
@@ -139,6 +139,25 @@ async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
 `ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
 extension map for backend data (credentials, agent id) set by a stage. Never take
 identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0005
+
+### Choosing a tool executor
+
+Two interchangeable executor stages consume the same `ToolRegistry` and keep the
+same remote-tool wire contract (`{type: "tool_call"}` out, `TOOL_RESULT` back
+through the correlation gate). They differ only in how a call reaches the model:
+
+| Stage | How calls travel | Use when |
+|-------|------------------|----------|
+| `ToolExecutorStage` | prompt-XML `<tool_call>`, parsed back out of the response text | the endpoint has no native `tools` field |
+| `ToolExecutorJsonStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
+
+`ToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
+an endpoint that supports it: models post-trained for native function calling
+mangle the XML format, and an unparseable call falls through as the final answer
+— tool-call syntax spoken to the user. It needs a `ToolsLlmClient` rather than
+`LlmClient`, because a native round carries messages `LlmMessage` cannot
+represent (an assistant turn holding `tool_calls`, and `role: tool` results keyed
+by `tool_call_id`).
 
 ### Adding a New Pipeline Stage
 
@@ -211,11 +230,12 @@ src/
 ├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls
 ├── observer/       # Observer trait + log impl
-├── tools/          # Tool trait + shell, open, reminder, get_artifact, remote
+├── tools/          # Tool trait + shell, open, reminder, get_artifact, remote, corpus, untrusted
 ├── skills/         # SkillRegistry, manifest parsing, prefiltering
 ├── persona/        # PersonaProvider, cache, local/cloud providers
 ├── identity/       # IdentityResolver, cross-platform resolution
 ├── llm_client.rs   # Shared OpenAI-compatible client
+├── llm_tools_client.rs  # OpenAI-compatible client for native (JSON) tool calling
 ├── prelude.rs      # Convenience re-exports
 └── lib.rs          # Crate root, public API surface
 ```
