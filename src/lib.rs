@@ -43,6 +43,12 @@ pub mod llm_client;
 #[cfg(feature = "llm-client")]
 pub mod llm_tools_client;
 
+/// Re-exported because [`llm_tools_client::ToolsLlmClient`] carries its request
+/// types in public signatures: a consumer cannot name them otherwise, and a
+/// version bump here is a breaking change to this crate.
+#[cfg(feature = "llm-client")]
+pub use async_openai;
+
 #[cfg(feature = "persona")]
 pub mod episode;
 #[cfg(feature = "persona")]

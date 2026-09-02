@@ -331,32 +331,13 @@ impl ToolExecutorJsonStage {
             } else {
                 serde_json::from_str::<serde_json::Value>(&call.arguments)
             };
-            // Abandoning the remote dispatch must still answer EVERY id the
-            // assistant turn declared, or the provider rejects the next round.
-            let args = match args {
-                Ok(args) => args,
-                Err(e) => {
-                    for other in &outcome.tool_calls {
-                        let result = if other.id == call.id {
-                            format!("Error: invalid arguments JSON: {e}")
-                        } else {
-                            execute_local(registry, tool_ctx, other).await
-                        };
-                        events.push(StreamEvent::ToolCall {
-                            name: other.name.clone(),
-                            arguments: other.arguments.clone(),
-                        });
-                        events.push(StreamEvent::ToolResult {
-                            name: other.name.clone(),
-                            result: result.clone(),
-                        });
-                        messages.push(tool_turn(&other.id, result)?);
-                    }
-                    return Ok(Round {
-                        outcome: RoundOutcome::Continue,
-                        events,
-                    });
-                }
+            // Falling through answers EVERY id the assistant turn declared —
+            // `execute_local` reports the same parse error, and the round stays
+            // complete, which the provider requires.
+            let Ok(args) = args else {
+                return self
+                    .local_round(registry, tool_ctx, message_channel, outcome, messages)
+                    .await;
             };
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
@@ -377,6 +358,20 @@ impl ToolExecutorJsonStage {
             });
         }
 
+        self.local_round(registry, tool_ctx, message_channel, outcome, messages)
+            .await
+    }
+
+    /// Run every call locally and append one tool result per declared id.
+    async fn local_round(
+        &self,
+        registry: &ToolRegistry,
+        tool_ctx: &ToolContext,
+        message_channel: &str,
+        outcome: crate::llm_tools_client::ToolsChatOutcome,
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+    ) -> Result<Round> {
+        let mut events = Vec::new();
         #[cfg(feature = "artifacts")]
         let mut load_ids: Vec<String> = Vec::new();
 
@@ -794,6 +789,120 @@ mod tests {
         assert!(
             !result_ctx.halted,
             "the gate dropped a result answering its own outstanding call"
+        );
+    }
+
+    /// ADR-0008: a framed remote call is control traffic for the client.
+    /// `Chunk` feeds TTS, so yielding one there speaks the envelope aloud.
+    #[tokio::test]
+    async fn the_streaming_path_never_chunks_a_framed_remote_call() {
+        use futures::StreamExt;
+
+        let reply = json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1", "type": "function",
+                        "function": {"name": "take_photo", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(listener, vec![reply]);
+
+        let client = ToolsLlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = ToolExecutorJsonStage::new(client, Arc::new(registry));
+
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        let events: Vec<StreamEvent> = stage.stream(&mut ctx).collect().await;
+        server.await.unwrap();
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Chunk { .. })),
+            "a framed remote call must never be spoken as a Chunk: {events:?}"
+        );
+        let complete = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Complete { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("the turn still completes");
+        assert!(
+            complete.contains("\"type\":\"tool_call\""),
+            "Complete must still carry the envelope: {complete}"
+        );
+    }
+
+    /// `get_artifact` returns only a confirmation string, so the executor owes
+    /// the model the bytes. They ride a follow-up user turn, since the OpenAI
+    /// `tool` role carries text alone.
+    #[cfg(feature = "artifacts")]
+    #[tokio::test]
+    async fn artifacts_are_re_attached_as_a_follow_up_user_turn() {
+        use crate::artifacts::LocalArtifactStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::artifacts::ArtifactStore> =
+            Arc::new(LocalArtifactStore::new(tmp.path()));
+        let id = store
+            .save("chan1", &[9, 9, 9], "image/png")
+            .await
+            .unwrap()
+            .id;
+
+        let msg = artifact_turn(vec![id.clone()], &store, "chan1")
+            .await
+            .expect("a follow-up turn carrying the bytes");
+
+        let rendered = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            rendered["role"], "user",
+            "the tool role cannot carry images"
+        );
+        let parts = rendered["content"].as_array().expect("multimodal parts");
+        assert!(
+            parts.iter().any(|p| p["type"] == "image_url"),
+            "the image bytes must reach the model: {rendered}"
+        );
+    }
+
+    #[cfg(feature = "artifacts")]
+    #[tokio::test]
+    async fn a_missing_artifact_degrades_to_text_rather_than_failing() {
+        use crate::artifacts::LocalArtifactStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::artifacts::ArtifactStore> =
+            Arc::new(LocalArtifactStore::new(tmp.path()));
+
+        let msg = artifact_turn(vec!["no-such-id".into()], &store, "chan1")
+            .await
+            .expect("still produces a turn");
+
+        let rendered = serde_json::to_value(&msg).unwrap();
+        assert!(
+            rendered.to_string().contains("could not re-attach"),
+            "the model must be told the bytes are missing: {rendered}"
         );
     }
 

@@ -108,6 +108,13 @@ add the field (or the `..Default::default()` tail).
 
 ### Fixed
 
+- `ToolExecutorStage` recorded an outstanding remote call under
+  `ToolContext::channel_id` — the workspace id on any transport that stamps
+  `magickspace_id` — while `RemoteResultGate` claims the returning result under
+  the delivery channel. The keys never matched, so on Centrifugo every client
+  tool result was dropped as unsolicited and the turn halted. Only the
+  non-streaming `PipelineStage::process` path was affected; the streaming path
+  already keyed on the delivery channel. Both now do.
 - `PerTurnToolsStage` now requires an authenticated sender, matching
   `ManifestStage`. Previously an unnameable publisher's tool names and
   descriptions reached the turn's system prompt.

@@ -150,7 +150,7 @@ impl ToolsLlmClient {
             // Budget the client-advertised half on its WIRE size, so a client
             // cannot crowd out the agent's own tools.
             if remote {
-                let cost = serde_json::to_string(&spec).map_or(0, |s| s.len());
+                let cost = serde_json::to_string(&spec).map_or(usize::MAX, |s| s.len());
                 if remote_bytes + cost > MAX_REMOTE_TOOL_PROMPT_BYTES {
                     dropped += 1;
                     continue;

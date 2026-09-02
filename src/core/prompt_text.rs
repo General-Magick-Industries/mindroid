@@ -24,8 +24,8 @@ pub(crate) fn is_layout_control(c: char) -> bool {
             | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{2028}' | '\u{2029}'
             | '\u{fe00}'..='\u{fe0f}' | '\u{fff9}'..='\u{fffb}'
-            | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e007f}'
-            | '\u{e0100}'..='\u{e01ef}')
+            | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}'
+            | '\u{2065}' | '\u{fff0}'..='\u{fff8}' | '\u{1bca0}'..='\u{1bca3}')
 }
 
 /// Cap on one replayed history item or knowledge block.
