@@ -83,16 +83,16 @@ The generated prompt includes each tool's name, description, and JSON Schema par
 
 ## Tool Execution Loop
 
-> Two executor stages implement this loop. `ToolExecutorStage`, described below,
+> Two executor stages implement this loop. `XmlToolExecutorStage`, described below,
 > asks the model for `<tool_call>` markup and parses it back out of the response
-> text. `ToolExecutorJsonStage` instead sends tools in the request's native
+> text. `ToolExecutorStage` instead sends tools in the request's native
 > `tools` field and reads structured `tool_calls` back, which is what you want on
 > an endpoint that speaks OpenAI function calling — the XML failure modes in this
 > section do not apply to it. Everything else (registry, `ToolContext`, remote
 > tools, artifact re-injection) is identical. See "Choosing a tool executor" in
 > `AGENTS.md`.
 
-`ToolExecutorStage` implements an iterative loop that lets the LLM use multiple tools in sequence:
+`XmlToolExecutorStage` implements an iterative loop that lets the LLM use multiple tools in sequence:
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -131,7 +131,7 @@ The parser extracts these, executes each tool, and feeds results back as user me
 ### Configuration
 
 ```rust
-ToolExecutorStage::new(client, registry)
+XmlToolExecutorStage::new(client, registry)
     .with_max_iterations(10)       // default: 20
     .with_parser(MyCustomParser)   // default: XmlToolCallParser
 ```

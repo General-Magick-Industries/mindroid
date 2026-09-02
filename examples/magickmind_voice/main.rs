@@ -19,7 +19,7 @@ use mindroid::llm_client::LlmClient;
 use mindroid::memory::magickmind::MagickmindMemory;
 use mindroid::observer::log::LogObserver;
 use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindContextConfig};
-use mindroid::pipeline::stages::{PostProcessor, SimpleContextBuilder, ToolExecutorStage};
+use mindroid::pipeline::stages::{PostProcessor, SimpleContextBuilder, XmlToolExecutorStage};
 use mindroid::tools::ToolRegistry;
 use mindroid::transport::centrifugo::CentrifugoTransport;
 #[cfg(feature = "transport-audio")]
@@ -259,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
                         history,
                     ))
                     .add_streaming_stage(match LlmClient::new((*llm_config).clone()) {
-                        Ok(c) => ToolExecutorStage::new(c, Arc::clone(&registry)),
+                        Ok(c) => XmlToolExecutorStage::new(c, Arc::clone(&registry)),
                         Err(e) => {
                             tracing::error!("LlmClient init failed: {e}");
                             return;

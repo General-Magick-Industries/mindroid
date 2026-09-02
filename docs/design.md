@@ -184,7 +184,7 @@ same store:
    has no memory knowledge; `MemoryPersistence` later saves whatever the parts
    became.
 3. **`GetArtifactTool`** (`get_artifact`) — the model calls it with an id;
-   `ToolExecutorStage` resolves the bytes via the store's `load` and re-injects
+   `XmlToolExecutorStage` resolves the bytes via the store's `load` and re-injects
    them as a multimodal `Role::Tool` message the model can see. A round
    re-attaches at most 8 artifacts, deduplicated — every one is held in memory
    and base64-expanded into the request — and the message names any left out.

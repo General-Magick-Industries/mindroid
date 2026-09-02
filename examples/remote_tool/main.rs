@@ -27,7 +27,7 @@ use mindroid::llm_client::{LlmClient, LlmClientConfig};
 use mindroid::memory::Memory;
 use mindroid::memory::sqlite::SqliteMemory;
 use mindroid::models::{LlmMessage, Message};
-use mindroid::pipeline::stages::{SimpleContextBuilder, ToolExecutorStage};
+use mindroid::pipeline::stages::{SimpleContextBuilder, XmlToolExecutorStage};
 use mindroid::{Pipeline, PipelineContext, RemoteTool, Result, ToolRegistry};
 
 const CHANNEL: &str = "demo-channel";
@@ -70,11 +70,11 @@ async fn load_history(mem: &SqliteMemory) -> Result<Arc<Vec<LlmMessage>>> {
 /// current user turn.
 async fn run_turn(
     mem: &SqliteMemory,
-    executor: ToolExecutorStage,
+    executor: XmlToolExecutorStage,
     content: &str,
 ) -> Result<String> {
     let history = load_history(mem).await?;
-    // ToolExecutorStage IS the LLM caller (it adds the tool prompt and parses
+    // XmlToolExecutorStage IS the LLM caller (it adds the tool prompt and parses
     // <tool_call>), so it's the streaming stage — no separate LLM stage.
     let gate = executor.result_gate();
     let pipeline = Pipeline::new()
@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
             "type": "object", "properties": {}
         })),
     ));
-    let executor = ToolExecutorStage::new(llm_client()?, registry);
+    let executor = XmlToolExecutorStage::new(llm_client()?, registry);
 
     // ── run 1: user asks; LLM should emit the remote tool call ───────────────
     let question = "What time is it?";

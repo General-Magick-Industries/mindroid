@@ -42,7 +42,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 
 | Flag | Pulls in | Key types unlocked |
 |------|----------|--------------------|
-| `llm-client` | `async-openai`, `reqwest` | `GenericLlmProcessor`, `ToolExecutorStage`, `ToolExecutorJsonStage`, `ToolsLlmClient` |
+| `llm-client` | `async-openai`, `reqwest` | `GenericLlmProcessor`, `LlmClient`, `ToolExecutorStage`, `XmlToolExecutorStage` |
 | `llm-local` | (includes `llm-client`) | `ollama_pipeline` preset |
 | `llm-hosted` | (includes `llm-client`) | `magickmind_pipeline` preset |
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
@@ -149,8 +149,8 @@ model:
 
 | Stage | How calls travel | Use when |
 |-------|------------------|----------|
-| `ToolExecutorStage` | prompt-XML `<tool_call>`, parsed back out of the response text | the endpoint has no native `tools` field |
-| `ToolExecutorJsonStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
+| `XmlToolExecutorStage` | prompt-XML `<tool_call>`, parsed back out of the response text | the endpoint has no native `tools` field |
+| `ToolExecutorStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
 
 Both re-attach artifact bytes and clear the same remote-call correlation gate.
 Two differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
@@ -164,15 +164,16 @@ deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and 
 `tool_call_id`, so a tool result cannot travel back and the round-trip this stage
 needs does not exist on that path. Use it only against an endpoint that speaks
 OpenAI function calling directly (LiteLLM, vLLM, OpenAI). On the MagickMind
-inference path, keep `ToolExecutorStage`.
+inference path, keep `XmlToolExecutorStage`.
 
-`ToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
+`XmlToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling
 mangle the XML format, and an unparseable call falls through as the final answer
-— tool-call syntax spoken to the user. It needs a `ToolsLlmClient` rather than
-`LlmClient`, because a native round carries messages `LlmMessage` cannot
-represent (an assistant turn holding `tool_calls`, and `role: tool` results keyed
-by `tool_call_id`).
+— tool-call syntax spoken to the user. Both stages take the same `LlmClient`;
+the native round is `LlmClient::chat_with_tools`, which speaks async-openai
+request types directly because it carries messages `LlmMessage` cannot represent
+(an assistant turn holding `tool_calls`, and `role: tool` results keyed by
+`tool_call_id`).
 
 ### Adding a New Pipeline Stage
 
@@ -249,8 +250,7 @@ src/
 ├── skills/         # SkillRegistry, manifest parsing, prefiltering
 ├── persona/        # PersonaProvider, cache, local/cloud providers
 ├── identity/       # IdentityResolver, cross-platform resolution
-├── llm_client.rs   # Shared OpenAI-compatible client
-├── llm_tools_client.rs  # OpenAI-compatible client for native (JSON) tool calling
+├── llm_client.rs   # Shared OpenAI-compatible client (chat, stream, native tools)
 ├── prelude.rs      # Convenience re-exports
 └── lib.rs          # Crate root, public API surface
 ```

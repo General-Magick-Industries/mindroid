@@ -7,7 +7,7 @@ and reconnect recovery remain design work.
 
 ## Context
 
-The remote-tool feature (see `src/tools/remote.rs`, `ToolExecutorStage`) emits a
+The remote-tool feature (see `src/tools/remote.rs`, `XmlToolExecutorStage`) emits a
 tool call as terminal pipeline output; a client executes it and publishes the
 result back, which re-enters as a new inbound message. This is
 **async request-reply + correlation identifier**, resumed like a durable-execution
@@ -51,7 +51,7 @@ outstanding_tool_calls
 Pub-sub is at-least-once; duplicates are normal, not edge cases.
 
 - **Server side (result ingest): implemented process-locally.**
-  `ToolExecutorStage` performs mandatory correlation and one-shot claim; an
+  `XmlToolExecutorStage` performs mandatory correlation and one-shot claim; an
   unknown, mismatched, or already-consumed result is dropped. Moving the same
   check to durable storage remains necessary for restart safety.
 - **Client side (command execution):** the client must dedup by `tool_call_id`

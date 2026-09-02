@@ -126,11 +126,11 @@ pub trait Tool: Send + Sync {
     /// Whether this tool is executed by the client rather than the runtime.
     ///
     /// A remote tool is only *declared* to the LLM (name/description/schema);
-    /// when the LLM calls it, [`ToolExecutorStage`] emits the call as the
+    /// when the LLM calls it, [`XmlToolExecutorStage`] emits the call as the
     /// pipeline's response instead of running `execute` and looping. The client
     /// performs it and returns the result as a new inbound message.
     ///
-    /// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
+    /// [`XmlToolExecutorStage`]: crate::pipeline::stages::XmlToolExecutorStage
     fn is_remote(&self) -> bool {
         false
     }

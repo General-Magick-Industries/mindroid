@@ -19,7 +19,7 @@ const MAX_SCHEMA_DEPTH: usize = 16;
 const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 
 /// A tool the runtime does not execute — it declares the tool to the LLM and,
-/// when called, [`ToolExecutorStage`] emits the call as the pipeline response
+/// when called, [`XmlToolExecutorStage`] emits the call as the pipeline response
 /// for the client to perform. See [`Tool::is_remote`].
 ///
 /// ```ignore
@@ -31,9 +31,9 @@ const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 ///
 /// # Reliability
 ///
-/// Results are correlated by [`ToolExecutorStage`], and a result answering no
+/// Results are correlated by [`XmlToolExecutorStage`], and a result answering no
 /// outstanding call is dropped, including a redelivered duplicate. Its
-/// [`result_gate`](crate::pipeline::stages::ToolExecutorStage::result_gate) can
+/// [`result_gate`](crate::pipeline::stages::XmlToolExecutorStage::result_gate) can
 /// additionally reject results before context-building stages run.
 ///
 /// # Trust
@@ -49,7 +49,7 @@ const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 /// conversation stays truncated. Its pending entry expires after 5 minutes, but
 /// no retry resumes the turn. See `docs/design/remote-tool-reliability.md`.
 ///
-/// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
+/// [`XmlToolExecutorStage`]: crate::pipeline::stages::XmlToolExecutorStage
 pub struct RemoteTool {
     name: String,
     description: String,

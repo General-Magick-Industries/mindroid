@@ -22,7 +22,7 @@
 //! framework change.
 //!
 //! Per turn the pipeline is:
-//!   SimpleContextBuilder(history) → IngestStage → ToolExecutorStage(get_artifact)
+//!   SimpleContextBuilder(history) → IngestStage → XmlToolExecutorStage(get_artifact)
 //!     → PostProcessor → ArtifactOffload
 //! then the turn (with any artifact reference) is saved back to SQLite.
 //!
@@ -51,7 +51,7 @@ use mindroid::pipeline::extensions::{FileInput, FileInputs};
 use mindroid::pipeline::presets::memory::MemoryClient;
 use mindroid::pipeline::stages::{
     ArtifactOffload, GenericLlmProcessor, IngestStage, PostProcessor, SimpleContextBuilder,
-    ToolExecutorStage,
+    XmlToolExecutorStage,
 };
 use mindroid::tools::{GetArtifactTool, ToolRegistry};
 use mindroid::{MindroidConfig, Pipeline, PipelineContext, Runtime};
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
                 let pipeline = if let Some(mgr) = &artifact_mgr {
                     let tool = GetArtifactTool::from_manager(mgr.clone(), SCOPE);
                     let registry = Arc::new(ToolRegistry::new().register(tool));
-                    base.add_streaming_stage(ToolExecutorStage::new((*client).clone(), registry))
+                    base.add_streaming_stage(XmlToolExecutorStage::new((*client).clone(), registry))
                         .add_stage(PostProcessor)
                         .add_stage(ArtifactOffload::from_manager(mgr.clone()))
                 } else {
