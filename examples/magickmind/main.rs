@@ -1,6 +1,6 @@
 //! Full Magick Mind integration: Centrifugo transport + MagickMind pipeline + MagickMind memory.
 //!
-//! Run with: `cargo run --example magickmind --features full`
+//! Run with: `cargo run -p mindroid-example-magickmind --bin magickmind`
 //!
 //! Requires environment variables:
 //!   MINDROID_EMAIL     — MagickMind login email

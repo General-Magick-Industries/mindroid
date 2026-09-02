@@ -1,11 +1,14 @@
 #[cfg(feature = "apikey")]
 pub mod apikey;
+#[cfg(feature = "magickmind")]
+pub mod enduser;
 pub mod static_id;
 
 use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::models::CredentialKind;
 
 #[async_trait]
 pub trait Auth: Send + Sync + 'static {
@@ -16,6 +19,42 @@ pub trait Auth: Send + Sync + 'static {
     fn is_authenticated(&self) -> bool;
 
     async fn refresh(&self) -> Result<()>;
+
+    /// Whether the credential is permanently dead — waiting cannot help.
+    ///
+    /// Lets a caller distinguish "retry" from "stop". A reconnect loop that
+    /// cannot tell the difference retries a rejected credential forever, which
+    /// looks alive to a supervisor while every request 401s.
+    ///
+    /// Defaults to `false`: a credential with no notion of terminal failure
+    /// (a static token, an API key) is never permanently dead in this sense.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
+    /// Which identity this credential acts as.
+    ///
+    /// Adapters pick service-user vs end-user routes from this. It belongs to
+    /// the credential rather than to config: taking the two from different
+    /// sources lets an injected end-user token be presented to service-user
+    /// surfaces, which fails at the server as an opaque 401.
+    ///
+    /// Defaults to [`CredentialKind::ServiceUser`].
+    fn kind(&self) -> CredentialKind {
+        CredentialKind::ServiceUser
+    }
+
+    /// Record that a request bearing this credential was rejected (401/403).
+    ///
+    /// Rotation classifies its own failures, but a rejection discovered by any
+    /// *other* caller never reaches the credential — so a server-side revocation
+    /// leaves [`is_terminal`](Self::is_terminal) false and
+    /// [`is_authenticated`](Self::is_authenticated) true while every request
+    /// fails. Call this on a 401 to let the credential latch that state without
+    /// spending a rotation from its rate-limit budget.
+    ///
+    /// Default: no-op, for credentials with no failure state to track.
+    fn note_rejection(&self) {}
 }
 
 #[async_trait]
@@ -34,6 +73,18 @@ impl<T: Auth> Auth for Arc<T> {
 
     async fn refresh(&self) -> Result<()> {
         (**self).refresh().await
+    }
+
+    fn is_terminal(&self) -> bool {
+        (**self).is_terminal()
+    }
+
+    fn kind(&self) -> CredentialKind {
+        (**self).kind()
+    }
+
+    fn note_rejection(&self) {
+        (**self).note_rejection()
     }
 }
 

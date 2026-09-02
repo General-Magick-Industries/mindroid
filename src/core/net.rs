@@ -139,6 +139,25 @@ pub(crate) fn require_secure_url(base_url: &str, allow_insecure: bool, knob: &st
     Ok(())
 }
 
+/// Tell the credential when a request bearing it was rejected as unauthenticated.
+///
+/// Rotation classifies its own failures, but a 401 seen by any other caller never
+/// reaches the credential — so a server-side revocation leaves it reporting
+/// healthy while every request fails. Call this wherever a credential-bearing
+/// response is checked.
+///
+/// **401 only.** 403 is an *authorization* outcome and says nothing about the
+/// credential: backends use it for "not a member of this space", "belongs to
+/// another tenant", "no permission to post here". An agent @mentioned in a space
+/// it was removed from would otherwise discard a valid, unexpired credential
+/// over one membership check. Rotation still treats its own 403 as terminal,
+/// because there the verdict *is* about the credential.
+pub(crate) fn note_auth_status(auth: &dyn crate::auth::Auth, status: reqwest::StatusCode) {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        auth.note_rejection();
+    }
+}
+
 /// Longest error-body excerpt kept for diagnostics.
 const MAX_ERR_BODY: usize = 512;
 

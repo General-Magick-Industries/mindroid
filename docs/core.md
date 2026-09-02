@@ -99,7 +99,7 @@ Represents an incoming message from a transport (user, API, webhook, etc.).
 - `sender_type: SenderType` — Origin type: User, Agent, System (default: User)
 - `channel_id: String` — Where it came from (chat room ID, webhook source, etc.)
 - `channel_type: ChannelType` — Channel kind: Direct, Group, Broadcast (default: Direct)
-- `message_type: MessageType` — Content type: Text, Command, System, Image, Audio (default: Text)
+- `message_type: MessageType` — What the message is: Text, Command, System, Image, Audio, ToolCall, ToolResult, ToolManifest (default: Text)
 - `timestamp: DateTime<Utc>` — When it was sent (auto-set to now)
 - `metadata: HashMap<String, serde_json::Value>` — Transport-specific data (attachments, user info, etc.)
 
@@ -260,9 +260,10 @@ Typically set by a Processor stage and included in `StreamEvent::Complete`.
 
 Three simple enums representing message classifications. All serialize to snake_case and have `#[default]` on the first variant.
 
-**MessageType** — What the message contains:
+**MessageType** — What the message is:
 ```rust
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MessageType {
     #[default]
     Text,    // Plain text
@@ -270,8 +271,27 @@ pub enum MessageType {
     System,  // System message
     Image,   // Image attachment
     Audio,   // Audio attachment
+    // Tool-protocol traffic, declared by the sender rather than inferred
+    // from the message body. See `MessageType::from_wire` / `is_control`.
+    ToolCall,
+    ToolResult,
+    ToolManifest,
 }
 ```
+
+`MessageType::from_wire(&str)` maps a sender-declared wire value onto the tool
+variants, accepting either case (`TOOL_RESULT` and `tool_result` both map), and
+returns `None` for a plain conversational turn so a caller keeps its default.
+`is_control()` is true for the three tool variants.
+
+`Pipeline::run` / `run_streaming` refuse an inbound `ToolCall` outright, and a
+`ToolResult` whose body is not one complete `<tool_result>` envelope, before any
+stage runs — neither has a consumer, so left alone they reach the LLM as
+ordinary user content. `ToolManifest` is NOT refused: `ManifestStage` is its
+consumer, and no bundled preset wires that stage, so an embedder dispatching on
+manifests must wire it. See ADR-0008.
+
+The enum is `#[non_exhaustive]`: match on it with a wildcard arm.
 
 **SenderType** — Who sent it:
 ```rust
@@ -310,6 +330,8 @@ pub trait Transport: Send + Sync + 'static {
     fn is_connected(&self) -> bool;
     async fn send_typing(&self, _channel_id: &str) -> Result<()> { Ok(()) }
     async fn health_check(&self) -> bool { self.is_connected() }
+    fn set_health_reporter(&mut self, _reporter: HealthReporter) {}
+    fn reports_own_health(&self) -> bool { false }
 }
 ```
 
@@ -325,6 +347,8 @@ pub trait Transport: Send + Sync + 'static {
 | `is_connected()` | `fn(&self) -> bool` | True if currently connected (used by runtime health checks) |
 | `send_typing()` | `async fn(&self, _channel_id: &str) -> Result<()>` | Optional: send "typing..." indicator. Default: no-op. |
 | `health_check()` | `async fn(&self) -> bool` | Optional: check transport health. Default: calls `is_connected()`. |
+| `set_health_reporter()` | `fn(&mut self, reporter: HealthReporter)` | Optional: receive a sink for `Health` transitions. Called before `connect()`. Default: no-op. |
+| `reports_own_health()` | `fn(&self) -> bool` | Optional: `true` if the transport publishes its own `Health`. Default `false`, which lets the runtime report `Ready` once `connect()` succeeds. Return `true` when the connection is established in `listen()` rather than `connect()`, or the runtime reports `Ready` before anything is connected. |
 
 **Implementation notes:**
 
@@ -839,17 +863,54 @@ pub struct PipelineConfig {
 }
 ```
 
-**IdentityConfig** — Auth settings:
+**AuthConfig** — Auth settings (TOML section `[auth]`):
 ```rust
-pub struct IdentityConfig {
-    pub identity_type: Option<String>,   // "static", "apikey", etc.
+pub struct AuthConfig {
+    pub auth_type: Option<String>,       // TOML key `type`: "static", "apikey", "enduser"
     pub email: Option<String>,
     pub password: Option<String>,
     pub api_key: Option<String>,
     pub token: Option<String>,
     pub base_url: Option<String>,
+    pub allow_insecure: bool,            // permit credentials over plaintext http:// (local dev only)
+
+    // `enduser` only — see "End-user tokens" below.
+    pub token_expires_at: Option<String>, // RFC 3339 expiry of `token`, from the mint response
+    pub rotate_token: bool,               // default true
+    pub token_ttl_seconds: Option<i64>,   // TTL requested per rotation; server default (1h) if unset
 }
 ```
+
+### End-user tokens
+
+`type = "enduser"` carries a Magick Mind end-user JWT (from `POST /v1/end-users/tokens`)
+and routes magickmind calls to the id-less end-user API surface, where the agent is the
+token subject rather than a path parameter.
+
+These tokens are short-lived — one hour by default, 24 hours at the server's hard maximum
+— so `rotate_token` defaults to **true**: `EndUserAuth` exchanges the token via
+`POST /v1/end-user/tokens/refresh` before it expires. Without rotation a long-running
+agent stops working within a day, and the failure is silent (calls simply begin returning
+401).
+
+Rotation follows RFC 9700: the presented token is **revoked as the successor is issued**.
+Three consequences the SDK handles, and one the caller must:
+
+- Rotation is single-flight under a write lock. Two concurrent rotations would present the
+  same `jti`; the second lands outside the replay window and the server revokes the
+  **entire chain**.
+- A rejected rotation (400/401/403) is **terminal** — there is no fallback credential to
+  fall back to, unlike `apikey`. `EndUserAuth::is_terminal()` reports this so a supervisor
+  can tell "retry" from "re-mint or stop". 429 and 5xx are *not* terminal; they back off.
+- A chain is bounded server-side (30 days absolute, 14 days idle by default). Past either
+  cap, only a fresh mint restores service.
+- **Caller's job:** `Auth::refresh()` consumes the current token. Call it only when
+  reacting to a 401 from elsewhere — `get_token()` already rotates on its own schedule,
+  and each extra call spends one slot of the chain's rate-limit budget (60/hour default).
+
+Set `rotate_token = false` only when a supervisor rotates the token out of band. A token
+minted with `supervised: true` is barred from the self-refresh route server-side and will
+return 403, which `EndUserAuth` treats as terminal.
 
 **MemoryConfig** — Persistence settings:
 ```rust

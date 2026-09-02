@@ -1,0 +1,18 @@
+[package]
+name = "mindroid-example-corpus-probe"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "corpus_probe"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["full"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing-subscriber = { workspace = true }

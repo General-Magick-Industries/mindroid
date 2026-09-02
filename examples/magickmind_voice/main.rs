@@ -9,7 +9,7 @@
 //! Responses are spoken aloud via TTS and persisted back to MagickMind.
 //!
 //! Run with:
-//!   cargo run --example magickmind_voice --features full -- \
+//!   cargo run -p mindroid-example-magickmind-voice --bin magickmind_voice -- \
 //!     --config examples/magickmind_voice/config.toml
 
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use mindroid::llm_client::LlmClient;
 use mindroid::memory::magickmind::MagickmindMemory;
 use mindroid::observer::log::LogObserver;
 use mindroid::pipeline::presets::magickmind::{MagickmindClient, MagickmindContextConfig};
-use mindroid::pipeline::stages::{PostProcessor, SimpleContextBuilder, ToolExecutorStage};
+use mindroid::pipeline::stages::{PostProcessor, SimpleContextBuilder, XmlToolExecutorStage};
 use mindroid::tools::ToolRegistry;
 use mindroid::transport::centrifugo::CentrifugoTransport;
 #[cfg(feature = "transport-audio")]
@@ -244,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(&ctx.agent_config.agent_id),
                     )
                     .await
+                    .map(|prepared| prepared.messages)
                     .unwrap_or_else(|e| {
                         tracing::warn!("MagickMind context load failed: {e}");
                         Vec::new()
@@ -258,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
                         history,
                     ))
                     .add_streaming_stage(match LlmClient::new((*llm_config).clone()) {
-                        Ok(c) => ToolExecutorStage::new(c, Arc::clone(&registry)),
+                        Ok(c) => XmlToolExecutorStage::new(c, Arc::clone(&registry)),
                         Err(e) => {
                             tracing::error!("LlmClient init failed: {e}");
                             return;

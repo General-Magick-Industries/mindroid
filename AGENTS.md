@@ -12,6 +12,7 @@ These are load-bearing. If a change touches one, read the linked ADR in `docs/ad
 - **Concurrency = structured.** Prefer `JoinSet` / `select!` / `CancellationToken` over detached `tokio::spawn`. Fan-out collects results; it never shares `&mut Context` across tasks. → `docs/adr/0001-concurrency.md`
 - **Observability = middleware, never a mutable observer registry.** Cross-cutting concerns wrap traits (tower-style) or ride the `PipelineEvent` / callback stream. → `docs/adr/0002-observability.md`
 - **OmniSession is a separate execution model**, not an extended `Pipeline`. → `docs/adr/0003-omnisession.md`
+- **Control traffic with no consumer never becomes prompt text.** `Pipeline` refuses it at the entrance, before any stage runs — the one sanctioned deviation from "control flow composes from stages". → `docs/adr/0008-pipeline-admission.md`
 - **Accept traits, return structs.** Every subsystem is a swappable trait; keep them small and object-safe.
 
 See `docs/adr/README.md` for the full index. ADRs hold the *why* + rejected alternatives; this file holds the *operational* rules.
@@ -25,13 +26,15 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (zero warnings 
 cargo fmt --all -- --check          # Format check
 ```
 
-**Workspace examples** build separately — each is its own crate under `examples/`.
+**Workspace examples** build separately — each is its own crate under `examples/`. Run one with `cargo run -p <package> --bin <bin> -- [args]` (not `cargo run --example`; `autoexamples = false` disables that form).
 
 ## Rust Edition & Toolchain
 
 - Edition: **2024** (Cargo.toml `edition = "2024"`)
 - Resolver: **3** (workspace-level)
-- Release profile: `opt-level = "z"`, thin LTO, `panic = "abort"`
+- Release profile: `opt-level = "z"`, thin LTO, `panic = "abort"` — this crate's own
+  binaries/examples only. Cargo ignores a dependency's profile, so an embedding host
+  picks its own (see [Embedding many runtimes](#embedding-many-runtimes-in-one-process))
 
 ## Feature Flags
 
@@ -39,7 +42,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 
 | Flag | Pulls in | Key types unlocked |
 |------|----------|--------------------|
-| `llm-client` | `async-openai`, `reqwest` | `GenericLlmProcessor`, `ToolExecutorStage` |
+| `llm-client` | `async-openai`, `reqwest` | `GenericLlmProcessor`, `LlmClient`, `ToolExecutorStage`, `XmlToolExecutorStage` |
 | `llm-local` | (includes `llm-client`) | `ollama_pipeline` preset |
 | `llm-hosted` | (includes `llm-client`) | `magickmind_pipeline` preset |
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
@@ -49,7 +52,12 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |
 | `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
+| `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
+| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"`; with `llm-hosted`: `CorpusTool`, `CorpusCatalog` |
 | `full` | everything above | All types |
+
+Backend-specific code lives behind `magickmind`, not `persona` — enabling the
+persona system must not compile in a token client for one service.
 
 ## Architecture
 
@@ -58,10 +66,14 @@ Runtime (core/runtime.rs)
 ├── Transport  → mpsc → MessageContext → Pipeline → respond()
 ├── Auth       → token/headers for authed subsystems
 ├── Memory     → save/get/clear history
-├── Observer   → lifecycle hooks (on_start, on_message, on_error, …)
+├── Observer   → lifecycle hooks (on_start, on_message, on_error, …) — edge-triggered
+├── Health     → current liveness for a supervisor (Runtime::health) — level-triggered
 ├── Routines   → background poll/act loops (reminders, etc.)
 └── Pipeline   → ordered stages, at most ONE StreamingStage
 ```
+
+`Observer` reports that something *happened*; `Health` reports what the state *is* right
+now, which is what an out-of-process supervisor needs. See ADR-0007.
 
 For real-time bidirectional audio, `OmniSession` runs alongside `Pipeline` as a separate model (see ADR-0003).
 
@@ -88,6 +100,12 @@ Stages execute sequentially. Typical order:
 
 Set `ctx.halted = true` to stop the pipeline early from any stage.
 
+**Before stage 1**, `Pipeline` refuses inbound control traffic no stage can
+consume — a `TOOL_CALL`, or a `TOOL_RESULT` that is not one complete
+`<tool_result>` envelope. It halts with no response and no `PipelineEvent`.
+This is deliberate admission control, not a stage; see ADR-0008 before changing
+it.
+
 ### Combinators
 
 `pipeline/combinators.rs` provides `BranchStage` (gate → pass/fail), `RouterStage` (N-way), `RetryStage` (backoff), `ApprovalStage<T>` (HITL via `watch_session`). These are the functional composition layer — reach for them before writing bespoke control flow. Parallel fan-out (`ParallelStage`) is value-returning, not shared-`&mut` (ADR-0001).
@@ -112,7 +130,50 @@ Use `Runtime::from_config(config)?` when you need `auth_arc()` before `build()` 
 
 ### Adding a New Tool
 
-Implement `Tool` trait → register in `ToolRegistry` → `ToolExecutorStage` picks it up automatically. Schema is JSON Schema for arguments.
+Implement `Tool` trait → register in `ToolRegistry` → whichever executor stage the pipeline runs picks it up automatically. Schema is JSON Schema for arguments.
+
+```rust
+async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
+```
+
+`ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
+extension map for backend data (credentials, agent id) set by a stage. Never take
+identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0005
+
+### Choosing a tool executor
+
+Two interchangeable executor stages consume the same `ToolRegistry` and keep the
+same remote-tool wire contract (`{type: "tool_call"}` out, `TOOL_RESULT` back
+through the correlation gate). The primary difference is how a call reaches the
+model:
+
+| Stage | How calls travel | Use when |
+|-------|------------------|----------|
+| `XmlToolExecutorStage` | prompt-XML `<tool_call>`, parsed back out of the response text | the endpoint has no native `tools` field |
+| `ToolExecutorStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
+
+Both re-attach artifact bytes and clear the same remote-call correlation gate.
+Two differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
+mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
+events replay once the loop ends; and the JSON stage re-attaches artifacts as a
+follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
+role carries text alone.
+
+**The JSON stage cannot run against Cortex.** Cortex's ReasonService is
+deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and no
+`tool_call_id`, so a tool result cannot travel back and the round-trip this stage
+needs does not exist on that path. Use it only against an endpoint that speaks
+OpenAI function calling directly (LiteLLM, vLLM, OpenAI). On the MagickMind
+inference path, keep `XmlToolExecutorStage`.
+
+`XmlToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
+an endpoint that supports it: models post-trained for native function calling
+mangle the XML format, and an unparseable call falls through as the final answer
+— tool-call syntax spoken to the user. Both stages take the same `LlmClient`;
+the native round is `LlmClient::chat_with_tools`, which speaks async-openai
+request types directly because it carries messages `LlmMessage` cannot represent
+(an assistant turn holding `tool_calls`, and `role: tool` results keyed by
+`tool_call_id`).
 
 ### Adding a New Pipeline Stage
 
@@ -126,6 +187,30 @@ Implement `PipelineStage` (or `StreamingStage` for streaming). Use `pipeline.add
 
 Use `MindroidError` variants (`Auth`, `Transport`, `Pipeline`, `Memory`, `Api`, `Config`, `Other`). Return `mindroid::Result<T>`. `MindroidError::config("msg")` for config errors.
 
+### Embedding many runtimes in one process
+
+A control plane can run N agents as N tokio tasks in one process: build a
+`MindroidConfig` per agent, `Runtime::from_config_with_auth(cfg, auth)`, then
+`tokio::spawn(rt.run_until_cancelled(token))`. The SDK supports this — no global
+singletons, no library-level `tracing_subscriber` init, `Runtime` is `Send`.
+
+Four things the SDK does **not** do for you; the host owns them:
+
+1. **Build each config in code.** Never `MindroidConfig::resolve*` per agent — those
+   read CLI args and env, which are process-wide and assume one agent per process.
+   `merge_toml` layers a per-agent delta onto a shared base.
+2. **Per-agent credentials.** `from_config_with_auth` injects an `Auth` per runtime;
+   config-derived auth would be shared. Same reasoning as (1).
+3. **Per-agent tracing spans.** One subscriber interleaves every agent's logs.
+4. **`panic = "unwind"` + `catch_unwind` per task.** With `abort`, one agent's panic
+   takes the whole host down. Cargo ignores this crate's profile when it's a
+   dependency, so this is the host's choice to make.
+
+`run_until_cancelled(token)` is the stop path — it disconnects the transport and
+cancels routines, unlike `handle.abort()`, which drops mid-await. `Runtime::health()`
+reports `Starting`/`Ready`/`Reconnecting`/`Stopped` so a supervisor can tell a working
+agent from one that is alive but cannot receive.
+
 ## Gotchas
 
 - **One streaming stage max** — `Pipeline` panics at runtime if you add two `StreamingStage`s
@@ -133,7 +218,7 @@ Use `MindroidError` variants (`Auth`, `Transport`, `Pipeline`, `Memory`, `Api`, 
 - **Feature gating is pervasive** — check `#[cfg(feature = "...")]` before touching impl modules; code compiles with default features only
 - **`pv_cobra` yanked** — Cobra VAD infra exists but the real crate is unavailable on crates.io; see `Cargo.toml` comment
 - **macOS builds work out of the box** — Linux needs `libasound2-dev` for `transport-audio`
-- **CI runs `--lib` tests only** — no integration or doc tests in CI (`cargo test --all-features --lib`)
+- **CI runs `--lib` tests only** — no integration or doc tests in CI (`cargo test --all-features --lib`), on ubuntu and windows. The artifact store's symlink tests skip themselves where the OS denies symlink creation, so a green local run does not mean they ran; set `MINDROID_REQUIRE_SYMLINKS=1` to turn that skip into a failure, as the Windows CI job does
 - **`NoMemory` / `NoObserver`** are the no-op defaults — don't create new empty impls
 
 ## Anti-Patterns
@@ -157,13 +242,15 @@ src/
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
 ├── omni/           # OmniSession, OmniProvider, audio source/sink, VAD (ADR-0003)
+├── artifacts/      # ArtifactStore trait + local, manager (ADR-0004)
+├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls
 ├── observer/       # Observer trait + log impl
-├── tools/          # Tool trait + shell, open, reminder
+├── tools/          # Tool trait + shell, open, reminder, get_artifact, remote, corpus, untrusted
 ├── skills/         # SkillRegistry, manifest parsing, prefiltering
 ├── persona/        # PersonaProvider, cache, local/cloud providers
 ├── identity/       # IdentityResolver, cross-platform resolution
-├── llm_client.rs   # Shared OpenAI-compatible client
+├── llm_client.rs   # Shared OpenAI-compatible client (chat, stream, native tools)
 ├── prelude.rs      # Convenience re-exports
 └── lib.rs          # Crate root, public API surface
 ```
