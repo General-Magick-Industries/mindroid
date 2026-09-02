@@ -22,6 +22,7 @@ pub use magickmind::{
     AgentCredentials, AgentCredentialsStage, EpisodicMemoryTool, RecallTimeWindowTool,
 };
 pub use open::OpenTool;
+pub(crate) use registry::MAX_REMOTE_TOOL_PROMPT_BYTES;
 pub use registry::{DynamicRegistry, ToolRegistry};
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
 pub use remote::{

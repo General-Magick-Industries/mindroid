@@ -71,6 +71,24 @@ add the field (or the `..Default::default()` tail).
 
 ### Added
 
+- `ToolExecutorJsonStage` — a native (JSON) function-calling twin of
+  `ToolExecutorStage`, with `ToolsLlmClient` as its client. Models post-trained
+  for native tool calling mangle the prompt-XML format, and an unparseable call
+  falls through as the final answer, so tool syntax reaches the user. The XML
+  stage remains the default in every preset; swap deliberately, and only on an
+  endpoint that speaks native tools. Remote-tool wire contract, correlation gate
+  and artifact re-injection all match the XML stage.
+- `CorpusTool` (`query_corpus`) plus `CorpusCatalog` — knowledge-corpus
+  retrieval over the end-user query route, behind `magickmind` + `llm-hosted`.
+  The model-chosen `corpus_id` must match the turn's catalog or an
+  activation-granted id byte-for-byte before it reaches the URL. A missing
+  catalog fails closed: the host must seed `CorpusCatalog` into the tool run
+  scope.
+- `wrap_untrusted` — fences retrieved, attacker-influenced text as data, folding
+  every closing-fence spelling a model could read (separators inside `</`,
+  attribute tails, and invisible format characters) so a payload cannot escape
+  and issue instructions.
+
 - Context prepare now parses the `corpora` catalog (the space's bound knowledge
   bases). The parsed entries — id-less ones dropped, capped at 64 — are exposed
   on `PreparedContext::corpora` for tool wiring; the field deserializes to empty

@@ -326,7 +326,7 @@ pub(crate) const DEFAULT_MAX_ITERATIONS: usize = 20;
 /// not a turn: `messages` accumulates across iterations, so the worst case is
 /// still this times [`DEFAULT_MAX_ITERATIONS`].
 #[cfg(feature = "artifacts")]
-const MAX_REINJECTED_ARTIFACTS: usize = 8;
+pub(crate) const MAX_REINJECTED_ARTIFACTS: usize = 8;
 
 /// Prompt appended as a user message when `max_iterations` is reached, asking
 /// the LLM to summarise its findings rather than call more tools.
@@ -463,6 +463,7 @@ impl PipelineStage for ToolExecutorStage {
                 max_iterations: self.max_iterations,
                 pending: &self.pending,
                 trusted_sender: ctx.message.trusted_sender_id(),
+                message_channel: &ctx.message.channel_id,
                 #[cfg(feature = "artifacts")]
                 artifacts: &artifacts,
             },
@@ -829,6 +830,9 @@ struct LoopDeps<'a> {
     max_iterations: usize,
     pending: &'a PendingRemoteCalls,
     trusted_sender: Option<&'a str>,
+    /// Trusted delivery channel: what `RemoteResultGate` claims a returning
+    /// result under, so a recorded call must be keyed by it.
+    message_channel: &'a str,
     #[cfg(feature = "artifacts")]
     artifacts: &'a ArtifactReinjection,
 }
@@ -849,6 +853,7 @@ async fn run_tool_loop(
         max_iterations,
         pending,
         trusted_sender,
+        message_channel,
         #[cfg(feature = "artifacts")]
         artifacts,
     } = deps;
@@ -893,7 +898,7 @@ async fn run_tool_loop(
         }) {
             let (framed, call_id) = frame_remote_call(name, args, &acknowledgment(&response_text));
             pending.record_for(
-                &tool_ctx.channel_id,
+                message_channel,
                 executor_id.as_deref().or(trusted_sender),
                 &call_id,
                 name,
@@ -953,7 +958,7 @@ async fn run_tool_loop(
 /// Returns `Some(id)` only for `get_artifact` calls (Defect 2 + name-keyed
 /// detection per the verification report).
 #[cfg(feature = "artifacts")]
-fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
+pub(crate) fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
     if name == crate::tools::GET_ARTIFACT_TOOL {
         args.get("id").and_then(|v| v.as_str()).map(str::to_string)
     } else {
@@ -965,7 +970,7 @@ fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
 /// returning the ids left out. The model picks the count, and every artifact is
 /// held in memory at once before being base64-expanded into the request.
 #[cfg(feature = "artifacts")]
-fn plan_reinjection(load_ids: &mut Vec<String>) -> Vec<String> {
+pub(crate) fn plan_reinjection(load_ids: &mut Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     load_ids.retain(|id| seen.insert(id.clone()));
     load_ids.split_off(load_ids.len().min(MAX_REINJECTED_ARTIFACTS))

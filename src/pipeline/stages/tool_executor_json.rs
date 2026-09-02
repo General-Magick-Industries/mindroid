@@ -75,6 +75,72 @@ impl ToolExecutorJsonStage {
     pub fn result_gate(&self) -> RemoteResultGate {
         RemoteResultGate::with_pending(self.pending.clone())
     }
+
+    #[cfg(feature = "artifacts")]
+    fn artifact_store(&self) -> Option<Arc<dyn crate::artifacts::ArtifactStore>> {
+        self.registry
+            .load()
+            .get(crate::tools::GET_ARTIFACT_TOOL)
+            .and_then(|t| t.artifact_store())
+    }
+}
+
+/// Re-attach loaded artifact bytes as a follow-up USER turn.
+///
+/// `get_artifact` returns only a confirmation string; the executor owes the
+/// model the bytes. They cannot ride the `role: tool` result itself — that role
+/// carries text alone — so they arrive as the next user turn instead.
+#[cfg(feature = "artifacts")]
+async fn artifact_turn(
+    mut load_ids: Vec<String>,
+    store: &Arc<dyn crate::artifacts::ArtifactStore>,
+    scope: &str,
+) -> Option<ChatCompletionRequestMessage> {
+    use crate::core::content::{ContentPart, ContentSource};
+    use crate::models::Role;
+
+    let requested = load_ids.len();
+    let dropped = super::tool_executor::plan_reinjection(&mut load_ids);
+    if load_ids.is_empty() {
+        return None;
+    }
+
+    let mut parts = vec![ContentPart::text(
+        "Artifacts you loaded this round, attached below:".to_string(),
+    )];
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "ToolExecutorJsonStage: re-attaching {} of {requested} requested artifacts",
+            load_ids.len()
+        );
+        parts.push(ContentPart::text(format!(
+            "(only {} artifacts were re-attached this round; not attached: {})",
+            super::tool_executor::MAX_REINJECTED_ARTIFACTS,
+            dropped.join(", ")
+        )));
+    }
+
+    for id in load_ids {
+        match store.load(scope, &id).await {
+            Ok(art) if art.mime_type.starts_with("image/") => parts.push(ContentPart::image(
+                ContentSource::Inline { data: art.data },
+                art.mime_type,
+            )),
+            Ok(art) => parts.push(ContentPart::text(format!(
+                "(artifact {id} is {}, which cannot be shown inline)",
+                art.mime_type
+            ))),
+            Err(e) => {
+                tracing::warn!("ToolExecutorJsonStage: get_artifact '{id}' failed: {e}");
+                parts.push(ContentPart::text(format!(
+                    "(could not re-attach artifact {id})"
+                )));
+            }
+        }
+    }
+
+    let msg = crate::LlmMessage::with_parts(Role::User, parts);
+    ToolsLlmClient::base_messages(&[msg]).into_iter().next()
 }
 
 /// What one loop round decided.
@@ -167,10 +233,43 @@ async fn execute_local(
     result
 }
 
+enum LoopOutcome {
+    Answer(String),
+    Remote(String),
+}
+
+impl LoopOutcome {
+    fn text(&self) -> &str {
+        match self {
+            Self::Answer(t) | Self::Remote(t) => t,
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Answer(t) | Self::Remote(t) => t,
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+}
+
 struct Round {
     outcome: RoundOutcome,
     /// Events to surface (ToolCall/ToolResult), in order.
     events: Vec<StreamEvent>,
+}
+
+/// The turn-invariant inputs to a round, which travel together.
+struct RoundDeps<'a> {
+    registry: &'a ToolRegistry,
+    tool_ctx: &'a ToolContext,
+    /// Trusted delivery channel — the correlation key and the artifact scope.
+    message_channel: &'a str,
+    trusted_sender: Option<&'a str>,
+    tools: &'a [async_openai::types::chat::ChatCompletionTools],
 }
 
 impl ToolExecutorJsonStage {
@@ -179,13 +278,17 @@ impl ToolExecutorJsonStage {
     /// ends the loop via the returned outcome.
     async fn run_round(
         &self,
-        registry: &ToolRegistry,
-        tool_ctx: &ToolContext,
-        trusted_sender: Option<&str>,
+        deps: &RoundDeps<'_>,
         messages: &mut Vec<ChatCompletionRequestMessage>,
-        tools: &[async_openai::types::chat::ChatCompletionTools],
         iteration: usize,
     ) -> Result<Round> {
+        let RoundDeps {
+            registry,
+            tool_ctx,
+            message_channel,
+            trusted_sender,
+            tools,
+        } = *deps;
         let outcome = self
             .client
             .chat_with_tools(messages.clone(), tools, None)
@@ -221,15 +324,35 @@ impl ToolExecutorJsonStage {
             .iter()
             .find_map(|c| remote_executor_for(registry, &c.name, trusted_sender).map(|id| (c, id)))
         {
+            // Malformed args become an error result, as in `execute_local` —
+            // never a dispatched call with the arguments replaced by `{}`.
+            let args = if call.arguments.trim().is_empty() {
+                Ok(serde_json::json!({}))
+            } else {
+                serde_json::from_str::<serde_json::Value>(&call.arguments)
+            };
+            let args = match args {
+                Ok(args) => args,
+                Err(e) => {
+                    messages.push(tool_turn(
+                        &call.id,
+                        format!("Error: invalid arguments JSON: {e}"),
+                    )?);
+                    return Ok(Round {
+                        outcome: RoundOutcome::Continue,
+                        events,
+                    });
+                }
+            };
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            let args = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::json!({}));
             let (framed, call_id) = frame_remote_call(&call.name, &args, outcome.content.trim());
+            // The trusted delivery channel is what `RemoteResultGate` claims
+            // under; `tool_ctx.channel_id` is the workspace id and never matches.
             self.pending.record_for(
-                &tool_ctx.channel_id,
+                message_channel,
                 executor_id.as_deref().or(trusted_sender),
                 &call_id,
                 &call.name,
@@ -240,17 +363,34 @@ impl ToolExecutorJsonStage {
             });
         }
 
+        #[cfg(feature = "artifacts")]
+        let mut load_ids: Vec<String> = Vec::new();
+
         for call in &outcome.tool_calls {
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
+            #[cfg(feature = "artifacts")]
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                && let Some(id) = super::tool_executor::get_artifact_id(&call.name, &parsed)
+            {
+                load_ids.push(id);
+            }
             let result = execute_local(registry, tool_ctx, call).await;
             events.push(StreamEvent::ToolResult {
                 name: call.name.clone(),
                 result: result.clone(),
             });
             messages.push(tool_turn(&call.id, result)?);
+        }
+
+        #[cfg(feature = "artifacts")]
+        if !load_ids.is_empty()
+            && let Some(store) = self.artifact_store()
+            && let Some(msg) = artifact_turn(load_ids, &store, message_channel).await
+        {
+            messages.push(msg);
         }
 
         Ok(Round {
@@ -261,29 +401,29 @@ impl ToolExecutorJsonStage {
 
     /// Full loop shared by the streaming and non-streaming paths. Returns the
     /// final response text plus every ToolCall/ToolResult event in order.
-    async fn run_loop(&self, ctx: &Context) -> Result<(String, Vec<StreamEvent>)> {
+    async fn run_loop(&self, ctx: &Context) -> Result<(LoopOutcome, Vec<StreamEvent>)> {
         let registry = registry_for_turn(ctx, &self.registry);
         let tool_ctx = tool_context_for(ctx);
         let tools = ToolsLlmClient::tool_specs(&registry);
         let mut messages = ToolsLlmClient::base_messages(&ctx.llm_messages);
-        let trusted_sender = ctx.message.trusted_sender_id();
+        let deps = RoundDeps {
+            registry: &registry,
+            tool_ctx: &tool_ctx,
+            message_channel: &ctx.message.channel_id,
+            trusted_sender: ctx.message.trusted_sender_id(),
+            tools: &tools,
+        };
 
         let mut all_events = Vec::new();
         for iteration in 0..self.max_iterations {
-            let round = self
-                .run_round(
-                    &registry,
-                    &tool_ctx,
-                    trusted_sender,
-                    &mut messages,
-                    &tools,
-                    iteration,
-                )
-                .await?;
+            let round = self.run_round(&deps, &mut messages, iteration).await?;
             all_events.extend(round.events);
             match round.outcome {
-                RoundOutcome::Final(text) | RoundOutcome::Remote(text) => {
-                    return Ok((text, all_events));
+                RoundOutcome::Final(text) => {
+                    return Ok((LoopOutcome::Answer(text), all_events));
+                }
+                RoundOutcome::Remote(text) => {
+                    return Ok((LoopOutcome::Remote(text), all_events));
                 }
                 RoundOutcome::Continue => {}
             }
@@ -296,7 +436,7 @@ impl ToolExecutorJsonStage {
         messages.push(user_turn(SUMMARY_PROMPT)?);
         // No tools on the summary request — the model must answer, not call.
         let summary = self.client.chat_with_tools(messages, &[], None).await?;
-        Ok((summary.content, all_events))
+        Ok((LoopOutcome::Answer(summary.content), all_events))
     }
 
     /// The shared result-gate prologue; `true` means the turn was dropped.
@@ -325,8 +465,8 @@ impl PipelineStage for ToolExecutorJsonStage {
         if self.gate_dropped(ctx).await? {
             return Ok(());
         }
-        let (final_content, _events) = self.run_loop(ctx).await?;
-        ctx.response = Some(final_content);
+        let (outcome, _events) = self.run_loop(ctx).await?;
+        ctx.response = Some(outcome.into_text());
         Ok(())
     }
 }
@@ -342,20 +482,22 @@ impl StreamingStage for ToolExecutorJsonStage {
                     return;
                 }
             }
-            // Rounds are non-streaming API calls, so events surface per
-            // completed round — the same granularity the XML stage delivers
-            // (it buffers every round before forwarding chunks).
+            // Rounds are non-streaming API calls, so ToolCall/ToolResult events
+            // replay once the loop ends rather than live as the XML stage does.
             match self.run_loop(ctx).await {
                 Err(error) => {
                     yield StreamEvent::Error { message: error.to_string() };
                 }
-                Ok((final_content, events)) => {
+                Ok((outcome, events)) => {
                     for event in events {
                         yield event;
                     }
-                    if !final_content.is_empty() {
-                        yield StreamEvent::Chunk { content: final_content.clone() };
+                    // A framed remote call is control traffic for the client,
+                    // never spoken prose — Chunk feeds TTS (ADR-0008).
+                    if !outcome.is_remote() && !outcome.text().is_empty() {
+                        yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
+                    let final_content = outcome.into_text();
                     ctx.response = Some(final_content.clone());
                     yield StreamEvent::Complete { content: final_content, usage: None };
                 }
@@ -456,6 +598,96 @@ mod tests {
         stage.process(&mut ctx).await.unwrap();
 
         assert!(ctx.halted);
+    }
+
+    /// A workspace-stamped message must still let its own result back in.
+    /// `tool_context_for` rewrites `channel_id` to the `magickspace_id`
+    /// metadata, so recording under the tool context instead of the delivery
+    /// channel silently strands every remote call on Centrifugo.
+    #[tokio::test]
+    async fn a_recorded_remote_call_is_claimable_under_a_workspace_stamp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "take_photo", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed before completing the headers");
+                req.extend_from_slice(&buf[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+        });
+
+        let client = ToolsLlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = ToolExecutorJsonStage::new(client, Arc::new(registry));
+
+        let mut stamped = crate::models::Message::new("hi", "client", "chan1");
+        stamped
+            .metadata
+            .insert("magickspace_id".into(), json!("space-42"));
+        let mut ctx = Context::new(
+            Arc::new(stamped),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        assert_ne!(
+            tool_context_for(&ctx).channel_id,
+            ctx.message.channel_id,
+            "test is vacuous unless the two keys actually differ"
+        );
+
+        stage.process(&mut ctx).await.unwrap();
+        let framed: serde_json::Value =
+            serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
+                .expect("the response is the tool_call envelope");
+        assert_eq!(framed["type"], "tool_call");
+        let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
+
+        let mut result_ctx = Context::new(
+            Arc::new(crate::models::Message::new(
+                format!("<tool_result name=\"take_photo\" call=\"{call_id}\">ok</tool_result>"),
+                "client",
+                "chan1",
+            )),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        stage.result_gate().process(&mut result_ctx).await.unwrap();
+
+        assert!(
+            !result_ctx.halted,
+            "the gate dropped a result answering its own outstanding call"
+        );
     }
 
     #[test]

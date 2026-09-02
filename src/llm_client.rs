@@ -6,6 +6,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
+
+/// Bounds one non-streaming LLM request. A tool loop runs up to
+/// `DEFAULT_MAX_ITERATIONS` of these in sequence. Never apply it to a streaming
+/// client: reqwest's timeout spans the body read, which would truncate a long
+/// generation mid-stream.
+pub(crate) const LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(crate) const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::core::content::{ContentPart, ContentSource};
 use crate::{LlmMessage, Role, StreamEvent, TokenUsage};
@@ -255,8 +264,12 @@ impl LlmClient {
             default_headers.insert("x-api-key", val);
         }
 
+        // The credential rides a custom header, which reqwest does NOT strip
+        // across origins the way it strips `Authorization`.
         let http_client = reqwest::ClientBuilder::new()
             .default_headers(default_headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(LLM_CONNECT_TIMEOUT)
             .build()
             .map_err(|e| crate::MindroidError::Other(anyhow::Error::from(e)))?;
 

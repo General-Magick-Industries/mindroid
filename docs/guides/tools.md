@@ -83,6 +83,15 @@ The generated prompt includes each tool's name, description, and JSON Schema par
 
 ## Tool Execution Loop
 
+> Two executor stages implement this loop. `ToolExecutorStage`, described below,
+> asks the model for `<tool_call>` markup and parses it back out of the response
+> text. `ToolExecutorJsonStage` instead sends tools in the request's native
+> `tools` field and reads structured `tool_calls` back, which is what you want on
+> an endpoint that speaks OpenAI function calling — the XML failure modes in this
+> section do not apply to it. Everything else (registry, `ToolContext`, remote
+> tools, artifact re-injection) is identical. See "Choosing a tool executor" in
+> `AGENTS.md`.
+
 `ToolExecutorStage` implements an iterative loop that lets the LLM use multiple tools in sequence:
 
 ```

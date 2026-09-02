@@ -144,12 +144,18 @@ identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0
 
 Two interchangeable executor stages consume the same `ToolRegistry` and keep the
 same remote-tool wire contract (`{type: "tool_call"}` out, `TOOL_RESULT` back
-through the correlation gate). They differ only in how a call reaches the model:
+through the correlation gate). The primary difference is how a call reaches the
+model:
 
 | Stage | How calls travel | Use when |
 |-------|------------------|----------|
 | `ToolExecutorStage` | prompt-XML `<tool_call>`, parsed back out of the response text | the endpoint has no native `tools` field |
 | `ToolExecutorJsonStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
+
+Both re-attach artifact bytes and clear the same remote-call correlation gate.
+They differ in event timing: the XML stage yields `ToolCall`/`ToolResult` live,
+mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
+events replay once the loop ends.
 
 `ToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling

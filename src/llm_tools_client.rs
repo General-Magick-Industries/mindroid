@@ -21,9 +21,30 @@ use async_openai::{
     },
 };
 
-use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
-use crate::tools::ToolRegistry;
+use crate::core::prompt_text::sanitize_line;
+use crate::llm_client::{AuthStyle, LLM_REQUEST_TIMEOUT, LlmClient, LlmClientConfig};
+use crate::tools::{MAX_REMOTE_TOOL_PROMPT_BYTES, ToolRegistry};
 use crate::{LlmMessage, TokenUsage};
+
+/// Fold control characters out of every string a publisher placed in a schema —
+/// property keys and their descriptions both reach the model.
+fn sanitize_schema_text(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => *s = sanitize_line(s),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_schema_text),
+        serde_json::Value::Object(map) => {
+            *map = map
+                .iter()
+                .map(|(k, v)| {
+                    let mut v = v.clone();
+                    sanitize_schema_text(&mut v);
+                    (sanitize_line(k), v)
+                })
+                .collect();
+        }
+        _ => {}
+    }
+}
 
 /// One structured tool call the model made.
 #[derive(Debug, Clone)]
@@ -77,8 +98,12 @@ impl ToolsLlmClient {
             default_headers.insert("x-api-key", val);
         }
 
+        // reqwest strips `Authorization` across origins but not `x-api-key`,
+        // so a redirect would hand the key to another host.
         let http_client = reqwest::ClientBuilder::new()
             .default_headers(default_headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(LLM_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| crate::MindroidError::Other(anyhow::Error::from(e)))?;
 
@@ -93,21 +118,39 @@ impl ToolsLlmClient {
     }
 
     /// Render a registry's tools as the request's native function specs.
+    ///
+    /// Publisher-supplied text on a remote tool is neutralized and budgeted
+    /// here, because the JSON path never renders `ToolRegistry::system_prompt`
+    /// — the single point where the XML path does the same (MM-456).
     pub fn tool_specs(registry: &ToolRegistry) -> Vec<ChatCompletionTools> {
-        registry
-            .tools()
-            .iter()
-            .map(|tool| {
-                ChatCompletionTools::Function(ChatCompletionTool {
-                    function: FunctionObject {
-                        name: tool.name().to_string(),
-                        description: Some(tool.description().to_string()),
-                        parameters: Some(tool.parameters_schema()),
-                        strict: None,
-                    },
-                })
-            })
-            .collect()
+        let mut remote_bytes = 0usize;
+        let mut specs = Vec::new();
+        for tool in registry.tools() {
+            let mut name = tool.name().to_string();
+            let mut description = tool.description().to_string();
+            let mut parameters = tool.parameters_schema();
+
+            if tool.is_remote() {
+                name = sanitize_line(&name);
+                description = sanitize_line(&description);
+                sanitize_schema_text(&mut parameters);
+                let cost = name.len() + description.len() + parameters.to_string().len();
+                if remote_bytes + cost > MAX_REMOTE_TOOL_PROMPT_BYTES {
+                    continue;
+                }
+                remote_bytes += cost;
+            }
+
+            specs.push(ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name,
+                    description: Some(description),
+                    parameters: Some(parameters),
+                    strict: None,
+                },
+            }));
+        }
+        specs
     }
 
     fn pipeline_err(message: String) -> crate::MindroidError {

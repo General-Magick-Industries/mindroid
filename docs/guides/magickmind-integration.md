@@ -171,8 +171,10 @@ let prepared = client
     .await?;
 let messages: Vec<LlmMessage> = prepared.messages;
 // prepared.corpora lists the space's bound knowledge bases ({id, name,
-// description}) for wiring a corpus-query tool; the catalog system block is
-// rendered only when `MagickmindContextConfig::include_corpus_catalog` is set.
+// description}); pass them to the shipped `CorpusTool` by putting a
+// `CorpusCatalog(prepared.corpora)` in the tool run scope for the turn. The
+// catalog system block is rendered only when
+// `MagickmindContextConfig::include_corpus_catalog` is set.
 
 // Save a message
 let msg_id: Option<String> = client

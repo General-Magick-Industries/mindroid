@@ -6,7 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
+use crate::core::net::{error_excerpt, note_auth_status, require_secure_url, secure_json_client};
 use crate::error::{MindroidError, Result};
 use crate::models::CredentialKind;
 use crate::pipeline::presets::magickmind::CorpusCatalogEntry;
@@ -29,6 +31,7 @@ pub struct CorpusTool {
     activation_ids: Vec<String>,
     description: String,
     allow_insecure: bool,
+    client: reqwest::Client,
 }
 
 const BASE_DESCRIPTION: &str = "Query one of the knowledge corpora bound to this space for relevant \
@@ -47,6 +50,7 @@ impl CorpusTool {
             activation_ids: Vec::new(),
             description: BASE_DESCRIPTION.to_string(),
             allow_insecure: false,
+            client: secure_json_client(HTTP_TIMEOUT),
         }
     }
 
@@ -155,21 +159,11 @@ impl Tool for CorpusTool {
             ));
         }
 
-        if !self.base_url.starts_with("https://") && !self.allow_insecure {
-            return Err(MindroidError::config(
-                "refusing to send the agent's credential over a non-TLS corpus URL",
-            ));
-        }
+        require_secure_url(&self.base_url, self.allow_insecure, "corpus.allow_insecure")?;
 
         let headers = crate::auth::build_auth_header_map(creds.auth.as_ref()).await?;
-        let mut request = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            // Redirects are banned for the same reason as the shared llm
-            // client: reqwest strips Authorization across hosts unreliably and
-            // never strips the x-api-key header at all.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| MindroidError::config(format!("corpus query client: {e}")))?
+        let mut request = self
+            .client
             .post(self.query_url(corpus_id))
             .headers(headers)
             // only_need_context: the agent wants retrieved passages to reason
@@ -185,6 +179,7 @@ impl Tool for CorpusTool {
         })?;
 
         let status = resp.status();
+        note_auth_status(creds.auth.as_ref(), status);
         if status == reqwest::StatusCode::NOT_FOUND {
             // The catalog said yes but the backend said no: unbound since the
             // turn's context prepare, or a tenant-boundary refusal (the backend
@@ -197,6 +192,8 @@ impl Tool for CorpusTool {
             ));
         }
         if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            warn!("corpus query failed ({status}): {}", error_excerpt(&body));
             return Err(MindroidError::Api {
                 message: "corpus query failed".into(),
                 status_code: Some(status.as_u16()),

@@ -11,7 +11,7 @@ use crate::core::prompt_text::{escape_markup, sanitize_line};
 /// what that JSON renders to: `&` escapes to `&amp;`, a 5x expansion, and every
 /// other cap is per-tool or per-string. The rendered form is where the aggregate
 /// is knowable.
-const MAX_REMOTE_TOOL_PROMPT_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_REMOTE_TOOL_PROMPT_BYTES: usize = 32 * 1024;
 
 /// Render one tool's entry as the model will see it.
 ///
