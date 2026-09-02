@@ -11,8 +11,8 @@ mod post_processor;
 pub mod stt;
 #[cfg(feature = "llm-client")]
 mod tool_executor;
+mod tool_executor_xml;
 #[cfg(feature = "llm-client")]
-mod tool_executor_json;
 pub mod tts;
 
 #[cfg(feature = "artifacts")]
@@ -37,11 +37,11 @@ pub use stt::OpenAiStt;
 pub use stt::OpenAiSttConfig;
 pub use stt::{SttProvider, SttStage};
 #[cfg(feature = "llm-client")]
-pub use tool_executor::{
-    ParsedToolCall, RemoteResultGate, ToolCallParser, ToolExecutorStage, XmlToolCallParser,
-};
+pub use tool_executor::ToolExecutorStage;
 #[cfg(feature = "llm-client")]
-pub use tool_executor_json::ToolExecutorJsonStage;
+pub use tool_executor_xml::{
+    ParsedToolCall, RemoteResultGate, ToolCallParser, XmlToolCallParser, XmlToolExecutorStage,
+};
 #[cfg(feature = "transport-audio")]
 pub use tts::AudioOutputStage;
 #[cfg(feature = "speech")]

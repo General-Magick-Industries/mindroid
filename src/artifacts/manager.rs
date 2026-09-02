@@ -46,7 +46,7 @@ impl ArtifactManager {
     /// let registry = ToolRegistry::new().register(tool);
     /// let pipeline = Pipeline::new()
     ///     .add_stage(IngestStage::default_media())
-    ///     .add_streaming_stage(ToolExecutorStage::new(client, Arc::new(registry)))
+    ///     .add_streaming_stage(XmlToolExecutorStage::new(client, Arc::new(registry)))
     ///     .add_stage(offload);
     /// ```
     #[cfg(feature = "llm-client")]

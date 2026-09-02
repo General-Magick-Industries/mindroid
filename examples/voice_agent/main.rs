@@ -1,7 +1,7 @@
 //! Voice agent: microphone → STT → LLM (with tools) → TTS.
 //!
 //! Demonstrates the full audio pipeline: AudioTransport captures speech from
-//! the microphone using Silero VAD, SttStage transcribes it, ToolExecutorStage
+//! the microphone using Silero VAD, SttStage transcribes it, XmlToolExecutorStage
 //! generates a response and can control the local computer (run commands, open
 //! apps and URLs), and TtsStage synthesizes the final spoken reply.
 //!
@@ -29,7 +29,7 @@ use clap::Parser;
 use mindroid::TransportSender;
 use mindroid::auth::static_id::StaticAuth;
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::stages::{PostProcessor, SimpleContextBuilder, ToolExecutorStage};
+use mindroid::pipeline::stages::{PostProcessor, SimpleContextBuilder, XmlToolExecutorStage};
 use mindroid::runtime::TransportSend;
 use mindroid::skills::SkillSet;
 use mindroid::tools::ToolRegistry;
@@ -486,7 +486,7 @@ async fn main() -> anyhow::Result<()> {
     let builder = if text_mode {
         let pipeline = Pipeline::new()
             .add_stage(SimpleContextBuilder::with_prompt(jarvis_prompt).with_skills(&skills))
-            .add_streaming_stage(ToolExecutorStage::new(llm, registry))
+            .add_streaming_stage(XmlToolExecutorStage::new(llm, registry))
             .add_stage(PostProcessor);
         Runtime::builder()
             .config(config)
@@ -500,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
         let pipeline = Pipeline::new()
             .add_stage(mindroid::SttStage::from_arc(Arc::from(stt)))
             .add_stage(SimpleContextBuilder::with_prompt(jarvis_prompt).with_skills(&skills))
-            .add_streaming_stage(ToolExecutorStage::new(llm, registry))
+            .add_streaming_stage(XmlToolExecutorStage::new(llm, registry))
             .add_stage(PostProcessor);
         let audio =
             AudioTransport::with_config(&config.agent.agent_id, AudioTransportConfig::default());

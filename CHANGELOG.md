@@ -69,18 +69,56 @@ destructure.
 struct-literal construction without `..Default::default()` no longer compiles —
 add the field (or the `..Default::default()` tail).
 
+#### 5. The native tool executor takes the plain name; the XML one is qualified
+
+Native function calling is the default path now, so it owns the unqualified
+name. The prompt-XML stage keeps working and is still the right choice on an
+endpoint with no native `tools` field — including Cortex, which cannot carry a
+tool result back at all.
+
+```rust
+// before
+ToolExecutorStage::new(client, registry)          // prompt-XML
+ToolExecutorJsonStage::new(tools_client, registry) // native
+
+// after
+XmlToolExecutorStage::new(client, registry)       // prompt-XML, unchanged behaviour
+ToolExecutorStage::new(client, registry)          // native
+```
+
+`ToolsLlmClient` is gone: it is merged into `LlmClient`, which now serves both
+stages. A native round is `LlmClient::chat_with_tools`. The two types shared a
+config, auth style, header construction and base URL, so the split only
+duplicated the constructor.
+
+```rust
+// before
+let tools_client = ToolsLlmClient::new(config.clone())?;
+ToolExecutorJsonStage::new(tools_client, registry)
+
+// after
+ToolExecutorStage::new(LlmClient::new(config)?, registry)
+```
+
+Both non-streaming calls (`chat`, `chat_with_tools`) are now bounded by a
+120s deadline applied per call rather than on the shared HTTP client, so
+`stream_chat` keeps its unbounded body read and long generations are not
+truncated.
+
 ### Added
 
-- `ToolExecutorJsonStage` — a native (JSON) function-calling twin of
-  `ToolExecutorStage`, with `ToolsLlmClient` as its client. Models post-trained
-  for native tool calling mangle the prompt-XML format, and an unparseable call
-  falls through as the final answer, so tool syntax reaches the user. The XML
-  stage remains the default in every preset; swap deliberately, and only on an
-  endpoint that speaks native tools — notably NOT Cortex, whose ReasonService is
-  deliberately not an OpenAI drop-in and cannot carry a tool result back. Remote-
-  tool wire contract and correlation gate match the XML stage; artifacts are
-  re-attached as a follow-up `user` turn, since the `tool` role carries text
-  alone.
+- `ToolExecutorStage` — native (JSON) function calling, now the default
+  executor. Models post-trained for native tool calling mangle the prompt-XML
+  format, and an unparseable call falls through as the final answer, so tool
+  syntax reaches the user. Use it on any endpoint that speaks native tools —
+  notably NOT Cortex, whose ReasonService is deliberately not an OpenAI drop-in
+  and cannot carry a tool result back; keep `XmlToolExecutorStage` there. Remote-
+  tool wire contract and correlation gate are identical between the two;
+  artifacts are re-attached as a follow-up `user` turn, since the `tool` role
+  carries text alone.
+- `LlmClient::chat_with_tools`, `LlmClient::tool_specs` and
+  `LlmClient::convert_messages` — one client now covers streaming chat and
+  native tool rounds. `NativeToolCall` and `ToolsChatOutcome` come with them.
 - `CorpusTool` (`query_corpus`) plus `CorpusCatalog` — knowledge-corpus
   retrieval over the end-user query route, behind `magickmind` + `llm-hosted`.
   The model-chosen `corpus_id` must match the turn's catalog or an
@@ -108,7 +146,7 @@ add the field (or the `..Default::default()` tail).
 
 ### Fixed
 
-- `ToolExecutorStage` recorded an outstanding remote call under
+- `XmlToolExecutorStage` recorded an outstanding remote call under
   `ToolContext::channel_id` — the workspace id on any transport that stamps
   `magickspace_id` — while `RemoteResultGate` claims the returning result under
   the delivery channel. The keys never matched, so on Centrifugo every client
@@ -138,7 +176,7 @@ add the field (or the `..Default::default()` tail).
   correlation gate as an ordinary turn. Both previously reached the LLM as user
   content. A pipeline that omits `RemoteResultGate`, or orders it after context
   building, no longer becomes the permissive one.
-- `RemoteResultGate` and `ToolExecutorStage` now activate on the declared
+- `RemoteResultGate` and `XmlToolExecutorStage` now activate on the declared
   `MessageType::ToolResult` as well as on `<tool_result>` markup. Correlation
   keyed on markup alone, so a result whose body failed to normalize kept its
   raw body and slipped the gate by no longer looking like a result.
@@ -355,9 +393,9 @@ built-in `LocalArtifactStore`.
   channel rather than the payload.
 - **Remote tool results are correlated against outstanding calls.** An
   unsolicited `tool_result` — for a call the agent never made — was accepted and
-  rendered into history as genuine execution output. `ToolExecutorStage` now
+  rendered into history as genuine execution output. `XmlToolExecutorStage` now
   records each emitted call's `tool_call_id`, and the new `RemoteResultGate`
-  stage (`ToolExecutorStage::result_gate`) claims results against it. Claiming is
+  stage (`XmlToolExecutorStage::result_gate`) claims results against it. Claiming is
   one-shot, so at-least-once redelivery cannot append the same result twice, and
   the pending set is per-channel, bounded, and expiring.
 - **Inbound tool results can no longer forge tool executions.** `name` and

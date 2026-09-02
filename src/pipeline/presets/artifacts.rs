@@ -4,7 +4,7 @@
 //! The full artifact flow needs the same [`ArtifactStore`] in two places: the
 //! [`ArtifactOffload`] stage (write references) and the [`GetArtifactTool`] (the
 //! model's fetch tool). The store lives ON the tool, so the
-//! [`ToolExecutorStage`](crate::pipeline::stages::ToolExecutorStage) finds it
+//! [`XmlToolExecutorStage`](crate::pipeline::stages::XmlToolExecutorStage) finds it
 //! automatically when the tool is registered — no separate store injection.
 //! These builders hand back the matched `(offload, tool)` pair sharing one store;
 //! you place each where you want:
@@ -15,7 +15,7 @@
 //! let registry = ToolRegistry::new().register(tool); // + your other tools
 //! let pipeline = Pipeline::new()
 //!     .add_stage(IngestStage::default_media())
-//!     .add_streaming_stage(ToolExecutorStage::new(client, Arc::new(registry)))
+//!     .add_streaming_stage(XmlToolExecutorStage::new(client, Arc::new(registry)))
 //!     .add_stage(offload)          // place the offload wherever you like
 //!     .add_stage(PostProcessor);
 //! ```

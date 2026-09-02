@@ -3,7 +3,7 @@
 //! Because [`Tool::execute`] has no access to the live pipeline `Context`, this
 //! tool cannot itself attach image bytes to the conversation. It validates the id
 //! and returns a confirmation string; the actual byte re-injection is done by
-//! [`ToolExecutorStage`](crate::pipeline::stages::ToolExecutorStage), which holds
+//! [`XmlToolExecutorStage`](crate::pipeline::stages::XmlToolExecutorStage), which holds
 //! `&mut ctx` and recognizes a `get_artifact` call by name.
 
 use async_trait::async_trait;
@@ -23,7 +23,7 @@ pub const GET_ARTIFACT_TOOL: &str = "get_artifact";
 ///
 /// **Scope:** the `scope` held here is used ONLY for the validation message
 /// returned by `execute`. The bytes the model actually sees are re-injected by
-/// [`ToolExecutorStage`](crate::pipeline::stages::ToolExecutorStage) using the
+/// [`XmlToolExecutorStage`](crate::pipeline::stages::XmlToolExecutorStage) using the
 /// live per-message scope (`ctx.message.channel_id`), which is authoritative. In
 /// a multi-channel process this tool's pinned scope can therefore disagree with
 /// the executor's, making `execute`'s confirmation string wrong while the
@@ -96,7 +96,7 @@ impl Tool for GetArtifactTool {
 
     async fn execute(&self, args: Value, _ctx: &crate::tools::ToolContext) -> Result<String> {
         let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        // The actual bytes are attached by ToolExecutorStage (which holds ctx and
+        // The actual bytes are attached by XmlToolExecutorStage (which holds ctx and
         // the authoritative scope). Here we only produce the confirmation string.
         match &self.scope {
             Some(scope) => Ok(self.manager.load_described(scope, id).await),
@@ -105,7 +105,7 @@ impl Tool for GetArtifactTool {
         }
     }
 
-    /// Expose the backing store so `ToolExecutorStage` can re-inject loaded bytes
+    /// Expose the backing store so `XmlToolExecutorStage` can re-inject loaded bytes
     /// without a separate store injection.
     fn artifact_store(&self) -> Option<Arc<dyn ArtifactStore>> {
         Some(self.manager.store().clone())

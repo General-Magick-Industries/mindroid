@@ -82,13 +82,13 @@ impl DynamicRegistry {
 
 /// Registry of tools available to the agent.
 ///
-/// Pass to [`ToolExecutorStage`](crate::pipeline::stages::ToolExecutorStage) after building:
+/// Pass to [`XmlToolExecutorStage`](crate::pipeline::stages::XmlToolExecutorStage) after building:
 ///
 /// ```ignore
 /// let registry = ToolRegistry::new()
 ///     .register(ShellTool::default())
 ///     .register(OpenTool);
-/// let stage = ToolExecutorStage::new(client, Arc::new(registry));
+/// let stage = XmlToolExecutorStage::new(client, Arc::new(registry));
 /// ```
 #[derive(Clone)]
 pub struct ToolRegistry {

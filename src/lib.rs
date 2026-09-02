@@ -18,7 +18,7 @@ pub use skills::{
 pub mod tools;
 #[cfg(feature = "llm-client")]
 pub use pipeline::stages::{
-    ParsedToolCall, ToolCallParser, ToolExecutorJsonStage, ToolExecutorStage, XmlToolCallParser,
+    ParsedToolCall, ToolCallParser, ToolExecutorStage, XmlToolCallParser, XmlToolExecutorStage,
 };
 pub use tools::{
     DelegationTool, OpenTool, ReminderRoutine, ReminderStore, RemoteTool, SetReminderTool,
@@ -40,10 +40,7 @@ pub mod transport;
 #[cfg(feature = "llm-client")]
 pub mod llm_client;
 
-#[cfg(feature = "llm-client")]
-pub mod llm_tools_client;
-
-/// Re-exported because [`llm_tools_client::ToolsLlmClient`] carries its request
+/// Re-exported because [`llm_client::LlmClient`] carries its request
 /// types in public signatures: a consumer cannot name them otherwise, and a
 /// version bump here is a breaking change to this crate.
 #[cfg(feature = "llm-client")]

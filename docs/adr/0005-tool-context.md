@@ -2,7 +2,7 @@
 
 - Status: Accepted (2026-08-06)
 - Deciders: Mindroid maintainers
-- Applies to: the `Tool` trait (`src/tools/`) and `ToolExecutorStage`
+- Applies to: the `Tool` trait (`src/tools/`) and `XmlToolExecutorStage`
 
 ## Context
 
