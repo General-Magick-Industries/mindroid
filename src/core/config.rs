@@ -554,6 +554,11 @@ pub struct ModelConfig {
     /// `v1`; set `v2` for an endpoint that serves a second API version at the
     /// same host.
     pub api_path: Option<String>,
+    /// Extra top-level fields merged into every chat request body — knobs the
+    /// endpoint understands but the OpenAI schema has no name for. A key here
+    /// overrides the typed field of the same name.
+    #[serde(default)]
+    pub extra_body: HashMap<String, serde_json::Value>,
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 }
@@ -721,6 +726,7 @@ impl MindroidConfig {
             .trim_matches('/');
         let mut llm_config = LlmClientConfig::new(format!("{base_url}/{api_path}"));
         llm_config.default_reasoning_effort = model_cfg.reasoning_effort.clone();
+        llm_config.extra_body = model_cfg.extra_body.clone();
         llm_config.api_key = api_key;
         llm_config.default_model = model_cfg.model.clone();
         llm_config.auth_style = auth_style;
@@ -777,6 +783,33 @@ mod example_config_tests {
             .unwrap_or_else(|e| panic!("scope = \"{literal}\" must parse: {e}"));
             assert_eq!(cfg.episodes.scope, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod llm_config_tests {
+    use super::*;
+
+    #[test]
+    fn extra_body_reaches_the_client_config() {
+        let cfg = MindroidConfig::from_toml_str(
+            r#"
+            [providers.p]
+            base_url = "https://example.test"
+            api_key = "k"
+            [models.m]
+            provider = "p"
+            model = "x"
+            [models.m.extra_body]
+            verified = true
+            "#,
+        )
+        .unwrap();
+        let llm = cfg.llm("m").unwrap();
+        assert_eq!(
+            llm.extra_body.get("verified"),
+            Some(&serde_json::json!(true))
+        );
     }
 }
 

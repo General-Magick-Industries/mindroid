@@ -28,8 +28,10 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-        ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FinishReason,
-        FunctionObject, ImageUrl, ReasoningEffort, ResponseFormat,
+        ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionObject, ImageUrl,
+        ReasoningEffort, ResponseFormat,
     },
 };
 use futures::StreamExt;
@@ -71,6 +73,9 @@ pub struct LlmClientConfig {
     pub auth_style: AuthStyle,
     /// Extra headers to include on every request.
     pub custom_headers: HashMap<String, String>,
+    /// Extra top-level fields merged into every request body; a key here
+    /// overrides the typed field of the same name.
+    pub extra_body: HashMap<String, serde_json::Value>,
 }
 
 impl LlmClientConfig {
@@ -85,8 +90,22 @@ impl LlmClientConfig {
             default_reasoning_effort: None,
             auth_style: AuthStyle::Bearer,
             custom_headers: HashMap::new(),
+            extra_body: HashMap::new(),
         }
     }
+}
+
+/// The typed request as JSON with `extra_body` merged over it. Sent through
+/// async-openai's bring-your-own-type methods, which post any `Serialize`.
+fn body_with_extras(
+    request: &CreateChatCompletionRequest,
+    extra_body: &HashMap<String, serde_json::Value>,
+) -> serde_json::Result<serde_json::Value> {
+    let mut body = serde_json::to_value(request)?;
+    if let Some(map) = body.as_object_mut() {
+        map.extend(extra_body.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    Ok(body)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,12 +423,14 @@ impl LlmClient {
         if !tools.is_empty() {
             request.tools = Some(tools.to_vec());
         }
+        let body = body_with_extras(&request, &self.config.extra_body)
+            .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))?;
 
         // The shared http client carries only a connect timeout, because a full
         // reqwest timeout spans the body read and would truncate `stream_chat`.
         // Non-streaming calls bound themselves here instead.
-        let response =
-            tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create(request))
+        let response: CreateChatCompletionResponse =
+            tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create_byot(body))
                 .await
                 .map_err(|_| {
                     Self::pipeline_err(format!(
@@ -590,12 +611,14 @@ impl LlmClient {
         if let Some(fmt) = req.response_format {
             request.response_format = Some(fmt);
         }
+        let body = body_with_extras(&request, &self.config.extra_body)
+            .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))?;
 
         // The shared http client carries only a connect timeout, because a full
         // reqwest timeout spans the body read and would truncate `stream_chat`.
         // Non-streaming calls bound themselves here instead.
-        let response =
-            tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create(request))
+        let response: CreateChatCompletionResponse =
+            tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create_byot(body))
                 .await
                 .map_err(|_| {
                     Self::pipeline_err(format!(
@@ -630,6 +653,7 @@ impl LlmClient {
         let max_tokens = self.resolve_max_tokens(req.max_tokens);
         let response_format = req.response_format;
         let client = self.client.clone();
+        let extra_body = self.config.extra_body.clone();
 
         let stream = async_stream::stream! {
             debug!("stream_chat: model={model}, messages={}", messages.len());
@@ -658,9 +682,26 @@ impl LlmClient {
                 request.response_format = Some(ResponseFormat::clone(fmt));
             }
 
+            // The byot path skips the typed call's stream check, so the flag
+            // is set here.
+            request.stream = Some(true);
+            let body = match body_with_extras(&request, &extra_body) {
+                Ok(b) => b,
+                Err(e) => {
+                    yield StreamEvent::Error {
+                        message: format!("Failed to serialize request: {e}"),
+                    };
+                    return;
+                }
+            };
+
             debug!("stream_chat: model={model}");
 
-            let mut response_stream = match client.chat().create_stream(request).await {
+            let mut response_stream = match client
+                .chat()
+                .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body)
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     yield StreamEvent::Error {
@@ -744,6 +785,28 @@ impl fmt::Debug for LlmClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A key the OpenAI schema has no name for rides the body, and one it
+    /// does name wins over the typed field.
+    #[test]
+    fn extra_body_is_merged_over_the_typed_request() {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("typed")
+            .messages(Vec::<ChatCompletionRequestMessage>::new())
+            .build()
+            .unwrap();
+        let extra = HashMap::from([
+            ("verified".to_string(), json!(true)),
+            ("model".to_string(), json!("override")),
+        ]);
+        let body = body_with_extras(&request, &extra).unwrap();
+        assert_eq!(body["verified"], json!(true));
+        assert_eq!(body["model"], json!("override"));
+        assert!(
+            body.get("stream").is_none(),
+            "unset typed fields stay absent"
+        );
+    }
 
     #[test]
     fn construction_with_all_auth_styles() {

@@ -121,7 +121,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 dirs = "6"
 
 # Optional: llm-client
-async-openai = { version = "0.33", features = ["chat-completion", "audio"], optional = true }
+async-openai = { version = "0.33", features = ["chat-completion", "audio", "byot"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW for the artifact store's no-follow opens.
