@@ -29,7 +29,7 @@ use async_openai::{
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
         ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FinishReason,
-        FunctionObject, ImageUrl, ResponseFormat,
+        FunctionObject, ImageUrl, ReasoningEffort, ResponseFormat,
     },
 };
 use futures::StreamExt;
@@ -66,6 +66,8 @@ pub struct LlmClientConfig {
     /// Fallback max_tokens.
     pub default_max_tokens: Option<u32>,
     /// How to send credentials.
+    /// OpenAI `reasoning_effort` for every request from this client.
+    pub default_reasoning_effort: Option<String>,
     pub auth_style: AuthStyle,
     /// Extra headers to include on every request.
     pub custom_headers: HashMap<String, String>,
@@ -80,6 +82,7 @@ impl LlmClientConfig {
             default_model: None,
             default_temperature: None,
             default_max_tokens: None,
+            default_reasoning_effort: None,
             auth_style: AuthStyle::Bearer,
             custom_headers: HashMap::new(),
         }
@@ -392,6 +395,9 @@ impl LlmClient {
         if let Some(max) = self.config.default_max_tokens {
             builder.max_completion_tokens(max);
         }
+        if let Some(effort) = self.resolve_reasoning_effort() {
+            builder.reasoning_effort(effort);
+        }
         let mut request = builder
             .build()
             .map_err(|e| Self::pipeline_err(format!("Failed to build request: {e}")))?;
@@ -456,6 +462,33 @@ impl LlmClient {
 
     fn resolve_temperature(&self, req_temp: Option<f32>) -> Option<f32> {
         req_temp.or(self.config.default_temperature)
+    }
+
+    /// The configured effort, mapped onto async-openai's enum.
+    ///
+    /// Unknown spellings are dropped rather than defaulted: silently sending
+    /// `medium` for a typo'd `minimal` would look like the setting had no
+    /// effect, which is the hardest kind of latency bug to notice.
+    fn resolve_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        match self
+            .config
+            .default_reasoning_effort
+            .as_deref()?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "none" => Some(ReasoningEffort::None),
+            "minimal" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::Xhigh),
+            other => {
+                tracing::warn!("ignoring unknown reasoning_effort {other:?}");
+                None
+            }
+        }
     }
 
     fn resolve_max_tokens(&self, req_max: Option<u32>) -> Option<u32> {
@@ -545,6 +578,9 @@ impl LlmClient {
         }
         if let Some(max) = self.resolve_max_tokens(req.max_tokens) {
             builder.max_completion_tokens(max);
+        }
+        if let Some(effort) = self.resolve_reasoning_effort() {
+            builder.reasoning_effort(effort);
         }
 
         let mut request = builder

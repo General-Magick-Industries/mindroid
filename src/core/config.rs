@@ -542,6 +542,18 @@ pub struct ModelConfig {
     pub compute_power: Option<u8>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// How hard a reasoning model should think: `minimal` | `low` | `medium` |
+    /// `high`. Sent as OpenAI's `reasoning_effort`.
+    ///
+    /// Latency on a reasoning model is dominated by tokens it generates, and
+    /// output includes what it spends reasoning — so this is the cheapest lever
+    /// there is on a turn that does not need deliberation. `None` leaves the
+    /// endpoint's own default.
+    pub reasoning_effort: Option<String>,
+    /// Path segment between `base_url` and `/chat/completions`. Defaults to
+    /// `v1`; set `v2` for an endpoint that serves a second API version at the
+    /// same host.
+    pub api_path: Option<String>,
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 }
@@ -702,7 +714,13 @@ impl MindroidConfig {
             AuthStyle::None
         };
 
-        let mut llm_config = LlmClientConfig::new(format!("{base_url}/v1"));
+        let api_path = model_cfg
+            .api_path
+            .as_deref()
+            .unwrap_or("v1")
+            .trim_matches('/');
+        let mut llm_config = LlmClientConfig::new(format!("{base_url}/{api_path}"));
+        llm_config.default_reasoning_effort = model_cfg.reasoning_effort.clone();
         llm_config.api_key = api_key;
         llm_config.default_model = model_cfg.model.clone();
         llm_config.auth_style = auth_style;
