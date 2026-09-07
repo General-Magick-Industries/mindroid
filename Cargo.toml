@@ -121,6 +121,8 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 dirs = "6"
 
 # Optional: llm-client
+# byot compiles out the crate's own stream-flag guard on the typed methods,
+# so a streaming caller must set `stream: true` itself.
 async-openai = { version = "0.33", features = ["chat-completion", "audio", "byot"], optional = true }
 
 [target.'cfg(unix)'.dependencies]

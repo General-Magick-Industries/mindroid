@@ -101,7 +101,9 @@ fn body_with_extras(
     request: &CreateChatCompletionRequest,
     extra_body: &HashMap<String, serde_json::Value>,
 ) -> serde_json::Result<serde_json::Value> {
-    let mut body = serde_json::to_value(request)?;
+    // Through the text form, not `to_value`: that widens f32 fields to f64
+    // (`0.7` → `0.699999988079071`), and the wire must not drift.
+    let mut body: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(request)?)?;
     if let Some(map) = body.as_object_mut() {
         map.extend(extra_body.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
@@ -806,6 +808,19 @@ mod tests {
             body.get("stream").is_none(),
             "unset typed fields stay absent"
         );
+    }
+
+    /// An f32 field must reach the wire as the typed path wrote it.
+    #[test]
+    fn extra_body_does_not_widen_f32_fields() {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("m")
+            .messages(Vec::<ChatCompletionRequestMessage>::new())
+            .temperature(0.7)
+            .build()
+            .unwrap();
+        let body = body_with_extras(&request, &HashMap::new()).unwrap();
+        assert_eq!(body["temperature"].to_string(), "0.7");
     }
 
     #[test]
