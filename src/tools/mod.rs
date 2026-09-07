@@ -135,6 +135,19 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether a call to this tool ends the turn.
+    ///
+    /// A tool that delivers the reply itself has nothing to loop back for:
+    /// [`ToolExecutorStage`] finishes the round's other calls and then stops
+    /// instead of asking the model again, and the round's prose becomes the
+    /// response. [`XmlToolExecutorStage`] does not honour this.
+    ///
+    /// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
+    /// [`XmlToolExecutorStage`]: crate::pipeline::stages::XmlToolExecutorStage
+    fn ends_turn(&self) -> bool {
+        false
+    }
+
     /// Authenticated identity expected to execute this remote tool.
     ///
     /// Manifest-backed tools set this to their publisher. Static remote tools

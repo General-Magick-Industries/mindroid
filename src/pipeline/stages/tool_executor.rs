@@ -147,7 +147,8 @@ async fn artifact_turn(
 
 /// What one loop round decided.
 enum RoundOutcome {
-    /// No tool calls — the round's prose is the final answer.
+    /// No tool calls, or a turn-ending tool ran — the round's prose is the
+    /// final answer.
     Final(String),
     /// A remote call was framed as the response; the client executes it.
     Remote(String),
@@ -376,8 +377,10 @@ impl ToolExecutorStage {
         let mut events = Vec::new();
         #[cfg(feature = "artifacts")]
         let mut load_ids: Vec<String> = Vec::new();
+        let mut ends_turn = false;
 
         for call in &outcome.tool_calls {
+            ends_turn |= registry.get(&call.name).is_some_and(|t| t.ends_turn());
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
@@ -404,10 +407,14 @@ impl ToolExecutorStage {
             messages.push(msg);
         }
 
-        Ok(Round {
-            outcome: RoundOutcome::Continue,
-            events,
-        })
+        // Every declared id was still answered above, so the turn's transcript
+        // stays a valid round even though the model is not asked again.
+        let outcome = if ends_turn {
+            RoundOutcome::Final(outcome.content)
+        } else {
+            RoundOutcome::Continue
+        };
+        Ok(Round { outcome, events })
     }
 
     /// Full loop shared by the streaming and non-streaming paths. Returns the
@@ -520,6 +527,7 @@ impl StreamingStage for ToolExecutorStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
     use serde_json::json;
 
     /// Serve `replies` in order, draining each request body first — replying
@@ -619,20 +627,75 @@ mod tests {
         assert!(out.starts_with("Error: invalid arguments JSON"), "{out}");
     }
 
+    fn completion(message: serde_json::Value) -> String {
+        json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
+        })
+        .to_string()
+    }
+
+    fn stub_client(addr: std::net::SocketAddr) -> LlmClient {
+        LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap()
+    }
+
+    /// The stub serves exactly one completion, so a loop that went back to the
+    /// model for a second round would fail to connect and error the stage.
+    #[tokio::test]
+    async fn a_turn_ending_tool_stops_the_loop() {
+        struct Deliver;
+        #[async_trait]
+        impl Tool for Deliver {
+            fn name(&self) -> &str {
+                "deliver"
+            }
+            fn description(&self) -> &str {
+                "Deliver the reply"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
+                Ok("Delivered.".into())
+            }
+            fn ends_turn(&self) -> bool {
+                true
+            }
+        }
+
+        let only = completion(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call-1", "type": "function",
+                 "function": {"name": "deliver", "arguments": "{}"}}
+            ]
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(listener, vec![only]);
+
+        let registry = ToolRegistry::new().register(Deliver);
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        stage.process(&mut ctx).await.unwrap();
+
+        assert_eq!(server.await.unwrap().len(), 1, "one round, no summary call");
+        assert_eq!(ctx.response.as_deref(), Some(""));
+    }
+
     /// An assistant turn declaring N tool_calls must be followed by N tool
     /// responses; a provider rejects the round otherwise, killing the turn.
     /// The stub asserts that invariant on the SECOND request, which is the one
     /// that would 400 in production.
     #[tokio::test]
     async fn a_malformed_remote_call_still_answers_every_declared_id() {
-        fn completion(message: serde_json::Value) -> String {
-            json!({
-                "id": "c", "object": "chat.completion", "created": 0, "model": "m",
-                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
-            })
-            .to_string()
-        }
-
         let first = completion(json!({
             "role": "assistant",
             "tool_calls": [
@@ -648,13 +711,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = serve_completions(listener, vec![first, second]);
 
-        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
-            "http://{addr}/v1"
-        )))
-        .unwrap();
         let registry =
             ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
-        let stage = ToolExecutorStage::new(client, Arc::new(registry)).with_max_iterations(2);
+        let stage =
+            ToolExecutorStage::new(stub_client(addr), Arc::new(registry)).with_max_iterations(2);
 
         let mut ctx = Context::new(
             Arc::new(crate::models::Message::new("hi", "client", "chan1")),
