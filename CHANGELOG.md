@@ -107,6 +107,11 @@ truncated.
 
 ### Added
 
+- `Tool::ends_turn` (default `false`) — a tool that delivers the reply itself
+  can end the turn: after a local round in which such a call succeeds,
+  `ToolExecutorStage` stops instead of asking the model again, and the
+  round's prose becomes the response. A failed call still loops back.
+  `XmlToolExecutorStage` does not honour it.
 - `ToolExecutorStage` — native (JSON) function calling, now the default
   executor. Models post-trained for native tool calling mangle the prompt-XML
   format, and an unparseable call falls through as the final answer, so tool

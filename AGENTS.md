@@ -153,11 +153,12 @@ model:
 | `ToolExecutorStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
 
 Both re-attach artifact bytes and clear the same remote-call correlation gate.
-Two differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
+Three differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
 mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
-events replay once the loop ends; and the JSON stage re-attaches artifacts as a
+events replay once the loop ends; the JSON stage re-attaches artifacts as a
 follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
-role carries text alone.
+role carries text alone; and only the JSON stage honours `Tool::ends_turn`, so a
+self-delivering tool on the XML stage may be re-called, up to the iteration cap.
 
 **The JSON stage cannot run against Cortex.** Cortex's ReasonService is
 deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and no
