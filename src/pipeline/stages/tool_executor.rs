@@ -206,34 +206,35 @@ fn err(e: impl std::fmt::Display) -> crate::MindroidError {
 
 /// Execute one local call against the registry. Argument JSON the model
 /// produced is parsed here; a malformed payload becomes an error RESULT the
-/// model can react to, never a dropped call.
+/// model can react to, never a dropped call. `Err` carries that text.
 async fn execute_local(
     registry: &ToolRegistry,
     tool_ctx: &ToolContext,
     call: &NativeToolCall,
-) -> String {
+) -> std::result::Result<String, String> {
     let args = if call.arguments.trim().is_empty() {
         Ok(serde_json::json!({}))
     } else {
         serde_json::from_str::<serde_json::Value>(&call.arguments)
     };
-    let result = match args {
-        Err(e) => format!("Error: invalid arguments JSON: {e}"),
+    let outcome = match args {
+        Err(e) => Err(format!("Error: invalid arguments JSON: {e}")),
         Ok(args) => match registry.get(&call.name) {
             Some(tool) => tool
                 .execute(args, tool_ctx)
                 .await
-                .unwrap_or_else(|e| format!("Error: {e}")),
-            None => format!("Error: unknown tool '{}'", call.name),
+                .map_err(|e| format!("Error: {e}")),
+            None => Err(format!("Error: unknown tool '{}'", call.name)),
         },
     };
+    let text = outcome.as_ref().unwrap_or_else(|e| e);
     debug!(
         "ToolExecutorStage: tool '{}' executed → {} bytes: {:?}",
         call.name,
-        result.len(),
-        truncate_str(&result, 120)
+        text.len(),
+        truncate_str(text, 120)
     );
-    result
+    outcome
 }
 
 enum LoopOutcome {
@@ -380,7 +381,6 @@ impl ToolExecutorStage {
         let mut ends_turn = false;
 
         for call in &outcome.tool_calls {
-            ends_turn |= registry.get(&call.name).is_some_and(|t| t.ends_turn());
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
@@ -391,7 +391,12 @@ impl ToolExecutorStage {
             {
                 load_ids.push(id);
             }
-            let result = execute_local(registry, tool_ctx, call).await;
+            let executed = execute_local(registry, tool_ctx, call).await;
+            // Only a call that ran ends the turn: a failed one loops back so
+            // the model sees the error and can retry.
+            ends_turn |=
+                executed.is_ok() && registry.get(&call.name).is_some_and(|t| t.ends_turn());
+            let result = executed.unwrap_or_else(|e| e);
             events.push(StreamEvent::ToolResult {
                 name: call.name.clone(),
                 result: result.clone(),
@@ -400,7 +405,8 @@ impl ToolExecutorStage {
         }
 
         #[cfg(feature = "artifacts")]
-        if !load_ids.is_empty()
+        if !ends_turn
+            && !load_ids.is_empty()
             && let Some(store) = self.artifact_store()
             && let Some(msg) = artifact_turn(load_ids, &store, message_channel).await
         {
@@ -409,12 +415,15 @@ impl ToolExecutorStage {
 
         // Every declared id was still answered above, so the turn's transcript
         // stays a valid round even though the model is not asked again.
-        let outcome = if ends_turn {
+        let round_outcome = if ends_turn {
             RoundOutcome::Final(outcome.content)
         } else {
             RoundOutcome::Continue
         };
-        Ok(Round { outcome, events })
+        Ok(Round {
+            outcome: round_outcome,
+            events,
+        })
     }
 
     /// Full loop shared by the streaming and non-streaming paths. Returns the
@@ -623,7 +632,8 @@ mod tests {
             &ToolContext::default(),
             &call("c1", "anything", "{not json"),
         )
-        .await;
+        .await
+        .unwrap_err();
         assert!(out.starts_with("Error: invalid arguments JSON"), "{out}");
     }
 
@@ -642,52 +652,102 @@ mod tests {
         .unwrap()
     }
 
+    /// A turn-ending tool that delivers out of band; `msg` must be a string.
+    struct Deliver;
+    #[async_trait]
+    impl Tool for Deliver {
+        fn name(&self) -> &str {
+            "deliver"
+        }
+        fn description(&self) -> &str {
+            "Deliver the reply"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {"msg": {"type": "string"}}})
+        }
+        async fn execute(&self, args: serde_json::Value, _: &ToolContext) -> Result<String> {
+            args.get("msg")
+                .and_then(serde_json::Value::as_str)
+                .map(|_| "Delivered.".into())
+                .ok_or_else(|| anyhow::anyhow!("msg is required").into())
+        }
+        fn ends_turn(&self) -> bool {
+            true
+        }
+    }
+
+    /// One round calling `deliver` with `arguments` and an unknown tool.
+    fn deliver_round(arguments: &str, content: &str) -> String {
+        completion(json!({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {"id": "call-deliver", "type": "function",
+                 "function": {"name": "deliver", "arguments": arguments}},
+                {"id": "call-other", "type": "function",
+                 "function": {"name": "nope", "arguments": "{}"}}
+            ]
+        }))
+    }
+
+    fn fresh_ctx() -> Context {
+        Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        )
+    }
+
     /// The stub serves exactly one completion, so a loop that went back to the
-    /// model for a second round would fail to connect and error the stage.
+    /// model for a second round would fail to connect and error the stage. The
+    /// other call in the round still runs, and the round's prose is served.
     #[tokio::test]
     async fn a_turn_ending_tool_stops_the_loop() {
-        struct Deliver;
-        #[async_trait]
-        impl Tool for Deliver {
-            fn name(&self) -> &str {
-                "deliver"
-            }
-            fn description(&self) -> &str {
-                "Deliver the reply"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                json!({"type": "object"})
-            }
-            async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
-                Ok("Delivered.".into())
-            }
-            fn ends_turn(&self) -> bool {
-                true
-            }
-        }
+        use futures::StreamExt;
 
-        let only = completion(json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "call-1", "type": "function",
-                 "function": {"name": "deliver", "arguments": "{}"}}
-            ]
-        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let only = deliver_round(r#"{"msg": "hi"}"#, "Here you go.");
         let server = serve_completions(listener, vec![only]);
 
         let registry = ToolRegistry::new().register(Deliver);
         let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
-        let mut ctx = Context::new(
-            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
-        stage.process(&mut ctx).await.unwrap();
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
 
         assert_eq!(server.await.unwrap().len(), 1, "one round, no summary call");
-        assert_eq!(ctx.response.as_deref(), Some(""));
+        assert_eq!(ctx.response.as_deref(), Some("Here you go."));
+        let answered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolResult { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered, ["deliver", "nope"], "every declared call ran");
+    }
+
+    /// A turn-ending call that fails is not a delivery: the loop goes back to
+    /// the model with the error, and the transcript still answers every id.
+    #[tokio::test]
+    async fn a_failed_turn_ending_call_loops_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let first = deliver_round("{not json", "");
+        let second = completion(json!({"role": "assistant", "content": "retried"}));
+        let server = serve_completions(listener, vec![first, second]);
+
+        let registry = ToolRegistry::new().register(Deliver);
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
+        let mut ctx = fresh_ctx();
+        stage.process(&mut ctx).await.unwrap();
+
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 2, "the model gets to react to the error");
+        assert_eq!(ctx.response.as_deref(), Some("retried"));
+        let replayed: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        let messages = replayed["messages"].as_array().unwrap();
+        let answered = messages.iter().filter(|m| m["role"] == "tool").count();
+        assert_eq!(answered, 2, "{messages:#?}");
     }
 
     /// An assistant turn declaring N tool_calls must be followed by N tool
@@ -747,14 +807,17 @@ mod tests {
             &ToolContext::default(),
             &call("c1", "nope", "{}"),
         )
-        .await;
+        .await
+        .unwrap_err();
         assert_eq!(out, "Error: unknown tool 'nope'");
     }
 
     #[tokio::test]
     async fn empty_arguments_default_to_an_empty_object() {
         let registry = ToolRegistry::new();
-        let out = execute_local(&registry, &ToolContext::default(), &call("c1", "nope", "")).await;
+        let out = execute_local(&registry, &ToolContext::default(), &call("c1", "nope", ""))
+            .await
+            .unwrap_err();
         // Reaches tool lookup (unknown here) instead of failing JSON parsing.
         assert_eq!(out, "Error: unknown tool 'nope'");
     }
@@ -807,13 +870,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = serve_completions(listener, vec![body]);
 
-        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
-            "http://{addr}/v1"
-        )))
-        .unwrap();
         let registry =
             ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
-        let stage = ToolExecutorStage::new(client, Arc::new(registry));
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
 
         let mut stamped = crate::models::Message::new("hi", "client", "chan1");
         stamped
@@ -880,13 +939,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = serve_completions(listener, vec![reply]);
 
-        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
-            "http://{addr}/v1"
-        )))
-        .unwrap();
         let registry =
             ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
-        let stage = ToolExecutorStage::new(client, Arc::new(registry));
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
 
         let mut ctx = Context::new(
             Arc::new(crate::models::Message::new("hi", "client", "chan1")),
