@@ -816,7 +816,7 @@ mod tests {
         let request = CreateChatCompletionRequestArgs::default()
             .model("m")
             .messages(Vec::<ChatCompletionRequestMessage>::new())
-            .temperature(0.7)
+            .temperature(0.7_f32)
             .build()
             .unwrap();
         let body = body_with_extras(&request, &HashMap::new()).unwrap();
