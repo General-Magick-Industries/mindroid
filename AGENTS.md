@@ -158,7 +158,7 @@ mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
 events replay once the loop ends; the JSON stage re-attaches artifacts as a
 follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
 role carries text alone; and only the JSON stage honours `Tool::ends_turn`, so a
-self-delivering tool on the XML stage is re-called until the iteration cap.
+self-delivering tool on the XML stage may be re-called, up to the iteration cap.
 
 **The JSON stage cannot run against Cortex.** Cortex's ReasonService is
 deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and no

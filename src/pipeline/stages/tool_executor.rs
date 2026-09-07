@@ -227,7 +227,7 @@ async fn execute_local(
             None => Err(format!("Error: unknown tool '{}'", call.name)),
         },
     };
-    let text = outcome.as_ref().unwrap_or_else(|e| e);
+    let (Ok(text) | Err(text)) = &outcome;
     debug!(
         "ToolExecutorStage: tool '{}' executed → {} bytes: {:?}",
         call.name,
@@ -413,8 +413,8 @@ impl ToolExecutorStage {
             messages.push(msg);
         }
 
-        // Every declared id was still answered above, so the turn's transcript
-        // stays a valid round even though the model is not asked again.
+        // The round's other calls still ran and reported above; only the
+        // follow-up model call is skipped.
         let round_outcome = if ends_turn {
             RoundOutcome::Final(outcome.content)
         } else {
@@ -669,7 +669,7 @@ mod tests {
             args.get("msg")
                 .and_then(serde_json::Value::as_str)
                 .map(|_| "Delivered.".into())
-                .ok_or_else(|| anyhow::anyhow!("msg is required").into())
+                .ok_or_else(|| crate::MindroidError::config("msg is required"))
         }
         fn ends_turn(&self) -> bool {
             true
@@ -728,26 +728,33 @@ mod tests {
 
     /// A turn-ending call that fails is not a delivery: the loop goes back to
     /// the model with the error, and the transcript still answers every id.
+    /// Both failure kinds — unparseable arguments and the tool's own error.
     #[tokio::test]
     async fn a_failed_turn_ending_call_loops_back() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let first = deliver_round("{not json", "");
-        let second = completion(json!({"role": "assistant", "content": "retried"}));
-        let server = serve_completions(listener, vec![first, second]);
+        for arguments in ["{not json", r#"{"other": 1}"#] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let first = deliver_round(arguments, "");
+            let second = completion(json!({"role": "assistant", "content": "retried"}));
+            let server = serve_completions(listener, vec![first, second]);
 
-        let registry = ToolRegistry::new().register(Deliver);
-        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
-        let mut ctx = fresh_ctx();
-        stage.process(&mut ctx).await.unwrap();
+            let registry = ToolRegistry::new().register(Deliver);
+            let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
+            let mut ctx = fresh_ctx();
+            stage.process(&mut ctx).await.unwrap();
 
-        let bodies = server.await.unwrap();
-        assert_eq!(bodies.len(), 2, "the model gets to react to the error");
-        assert_eq!(ctx.response.as_deref(), Some("retried"));
-        let replayed: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
-        let messages = replayed["messages"].as_array().unwrap();
-        let answered = messages.iter().filter(|m| m["role"] == "tool").count();
-        assert_eq!(answered, 2, "{messages:#?}");
+            let bodies = server.await.unwrap();
+            assert_eq!(
+                bodies.len(),
+                2,
+                "{arguments}: the model reacts to the error"
+            );
+            assert_eq!(ctx.response.as_deref(), Some("retried"));
+            let replayed: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+            let messages = replayed["messages"].as_array().unwrap();
+            let answered = messages.iter().filter(|m| m["role"] == "tool").count();
+            assert_eq!(answered, 2, "{messages:#?}");
+        }
     }
 
     /// An assistant turn declaring N tool_calls must be followed by N tool
@@ -776,10 +783,7 @@ mod tests {
         let stage =
             ToolExecutorStage::new(stub_client(addr), Arc::new(registry)).with_max_iterations(2);
 
-        let mut ctx = Context::new(
-            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
+        let mut ctx = fresh_ctx();
         stage.process(&mut ctx).await.unwrap();
 
         let bodies = server.await.unwrap();
@@ -943,10 +947,7 @@ mod tests {
             ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
         let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
 
-        let mut ctx = Context::new(
-            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
+        let mut ctx = fresh_ctx();
 
         let events: Vec<StreamEvent> = stage.stream(&mut ctx).collect().await;
         server.await.unwrap();

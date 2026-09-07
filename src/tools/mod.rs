@@ -140,9 +140,10 @@ pub trait Tool: Send + Sync {
     /// For a tool that delivers the reply itself, so its result is never the
     /// response: [`ToolExecutorStage`] finishes the round's other calls and
     /// then stops instead of asking the model again, and the round's prose
-    /// (often empty) becomes the response. A call that errors loops back so
-    /// the model can retry, and a remote call in the same round still takes
-    /// precedence. [`XmlToolExecutorStage`] does not honour this.
+    /// becomes the response — often empty, which a caller that auto-replies
+    /// should skip. A call that errors does not end the turn on its own, so
+    /// the model can retry; a well-formed remote call in the same round still
+    /// takes precedence. [`XmlToolExecutorStage`] does not honour this.
     ///
     /// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
     /// [`XmlToolExecutorStage`]: crate::pipeline::stages::XmlToolExecutorStage
