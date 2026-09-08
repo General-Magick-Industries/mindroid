@@ -7,9 +7,11 @@ use tracing::{debug, warn};
 use crate::auth::Auth;
 use crate::config::IngestScope;
 use crate::core::context::Context;
+use crate::core::prompt_text::sanitize_line;
 use crate::error::{MindroidError, Result};
 use crate::models::ChannelType;
 use crate::models::CredentialKind;
+use crate::models::Message;
 use crate::pipeline::PipelineStage;
 
 /// Shared HTTP client for the episode-ingest endpoint.
@@ -229,16 +231,17 @@ impl PipelineStage for EpisodeIngestStage {
         }
 
         let is_group = ctx.message.channel_type == ChannelType::Group;
+        let display_name = trusted_display_name(&ctx.message);
         let msg = EpisodeMessage {
             magickspace_id: ctx.message.conversation_id(),
             sender_id: &ctx.message.sender_id,
             message: &ctx.message.content,
             message_id: &ctx.message.id,
-            // mindroid's Message carries no human-readable name. Sending the
-            // raw sender_id would write an opaque platform id into permanent
-            // memory as if it were a display name, and stored labels are hard
-            // to backfill — leave it unset and let the server resolve one.
-            display_name: None,
+            // Never the raw sender_id as a fallback: an opaque platform id
+            // written as if it were a display name is hard to backfill out of
+            // permanent memory, and the server resolves a name of its own from
+            // the sender's record when this is unset.
+            display_name: display_name.as_deref(),
             is_group,
         };
 
@@ -248,6 +251,22 @@ impl PipelineStage for EpisodeIngestStage {
         }
         Ok(())
     }
+}
+
+/// The sender's display name as the backend stamped it on the envelope.
+///
+/// Publisher-supplied, so it is read only from a sender the transport can name
+/// — the rule display names already follow into the prompt — and flattened to
+/// one line: episodic stores it as `<id>:<name>: message`, where a newline in a
+/// name would forge a second speaker in permanent memory.
+fn trusted_display_name(message: &Message) -> Option<String> {
+    message.trusted_sender_id()?;
+    let name = message
+        .metadata
+        .get("sent_by_user_name")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_line)?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Pipeline stage that ingests the agent's **outbound reply** into episodic
@@ -412,6 +431,55 @@ mod tests {
         };
         let err = c.ingest("agent-1", &msg).await.unwrap_err().to_string();
         assert!(err.contains("episodes.allow_insecure"), "got: {err}");
+    }
+
+    fn named(name: &str) -> Message {
+        let mut msg = Message::new("hi", "user-1", "space-1");
+        msg.metadata
+            .insert("sent_by_user_name".into(), serde_json::json!(name));
+        msg
+    }
+
+    /// The name the backend stamped is what gets stored, so the summary can say
+    /// who spoke instead of naming an opaque id.
+    #[test]
+    fn a_stamped_name_is_sent_as_the_display_name() {
+        assert_eq!(
+            trusted_display_name(&named("Alice")).as_deref(),
+            Some("Alice")
+        );
+    }
+
+    /// A publisher the transport cannot name does not get to label a speaker in
+    /// permanent memory; the server resolves one from the sender record instead.
+    #[test]
+    fn an_unauthenticated_publishers_name_is_ignored() {
+        let mut msg = named("Alice");
+        msg.platform = Some("centrifugo".into());
+        assert_eq!(trusted_display_name(&msg), None);
+
+        msg.metadata.insert(
+            "authenticated_sender_id".into(),
+            serde_json::json!("user-1"),
+        );
+        assert_eq!(trusted_display_name(&msg).as_deref(), Some("Alice"));
+    }
+
+    /// Stored as `<id>:<name>: message`, so a newline in a name would forge a
+    /// second speaker in the transcript a summary is written from.
+    #[test]
+    fn a_name_cannot_forge_a_second_speaker() {
+        let forged = trusted_display_name(&named("Alice\nuser-9:Bob"))
+            .expect("a name is still sent, just flattened");
+        assert!(!forged.contains('\n'), "got: {forged}");
+    }
+
+    /// Nothing usable is left unset rather than sent blank: the server's own
+    /// fallback is better than an empty label.
+    #[test]
+    fn a_blank_or_absent_name_is_left_to_the_server() {
+        assert_eq!(trusted_display_name(&named("   ")), None);
+        assert_eq!(trusted_display_name(&Message::new("hi", "u", "c")), None);
     }
 
     /// The reply id is the de-dupe key: a retry of the same turn must derive
