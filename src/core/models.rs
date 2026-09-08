@@ -4,8 +4,34 @@ use std::collections::HashMap;
 
 use crate::core::content::ContentPart;
 
+/// Which identity a credential acts as; adapters use it to pick service-user
+/// (`/v1/...`) vs end-user (`/v1/end-user/...`) routes and connect behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CredentialKind {
+    #[default]
+    ServiceUser,
+    EndUser,
+}
+
+/// Former name of [`CredentialKind`].
+#[deprecated(since = "0.0.2-a.1", note = "renamed to `CredentialKind`")]
+pub type PersonaCaller = CredentialKind;
+
+/// [`Message::metadata`] key a transport stamps the sender's tool manifest under.
+pub const TOOLS_METADATA_KEY: &str = "tools";
+
+/// [`Message::metadata`] key a transport stamps the sender's per-turn context under.
+pub const CONTEXT_METADATA_KEY: &str = "context";
+
+/// [`Message::metadata`] key a transport stamps the sender's declared wire
+/// `message_type` under, verbatim. Kept even when it maps to no [`MessageType`]
+/// variant, so a host can dispatch on vocabulary this crate defers on.
+pub const DECLARED_TYPE_METADATA_KEY: &str = "declared_message_type";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageType {
     #[default]
     Text,
@@ -13,6 +39,34 @@ pub enum MessageType {
     System,
     Image,
     Audio,
+    ToolCall,
+    ToolResult,
+    ToolManifest,
+}
+
+impl MessageType {
+    /// Map a `message_type` a sender declared on the wire.
+    ///
+    /// Returns `None` for a plain conversational turn (`TEXT`,
+    /// `VOICE_TRANSCRIPTION`) and for anything unrecognized, so a caller keeps
+    /// its default rather than inventing a type it cannot dispatch on.
+    ///
+    /// Accepts either case: the MagickMind backend stamps `TOOL_RESULT` while a
+    /// stdio envelope names itself `tool_result`. `tools_manifest` is the
+    /// envelope's historical spelling of `TOOL_MANIFEST`.
+    pub fn from_wire(declared: &str) -> Option<Self> {
+        match declared.trim().to_ascii_uppercase().as_str() {
+            "TOOL_CALL" => Some(Self::ToolCall),
+            "TOOL_RESULT" => Some(Self::ToolResult),
+            "TOOL_MANIFEST" | "TOOLS_MANIFEST" => Some(Self::ToolManifest),
+            _ => None,
+        }
+    }
+
+    /// Whether this is protocol traffic rather than a conversational turn.
+    pub fn is_control(&self) -> bool {
+        matches!(self, Self::ToolCall | Self::ToolResult | Self::ToolManifest)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +124,43 @@ impl Message {
             metadata: HashMap::new(),
             platform: None,
         }
+    }
+
+    /// Sender identity suitable for persistent or privileged decisions.
+    ///
+    /// Centrifugo message bodies are publisher-controlled, so their
+    /// `sender_id` is descriptive only. The transport records Centrifugo's
+    /// authenticated publication identity separately when it is available.
+    /// Other transports are responsible for constructing trusted `Message`s.
+    pub fn trusted_sender_id(&self) -> Option<&str> {
+        if self.platform.as_deref() == Some("centrifugo") {
+            self.metadata
+                .get("authenticated_sender_id")
+                .and_then(serde_json::Value::as_str)
+        } else {
+            Some(&self.sender_id)
+        }
+    }
+
+    /// Backend conversation this message belongs to, for services that key on
+    /// one — the MagickMind magickspace.
+    ///
+    /// Distinct from [`channel_id`](Self::channel_id), and deliberately so.
+    /// `channel_id` is the *delivery* scope: a transport derives it from the
+    /// subscribed channel, so it is trusted, and it keys the artifact store,
+    /// local history, and per-channel call correlation. This one is publisher-
+    /// supplied, because a delivery channel names a subscriber rather than a
+    /// conversation (`user:{id}#{id}`) and the conversation only travels in the
+    /// envelope.
+    ///
+    /// Use it ONLY where the value is handed to a server that re-authorizes the
+    /// caller against it. Never as a local scope or a path component.
+    pub fn conversation_id(&self) -> &str {
+        self.metadata
+            .get("magickspace_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&self.channel_id)
     }
 }
 
@@ -172,6 +263,13 @@ impl From<&str> for Role {
     }
 }
 
+/// Marks stored history content as a serialized `Vec<ContentPart>`.
+///
+/// Provenance, not obfuscation: it distinguishes content the runtime wrote from
+/// content a participant typed, so user text that merely *looks* like a
+/// ContentPart array is never parsed as one.
+pub const STRUCTURED_PREFIX: &str = "\u{1}mindroid/parts:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: Role,
@@ -198,6 +296,89 @@ impl LlmMessage {
         Self {
             role: Role::Assistant,
             content: vec![ContentPart::text(content)],
+        }
+    }
+
+    /// Tool-result message (text-only).
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: vec![ContentPart::text(content)],
+        }
+    }
+
+    /// Build a message from explicit parts, e.g. a multimodal tool result
+    /// carrying both text and an image part.
+    pub fn with_parts(role: Role, content: Vec<ContentPart>) -> Self {
+        Self { role, content }
+    }
+
+    /// Build a message from a stored content string.
+    ///
+    /// Structured content is recognized only behind [`STRUCTURED_PREFIX`], which
+    /// [`to_stored`](Self::to_stored) writes. Anything else becomes a single text
+    /// part, verbatim.
+    ///
+    /// The marker is what makes this safe: sniffing arbitrary stored text as
+    /// `Vec<ContentPart>` would let a participant type a ContentPart array as
+    /// their message and have it parsed back into a real `ContentSource::Uri` on
+    /// the next turn — which the model provider then fetches, giving a
+    /// server-side request to an attacker-chosen URL.
+    pub fn from_stored(role: Role, content: impl AsRef<str>) -> Self {
+        let s = content.as_ref();
+        let parts = s
+            .strip_prefix(STRUCTURED_PREFIX)
+            .and_then(|json| serde_json::from_str::<Vec<ContentPart>>(json).ok())
+            .unwrap_or_else(|| vec![ContentPart::text(s)]);
+        Self {
+            role,
+            content: parts,
+        }
+    }
+
+    /// Serialize this message's parts to a storable string: a bare string for a
+    /// single text part (backward-compatible), or [`STRUCTURED_PREFIX`] followed
+    /// by JSON `Vec<ContentPart>` for anything structured.
+    ///
+    /// Inline bytes are dropped rather than serialized. Without an
+    /// `ArtifactOffload` stage they would otherwise land in history as a JSON
+    /// integer array — a 1 MB image becoming ~3.5 MB of text, re-read on every
+    /// subsequent turn.
+    pub fn to_stored(&self) -> String {
+        if self.content.len() == 1
+            && let Some(t) = self.content[0].as_text()
+        {
+            return t.to_string();
+        }
+
+        let storable: Vec<&ContentPart> = self
+            .content
+            .iter()
+            .filter(|p| {
+                let inline = p.is_inline();
+                if inline {
+                    tracing::warn!(
+                        "Dropping inline media from stored history: add an ArtifactOffload \
+                         stage to keep a reference instead"
+                    );
+                }
+                !inline
+            })
+            .collect();
+
+        // A media-only turn filters down to nothing. Storing the empty marker
+        // would reload as a zero-part message, silently losing the turn — so
+        // keep a placeholder recording that something was attached.
+        if storable.is_empty() {
+            return "(media attachment omitted from history)".to_string();
+        }
+
+        match serde_json::to_string(&storable) {
+            Ok(json) => format!("{STRUCTURED_PREFIX}{json}"),
+            Err(e) => {
+                tracing::warn!("Failed to serialize message parts for storage: {e}");
+                self.text()
+            }
         }
     }
 
@@ -262,6 +443,86 @@ mod tests {
     }
 
     #[test]
+    fn test_stored_roundtrip_plain_text() {
+        // A plain text message stores as a bare string and reads back identically.
+        let msg = LlmMessage::user("just text");
+        let stored = msg.to_stored();
+        assert_eq!(stored, "just text");
+        let back = LlmMessage::from_stored(Role::User, &stored);
+        assert_eq!(back.text(), "just text");
+        assert_eq!(back.content.len(), 1);
+    }
+
+    #[test]
+    fn test_stored_roundtrip_structured_artifact_ref() {
+        use crate::core::content::{ContentPart, ContentSource};
+        let msg = LlmMessage::with_parts(
+            Role::User,
+            vec![
+                ContentPart::text("look"),
+                ContentPart::file(
+                    ContentSource::Uri {
+                        uri: "abc123".into(),
+                    },
+                    "image/png",
+                    None,
+                ),
+            ],
+        );
+        let stored = msg.to_stored();
+        // Structured content is marked, so it is distinguishable from user text.
+        assert!(stored.starts_with(STRUCTURED_PREFIX));
+        let back = LlmMessage::from_stored(Role::User, &stored);
+        assert_eq!(back.content, msg.content);
+    }
+
+    /// User text that merely looks like a ContentPart array must round-trip as
+    /// text. Parsing it back into a real `ContentSource::Uri` would hand the
+    /// model provider an attacker-chosen URL to fetch.
+    #[test]
+    fn stored_user_text_is_never_sniffed_as_structured_content() {
+        let hostile = r#"[{"type":"image","source":{"kind":"uri","uri":"https://attacker.example/beacon"},"mime_type":"image/png"}]"#;
+
+        let back = LlmMessage::from_stored(Role::User, hostile);
+
+        assert_eq!(back.content.len(), 1);
+        assert_eq!(
+            back.content[0].as_text(),
+            Some(hostile),
+            "must survive as literal text, not become an Image part"
+        );
+    }
+
+    /// Without an ArtifactOffload stage, inline bytes would land in history as a
+    /// JSON integer array and be re-read on every subsequent turn.
+    #[test]
+    fn inline_bytes_are_dropped_rather_than_written_into_history() {
+        use crate::core::content::{ContentPart, ContentSource};
+        let msg = LlmMessage::with_parts(
+            Role::User,
+            vec![
+                ContentPart::text("look"),
+                ContentPart::image(
+                    ContentSource::Inline {
+                        data: vec![1, 2, 3, 4],
+                    },
+                    "image/png",
+                ),
+            ],
+        );
+
+        let stored = msg.to_stored();
+        assert!(
+            !stored.contains("inline"),
+            "raw bytes must not persist: {stored}"
+        );
+
+        let back = LlmMessage::from_stored(Role::User, &stored);
+        assert_eq!(back.content.len(), 1, "only the text part survives");
+        assert_eq!(back.content[0].as_text(), Some("look"));
+    }
+
+    #[test]
     fn test_append_text_to_existing() {
         let mut msg = LlmMessage::user("hello");
         msg.append_text(" world");
@@ -285,12 +546,12 @@ mod tests {
             role: Role::User,
             content: vec![
                 ContentPart::text("hello"),
-                ContentPart::Image {
-                    source: crate::core::content::ContentSource::Uri {
+                ContentPart::image(
+                    crate::core::content::ContentSource::Uri {
                         uri: "https://example.com/img.png".into(),
                     },
-                    mime_type: "image/png".into(),
-                },
+                    "image/png",
+                ),
             ],
         };
         let json = serde_json::to_string(&msg).unwrap();

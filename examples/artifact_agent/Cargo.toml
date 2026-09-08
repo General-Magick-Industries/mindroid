@@ -1,0 +1,27 @@
+[package]
+name = "mindroid-example-artifact-agent"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "artifact_agent"
+path = "main.rs"
+
+[dependencies]
+# stdio transport is always available; llm-local = LLM client;
+# persistence = SQLite memory; artifacts = the offload store + get_artifact tool.
+mindroid = { workspace = true, features = [
+    "llm-local",
+    "persistence",
+    "artifacts",
+] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# JPEG encoding for the synthetic `/snap` frame. jpeg-only: the default feature
+# set pulls a large codec tail (rav1e, ravif, exr, …) this example never uses.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

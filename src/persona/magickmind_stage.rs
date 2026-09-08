@@ -204,6 +204,7 @@ impl MagickmindPersonaStage {
             })?;
 
         let status = resp.status();
+        crate::core::net::note_auth_status(self.identity.as_ref(), status);
         if !status.is_success() {
             let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
             return Err(MindroidError::Api {
@@ -253,7 +254,11 @@ impl PipelineStage for MagickmindPersonaStage {
             messages.len(),
         );
 
+        let current_user = messages.len() - 1;
         ctx.llm_messages = messages;
+        ctx.set(crate::pipeline::extensions::CurrentUserMessage(
+            current_user,
+        ));
 
         Ok(())
     }

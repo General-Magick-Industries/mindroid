@@ -104,7 +104,7 @@ impl Tool for ShellTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String> {
+    async fn execute(&self, args: Value, _ctx: &super::ToolContext) -> Result<String> {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())

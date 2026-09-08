@@ -1,5 +1,5 @@
 # Voice agent configuration
-# Run with: cargo run --example voice_agent --features full -- --config examples/voice_agent.toml
+# Run with: cargo run -p mindroid-example-voice-agent --bin voice_agent -- --config examples/voice_agent/config.toml
 #
 # API keys can be set here or via environment variables:
 #   OPENAI_API_KEY   — overrides providers.openai.api_key

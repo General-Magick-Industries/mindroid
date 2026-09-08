@@ -160,7 +160,7 @@ Create a client and fetch context or save messages:
 let client = MagickmindClient::new(base_url, identity);
 
 // Fetch conversation context (magickspace_id = the message's channel_id)
-let messages: Vec<LlmMessage> = client
+let prepared = client
     .prepare_context(
         magickspace_id,
         participant_id,
@@ -169,6 +169,12 @@ let messages: Vec<LlmMessage> = client
         None, // exclude_sender
     )
     .await?;
+let messages: Vec<LlmMessage> = prepared.messages;
+// prepared.corpora lists the space's bound knowledge bases ({id, name,
+// description}); pass them to the shipped `CorpusTool` by putting a
+// `CorpusCatalog(prepared.corpora)` in the tool run scope for the turn. The
+// catalog system block is rendered only when
+// `MagickmindContextConfig::include_corpus_catalog` is set.
 
 // Save a message
 let msg_id: Option<String> = client

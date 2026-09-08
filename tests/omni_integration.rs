@@ -43,7 +43,11 @@ impl Tool for EchoTool {
         json!({ "type": "object", "properties": {} })
     }
 
-    async fn execute(&self, args: Value) -> mindroid::Result<String> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &mindroid::tools::ToolContext,
+    ) -> mindroid::Result<String> {
         Ok(args.to_string())
     }
 }
