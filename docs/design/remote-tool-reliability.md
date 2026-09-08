@@ -1,9 +1,10 @@
 # Remote-tool reliability
 
 Status: **partially implemented.** Process-local correlation, server-side
-deduplication, sender binding, input bounds, and mandatory result gating are in
-place. Durable outstanding-call storage, timeouts, client-side deduplication,
-and reconnect recovery remain design work.
+deduplication, sender binding, input bounds, mandatory result gating, and
+per-call timeouts with a synthesized error result (gap 2) are in place. Durable
+outstanding-call storage, client-side deduplication, and reconnect recovery
+remain design work.
 
 ## Context
 
@@ -60,24 +61,34 @@ Pub-sub is at-least-once; duplicates are normal, not edge cases.
   is harmless). This is a client-contract note, documented in the manifest/protocol,
   not mindroid code.
 
-## Gap 2 — timeout / orphaned tasks
+## Gap 2 — timeout / orphaned tasks — **implemented (process-local)**
 
-A halted conversation waiting on a client that never returns hangs forever.
+A halted conversation waiting on a client that never returns used to hang
+forever. Now:
 
-- Give every outstanding call a **deadline** (the table column).
-- A timer sweeps for expired, unconsumed rows. Reuse the combinator layer
-  (`pipeline/combinators.rs` `RetryStage`, or a small dedicated timeout routine
-  in the `Routines` slot) rather than bespoke `tokio::spawn`.
-- On expiry: mark `consumed = 1` and **synthesize a `tool_result`** (`<tool_result
-  name="X">error: timed out</tool_result>`) injected as an inbound message, so the
-  pipeline resumes and the LLM can react ("the door didn't respond…") instead of
-  hanging.
-- Because the row is now `consumed = 1`, a late real result is rejected (mirrors
-  Step Functions invalidating the task token on timeout, and OpenAI Assistants
-  refusing outputs on an `expired` run).
+- Every outstanding call carries a **deadline**, from `Tool::remote_timeout`.
+  `RemoteTool::timeout` sets it per tool and a manifest entry can declare its own
+  through `timeout_secs`; both clamp to 1s..1h, so a publisher cannot park one of
+  the channel's 32 slots indefinitely. Default 5 minutes.
+- `PendingRemoteCalls::sweep_expired` reaps past-deadline calls onto an expiry
+  queue. Every mutating path reaps, so the memory-safety pruning that already
+  existed cannot swallow a notification, and draining is one-shot.
+- `RemoteCallTimeout` — a `Routine`, per the `Routines` slot suggested here
+  rather than a bespoke `tokio::spawn` — drains that queue each tick, synthesizes
+  `<tool_result name="X">error: …</tool_result>`, and runs it through the
+  pipeline so the LLM can react ("the door didn't respond…"). It marks the
+  synthesized message `CorrelatedRemoteResult`, since the sweep already consumed
+  the claim; the gate and the pipeline's admission check both honour that.
+- Because the sweep removed the pending entry, a late real result finds nothing
+  to claim and is dropped as unsolicited (mirrors Step Functions invalidating the
+  task token on timeout, and OpenAI Assistants refusing outputs on an `expired`
+  run).
 
-Timeout value: per-tool sensible default (game action ~ seconds; a long robot
-task ~ minutes), overridable on the `RemoteTool` / manifest entry.
+**Still process-local.** The deadline lives in memory, so a restart forgets every
+outstanding call and no timeout fires for one issued before it — that is the
+durable-table work in gap 1, which this does not do. A host that never wires
+`RemoteCallTimeout` gets expiry (the slot frees, a late result is refused) but
+not resumption; the routine is the part that ends the silence.
 
 ## Gap 3 — reconnect-safe delivery
 
@@ -103,8 +114,8 @@ client can also miss the outbound command.
 
 1. **Persist the process-local outstanding-call set** — keeps the implemented
    server-side correlation and dedup guarantees across restarts.
-2. **Timeout sweep + synthesized error result** (gap 2) — stops orphaned hangs;
-   reuses `RetryStage`/routines.
+2. ~~**Timeout sweep + synthesized error result** (gap 2)~~ — done, as
+   `RemoteCallTimeout`. Persisting the deadline (item 1) is what remains.
 3. **Centrifugo recovery config + resubscribe-with-recovery** (gap 3) — mostly
    configuration + a transport tweak.
 

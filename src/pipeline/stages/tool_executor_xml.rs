@@ -73,6 +73,13 @@ pub(crate) fn remote_executor_for(
         .then(|| tool.remote_executor_id().or(requester).map(str::to_owned))
 }
 
+pub(crate) fn remote_timeout_for(registry: &ToolRegistry, name: &str) -> Duration {
+    registry
+        .get(name)
+        .map(|t| t.remote_timeout())
+        .unwrap_or(crate::tools::remote::DEFAULT_REMOTE_CALL_TIMEOUT)
+}
+
 /// Prose the model wrote alongside a tool call, with the `<tool_call>` blocks
 /// removed. Serves as an acknowledgment the client can show while it performs
 /// the action (e.g. an NPC saying "on it…" before the result lands).
@@ -121,52 +128,151 @@ pub(crate) fn frame_remote_call(
 /// `Context` with no session map attached.
 ///
 /// Bounded and time-limited: a client that never answers must not pin memory.
+///
+/// Every call carries its own deadline, from
+/// [`Tool::remote_timeout`](crate::tools::Tool::remote_timeout). A call that
+/// reaches it stops being claimable and is moved to an expiry queue that
+/// [`RemoteCallTimeout`](crate::tools::RemoteCallTimeout) drains — see
+/// [`sweep_expired`](Self::sweep_expired).
 #[derive(Clone, Default)]
 pub struct PendingRemoteCalls {
-    inner: Arc<std::sync::Mutex<HashMap<String, Vec<PendingCall>>>>,
+    inner: Arc<std::sync::Mutex<Pending>>,
+}
+
+#[derive(Default)]
+struct Pending {
+    calls: HashMap<String, Vec<PendingCall>>,
+    expired: std::collections::VecDeque<ExpiredRemoteCall>,
 }
 
 struct PendingCall {
     id: String,
     name: String,
     sender: String,
-    issued: std::time::Instant,
+    deadline: std::time::Instant,
 }
 
-/// How long an unanswered remote call stays correlatable.
-const PENDING_TTL: Duration = Duration::from_secs(300);
+/// A remote call that will never be answered, awaiting notification.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExpiredRemoteCall {
+    pub channel_id: String,
+    pub id: String,
+    pub name: String,
+    pub sender_id: String,
+    pub reason: ExpiryReason,
+}
+
+/// Why a remote call stopped being answerable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExpiryReason {
+    /// The tool's timeout elapsed with no result.
+    TimedOut,
+    /// The channel's outstanding-call cap evicted it to admit a newer call.
+    Evicted,
+}
+
+impl ExpiryReason {
+    pub(crate) fn as_error(&self) -> &'static str {
+        match self {
+            Self::TimedOut => "the client did not answer in time",
+            Self::Evicted => "the call was dropped: too many outstanding calls on this channel",
+        }
+    }
+}
 
 /// Cap on concurrently outstanding calls per channel.
 const MAX_PENDING_PER_CHANNEL: usize = 32;
 
+/// Cap on undrained expiry notifications, reached only when nothing wires
+/// [`RemoteCallTimeout`](crate::tools::RemoteCallTimeout).
+const MAX_EXPIRED_QUEUE: usize = 256;
+
+impl Pending {
+    /// Move every call past its deadline onto the expiry queue.
+    ///
+    /// Every mutating path calls this, so expiry is queued exactly once whoever
+    /// notices first — pruning for memory safety would otherwise swallow the
+    /// notification silently.
+    fn reap(&mut self, now: std::time::Instant) {
+        let expired = &mut self.expired;
+        self.calls.retain(|channel, calls| {
+            calls.retain(|c| {
+                if now < c.deadline {
+                    return true;
+                }
+                push_expiry(expired, channel, c, ExpiryReason::TimedOut);
+                false
+            });
+            !calls.is_empty()
+        });
+    }
+}
+
+fn push_expiry(
+    queue: &mut std::collections::VecDeque<ExpiredRemoteCall>,
+    channel: &str,
+    call: &PendingCall,
+    reason: ExpiryReason,
+) {
+    if queue.len() >= MAX_EXPIRED_QUEUE {
+        warn!(
+            "Dropping the oldest remote-call expiry: {} undrained. Wire RemoteCallTimeout, \
+             or a client that stops answering leaves its turns truncated",
+            queue.len()
+        );
+        queue.pop_front();
+    }
+    queue.push_back(ExpiredRemoteCall {
+        channel_id: channel.to_string(),
+        id: call.id.clone(),
+        name: call.name.clone(),
+        sender_id: call.sender.clone(),
+        reason,
+    });
+}
+
 impl PendingRemoteCalls {
-    pub(crate) fn record_for(&self, channel: &str, sender: Option<&str>, id: &str, name: &str) {
+    pub(crate) fn record_for(
+        &self,
+        channel: &str,
+        sender: Option<&str>,
+        id: &str,
+        name: &str,
+        timeout: Duration,
+    ) {
         let Some(sender) = sender else {
             warn!("Remote tool call is not correlatable without an authenticated sender");
             return;
         };
-        let mut map = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let pending = &mut *guard;
         let now = std::time::Instant::now();
 
         // Sweep channels that have gone quiet. Pruning only the touched channel
         // leaves one permanent key per channel ever seen, which pins memory in a
         // process serving many short-lived channels.
-        map.retain(|_, calls| {
-            calls.retain(|c| now.duration_since(c.issued) < PENDING_TTL);
-            !calls.is_empty()
-        });
+        pending.reap(now);
 
-        let entry = map.entry(channel.to_string()).or_default();
-        entry.retain(|c| now.duration_since(c.issued) < PENDING_TTL);
+        let entry = pending.calls.entry(channel.to_string()).or_default();
         if entry.len() >= MAX_PENDING_PER_CHANNEL {
-            entry.remove(0);
+            let evicted = entry.remove(0);
+            push_expiry(
+                &mut pending.expired,
+                channel,
+                &evicted,
+                ExpiryReason::Evicted,
+            );
         }
-        entry.push(PendingCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            sender: sender.to_string(),
-            issued: now,
-        });
+        pending
+            .calls
+            .entry(channel.to_string())
+            .or_default()
+            .push(PendingCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                sender: sender.to_string(),
+                deadline: now + timeout,
+            });
     }
 
     /// Claim a returning result. `Some(name)` when `id` was outstanding for this
@@ -181,18 +287,25 @@ impl PendingRemoteCalls {
         id: &str,
         name: &str,
     ) -> Option<String> {
-        let mut map = self.inner.lock().unwrap();
-        let entry = map.get_mut(channel)?;
-        let now = std::time::Instant::now();
-        entry.retain(|c| now.duration_since(c.issued) < PENDING_TTL);
+        let mut pending = self.inner.lock().unwrap();
+        pending.reap(std::time::Instant::now());
+        let entry = pending.calls.get_mut(channel)?;
         let claimed = entry
             .iter()
             .position(|c| c.id == id && c.name == name && Some(c.sender.as_str()) == sender)
             .map(|pos| entry.remove(pos).name);
         if entry.is_empty() {
-            map.remove(channel);
+            pending.calls.remove(channel);
         }
         claimed
+    }
+
+    /// Take every call that will never be answered, newly expired or already
+    /// queued. Draining is one-shot, so a call is reported exactly once.
+    pub fn sweep_expired(&self) -> Vec<ExpiredRemoteCall> {
+        let mut pending = self.inner.lock().unwrap();
+        pending.reap(std::time::Instant::now());
+        pending.expired.drain(..).collect()
     }
 }
 
@@ -241,6 +354,13 @@ impl PipelineStage for RemoteResultGate {
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         let content = ctx.message.content.clone();
         if !declares_tool_result(ctx) {
+            return Ok(());
+        }
+
+        // A timeout result the runtime synthesized for itself is already
+        // authenticated and claimed — the sweep claimed it by taking the pending
+        // entry. Run scope is in-process only, so this cannot arrive off the wire.
+        if crate::pipeline::claimed_this_message(ctx) {
             return Ok(());
         }
 
@@ -384,6 +504,12 @@ impl XmlToolExecutorStage {
         RemoteResultGate {
             pending: self.pending.clone(),
         }
+    }
+
+    /// This stage's outstanding remote calls, for
+    /// [`RemoteCallTimeout`](crate::tools::RemoteCallTimeout).
+    pub fn pending(&self) -> PendingRemoteCalls {
+        self.pending.clone()
     }
 
     pub fn new(client: LlmClient, registry: Arc<ToolRegistry>) -> Self {
@@ -622,6 +748,7 @@ impl StreamingStage for XmlToolExecutorStage {
                             .or_else(|| ctx.message.trusted_sender_id()),
                         &call_id,
                         name,
+                        remote_timeout_for(&registry, name),
                     );
                     final_content = framed;
                     break;
@@ -902,6 +1029,7 @@ async fn run_tool_loop(
                 executor_id.as_deref().or(trusted_sender),
                 &call_id,
                 name,
+                remote_timeout_for(registry, name),
             );
             final_content = framed;
             break;
@@ -1108,7 +1236,235 @@ fn parse_tool_calls(text: &str) -> Vec<(String, serde_json::Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::DEFAULT_REMOTE_CALL_TIMEOUT;
     use serde_json::json;
+
+    /// Serve one SSE chat completion per reply, then close. async-openai reads
+    /// an ordinary `data:` event stream, so a raw socket is enough to drive the
+    /// streaming client the non-streaming `process` path uses underneath.
+    fn serve_sse(
+        listener: tokio::net::TcpListener,
+        replies: Vec<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for reply in replies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // Drain the request before replying, or the peer sees a reset.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_string)
+                            })
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if body.len() >= len {
+                            break;
+                        }
+                    }
+                }
+                let chunk = json!({
+                    "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": null}]
+                });
+                let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.ok();
+                sock.shutdown().await.ok();
+            }
+        })
+    }
+
+    /// The XML stage's non-streaming `process` recorded an outstanding remote
+    /// call under `ToolContext::channel_id` — the workspace id on any transport
+    /// that stamps `magickspace_id` — while the gate claims under the delivery
+    /// channel. The keys never matched, so on Centrifugo every returning client
+    /// result was dropped as unsolicited and the turn halted.
+    #[tokio::test]
+    async fn a_recorded_remote_call_is_claimable_under_a_workspace_stamp() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_sse(
+            listener,
+            vec![r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#.into()],
+        );
+
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(registry),
+        );
+
+        let mut stamped = crate::models::Message::new("hi", "client", "chan1");
+        stamped
+            .metadata
+            .insert("magickspace_id".into(), json!("space-42"));
+        let mut ctx = Context::new(
+            Arc::new(stamped),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        assert_ne!(
+            tool_context_for(&ctx).channel_id,
+            ctx.message.channel_id,
+            "test is vacuous unless the two keys actually differ"
+        );
+
+        PipelineStage::process(&stage, &mut ctx).await.unwrap();
+        server.await.unwrap();
+
+        let framed: serde_json::Value =
+            serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
+                .expect("the response is the tool_call envelope");
+        assert_eq!(framed["type"], "tool_call");
+        let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
+
+        let mut result_ctx = Context::new(
+            Arc::new(crate::models::Message::new(
+                format!("<tool_result name=\"take_photo\" call=\"{call_id}\">ok</tool_result>"),
+                "client",
+                "chan1",
+            )),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        stage.result_gate().process(&mut result_ctx).await.unwrap();
+
+        assert!(
+            !result_ctx.halted,
+            "the client's own result was dropped as unsolicited"
+        );
+    }
+
+    #[test]
+    fn a_call_expires_on_its_own_deadline_not_a_shared_one() {
+        let pending = PendingRemoteCalls::default();
+        pending.record_for("chan1", Some("client"), "slow", "t", Duration::ZERO);
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "live",
+            "t",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
+
+        let expired = pending.sweep_expired();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "slow");
+
+        assert!(
+            pending
+                .claim_for("chan1", Some("client"), "slow", "t")
+                .is_none(),
+            "an expired call must not still be claimable"
+        );
+        assert!(
+            pending
+                .claim_for("chan1", Some("client"), "live", "t")
+                .is_some(),
+            "a call inside its deadline is untouched by another's expiry"
+        );
+    }
+
+    /// Pruning for memory safety happens on every mutating path. If it dropped
+    /// the entry without queueing it, the turn would never be resumed and the
+    /// silence this whole mechanism exists to end would come back.
+    #[test]
+    fn expiry_noticed_while_claiming_is_still_reported() {
+        let pending = PendingRemoteCalls::default();
+        pending.record_for("chan1", Some("client"), "gone", "t", Duration::ZERO);
+
+        assert!(
+            pending
+                .claim_for("chan1", Some("client"), "gone", "t")
+                .is_none()
+        );
+
+        let expired = pending.sweep_expired();
+        assert_eq!(expired.len(), 1, "the claim swallowed the expiry");
+        assert_eq!(expired[0].id, "gone");
+        assert_eq!(expired[0].reason, ExpiryReason::TimedOut);
+        assert!(
+            pending.sweep_expired().is_empty(),
+            "draining is one-shot, or one call resumes the turn every sweep"
+        );
+    }
+
+    #[test]
+    fn a_call_evicted_by_the_channel_cap_is_reported_too() {
+        let pending = PendingRemoteCalls::default();
+        for i in 0..=MAX_PENDING_PER_CHANNEL {
+            pending.record_for(
+                "chan1",
+                Some("client"),
+                &format!("call-{i}"),
+                "t",
+                DEFAULT_REMOTE_CALL_TIMEOUT,
+            );
+        }
+
+        let expired = pending.sweep_expired();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(
+            expired[0].id, "call-0",
+            "the oldest call is the evicted one"
+        );
+        assert_eq!(expired[0].reason, ExpiryReason::Evicted);
+    }
+
+    #[test]
+    fn the_expiry_queue_is_bounded_without_a_routine_to_drain_it() {
+        let pending = PendingRemoteCalls::default();
+        for i in 0..MAX_EXPIRED_QUEUE + 10 {
+            pending.record_for(
+                &format!("chan-{i}"),
+                Some("client"),
+                &format!("call-{i}"),
+                "t",
+                Duration::ZERO,
+            );
+        }
+
+        assert_eq!(pending.sweep_expired().len(), MAX_EXPIRED_QUEUE);
+    }
+
+    #[test]
+    fn the_executor_reads_the_timeout_off_the_tool() {
+        let registry = ToolRegistry::new()
+            .register(crate::tools::RemoteTool::new("quick", "x").timeout(Duration::from_secs(30)))
+            .register(crate::tools::RemoteTool::new("default", "x"));
+
+        assert_eq!(
+            remote_timeout_for(&registry, "quick"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            remote_timeout_for(&registry, "default"),
+            DEFAULT_REMOTE_CALL_TIMEOUT
+        );
+        assert_eq!(
+            remote_timeout_for(&registry, "not_registered"),
+            DEFAULT_REMOTE_CALL_TIMEOUT
+        );
+    }
 
     #[test]
     fn parse_single_tool_call() {
@@ -1156,7 +1512,13 @@ mod tests {
     #[tokio::test]
     async fn an_outstanding_call_is_claimed_exactly_once() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
 
         assert_eq!(
             pending
@@ -1174,7 +1536,13 @@ mod tests {
     #[tokio::test]
     async fn a_call_cannot_be_claimed_from_another_channel() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         assert_eq!(
             pending.claim_for("chan2", Some("client"), "call-1", "take_photo"),
             None
@@ -1191,7 +1559,13 @@ mod tests {
     async fn the_pending_set_is_bounded_per_channel() {
         let pending = PendingRemoteCalls::default();
         for i in 0..MAX_PENDING_PER_CHANNEL + 5 {
-            pending.record_for("chan1", Some("client"), &format!("call-{i}"), "t");
+            pending.record_for(
+                "chan1",
+                Some("client"),
+                &format!("call-{i}"),
+                "t",
+                DEFAULT_REMOTE_CALL_TIMEOUT,
+            );
         }
         // The oldest were evicted; a client that never answers cannot pin memory.
         assert_eq!(
@@ -1316,7 +1690,13 @@ mod tests {
     #[tokio::test]
     async fn the_gate_passes_a_correlated_result_and_strips_the_attribute() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };
@@ -1335,7 +1715,13 @@ mod tests {
     #[tokio::test]
     async fn a_result_from_another_sender_cannot_claim_the_call() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };
@@ -1363,7 +1749,13 @@ mod tests {
             .flatten()
             .unwrap();
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some(&executor), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some(&executor),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };
@@ -1379,7 +1771,13 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_name_does_not_consume_the_legitimate_call() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };
@@ -1404,7 +1802,13 @@ mod tests {
     #[tokio::test]
     async fn a_truncated_result_does_not_consume_the_pending_call() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };
@@ -1432,7 +1836,13 @@ mod tests {
     #[tokio::test]
     async fn a_multi_block_result_does_not_consume_the_pending_call() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };
@@ -1458,7 +1868,13 @@ mod tests {
     async fn a_duplicate_attribute_never_consumes_the_pending_call() {
         for sep in [" ", "\t", "\r", "\n"] {
             let pending = PendingRemoteCalls::default();
-            pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+            pending.record_for(
+                "chan1",
+                Some("client"),
+                "call-1",
+                "take_photo",
+                DEFAULT_REMOTE_CALL_TIMEOUT,
+            );
             let gate = RemoteResultGate {
                 pending: pending.clone(),
             };
@@ -1486,7 +1902,13 @@ mod tests {
     #[tokio::test]
     async fn a_valid_result_is_claimed_only_once_through_the_gate() {
         let pending = PendingRemoteCalls::default();
-        pending.record_for("chan1", Some("client"), "call-1", "take_photo");
+        pending.record_for(
+            "chan1",
+            Some("client"),
+            "call-1",
+            "take_photo",
+            DEFAULT_REMOTE_CALL_TIMEOUT,
+        );
         let gate = RemoteResultGate {
             pending: pending.clone(),
         };

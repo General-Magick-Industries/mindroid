@@ -1,6 +1,7 @@
 //! Client-executed tools: declared to the LLM, emitted to the client to run.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -18,6 +19,22 @@ const MAX_SCHEMA_DEPTH: usize = 16;
 /// Upper bound on any string node inside a manifest-supplied schema.
 const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 
+/// How long a remote call waits for its client, unless the tool sets otherwise.
+///
+/// Five minutes: long enough for a human-in-the-loop confirmation or a slow
+/// physical action, short enough that a conversation does not sit silent for
+/// the rest of the session.
+pub const DEFAULT_REMOTE_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Floor and ceiling applied to any configured remote-call timeout.
+///
+/// The ceiling matters most for manifest entries, which are publisher-supplied:
+/// an outstanding call holds one of a channel's 32 slots, so an unbounded
+/// timeout is a slot a client could park indefinitely.
+pub const MIN_REMOTE_CALL_TIMEOUT: Duration = Duration::from_secs(1);
+/// See [`MIN_REMOTE_CALL_TIMEOUT`].
+pub const MAX_REMOTE_CALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// A tool the runtime does not execute — it declares the tool to the LLM and,
 /// when called, [`XmlToolExecutorStage`] emits the call as the pipeline response
 /// for the client to perform. See [`Tool::is_remote`].
@@ -25,7 +42,8 @@ const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 /// ```ignore
 /// let take_photo = RemoteTool::new("take_photo", "Capture from the device camera.")
 ///     .schema(json!({ "type": "object", "properties": {
-///         "resolution": { "type": "string" } } }));
+///         "resolution": { "type": "string" } } }))
+///     .timeout(Duration::from_secs(30));
 /// registry.register(take_photo);
 /// ```
 ///
@@ -45,9 +63,14 @@ const MAX_SCHEMA_STRING_BYTES: usize = 1024;
 ///
 /// # Reliability (continued)
 ///
-/// Still unguarded: a call the client never answers has no timeout, so the
-/// conversation stays truncated. Its pending entry expires after 5 minutes, but
-/// no retry resumes the turn. See `docs/design/remote-tool-reliability.md`.
+/// A call the client never answers expires after [`timeout`](Self::timeout)
+/// (default [`DEFAULT_REMOTE_CALL_TIMEOUT`]). Wire
+/// [`RemoteCallTimeout`](crate::tools::RemoteCallTimeout) to turn that expiry
+/// into a synthesized error result, so the turn resumes and the model can say
+/// the tool never answered; without it the expiry only frees the slot and the
+/// conversation stays truncated. Remaining gaps — durable outstanding calls
+/// across a restart, client-side dedup, reconnect recovery — are in
+/// `docs/design/remote-tool-reliability.md`.
 ///
 /// [`XmlToolExecutorStage`]: crate::pipeline::stages::XmlToolExecutorStage
 pub struct RemoteTool {
@@ -55,6 +78,7 @@ pub struct RemoteTool {
     description: String,
     schema: Value,
     executor_id: Option<String>,
+    timeout: Duration,
 }
 
 impl RemoteTool {
@@ -64,12 +88,23 @@ impl RemoteTool {
             description: description.into(),
             schema: json!({ "type": "object", "properties": {} }),
             executor_id: None,
+            timeout: DEFAULT_REMOTE_CALL_TIMEOUT,
         }
     }
 
     /// Set the JSON Schema describing the tool's arguments.
     pub fn schema(mut self, schema: Value) -> Self {
         self.schema = schema;
+        self
+    }
+
+    /// How long a call to this tool waits for the client before it expires.
+    ///
+    /// Match it to the action: a game move is seconds, a physical robot task or
+    /// a human confirmation is minutes. Clamped to
+    /// [`MIN_REMOTE_CALL_TIMEOUT`]..=[`MAX_REMOTE_CALL_TIMEOUT`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.clamp(MIN_REMOTE_CALL_TIMEOUT, MAX_REMOTE_CALL_TIMEOUT);
         self
     }
 
@@ -109,6 +144,10 @@ impl Tool for RemoteTool {
     fn remote_executor_id(&self) -> Option<&str> {
         self.executor_id.as_deref()
     }
+
+    fn remote_timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 /// One tool a client advertises in a [`ToolsManifest`].
@@ -119,6 +158,11 @@ pub struct ManifestTool {
     pub description: String,
     #[serde(default = "empty_object_schema")]
     pub schema: Value,
+    /// How long the runtime waits for this client to answer a call, in seconds.
+    /// Absent means [`DEFAULT_REMOTE_CALL_TIMEOUT`]; the value is clamped, so a
+    /// publisher cannot park an outstanding-call slot indefinitely.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 fn empty_object_schema() -> Value {
@@ -225,7 +269,10 @@ impl ToolsManifest {
                 // Stored raw and neutralized at render time instead, so that a
                 // `RemoteTool` an embedder builds directly gets the same
                 // treatment as a manifest one. See `ToolRegistry::system_prompt`.
-                let tool = RemoteTool::new(t.name, t.description).schema(t.schema);
+                let mut tool = RemoteTool::new(t.name, t.description).schema(t.schema);
+                if let Some(secs) = t.timeout_secs {
+                    tool = tool.timeout(Duration::from_secs(secs));
+                }
                 match executor_id {
                     Some(executor_id) => tool.executor_id(executor_id),
                     None => tool,
@@ -908,11 +955,13 @@ mod tests {
                     name: "good_tool".into(),
                     description: "line one\n\n## Fake header\nline two".into(),
                     schema: empty_object_schema(),
+                    timeout_secs: None,
                 },
                 ManifestTool {
                     name: "bad name!".into(),
                     description: String::new(),
                     schema: empty_object_schema(),
+                    timeout_secs: None,
                 },
             ],
         };
@@ -1081,6 +1130,35 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_timeout_is_honoured_and_clamped() {
+        let manifest: ToolsManifest = serde_json::from_value(json!({
+            "tools": [
+                { "name": "quick", "timeout_secs": 30 },
+                { "name": "greedy", "timeout_secs": 86_400 },
+                { "name": "unset" },
+            ]
+        }))
+        .unwrap();
+
+        let tools = manifest.build_tools();
+        let timeout = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name() == name)
+                .unwrap()
+                .remote_timeout()
+        };
+
+        assert_eq!(timeout("quick"), Duration::from_secs(30));
+        assert_eq!(
+            timeout("greedy"),
+            MAX_REMOTE_CALL_TIMEOUT,
+            "a publisher must not park an outstanding-call slot for a day"
+        );
+        assert_eq!(timeout("unset"), DEFAULT_REMOTE_CALL_TIMEOUT);
+    }
+
+    #[test]
     fn manifest_parses_and_builds_tools() {
         let msg = message_with_tools(json!([
             {"name":"attack","description":"hit it","schema":{"type":"object"}},
@@ -1112,6 +1190,7 @@ mod tests {
                 name: "deep".into(),
                 description: String::new(),
                 schema,
+                timeout_secs: None,
             }],
         };
         assert!(manifest.build_tools().is_empty());

@@ -78,6 +78,12 @@ impl ToolExecutorStage {
         RemoteResultGate::with_pending(self.pending.clone())
     }
 
+    /// This stage's outstanding remote calls, for
+    /// [`RemoteCallTimeout`](crate::tools::RemoteCallTimeout).
+    pub fn pending(&self) -> super::tool_executor_xml::PendingRemoteCalls {
+        self.pending.clone()
+    }
+
     #[cfg(feature = "artifacts")]
     fn artifact_store(&self) -> Option<Arc<dyn crate::artifacts::ArtifactStore>> {
         self.registry
@@ -355,6 +361,7 @@ impl ToolExecutorStage {
                 executor_id.as_deref().or(trusted_sender),
                 &call_id,
                 &call.name,
+                super::tool_executor_xml::remote_timeout_for(registry, &call.name),
             );
             return Ok(Round {
                 outcome: RoundOutcome::Remote(framed),

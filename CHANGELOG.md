@@ -69,7 +69,13 @@ destructure.
 struct-literal construction without `..Default::default()` no longer compiles —
 add the field (or the `..Default::default()` tail).
 
-#### 5. The native tool executor takes the plain name; the XML one is qualified
+#### 5. `ManifestTool` gained a field
+
+`timeout_secs: Option<u64>`. Deserialization is unaffected — the field defaults
+to `None` when a client omits it — but a struct-literal construction without it
+no longer compiles. Add `timeout_secs: None`.
+
+#### 6. The native tool executor takes the plain name; the XML one is qualified
 
 Native function calling is the default path now, so it owns the unqualified
 name. The prompt-XML stage keeps working and is still the right choice on an
@@ -107,6 +113,24 @@ truncated.
 
 ### Added
 
+- **Remote tool calls have a timeout.** `RemoteTool::timeout` sets how long a
+  call waits for its client, defaulting to `DEFAULT_REMOTE_CALL_TIMEOUT` (5
+  minutes) and clamped to `MIN_REMOTE_CALL_TIMEOUT`..=`MAX_REMOTE_CALL_TIMEOUT`
+  (1s..1h). It reaches the executor through the new `Tool::remote_timeout`
+  (defaulted, so no implementor has to change), and a manifest entry can carry
+  its own via the new `ManifestTool::timeout_secs`.
+
+  Wire the new `RemoteCallTimeout` routine with an executor's `pending()` set to
+  act on an expiry: it sweeps expired calls and feeds each back into the
+  pipeline as `<tool_result name="…">error: …</tool_result>`, so the turn
+  finishes and the model can say the tool never answered. Unwired, an expiry
+  only frees the slot — the previous behaviour, where the conversation simply
+  stayed truncated. Closes gap 2 of `docs/design/remote-tool-reliability.md`.
+
+  Expiry is queued exactly once however it is noticed (the sweep, a later call,
+  or a returning result), so pruning for memory safety cannot swallow the
+  notification. A call evicted by the 32-per-channel cap is reported the same
+  way. The queue is bounded at 256 undrained entries.
 - `Tool::ends_turn` (default `false`) — a tool that delivers the reply itself
   can end the turn: after a local round in which such a call succeeds,
   `ToolExecutorStage` stops instead of asking the model again, and the

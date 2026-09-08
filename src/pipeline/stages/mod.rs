@@ -40,7 +40,8 @@ pub use stt::{SttProvider, SttStage};
 pub use tool_executor::ToolExecutorStage;
 #[cfg(feature = "llm-client")]
 pub use tool_executor_xml::{
-    ParsedToolCall, RemoteResultGate, ToolCallParser, XmlToolCallParser, XmlToolExecutorStage,
+    ExpiredRemoteCall, ExpiryReason, ParsedToolCall, PendingRemoteCalls, RemoteResultGate,
+    ToolCallParser, XmlToolCallParser, XmlToolExecutorStage,
 };
 #[cfg(feature = "transport-audio")]
 pub use tts::AudioOutputStage;

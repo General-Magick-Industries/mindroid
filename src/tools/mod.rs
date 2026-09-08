@@ -9,6 +9,8 @@ pub mod open;
 mod registry;
 pub mod reminder;
 pub mod remote;
+#[cfg(feature = "llm-client")]
+pub mod remote_timeout;
 pub mod shell;
 pub mod untrusted;
 
@@ -26,8 +28,11 @@ pub(crate) use registry::MAX_REMOTE_TOOL_PROMPT_BYTES;
 pub use registry::{DynamicRegistry, ToolRegistry};
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
 pub use remote::{
-    ManifestStage, ManifestTool, PerTurnTools, PerTurnToolsStage, RemoteTool, ToolsManifest,
+    DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_CALL_TIMEOUT, MIN_REMOTE_CALL_TIMEOUT, ManifestStage,
+    ManifestTool, PerTurnTools, PerTurnToolsStage, RemoteTool, ToolsManifest,
 };
+#[cfg(feature = "llm-client")]
+pub use remote_timeout::RemoteCallTimeout;
 pub use shell::ShellTool;
 pub use untrusted::wrap_untrusted;
 
@@ -157,6 +162,16 @@ pub trait Tool: Send + Sync {
     /// return `None` and are executed by the authenticated caller.
     fn remote_executor_id(&self) -> Option<&str> {
         None
+    }
+
+    /// How long a call to this remote tool waits for the client's result.
+    ///
+    /// Ignored for a local tool. Once the deadline passes the call stops being
+    /// correlatable, so a late result is dropped as unsolicited; wiring
+    /// [`RemoteCallTimeout`] additionally resumes the turn with a synthesized
+    /// error result. See [`RemoteTool::timeout`].
+    fn remote_timeout(&self) -> std::time::Duration {
+        remote::DEFAULT_REMOTE_CALL_TIMEOUT
     }
 
     /// If this tool is backed by an [`ArtifactStore`](crate::artifacts::ArtifactStore),

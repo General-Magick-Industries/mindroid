@@ -68,7 +68,7 @@ Runtime (core/runtime.rs)
 ├── Memory     → save/get/clear history
 ├── Observer   → lifecycle hooks (on_start, on_message, on_error, …) — edge-triggered
 ├── Health     → current liveness for a supervisor (Runtime::health) — level-triggered
-├── Routines   → background poll/act loops (reminders, etc.)
+├── Routines   → background poll/act loops (reminders, remote-call timeouts)
 └── Pipeline   → ordered stages, at most ONE StreamingStage
 ```
 
@@ -166,6 +166,16 @@ deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and 
 needs does not exist on that path. Use it only against an endpoint that speaks
 OpenAI function calling directly (LiteLLM, vLLM, OpenAI). On the MagickMind
 inference path, keep `XmlToolExecutorStage`.
+
+**A remote call the client never answers times out.** Every remote tool carries a
+deadline — `RemoteTool::timeout`, or `timeout_secs` on a manifest entry,
+defaulting to 5 minutes and clamped to 1s..1h. Expiry alone only frees the slot
+and refuses a late result; wire the `RemoteCallTimeout` routine with the
+executor's `pending()` set to also resume the turn with a synthesized
+`<tool_result>error: …</tool_result>`, so the model can tell the user the tool
+never responded rather than leaving the conversation silent. Deadlines are
+process-local — a restart forgets outstanding calls. See
+`docs/design/remote-tool-reliability.md`.
 
 `XmlToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling
