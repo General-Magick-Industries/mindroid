@@ -313,10 +313,13 @@ impl MagickmindClient {
             });
         }
 
-        let parsed: PrepareContextResponse = resp.json().await.map_err(|e| MindroidError::Api {
-            message: format!("Failed to parse Magickmind prepare_context response: {e}"),
-            status_code: None,
-        })?;
+        let mut parsed: PrepareContextResponse =
+            resp.json().await.map_err(|e| MindroidError::Api {
+                message: format!("Failed to parse Magickmind prepare_context response: {e}"),
+                status_code: None,
+            })?;
+
+        drop_inbound_turn(&mut parsed.chat_history, participant_id, query);
 
         Ok(convert_context_response(
             parsed,
@@ -500,6 +503,18 @@ impl ContextProvider for MagickmindContext {
 /// Backend cap is 64 entries; enforced here too so a misbehaving backend
 /// cannot spend the whole context window on catalog lines.
 const MAX_CATALOG_ENTRIES: usize = 64;
+
+/// The backend persists a message before fanning it out, so the newest entry is
+/// the turn being answered. Callers append the live turn themselves, and keeping
+/// both sends it to the model twice.
+fn drop_inbound_turn(history: &mut Vec<ChatHistoryItem>, sender_id: &str, content: &str) {
+    if history
+        .first()
+        .is_some_and(|newest| newest.sent_by_user_id == sender_id && newest.content == content)
+    {
+        history.remove(0);
+    }
+}
 
 fn convert_context_response(
     mut resp: PrepareContextResponse,
@@ -763,6 +778,47 @@ mod tests {
             body["catalog_corpus_ids"],
             serde_json::json!(["c-1", "c-2"])
         );
+    }
+
+    fn history(items: &[(&str, &str)]) -> Vec<ChatHistoryItem> {
+        items
+            .iter()
+            .map(|(sender, content)| ChatHistoryItem {
+                sent_by_user_id: (*sender).to_string(),
+                sent_by_user_name: String::new(),
+                content: (*content).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_turn_being_answered_is_dropped_from_its_own_transcript() {
+        let mut items = history(&[("u1", "current"), ("a1", "reply"), ("u1", "earlier")]);
+
+        drop_inbound_turn(&mut items, "u1", "current");
+
+        let left: Vec<&str> = items.iter().map(|i| i.content.as_str()).collect();
+        assert_eq!(left, vec!["reply", "earlier"]);
+    }
+
+    /// Only the newest entry is the live turn. An older turn with the same text
+    /// is something the sender really did say twice, and must survive.
+    #[test]
+    fn an_earlier_identical_turn_is_kept() {
+        let mut items = history(&[("u1", "newest"), ("a1", "reply"), ("u1", "hey")]);
+
+        drop_inbound_turn(&mut items, "u1", "hey");
+
+        assert_eq!(items.len(), 3, "only the newest entry may be dropped");
+    }
+
+    #[test]
+    fn another_senders_newest_turn_is_kept() {
+        let mut items = history(&[("u2", "hey"), ("u1", "earlier")]);
+
+        drop_inbound_turn(&mut items, "u1", "hey");
+
+        assert_eq!(items.len(), 2, "the match is on sender as well as content");
     }
 
     /// Context prepare answers newest-first. Passed through unchanged, the model
