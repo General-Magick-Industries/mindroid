@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::core::models::{CONTEXT_METADATA_KEY, DECLARED_TYPE_METADATA_KEY, TOOLS_METADATA_KEY};
-use crate::{Auth, Message, MessageType, MindroidError, Response, Result, Transport};
+use crate::{Auth, ChannelType, Message, MessageType, MindroidError, Response, Result, Transport};
 
 fn transport_err(msg: impl Into<String>) -> MindroidError {
     MindroidError::Transport {
@@ -608,6 +608,21 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
             msg.metadata
                 .insert(key.into(), serde_json::Value::String(value.to_string()));
         }
+    }
+    // The space type also has to reach the message itself, not just metadata:
+    // episodic ingest keys the stored speaker prefix off `channel_type`, so a
+    // group left as `Direct` is remembered as an unattributed 1:1. Suffix match
+    // for the same reason hosts use one -- the backend spells it both `GROUP`
+    // and `MAGICKSPACE_TYPE_GROUP` -- and anything else stays `Direct`, which is
+    // the safe default here (attribution is per-message, and the reply gate
+    // reads the raw metadata and fails closed on its own).
+    if let Some(space_type) = msg
+        .metadata
+        .get("magickspace_type")
+        .and_then(serde_json::Value::as_str)
+        && space_type.to_ascii_uppercase().ends_with("GROUP")
+    {
+        msg.channel_type = ChannelType::Group;
     }
     if let Some(authenticated_sender) = push
         .get("pub")
@@ -1770,6 +1785,39 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("GROUP")
         );
+    }
+
+    /// The stamped space type also lands on `channel_type`, which is what
+    /// episodic ingest reads to decide whether the stored line is attributed.
+    #[test]
+    fn a_group_space_type_makes_the_message_a_group_message() {
+        for spelling in ["GROUP", "MAGICKSPACE_TYPE_GROUP", "magickspace_type_group"] {
+            let frame = push(
+                "user:a1#a1",
+                serde_json::json!({
+                    "content": "hi",
+                    "sender_id": "u1",
+                    "magickspace_type": spelling,
+                }),
+            );
+            let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+            assert_eq!(msg.channel_type, ChannelType::Group, "{spelling}");
+        }
+    }
+
+    /// Everything else stays `Direct` — a private space, an unstamped publisher,
+    /// and vocabulary this build does not know.
+    #[test]
+    fn any_other_space_type_leaves_the_message_direct() {
+        for stamped in [Some("MAGICKSPACE_TYPE_PRIVATE"), Some("BROADCAST"), None] {
+            let mut payload = serde_json::json!({"content": "hi", "sender_id": "u1"});
+            if let Some(value) = stamped {
+                payload["magickspace_type"] = serde_json::json!(value);
+            }
+            let frame = push("user:a1#a1", payload);
+            let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+            assert_eq!(msg.channel_type, ChannelType::Direct, "{stamped:?}");
+        }
     }
 
     #[test]
