@@ -71,13 +71,23 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = Arc::new(ToolRegistry::new().register(ShellTool::new(30)));
 
+    // Only local tools here, but the gate is wired anyway: it is what claims a
+    // returning remote result, and `LlmRound` refuses a turn carrying a
+    // tool_result nothing claimed. Take it before the round moves into the body.
+    let tools = ToolRound::new(registry.clone());
+    let result_gate = tools.result_gate();
+
     let agent = AgentLoop::new(
         Pipeline::new()
             .add_stage(TranscriptCompaction::from_tokens(args.context_budget))
-            .add_stage(LlmRound::new(client, registry.clone()))
-            .add_stage(ToolRound::new(registry)),
+            .add_stage(LlmRound::new(client, registry))
+            .add_stage(tools),
     )
-    .with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
+    .with_setup(
+        Pipeline::new()
+            .add_stage(result_gate)
+            .add_stage(SimpleContextBuilder::with_prompt(SYSTEM)),
+    )
     .with_finish(Pipeline::new().add_stage(PostProcessor))
     .with_max_iterations(args.max_iterations);
 

@@ -88,11 +88,17 @@ identically to a plain pipeline.
 
 This is what makes compaction, approval, retry and per-round model routing ordinary
 stages: they sit *inside* the reasoning loop rather than around an executor that owns
-its own. `LlmRound` + `ToolRound` are the native tool round split for this — local
-tools only; remote tools, the correlation gate and artifact re-attachment stay in
-`ToolExecutorStage`. `TranscriptCompaction` drops whole rounds, never half of one:
-splitting an assistant `tool_calls` turn from its results makes the provider reject
-the request.
+its own. `LlmRound` + `ToolRound` are the native tool round split for this.
+`TranscriptCompaction` drops whole rounds, never half of one: splitting an assistant
+`tool_calls` turn from its results makes the provider reject the request.
+
+**Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
+deadline, same correlation gate — but a split round cannot run the gate inline the way
+`ToolExecutorStage` does, because `LlmRound` has already called the model by then. Wire
+`ToolRound::result_gate()` into `setup`, ahead of context building. Forget it and
+`LlmRound` refuses the turn rather than letting an unclaimed `tool_result` reach the
+model. Artifact re-attachment and `ToolCall`/`ToolResult` stream events are still
+`ToolExecutorStage`-only.
 
 ```rust
 AgentLoop::new(

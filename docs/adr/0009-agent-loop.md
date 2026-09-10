@@ -110,10 +110,22 @@ on purpose.
 - `PipelineEvent` gains `LoopIterationStarted` and `LoopCompleted`.
 - Nothing existing changes behaviour: no preset, example or embedder uses
   `AgentLoop` unless it opts in, and a body with no loop-aware stage runs once.
-- `LlmRound`/`ToolRound` cover local tools only. Remote tools, the correlation
-  gate and artifact re-attachment stay in `ToolExecutorStage`; a pipeline
-  needing those keeps using it. Porting them is follow-up work, and is the point
-  at which the two executors could collapse into one composition.
+- `LlmRound`/`ToolRound` keep `ToolExecutorStage`'s remote-tool wire contract
+  exactly: the call is framed as `{type: "tool_call"}`, the outstanding call is
+  recorded with the same deadline, and the returning `TOOL_RESULT` clears the
+  same gate. A remote call ends the turn without requesting another pass, which
+  is the natural expression of "there is nothing to iterate on until the client
+  answers" — the executor needed a distinct `RoundOutcome::Remote` to say it.
+- **The correlation gate moves out of the stage and into `setup`.** A split
+  round cannot run it inline the way `ToolExecutorStage` does: by the time
+  `ToolRound` runs, `LlmRound` has already sent the context to the model. This
+  is where the XML stage's own documentation already recommended putting the
+  gate, since `setup` is ahead of context building. To keep the property that
+  correlation cannot simply be forgotten, `LlmRound` refuses a turn whose
+  declared `tool_result` nothing claimed — a missing gate costs a refused turn
+  rather than fabricated tool output reaching the model.
+- Artifact re-attachment stays in `ToolExecutorStage`, as do `ToolCall` /
+  `ToolResult` stream events; the split stages do not emit them yet.
 - `Runtime` still drives a `Pipeline`. An `AgentLoop` is run directly by the
   embedder for now; giving `MessageContext::process_and_respond` a loop to drive
   is follow-up work, and the point at which presets can offer one.
