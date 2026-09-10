@@ -1,3 +1,4 @@
+pub mod agent_loop;
 pub mod builder;
 pub mod config;
 pub mod content;

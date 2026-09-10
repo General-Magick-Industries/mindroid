@@ -164,7 +164,10 @@ enum RoundOutcome {
 
 /// Echo the assistant turn with its native calls, so the follow-up request is
 /// a valid OpenAI tool round the provider can correlate results against.
-fn assistant_turn(content: &str, calls: &[NativeToolCall]) -> Result<ChatCompletionRequestMessage> {
+pub(crate) fn assistant_turn(
+    content: &str,
+    calls: &[NativeToolCall],
+) -> Result<ChatCompletionRequestMessage> {
     let tool_calls: Vec<ChatCompletionMessageToolCalls> = calls
         .iter()
         .map(|c| {
@@ -185,7 +188,7 @@ fn assistant_turn(content: &str, calls: &[NativeToolCall]) -> Result<ChatComplet
     Ok(builder.build().map_err(err)?.into())
 }
 
-fn tool_turn(call_id: &str, result: String) -> Result<ChatCompletionRequestMessage> {
+pub(crate) fn tool_turn(call_id: &str, result: String) -> Result<ChatCompletionRequestMessage> {
     Ok(ChatCompletionRequestToolMessageArgs::default()
         .content(result)
         .tool_call_id(call_id)
