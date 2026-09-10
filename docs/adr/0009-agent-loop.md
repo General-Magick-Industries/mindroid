@@ -64,6 +64,20 @@ assistant turn carrying `tool_calls` or a `role: tool` result keyed by
 `tool_call_id` — the same reason `LlmClient::chat_with_tools` takes async-openai
 types directly.
 
+### It is also a stage
+
+`AgentLoop` implements `PipelineStage`, so a loop nests inside another loop's
+body — a planning loop handing off to an executing loop within one turn. Two
+things differ from calling `run` directly: the response is written back to the
+context, because as a stage the turn is not over; and the enclosing loop's
+`Continue` is held aside for the duration, so the inner loop neither consumes
+its parent's request nor leaves its own behind.
+
+Nesting shares run scope, which is the point when composing phases of one turn
+and a hazard when the two are meant to be independent agents — both would write
+the same `Transcript`. A genuine sub-agent wants its own context, which is what
+`DelegationTool` builds.
+
 ## Alternatives rejected
 
 **Make `Pipeline` itself loop.** Three things resist it. `SimpleContextBuilder`
