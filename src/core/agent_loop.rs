@@ -116,6 +116,7 @@ pub struct AgentLoop {
     body: Pipeline,
     finish: Pipeline,
     max_iterations: usize,
+    name: String,
 }
 
 impl AgentLoop {
@@ -126,7 +127,14 @@ impl AgentLoop {
             body,
             finish: Pipeline::new(),
             max_iterations: DEFAULT_LOOP_ITERATIONS,
+            name: "AgentLoop".to_string(),
         }
+    }
+
+    /// Name this loop, so nested loops are distinguishable in logs and events.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Stages that run once before the first pass.
@@ -244,6 +252,9 @@ impl AgentLoop {
                 }
             }
 
+            // See `wrap_up`: a halted or capped pass can leave a request behind.
+            ctx.take::<Continue>();
+
             // `Pipeline::run` takes the response, so even an empty `finish`
             // drains it — the turn's text has to come back from the call.
             let content = match self.finish.run(ctx).await {
@@ -272,6 +283,11 @@ impl AgentLoop {
         iterations: usize,
         started: Instant,
     ) -> Result<LoopOutcome> {
+        // A pass that halted or hit the cap can leave its request behind. Left
+        // there it is a stale instruction to whoever reads run scope next —
+        // an enclosing loop would take it as its own and run again.
+        ctx.take::<Continue>();
+
         // `finish` post-processes the turn's response, so it has to be back on
         // the context before those stages run.
         ctx.response = carried;
@@ -289,6 +305,44 @@ impl AgentLoop {
             reason,
             iterations,
         })
+    }
+}
+
+/// A loop is also a stage, so one can nest inside another's body — a planning
+/// loop that hands off to an executing loop, both inside one turn.
+///
+/// # Two things it does that `run` does not
+///
+/// `run` ends with `finish` taking the response off the context; as a stage the
+/// turn is not over, so the response is written back for the stages after it.
+/// And the enclosing loop's [`Continue`] is held aside for the duration, so the
+/// inner loop neither consumes its parent's request nor leaves its own behind.
+///
+/// # What is still shared
+///
+/// Run scope. Both loops see one [`Context`], which is the point when composing
+/// phases of a single turn — the transcript carries from the planning loop into
+/// the executing one — and a hazard if the two are meant to be independent
+/// agents, since they would write the same `Transcript`. A genuine sub-agent
+/// wants its own context: nest it through
+/// [`DelegationTool`](crate::tools::DelegationTool), which builds a fresh one.
+///
+/// `ctx.halted` propagates outward unchanged: an inner loop that halts stops
+/// the enclosing pipeline too, which is what halting means everywhere else.
+#[async_trait::async_trait]
+impl crate::pipeline::PipelineStage for AgentLoop {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
+        let enclosing = ctx.take::<Continue>();
+        let outcome = self.run(ctx).await?;
+        ctx.response = outcome.response;
+        if let Some(request) = enclosing {
+            ctx.set(request);
+        }
+        Ok(())
     }
 }
 
@@ -601,6 +655,174 @@ mod tests {
             .unwrap();
 
         assert_eq!(last.load(Ordering::SeqCst), 3);
+    }
+
+    /// A pass that halted or hit the cap can still have asked for another one.
+    /// Left in run scope that request is a stale instruction to the next reader.
+    #[tokio::test]
+    async fn the_loop_leaves_no_request_behind() {
+        let mut capped = ctx();
+        let (body, _) = rounds(usize::MAX);
+        AgentLoop::new(body)
+            .with_max_iterations(2)
+            .run(&mut capped)
+            .await
+            .unwrap();
+        assert!(capped.get_run::<Continue>().is_none(), "capped");
+
+        struct AsksThenHalts;
+
+        #[async_trait]
+        impl PipelineStage for AsksThenHalts {
+            fn name(&self) -> &str {
+                "asks-then-halts"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.set(Continue);
+                ctx.halted = true;
+                Ok(())
+            }
+        }
+
+        let mut halted = ctx();
+        AgentLoop::new(Pipeline::new().add_stage(AsksThenHalts))
+            .run(&mut halted)
+            .await
+            .unwrap();
+        assert!(halted.get_run::<Continue>().is_none(), "halted");
+    }
+
+    /// Passes taken by the inner loop during the current outer pass. Its own
+    /// `setup` resets it, which is what makes the inner budget per-invocation.
+    struct InnerCount(usize);
+
+    struct ResetInner;
+
+    #[async_trait]
+    impl PipelineStage for ResetInner {
+        fn name(&self) -> &str {
+            "reset-inner"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            ctx.set(InnerCount(0));
+            Ok(())
+        }
+    }
+
+    /// Asks for another pass until `until` passes have run *this invocation*.
+    struct InnerRounds {
+        total: Arc<AtomicUsize>,
+        until: usize,
+    }
+
+    #[async_trait]
+    impl PipelineStage for InnerRounds {
+        fn name(&self) -> &str {
+            "inner-rounds"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            let n = ctx.get_run::<InnerCount>().map(|c| c.0).unwrap_or(0) + 1;
+            ctx.set(InnerCount(n));
+            self.total.fetch_add(1, Ordering::SeqCst);
+            if n < self.until {
+                ctx.set(Continue);
+            }
+            Ok(())
+        }
+    }
+
+    fn inner_loop(until: usize) -> (AgentLoop, Arc<AtomicUsize>) {
+        let total = Arc::new(AtomicUsize::new(0));
+        let agent = AgentLoop::new(Pipeline::new().add_stage(InnerRounds {
+            total: total.clone(),
+            until,
+        }))
+        .with_setup(Pipeline::new().add_stage(ResetInner))
+        .with_name("inner");
+        (agent, total)
+    }
+
+    /// A loop is a stage, so one nests in another's body.
+    #[tokio::test]
+    async fn a_loop_nests_inside_another_loops_body() {
+        let (inner, inner_total) = inner_loop(2);
+
+        // The outer body runs the inner loop to completion, then asks for one
+        // more outer pass of its own.
+        let outer_seen = Arc::new(AtomicUsize::new(0));
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(inner).add_stage(Rounds {
+            seen: outer_seen.clone(),
+            until: 2,
+        }))
+        .run(&mut ctx())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outer_seen.load(Ordering::SeqCst),
+            2,
+            "the outer loop ran twice"
+        );
+        assert_eq!(
+            inner_total.load(Ordering::SeqCst),
+            4,
+            "the inner loop ran its two passes on each outer pass"
+        );
+        assert_eq!(outcome.iterations, 2);
+    }
+
+    /// The inner loop must neither swallow the enclosing loop's request nor
+    /// leave its own behind — either one changes how many passes the parent runs.
+    #[tokio::test]
+    async fn a_nested_loop_does_not_disturb_its_parents_request() {
+        struct AsksThenNests(AgentLoop);
+
+        #[async_trait]
+        impl PipelineStage for AsksThenNests {
+            fn name(&self) -> &str {
+                "asks-then-nests"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                // The parent's request is set BEFORE the inner loop runs.
+                if ctx.get_run::<Asked>().is_none() {
+                    ctx.set(Asked);
+                    ctx.set(Continue);
+                }
+                self.0.process(ctx).await
+            }
+        }
+        struct Asked;
+
+        let (inner, inner_total) = inner_loop(3);
+
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(AsksThenNests(inner)))
+            .run(&mut ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.iterations, 2,
+            "the parent's request survived the nested loop"
+        );
+        assert_eq!(inner_total.load(Ordering::SeqCst), 6);
+    }
+
+    /// `run` ends with `finish` taking the response; as a stage the turn is not
+    /// over, so it has to be readable by the stages after it.
+    #[tokio::test]
+    async fn as_a_stage_the_response_is_left_on_the_context() {
+        let (body, _) = rounds(2);
+        let mut ctx = ctx();
+
+        crate::pipeline::PipelineStage::process(&AgentLoop::new(body), &mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.response.as_deref(), Some("round 2"));
     }
 
     #[tokio::test]

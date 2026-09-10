@@ -105,6 +105,12 @@ AgentLoop::new(
 .with_finish(Pipeline::new().add_stage(PostProcessor))
 ```
 
+`AgentLoop` is **also a `PipelineStage`**, so it is not an either/or with `Pipeline`:
+run it at the top of a turn, or nest one inside another loop's body (a planning loop
+feeding an executing loop). Nested loops share run scope — deliberate for phases of one
+turn, wrong for two independent agents, which would write the same `Transcript`. A real
+sub-agent wants its own `Context`: nest it through `DelegationTool`.
+
 `Runtime` still drives a `Pipeline`; an `AgentLoop` is run directly today (see
 `examples/agent_loop`). Wiring it behind `MessageContext::process_and_respond` is
 follow-up work.
