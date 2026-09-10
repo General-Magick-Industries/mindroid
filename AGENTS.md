@@ -12,6 +12,7 @@ These are load-bearing. If a change touches one, read the linked ADR in `docs/ad
 - **Concurrency = structured.** Prefer `JoinSet` / `select!` / `CancellationToken` over detached `tokio::spawn`. Fan-out collects results; it never shares `&mut Context` across tasks. → `docs/adr/0001-concurrency.md`
 - **Observability = middleware, never a mutable observer registry.** Cross-cutting concerns wrap traits (tower-style) or ride the `PipelineEvent` / callback stream. → `docs/adr/0002-observability.md`
 - **OmniSession is a separate execution model**, not an extended `Pipeline`. → `docs/adr/0003-omnisession.md`
+- **`AgentLoop` is likewise a separate execution model**, composed *of* pipelines. Iteration belongs to the loop, not to a stage that owns a private one. → `docs/adr/0009-agent-loop.md`
 - **Control traffic with no consumer never becomes prompt text.** `Pipeline` refuses it at the entrance, before any stage runs — the one sanctioned deviation from "control flow composes from stages". → `docs/adr/0008-pipeline-admission.md`
 - **Accept traits, return structs.** Every subsystem is a swappable trait; keep them small and object-safe.
 
@@ -76,6 +77,49 @@ Runtime (core/runtime.rs)
 now, which is what an out-of-process supervisor needs. See ADR-0007.
 
 For real-time bidirectional audio, `OmniSession` runs alongside `Pipeline` as a separate model (see ADR-0003).
+
+### AgentLoop — the iterative model (ADR-0009)
+
+A `Pipeline` runs once per message. `AgentLoop` runs three of them — `setup` once,
+`body` per iteration, `finish` once — over one `Context`, so run scope is the loop's
+state. A body stage requests another pass by setting `Continue` in run scope; the loop
+clears it before each pass, so a body that never asks runs exactly once and behaves
+identically to a plain pipeline.
+
+This is what makes compaction, approval, retry and per-round model routing ordinary
+stages: they sit *inside* the reasoning loop rather than around an executor that owns
+its own. `LlmRound` + `ToolRound` are the native tool round split for this.
+`TranscriptCompaction` drops whole rounds, never half of one: splitting an assistant
+`tool_calls` turn from its results makes the provider reject the request.
+
+**Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
+deadline, same correlation gate — but a split round cannot run the gate inline the way
+`ToolExecutorStage` does, because `LlmRound` has already called the model by then. Wire
+`ToolRound::result_gate()` into `setup`, ahead of context building. Forget it and
+`LlmRound` refuses the turn rather than letting an unclaimed `tool_result` reach the
+model. Artifact re-attachment and `ToolCall`/`ToolResult` stream events are still
+`ToolExecutorStage`-only.
+
+```rust
+AgentLoop::new(
+    Pipeline::new()
+        .add_stage(TranscriptCompaction::from_tokens(60_000))
+        .add_stage(LlmRound::new(client, registry.clone()))
+        .add_stage(ToolRound::new(registry)),
+)
+.with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
+.with_finish(Pipeline::new().add_stage(PostProcessor))
+```
+
+`AgentLoop` is **also a `PipelineStage`**, so it is not an either/or with `Pipeline`:
+run it at the top of a turn, or nest one inside another loop's body (a planning loop
+feeding an executing loop). Nested loops share run scope — deliberate for phases of one
+turn, wrong for two independent agents, which would write the same `Transcript`. A real
+sub-agent wants its own `Context`: nest it through `DelegationTool`.
+
+`Runtime` still drives a `Pipeline`; an `AgentLoop` is run directly today (see
+`examples/agent_loop`). Wiring it behind `MessageContext::process_and_respond` is
+follow-up work.
 
 ### Core Traits (always available, no feature gate)
 
