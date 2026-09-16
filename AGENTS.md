@@ -46,6 +46,8 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `llm-local` | (includes `llm-client`) | `ollama_pipeline` preset |
 | `llm-hosted` | (includes `llm-client`) | `magickmind_pipeline` preset |
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
+| `omni-gemini` | `tokio-tungstenite`, `base64` | `GeminiLiveProvider`, `GeminiLiveConfig`, `gemini::tool_declarations` |
+| `omni-openai` | `tokio-tungstenite`, `base64` | `OpenAiRealtimeProvider`, `OpenAiRealtimeConfig`, `openai_realtime::tool_declarations` |
 | `transport-audio` | `cpal`, `hound`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage` |
 | `speech` | `reqwest` | `OpenAiStt`, `DeepgramTts`, etc. |
 | `apikey` | `reqwest` | `ApiKeyAuth` |
@@ -76,6 +78,13 @@ Runtime (core/runtime.rs)
 now, which is what an out-of-process supervisor needs. See ADR-0007.
 
 For real-time bidirectional audio, `OmniSession` runs alongside `Pipeline` as a separate model (see ADR-0003).
+
+`GeminiLiveProvider` (`omni-gemini`) and `OpenAiRealtimeProvider` (`omni-openai`) are the concrete `OmniProvider`s; the latter also works through a LiteLLM `/v1/realtime` passthrough. Two
+things callers must get right: `OmniSession` keeps its tool list and `OmniConfig::tools_schema`
+separate, so set both from the same slice via that provider's `tool_declarations`; and the
+rates differ per provider — Gemini is 16 kHz in / 24 kHz out (`CpalAudio::new_split`),
+OpenAI is 24 kHz both ways (`CpalAudio::new`). See `docs/design/omni-support.md` §3 for
+the refactor that removes both footguns.
 
 ### Core Traits (always available, no feature gate)
 
@@ -252,7 +261,7 @@ src/
 │   ├── combinators.rs  # Branch/Router/Retry/Approval (+ Parallel/Fusion)
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
-├── omni/           # OmniSession, OmniProvider, audio source/sink, VAD (ADR-0003)
+├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio source/sink, VAD (ADR-0003)
 ├── artifacts/      # ArtifactStore trait + local, manager (ADR-0004)
 ├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls
@@ -276,4 +285,4 @@ src/
 
 ## Git
 
-Gita repo (own `.git`). PRs go to `General-Magick-Industries/mindroid` on GitHub, branch `main`.
+Gita repo (own `.git`). PRs go to `General-Magick-Industries/mindroid` on GitHub. While the v2 line is in flight, feature PRs target `feat/mindroid-v2` (PR #31 carries it to `main`); pin downstream to a merge commit on that branch, never a PR head.

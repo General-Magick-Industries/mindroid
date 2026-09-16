@@ -1,15 +1,22 @@
 use crate::core::config::AgentConfig;
 use crate::core::error::MindroidError;
+use crate::core::models::{Message, SenderType};
+use crate::memory::Memory;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
-    AudioChunk, BargeInMode, OmniConfig, OmniEvent, SessionState, TurnDetection,
+    AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionState,
+    TranscriptSource, TurnDetection, Usage,
 };
-use crate::tools::Tool;
+use crate::pipeline::stages::stt::SttProvider;
+use crate::tools::{Tool, ToolContext};
 use futures::StreamExt;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 // Local-VAD imports — only compiled when the Silero ONNX feature is present.
@@ -20,6 +27,130 @@ use {
     crate::voice::types::VadConfig,
     std::time::Instant,
 };
+
+/// Which conversation a session belongs to. `channel_id` keys memory and scopes
+/// tools; `sender_id` is the user speaking; `agent_id` is who the model's turns
+/// are saved as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    pub channel_id: String,
+    pub sender_id: String,
+    pub agent_id: String,
+}
+
+/// Populates each per-tool-call [`ToolContext`] before a tool runs — the omni
+/// equivalent of the pipeline stages that deposit `AgentCredentials` and the like.
+pub type ToolContextInit = Arc<dyn Fn(&ToolContext) + Send + Sync>;
+
+enum PersistJob {
+    Turn {
+        source: TranscriptSource,
+        text: String,
+    },
+    /// A user turn whose words are still being transcribed. The writer waits for
+    /// it, so the reply is never stored ahead of the turn that prompted it.
+    Pending(oneshot::Receiver<Option<String>>),
+}
+
+/// Longest shutdown waits for the session's transcriptions.
+const TRANSCRIBE_WAIT: Duration = Duration::from_secs(30);
+
+/// A gap at least this long between the last stored turn and a new session is
+/// treated as the user returning, not a natural pause, and is noted to the model.
+const RESUME_GAP_SECS: i64 = 90;
+
+/// A coarse, human-readable elapsed time for the resumed-session note.
+fn humanize_gap(gap: chrono::Duration) -> String {
+    let mins = gap.num_minutes();
+    if mins < 60 {
+        format!("{} minute{}", mins.max(1), if mins == 1 { "" } else { "s" })
+    } else if mins < 60 * 24 {
+        let h = mins / 60;
+        format!("{h} hour{}", if h == 1 { "" } else { "s" })
+    } else {
+        let d = mins / (60 * 24);
+        format!("{d} day{}", if d == 1 { "" } else { "s" })
+    }
+}
+
+/// Rolling buffer of mic audio; slices one utterance out between the provider's
+/// speech-start and speech-stop signals. Mic chunks are assumed PCM16.
+struct UtteranceCapture {
+    buf: VecDeque<u8>,
+    total: usize,
+    start: Option<usize>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl UtteranceCapture {
+    const KEEP_SECS: usize = 30;
+    /// Server VAD reports speech start after it has begun; keep this much before it.
+    const LEAD_MS: usize = 500;
+    const MIN_MS: usize = 200;
+
+    fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+            total: 0,
+            start: None,
+            sample_rate: 0,
+            channels: 1,
+        }
+    }
+
+    fn bytes_per_sec(&self) -> usize {
+        self.sample_rate as usize * 2 * self.channels as usize
+    }
+
+    fn push(&mut self, chunk: &AudioChunk) {
+        if self.sample_rate == 0 {
+            self.sample_rate = chunk.sample_rate;
+            self.channels = chunk.channels.max(1);
+        }
+        self.buf.extend(chunk.data.iter().copied());
+        self.total += chunk.data.len();
+        let cap = self.bytes_per_sec() * Self::KEEP_SECS;
+        if self.buf.len() > cap {
+            let excess = self.buf.len() - cap;
+            self.buf.drain(..excess);
+        }
+    }
+
+    fn mark_start(&mut self) {
+        let lead = self.bytes_per_sec() * Self::LEAD_MS / 1000;
+        self.start = Some(self.total.saturating_sub(lead));
+    }
+
+    /// The utterance since `mark_start`, as a WAV, or `None` if too short to bother.
+    fn take_wav(&mut self) -> Option<Vec<u8>> {
+        let start = self.start.take()?;
+        let first = self.total - self.buf.len();
+        let from = start.max(first) - first;
+        let pcm: Vec<u8> = self.buf.range(from..).copied().collect();
+        (pcm.len() >= self.bytes_per_sec() * Self::MIN_MS / 1000)
+            .then(|| wav_pcm16(&pcm, self.sample_rate, self.channels))
+    }
+}
+
+fn wav_pcm16(pcm: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
+    let block = channels * 2;
+    let mut w = Vec::with_capacity(44 + pcm.len());
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&channels.to_le_bytes());
+    w.extend_from_slice(&sample_rate.to_le_bytes());
+    w.extend_from_slice(&(sample_rate * u32::from(block)).to_le_bytes());
+    w.extend_from_slice(&block.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    w.extend_from_slice(pcm);
+    w
+}
 
 /// An omnimodal session that connects an [`OmniProvider`] with optional audio
 /// I/O and tools, managing session lifecycle state.
@@ -34,6 +165,28 @@ pub struct OmniSession {
     agent_config: Arc<AgentConfig>,
     state: SessionState,
     cancel: CancellationToken,
+    memory: Option<Arc<dyn Memory>>,
+    conversation: Option<Conversation>,
+    history_limit: usize,
+    persist_tx: Option<mpsc::Sender<PersistJob>>,
+    writer: JoinSet<()>,
+    transcriber: Option<Arc<dyn SttProvider>>,
+    tool_ctx_init: Option<ToolContextInit>,
+    capture: UtteranceCapture,
+    pending_transcriptions: Vec<(oneshot::Sender<Option<String>>, Vec<u8>)>,
+    stt_tasks: JoinSet<()>,
+    usage_total: Usage,
+}
+
+fn history_turn(message: Message, agent_id: &str) -> Option<HistoryTurn> {
+    let role = match message.sender_type {
+        SenderType::System => return None,
+        SenderType::Agent => Role::Model,
+        SenderType::User if message.sender_id == agent_id => Role::Model,
+        SenderType::User => Role::User,
+    };
+    let text = message.content;
+    (!text.trim().is_empty()).then_some(HistoryTurn { role, text })
 }
 
 impl OmniSession {
@@ -47,9 +200,245 @@ impl OmniSession {
         self.state
     }
 
+    /// The effective config, including any history seeded from memory.
+    pub fn config(&self) -> &OmniConfig {
+        &self.config
+    }
+
+    /// Token usage accumulated so far this session, for hosts that meter or bill.
+    pub fn usage(&self) -> Usage {
+        self.usage_total
+    }
+
+    fn tool_context(&self) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        if let Some(conv) = &self.conversation {
+            ctx.channel_id = conv.channel_id.clone();
+            ctx.sender_id = conv.sender_id.clone();
+        }
+        if let Some(init) = &self.tool_ctx_init {
+            init(&ctx);
+        }
+        ctx
+    }
+
+    async fn seed_history(&mut self) {
+        if !self.config.history.is_empty() {
+            return;
+        }
+        let (memory, conv) = match (&self.memory, &self.conversation) {
+            (Some(m), Some(c)) => (Arc::clone(m), c.clone()),
+            _ => return,
+        };
+        match memory
+            .get_history(&conv.channel_id, self.history_limit)
+            .await
+        {
+            Ok(messages) => {
+                let last_ts = messages.last().map(|m| m.timestamp);
+                self.config.history = messages
+                    .into_iter()
+                    .filter_map(|m| history_turn(m, &conv.agent_id))
+                    .collect();
+                if let Some(gap) = last_ts
+                    .map(|ts| chrono::Utc::now().signed_duration_since(ts))
+                    .filter(|g| *g >= chrono::Duration::seconds(RESUME_GAP_SECS))
+                {
+                    self.note_resumed_session(gap);
+                }
+                tracing::info!(
+                    turns = self.config.history.len(),
+                    channel = %conv.channel_id,
+                    "seeded conversation history"
+                );
+            }
+            Err(e) => tracing::warn!(%e, "could not load history; starting cold"),
+        }
+    }
+
+    /// Tell the model this is a resumed session after a gap, so it greets the user
+    /// as returning rather than continuing the previous thought. Appended to the
+    /// system prompt because both providers deliver history as plain turns with no
+    /// place for an out-of-band marker.
+    fn note_resumed_session(&mut self, gap: chrono::Duration) {
+        let note = format!(
+            "The conversation history above is from an earlier voice session that \
+             ended about {} ago. This is a new session: greet the user as returning, \
+             and do not continue a sentence or task from the previous one unless they \
+             raise it.",
+            humanize_gap(gap)
+        );
+        match &mut self.config.system_prompt {
+            Some(p) => {
+                p.push_str("\n\n");
+                p.push_str(&note);
+            }
+            None => self.config.system_prompt = Some(note),
+        }
+    }
+
+    /// One writer task, fed in event order, so turns persist in the order they
+    /// happened even when the store is slow. Off the hot path; `finish_persistence`
+    /// awaits it on every exit.
+    fn start_writer(&mut self) {
+        let (Some(memory), Some(conv)) = (self.memory.clone(), self.conversation.clone()) else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel::<PersistJob>(1024);
+        self.persist_tx = Some(tx);
+        self.writer.spawn(async move {
+            let mut last_user_id: Option<String> = None;
+            while let Some(job) = rx.recv().await {
+                let (source, text) = match job {
+                    PersistJob::Turn { source, text } => (source, text),
+                    PersistJob::Pending(done) => match done.await {
+                        Ok(Some(text)) => (TranscriptSource::Input, text),
+                        _ => continue,
+                    },
+                };
+                let (sender, reply_to) = match source {
+                    TranscriptSource::Input => (conv.sender_id.as_str(), None),
+                    TranscriptSource::Output => (conv.agent_id.as_str(), last_user_id.as_deref()),
+                };
+                match memory
+                    .save_message(&conv.channel_id, sender, &text, reply_to)
+                    .await
+                {
+                    Ok(id) => {
+                        if source == TranscriptSource::Input {
+                            last_user_id = id;
+                        }
+                    }
+                    Err(e) => tracing::warn!(%e, "could not persist transcript"),
+                }
+            }
+        });
+    }
+
+    fn persist_final(
+        tx: &Option<mpsc::Sender<PersistJob>>,
+        source: TranscriptSource,
+        text: String,
+    ) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Some(tx) = tx
+            && let Err(e) = tx.try_send(PersistJob::Turn { source, text })
+        {
+            tracing::warn!(%e, "transcript dropped: persistence queue full");
+        }
+    }
+
+    /// Reserve the user turn's slot now; the audio is transcribed when the session
+    /// closes, so the live loop never competes with speech-to-text calls.
+    fn queue_transcription(
+        transcriber: &Option<Arc<dyn SttProvider>>,
+        persist_tx: &Option<mpsc::Sender<PersistJob>>,
+        capture: &mut UtteranceCapture,
+        pending: &mut Vec<(oneshot::Sender<Option<String>>, Vec<u8>)>,
+    ) {
+        if transcriber.is_none() {
+            return;
+        }
+        let Some(tx) = persist_tx else {
+            return;
+        };
+        let Some(wav) = capture.take_wav() else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        if tx.try_send(PersistJob::Pending(done_rx)).is_err() {
+            tracing::warn!("user turn dropped: persistence queue full");
+            return;
+        }
+        pending.push((done_tx, wav));
+    }
+
+    async fn transcribe_pending(&mut self) {
+        let Some(stt) = self.transcriber.clone() else {
+            return;
+        };
+        let jobs = std::mem::take(&mut self.pending_transcriptions);
+        if jobs.is_empty() {
+            return;
+        }
+        tracing::info!(turns = jobs.len(), "transcribing user turns");
+        for (done_tx, wav) in jobs {
+            let stt = Arc::clone(&stt);
+            self.stt_tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let text = match stt.transcribe(&wav).await {
+                    Ok(t) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
+                    Err(e) => {
+                        tracing::warn!(%e, "user transcription failed");
+                        None
+                    }
+                };
+                tracing::info!(
+                    ms = started.elapsed().as_millis(),
+                    audio_bytes = wav.len(),
+                    text = text.as_deref().unwrap_or("<empty>"),
+                    "user turn transcribed"
+                );
+                let _ = done_tx.send(text);
+            });
+        }
+        let all = async {
+            while let Some(res) = self.stt_tasks.join_next().await {
+                if let Err(e) = res {
+                    tracing::warn!(%e, "transcription task failed");
+                }
+            }
+        };
+        if tokio::time::timeout(TRANSCRIBE_WAIT, all).await.is_err() {
+            tracing::warn!("giving up on in-flight transcriptions");
+            self.stt_tasks.abort_all();
+        }
+    }
+
+    async fn finish_persistence(&mut self) {
+        self.transcribe_pending().await;
+        self.persist_tx = None;
+        while let Some(res) = self.writer.join_next().await {
+            if let Err(e) = res {
+                tracing::warn!(%e, "persistence writer failed");
+            }
+        }
+    }
+
     /// Connect to the provider and run the main event loop until cancelled,
-    /// the provider stream ends, or a fatal error occurs.
+    /// the provider stream ends, or a fatal error occurs. Pending transcript
+    /// writes are awaited before this returns, whatever the exit path.
     pub async fn run(&mut self) -> Result<(), MindroidError> {
+        let result = self.run_inner().await;
+        self.finish_persistence().await;
+        let (channel, sender) = self.identity();
+        let t = self.usage_total;
+        tracing::info!(
+            %channel,
+            %sender,
+            input = t.input_tokens,
+            output = t.output_tokens,
+            input_audio = t.input_audio_tokens,
+            output_audio = t.output_audio_tokens,
+            "session usage total"
+        );
+        result
+    }
+
+    fn identity(&self) -> (String, String) {
+        self.conversation
+            .as_ref()
+            .map(|c| (c.channel_id.clone(), c.sender_id.clone()))
+            .unwrap_or_default()
+    }
+
+    async fn run_inner(&mut self) -> Result<(), MindroidError> {
+        self.seed_history().await;
+        self.start_writer();
+        let (channel, sender) = self.identity();
+
         // 1. Connect
         self.state = SessionState::Connecting;
         self.provider.connect(&self.config).await?;
@@ -155,6 +544,8 @@ impl OmniSession {
             None
         };
 
+        let (mut mic_sq, mut mic_n, mut mic_last) = (0f64, 0usize, std::time::Instant::now());
+
         // 7. The select! loop.
         //
         //    The VAD results arm is always present syntactically (tokio::select!
@@ -235,6 +626,25 @@ impl OmniSession {
                     }
                 } => {
                     if let Some(chunk) = chunk {
+                        mic_sq += chunk
+                            .data
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| {
+                                let v = f64::from(i16::from_le_bytes(*b)) / 32768.0;
+                                v * v
+                            })
+                            .sum::<f64>();
+                        mic_n += chunk.data.len() / 2;
+                        if mic_last.elapsed() >= std::time::Duration::from_secs(1) && mic_n > 0 {
+                            let rms = (mic_sq / mic_n as f64).sqrt();
+                            tracing::debug!(dbfs = format!("{:.1}", 20.0 * rms.max(1e-9).log10()), "mic level");
+                            (mic_sq, mic_n, mic_last) = (0.0, 0, std::time::Instant::now());
+                        }
+                        if self.transcriber.is_some() {
+                            self.capture.push(&chunk);
+                        }
                         // Always forward to provider.
                         self.provider.send_audio(chunk.clone()).await?;
 
@@ -269,6 +679,7 @@ impl OmniSession {
                             }
                         }
                         Some(OmniEvent::ToolCall { id, name, args }) => {
+                            tracing::info!(%channel, %sender, %id, %name, "tool call");
                             self.state = SessionState::ToolCall;
                             let result = self.execute_tool(&name, args).await;
                             let result_value = match result {
@@ -279,7 +690,17 @@ impl OmniSession {
                             // Return to Listening after tool call is dispatched.
                             self.state = SessionState::Listening;
                         }
+                        Some(OmniEvent::UserSpeechEnded) => {
+                            Self::queue_transcription(
+                                &self.transcriber,
+                                &self.persist_tx,
+                                &mut self.capture,
+                                &mut self.pending_transcriptions,
+                            );
+                        }
                         Some(OmniEvent::Interrupted) => {
+                            self.capture.mark_start();
+                            tracing::info!(%channel, %sender, "barge-in: stopping playback");
                             if let Some(ref sink) = self.audio_sink {
                                 sink.stop().await?;
                             }
@@ -302,9 +723,30 @@ impl OmniSession {
                                 .unwrap_or_else(|arc| MindroidError::pipeline(arc.to_string()));
                             return Err(err);
                         }
-                        Some(OmniEvent::Transcript { .. }) => {
-                            // Transcript events — log/ignore for now.
-                            // TODO: expose transcripts via a callback/channel.
+                        Some(OmniEvent::Transcript { text, is_final, source }) => {
+                            tracing::debug!(?source, is_final, %text, "omni transcript");
+                            let ours = source == TranscriptSource::Input && self.transcriber.is_some();
+                            if is_final && !ours {
+                                Self::persist_final(&self.persist_tx, source, text);
+                            }
+                        }
+                        Some(OmniEvent::Usage(u)) => {
+                            self.usage_total += u;
+                            tracing::info!(
+                                %channel,
+                                %sender,
+                                input = u.input_tokens,
+                                output = u.output_tokens,
+                                input_audio = u.input_audio_tokens,
+                                output_audio = u.output_audio_tokens,
+                                "turn usage"
+                            );
+                        }
+                        Some(OmniEvent::SessionEnding { in_secs }) => {
+                            tracing::warn!(?in_secs, "provider is closing the session");
+                        }
+                        Some(OmniEvent::ResumptionHandle(handle)) => {
+                            tracing::debug!(%handle, "session resumption handle updated");
                         }
                         None => {
                             // Provider stream exhausted — clean exit.
@@ -325,8 +767,7 @@ impl OmniSession {
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| MindroidError::pipeline(format!("tool not found: {name}")))?;
-        tool.execute(args, &crate::tools::ToolContext::default())
-            .await
+        tool.execute(args, &self.tool_context()).await
     }
 
     /// Test-only entry point that injects a pre-populated VAD results channel,
@@ -459,7 +900,9 @@ impl OmniSession {
                             self.provider.send_tool_result(&id, result_value).await?;
                             self.state = SessionState::Listening;
                         }
+                        Some(OmniEvent::UserSpeechEnded) => {}
                         Some(OmniEvent::Interrupted) => {
+                            tracing::info!("barge-in: stopping playback");
                             if let Some(ref sink) = self.audio_sink {
                                 sink.stop().await?;
                             }
@@ -480,7 +923,12 @@ impl OmniSession {
                                 .unwrap_or_else(|arc| MindroidError::pipeline(arc.to_string()));
                             return Err(err);
                         }
-                        Some(OmniEvent::Transcript { .. }) => {}
+                        Some(
+                            OmniEvent::Transcript { .. }
+                            | OmniEvent::SessionEnding { .. }
+                            | OmniEvent::ResumptionHandle(_)
+                            | OmniEvent::Usage(_),
+                        ) => {}
                         None => {
                             self.state = SessionState::Closed;
                             break;
@@ -502,6 +950,11 @@ pub struct OmniSessionBuilder {
     config: OmniConfig,
     agent_config: Option<Arc<AgentConfig>>,
     cancel: Option<CancellationToken>,
+    memory: Option<Arc<dyn Memory>>,
+    conversation: Option<Conversation>,
+    history_limit: usize,
+    transcriber: Option<Arc<dyn SttProvider>>,
+    tool_ctx_init: Option<ToolContextInit>,
 }
 
 impl OmniSessionBuilder {
@@ -515,12 +968,23 @@ impl OmniSessionBuilder {
             config: OmniConfig::default(),
             agent_config: None,
             cancel: None,
+            memory: None,
+            conversation: None,
+            history_limit: 50,
+            transcriber: None,
+            tool_ctx_init: None,
         }
     }
 
     /// Set the omni provider (required).
     pub fn provider(mut self, p: impl OmniProvider + 'static) -> Self {
         self.provider = Some(Box::new(p));
+        self
+    }
+
+    /// An already-boxed provider, e.g. from a factory.
+    pub fn provider_boxed(mut self, p: Box<dyn OmniProvider>) -> Self {
+        self.provider = Some(p);
         self
     }
 
@@ -533,6 +997,12 @@ impl OmniSessionBuilder {
     /// Set the audio sink (optional — omit for server/text-only mode).
     pub fn audio_sink(mut self, s: impl AudioSink + 'static) -> Self {
         self.audio_sink = Some(Arc::new(s));
+        self
+    }
+
+    /// A sink shared with other sessions, e.g. one speaker across a gate's sessions.
+    pub fn audio_sink_shared(mut self, s: Arc<dyn AudioSink>) -> Self {
+        self.audio_sink = Some(s);
         self
     }
 
@@ -578,6 +1048,57 @@ impl OmniSessionBuilder {
         self
     }
 
+    /// Persist finished turns here, and seed prior turns from it at start.
+    pub fn memory(mut self, m: Arc<dyn Memory>) -> Self {
+        self.memory = Some(m);
+        self
+    }
+
+    /// Identify the conversation. Required for memory to do anything, and it also
+    /// scopes tools via [`ToolContext`].
+    pub fn conversation(
+        mut self,
+        channel_id: impl Into<String>,
+        sender_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Self {
+        self.conversation = Some(Conversation {
+            channel_id: channel_id.into(),
+            sender_id: sender_id.into(),
+            agent_id: agent_id.into(),
+        });
+        self
+    }
+
+    /// How many prior turns to seed. Default 50.
+    pub fn history_limit(mut self, n: usize) -> Self {
+        self.history_limit = n;
+        self
+    }
+
+    /// Transcribe the user's utterances on this side instead of trusting the
+    /// provider's input transcript. Mic audio is captured between the provider's
+    /// speech-start and speech-stop signals, one WAV per utterance, and all of
+    /// them are sent to `stt` when the session closes. Each is persisted as the
+    /// user turn in its original position, ahead of the reply it prompted, so
+    /// nothing is written to memory until the session ends. The provider's own
+    /// input transcripts are ignored while this is set.
+    pub fn transcriber(mut self, stt: Arc<dyn SttProvider>) -> Self {
+        self.transcriber = Some(stt);
+        self
+    }
+
+    /// Populate the [`ToolContext`] handed to every tool call — the omni analogue of
+    /// the pipeline stages that deposit `AgentCredentials`. The closure runs on a
+    /// fresh context (channel/sender already stamped) before each tool executes.
+    pub fn tool_context_init<F>(mut self, init: F) -> Self
+    where
+        F: Fn(&ToolContext) + Send + Sync + 'static,
+    {
+        self.tool_ctx_init = Some(Arc::new(init));
+        self
+    }
+
     /// Build the [`OmniSession`].
     ///
     /// # Errors
@@ -599,6 +1120,17 @@ impl OmniSessionBuilder {
             agent_config,
             state: SessionState::Connecting,
             cancel: self.cancel.unwrap_or_default(),
+            memory: self.memory,
+            conversation: self.conversation,
+            history_limit: self.history_limit,
+            persist_tx: None,
+            writer: JoinSet::new(),
+            transcriber: self.transcriber,
+            tool_ctx_init: self.tool_ctx_init,
+            capture: UtteranceCapture::new(),
+            pending_transcriptions: Vec::new(),
+            stt_tasks: JoinSet::new(),
+            usage_total: Usage::default(),
         })
     }
 }
@@ -611,6 +1143,41 @@ impl Default for OmniSessionBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utterance_capture_slices_with_lead_and_writes_a_wav_header() {
+        let mut cap = super::UtteranceCapture::new();
+        let chunk = |n: u8| super::AudioChunk {
+            data: vec![n; 16_000], // 0.5 s at 16 kHz mono
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        cap.push(&chunk(1));
+        cap.mark_start(); // 500 ms lead reaches back over the whole first chunk
+        cap.push(&chunk(2));
+        let wav = cap.take_wav().expect("long enough");
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(wav.len(), 44 + 32_000);
+        assert_eq!(wav[44], 1);
+        assert_eq!(wav[44 + 16_000], 2);
+        assert!(cap.take_wav().is_none(), "start is consumed");
+        cap.mark_start();
+        assert!(
+            cap.take_wav().is_some(),
+            "lead alone is 500 ms, above the minimum"
+        );
+        cap.mark_start();
+        cap.push(&super::AudioChunk {
+            data: vec![0; 100],
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 16,
+        });
+        let _ = cap.take_wav();
+    }
+
     use super::*;
     use crate::omni::types::{AudioChunk, OmniEvent};
     use async_stream::stream;

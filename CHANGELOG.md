@@ -8,7 +8,45 @@ listed under **Breaking Changes** with a migration note.
 
 ## [Unreleased]
 
+### Added
+
+- `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
+  (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
+  WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
+  passthrough.
+- `OmniSession` memory wiring: `.memory()` + `.conversation()` seed prior turns
+  as text history at `run()` and persist each turn's final transcript in event
+  order, the agent's reply threaded to the user's saved message.
+- `OmniEvent::Usage` per turn from both providers, plus `OmniSession::usage()`.
+- `OmniSession::builder().transcriber(stt)`: transcribe the user's utterances on this
+  side (captured between speech-start and the new `OmniEvent::UserSpeechEnded`), run
+  when the session closes, persisted in turn order ahead of the reply.
+- `omni::gate::VoiceGate`: open a session on detected speech, close it on silence,
+  reopen on the next speech; `SileroDetector` for the local VAD.
+- `OpenAiSttConfig.language` (ISO-639-1) — set it; without a hint short clips are
+  transcribed in random languages.
+- `CpalAudio::new_split` / `into_parts`.
+
 ### Breaking Changes
+
+#### 0. `OmniEvent` and `OmniConfig` grew for realtime providers
+
+`OmniEvent::Transcript` gained a required `source: TranscriptSource` field;
+`OmniEvent` gained `SessionEnding`, `ResumptionHandle` and `Usage` and is now
+`#[non_exhaustive]`; `OmniConfig` gained `history: Vec<HistoryTurn>`.
+
+```rust
+// before
+OmniEvent::Transcript { text, is_final }
+match event { OmniEvent::AudioChunk(_) => …, /* every variant */ }
+OmniConfig { turn_detection, barge_in, system_prompt, tools_schema, voice }
+// after
+OmniEvent::Transcript { text, is_final, source: TranscriptSource::Output }
+match event { OmniEvent::AudioChunk(_) => …, _ => {} }   // wildcard arm required
+OmniConfig { history: Vec::new(), ..OmniConfig::default() }
+```
+
+`is_final: true` now means the complete text for that turn and source.
 
 #### 1. Tool-protocol traffic is declared, not sniffed
 
