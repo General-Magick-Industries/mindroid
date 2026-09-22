@@ -11,12 +11,21 @@
 //! in the body pipeline sits *inside* the agent's reasoning loop:
 //!
 //! ```rust,ignore
+//! let llm = LlmRound::new(client, registry);
+//! let tools = llm.tool_round();                    // shares the registry handle
 //! Pipeline::new()
 //!     .add_stage(TranscriptCompaction::new(80_000))   // before every call
-//!     .add_stage(LlmRound::new(client, registry.clone()))
+//!     .add_stage(llm)
 //!     .add_stage(ApprovalStage::<UserApproval>::new("confirm"))  // before every tool
-//!     .add_stage(ToolRound::new(registry))
+//!     .add_stage(tools)
 //! ```
+//!
+//! The two stages must see one registry. Built separately from the same
+//! `Arc<ToolRegistry>` they each hold their own [`DynamicRegistry`], and a
+//! [`ManifestStage`](crate::tools::ManifestStage) swap reaches whichever one
+//! was handed the swapped handle — the model is offered a tool that
+//! `ToolRound` cannot find. [`LlmRound::tool_round`] is the pairing; build
+//! them apart only from one shared [`DynamicRegistry`].
 //!
 //! # Loop state
 //!
@@ -37,11 +46,12 @@
 //! recommend putting it, since that is ahead of context building:
 //!
 //! ```rust,ignore
-//! let tools = ToolRound::new(registry.clone());
+//! let llm = LlmRound::new(client, registry);
+//! let tools = llm.tool_round();
 //! let gate = tools.result_gate();                  // take the gate before moving
 //! AgentLoop::new(
 //!     Pipeline::new()
-//!         .add_stage(LlmRound::new(client, registry))
+//!         .add_stage(llm)
 //!         .add_stage(tools),
 //! )
 //! .with_setup(
@@ -88,8 +98,10 @@ pub struct PendingCalls(pub Vec<NativeToolCall>);
 
 /// One native-tool-calling round: call the model, record what it asked for.
 ///
-/// Sets `ctx.response` to the round's prose and, when the model called tools,
-/// leaves [`PendingCalls`] in run scope for [`ToolRound`].
+/// Sets `ctx.response` to the round's prose — `None` when the round had none,
+/// so a silent round never inherits an earlier pass's text as its own — and,
+/// when the model called tools, leaves [`PendingCalls`] in run scope for
+/// [`ToolRound`].
 pub struct LlmRound {
     client: LlmClient,
     registry: DynamicRegistry,
@@ -108,6 +120,12 @@ impl LlmRound {
             registry,
             model: None,
         }
+    }
+
+    /// The [`ToolRound`] that runs this stage's calls, sharing its registry
+    /// handle so a runtime tool swap reaches both stages or neither.
+    pub fn tool_round(&self) -> ToolRound {
+        ToolRound::with_dynamic_registry(self.registry.clone())
     }
 
     /// Override the model for this stage (default: the client's).
@@ -167,16 +185,16 @@ impl PipelineStage for LlmRound {
             truncate_str(&outcome.content, 200)
         );
 
-        if !outcome.content.trim().is_empty() {
-            ctx.response = Some(outcome.content.clone());
-        }
-
         if !outcome.tool_calls.is_empty() {
             transcript
                 .0
                 .push(assistant_turn(&outcome.content, &outcome.tool_calls)?);
             ctx.set(PendingCalls(outcome.tool_calls));
         }
+
+        // Unconditional: whatever was on the context belongs to an earlier
+        // pass, and `ToolRound` reads this round's prose from here.
+        ctx.response = Some(outcome.content).filter(|c| !c.trim().is_empty());
 
         ctx.set(transcript);
         Ok(())
@@ -206,6 +224,9 @@ pub struct ToolRound {
 }
 
 impl ToolRound {
+    /// Build over a fixed registry. Prefer [`LlmRound::tool_round`], which
+    /// shares the handle: two stages built separately diverge the moment a
+    /// [`ManifestStage`](crate::tools::ManifestStage) swaps tools at runtime.
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
         Self::with_dynamic_registry(DynamicRegistry::new((*registry).clone()))
     }
@@ -317,7 +338,13 @@ impl PipelineStage for ToolRound {
         ctx.set(transcript);
 
         // A tool that delivered the turn itself has nothing to report back.
-        if !ends_turn {
+        // The turn's text is this round's prose, exactly as
+        // `ToolExecutorStage` returns it — pinned even when empty, so the
+        // loop's carry cannot deliver an earlier pass's prose after the tool
+        // already sent the real reply.
+        if ends_turn {
+            ctx.response.get_or_insert_with(String::new);
+        } else {
             ctx.set(Continue);
         }
         Ok(())
@@ -655,6 +682,85 @@ mod tests {
         let transcript = ctx.get_run::<Transcript>().unwrap();
         assert_eq!(transcript.0.len(), 1, "the call was answered as an error");
         assert!(ctx.get_run::<Continue>().is_some());
+    }
+
+    /// The executor delivers the turn-ending round's own prose, empty or not.
+    /// A silent round must pin an empty response rather than leave `None` for
+    /// the loop's carry to fill with an earlier pass's "let me look that up".
+    #[tokio::test]
+    async fn a_turn_ending_tool_pins_this_rounds_prose_even_when_empty() {
+        let (reg, _) = registry(true);
+        let mut ctx = ctx();
+        ctx.set(PendingCalls(vec![call("c1", "echo", r#"{"text":"sent"}"#)]));
+
+        ToolRound::new(reg).process(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.response.as_deref(), Some(""));
+    }
+
+    /// The ack rides on `ctx.response`, so a round with no prose must clear
+    /// what an earlier pass left there — or the client is acked with a
+    /// sentence about a different action.
+    #[tokio::test]
+    async fn a_silent_round_clears_an_earlier_passes_prose() {
+        use super::super::tool_executor::fake_llm::{completion, serve_completions};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent_call = completion(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "move_to", "arguments": "{\"x\":1}"}}]
+        }));
+        let server = serve_completions(listener, vec![silent_call]);
+
+        let (reg, _) = mixed_registry();
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let llm = LlmRound::new(client, reg);
+        let tools = llm.tool_round();
+
+        let mut ctx = ctx();
+        ctx.response = Some("Let me check the sensor first".into());
+
+        llm.process(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response, None, "a silent round has no prose of its own");
+
+        tools.process(&mut ctx).await.unwrap();
+        let payload = framed_payload(ctx.response.as_deref().unwrap());
+        assert_eq!(payload["name"], "move_to");
+        assert_eq!(
+            payload["ack"], "",
+            "the ack is this round's, not the last pass's"
+        );
+        server.await.unwrap();
+    }
+
+    /// A tool swapped in through the shared handle must be visible to both
+    /// stages — offered by `LlmRound`, runnable by `ToolRound`.
+    #[tokio::test]
+    async fn tool_round_shares_the_registry_handle() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let shared = DynamicRegistry::new(ToolRegistry::new());
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(
+            "http://127.0.0.1:1/v1",
+        ))
+        .unwrap();
+        let tools = LlmRound::with_dynamic_registry(client, shared.clone()).tool_round();
+
+        shared.store(ToolRegistry::new().register(Echo {
+            hits: hits.clone(),
+            ends_turn: false,
+        }));
+
+        let mut ctx = ctx();
+        ctx.set(PendingCalls(vec![call("c1", "echo", r#"{"text":"ping"}"#)]));
+        tools.process(&mut ctx).await.unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the swapped-in tool ran");
     }
 
     #[test]

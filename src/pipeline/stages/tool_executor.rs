@@ -543,16 +543,24 @@ impl StreamingStage for ToolExecutorStage {
     }
 }
 
+/// A scripted OpenAI-compatible endpoint for the executor and round tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::Tool;
+pub(crate) mod fake_llm {
     use serde_json::json;
+
+    /// One non-streaming completion body around `message`.
+    pub(crate) fn completion(message: serde_json::Value) -> String {
+        json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
+        })
+        .to_string()
+    }
 
     /// Serve `replies` in order, draining each request body first — replying
     /// before the client finishes writing resets the connection under load.
     /// Returns the request bodies so a test can assert on what was replayed.
-    fn serve_completions(
+    pub(crate) fn serve_completions(
         listener: tokio::net::TcpListener,
         replies: Vec<String>,
     ) -> tokio::task::JoinHandle<Vec<String>> {
@@ -597,6 +605,14 @@ mod tests {
             bodies
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake_llm::{completion, serve_completions};
+    use super::*;
+    use crate::tools::Tool;
+    use serde_json::json;
 
     fn call(id: &str, name: &str, arguments: &str) -> NativeToolCall {
         NativeToolCall {
@@ -645,14 +661,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(out.starts_with("Error: invalid arguments JSON"), "{out}");
-    }
-
-    fn completion(message: serde_json::Value) -> String {
-        json!({
-            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
-            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
-        })
-        .to_string()
     }
 
     fn stub_client(addr: std::net::SocketAddr) -> LlmClient {
