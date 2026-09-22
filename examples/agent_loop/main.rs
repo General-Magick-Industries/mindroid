@@ -29,7 +29,7 @@ use mindroid::config::AgentConfig;
 use mindroid::llm_client::{LlmClient, LlmClientConfig};
 use mindroid::{
     AgentLoop, Context, LlmRound, Message, Pipeline, PostProcessor, ShellTool,
-    SimpleContextBuilder, ToolRegistry, ToolRound, TranscriptCompaction,
+    SimpleContextBuilder, ToolRegistry, TranscriptCompaction,
 };
 
 const SYSTEM: &str = "You are a terse assistant with shell access on this machine. \
@@ -74,13 +74,14 @@ async fn main() -> anyhow::Result<()> {
     // Only local tools here, but the gate is wired anyway: it is what claims a
     // returning remote result, and `LlmRound` refuses a turn carrying a
     // tool_result nothing claimed. Take it before the round moves into the body.
-    let tools = ToolRound::new(registry.clone());
+    let llm = LlmRound::new(client, registry);
+    let tools = llm.tool_round();
     let result_gate = tools.result_gate();
 
     let agent = AgentLoop::new(
         Pipeline::new()
             .add_stage(TranscriptCompaction::from_tokens(args.context_budget))
-            .add_stage(LlmRound::new(client, registry))
+            .add_stage(llm)
             .add_stage(tools),
     )
     .with_setup(
