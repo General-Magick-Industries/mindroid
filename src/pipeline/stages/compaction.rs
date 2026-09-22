@@ -30,13 +30,22 @@ use tracing::debug;
 use super::round::Transcript;
 use crate::core::context::Context;
 use crate::error::Result;
+use crate::llm_client::LlmClient;
 use crate::pipeline::PipelineStage;
 
 /// Drops the oldest complete rounds once the transcript exceeds a budget.
 ///
-/// Leading system messages and the most recent block always survive, so the
-/// agent keeps its instructions and the round it is working on however tight
-/// the budget is.
+/// Leading system messages, the newest user message and the most recent block
+/// always survive, so the agent keeps its instructions, the question it is
+/// answering and the round it is working on however tight the budget is.
+///
+/// On the first pass the transcript does not exist yet — [`LlmRound`] seeds
+/// it — so this stage seeds it the same way, from `ctx.llm_messages`. Without
+/// that the history built in `setup` would reach the model uncompacted once
+/// per turn, and a turn the model answers without tools would never be
+/// compacted at all.
+///
+/// [`LlmRound`]: super::LlmRound
 pub struct TranscriptCompaction {
     max_chars: usize,
 }
@@ -61,9 +70,9 @@ impl PipelineStage for TranscriptCompaction {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        let Some(Transcript(messages)) = ctx.take::<Transcript>() else {
-            return Ok(());
-        };
+        let Transcript(messages) = ctx
+            .take::<Transcript>()
+            .unwrap_or_else(|| Transcript(LlmClient::convert_messages(&ctx.llm_messages)));
 
         let before = messages.len();
         let kept = compact(messages, self.max_chars);
@@ -123,26 +132,59 @@ fn compact(
         }
     }
 
-    let head_size: usize = head.iter().map(size_of).sum();
-    let mut budget = max_chars.saturating_sub(head_size);
+    // Two blocks are kept whatever the budget. The newest, so a budget too
+    // small for one round degrades to "the current round only" rather than to
+    // an empty transcript, which the provider rejects outright. And the newest
+    // user message: the seed is `[system, history…, user(current)]` and every
+    // round lands after it, so under pressure the question being answered is
+    // otherwise the first thing to go, leaving the model a system prompt, a
+    // pile of tool output, and no idea what it was asked.
+    let newest = blocks.len().saturating_sub(1);
+    let newest_user = blocks
+        .iter()
+        .rposition(|b| matches!(b.first(), Some(ChatCompletionRequestMessage::User(_))));
+    let pinned = |i: usize| i == newest || Some(i) == newest_user;
 
-    // Newest first, so what survives is the tail of the conversation. The last
-    // block is kept unconditionally: a budget too small for one round degrades
-    // to "the current round only" rather than to an empty transcript, which the
-    // provider rejects outright.
-    let mut keep_from = blocks.len();
-    for (i, block) in blocks.iter().enumerate().rev() {
-        let cost: usize = block.iter().map(size_of).sum();
-        let newest = i + 1 == blocks.len();
-        if !newest && cost > budget {
-            break;
-        }
-        budget = budget.saturating_sub(cost);
-        keep_from = i;
-    }
+    let block_size = |b: &[ChatCompletionRequestMessage]| b.iter().map(size_of).sum::<usize>();
+    let fixed: usize = head.iter().map(size_of).sum::<usize>()
+        + blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pinned(*i))
+            .map(|(_, b)| block_size(b))
+            .sum::<usize>();
+    let mut budget = max_chars.saturating_sub(fixed);
 
-    blocks.drain(..keep_from);
-    head.extend(blocks.into_iter().flatten());
+    // Newest first, so what survives is the tail of the conversation; once a
+    // block does not fit, nothing older does either, so the drop is a prefix
+    // of the droppable blocks rather than a scatter.
+    let mut full = false;
+    let keep: Vec<bool> = (0..blocks.len())
+        .rev()
+        .map(|i| {
+            if pinned(i) {
+                return true;
+            }
+            let cost = block_size(&blocks[i]);
+            full |= cost > budget;
+            if full {
+                return false;
+            }
+            budget -= cost;
+            true
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    head.extend(
+        blocks
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .flat_map(|(block, _)| block),
+    );
     head
 }
 
@@ -286,21 +328,100 @@ mod tests {
         assert_eq!(calls, results);
     }
 
+    fn users(msgs: &[ChatCompletionRequestMessage]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ChatCompletionRequestMessage::User(u) => Some(format!("{:?}", u.content)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The seed is `[system, history…, user(current)]` and rounds land after
+    /// it, so the question is older than every round: it must be pinned or it
+    /// is the first thing dropped.
+    #[test]
+    fn the_current_question_survives_at_any_budget() {
+        for budget in [1, 100, 1_700, 4_000] {
+            let kept = compact(transcript(4, 400), budget);
+            assert_eq!(
+                users(&kept).len(),
+                1,
+                "budget {budget} dropped the question: {kept:?}"
+            );
+            let (calls, results) = calls_and_results(&kept);
+            assert_eq!(calls, results, "budget {budget}");
+        }
+    }
+
+    /// Only the newest user message is the question; earlier ones are history
+    /// and drop like any other block.
+    #[test]
+    fn earlier_user_turns_are_still_droppable() {
+        let mut msgs = vec![system("be helpful")];
+        for i in 0..5 {
+            msgs.push(user(&format!("old question {i}")));
+            msgs.extend(round(&format!("h{i}"), &"y".repeat(300)));
+        }
+        msgs.push(user("current question"));
+        msgs.extend(round("c0", &"x".repeat(300)));
+
+        let kept = compact(msgs, 900);
+
+        let kept_users = users(&kept);
+        assert_eq!(kept_users.len(), 1, "{kept_users:?}");
+        assert!(kept_users[0].contains("current question"));
+        let (calls, _) = calls_and_results(&kept);
+        assert_eq!(calls.last().map(String::as_str), Some("c0"));
+    }
+
+    /// Pinning the question must not scatter the drop: once a round does not
+    /// fit, no older round survives it.
+    #[test]
+    fn the_drop_is_a_prefix_of_the_rounds() {
+        let kept = compact(transcript(10, 200), 2_000);
+        let (calls, _) = calls_and_results(&kept);
+        let ids: Vec<usize> = calls
+            .iter()
+            .map(|c| c.trim_start_matches('c').parse().unwrap())
+            .collect();
+        let expected: Vec<usize> = (ids[0]..10).collect();
+        assert_eq!(ids, expected, "rounds must be contiguous up to the newest");
+    }
+
+    /// On the first pass nothing has seeded the transcript yet; the stage
+    /// seeds it from `llm_messages` so the history is compacted before the
+    /// first model call, not only from the second.
     #[tokio::test]
-    async fn the_stage_is_a_no_op_without_a_transcript() {
+    async fn the_stage_seeds_the_transcript_from_llm_messages() {
         use crate::config::AgentConfig;
-        use crate::models::Message;
+        use crate::models::{LlmMessage, Message};
         use std::sync::Arc;
 
         let mut ctx = Context::new(
             Arc::new(Message::new("hi", "u1", "c1")),
             Arc::new(AgentConfig::default()),
         );
-        TranscriptCompaction::new(10)
+        ctx.llm_messages = vec![
+            LlmMessage::system("be helpful"),
+            LlmMessage::user("older"),
+            LlmMessage::assistant("z".repeat(500)),
+            LlmMessage::user("current"),
+        ];
+
+        TranscriptCompaction::new(300)
             .process(&mut ctx)
             .await
             .unwrap();
-        assert!(ctx.get_run::<Transcript>().is_none());
+
+        let kept = &ctx.get_run::<Transcript>().unwrap().0;
+        assert!(
+            matches!(kept.first(), Some(ChatCompletionRequestMessage::System(_))),
+            "{kept:?}"
+        );
+        let kept_users = users(kept);
+        assert_eq!(kept_users.len(), 1, "{kept_users:?}");
+        assert!(kept_users[0].contains("current"));
     }
 
     #[tokio::test]
