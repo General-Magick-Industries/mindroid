@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -131,43 +130,43 @@ impl EpisodeClient {
                 status_code: Some(status.as_u16()),
             });
         }
-        let body = resp.bytes().await.map_err(|e| MindroidError::Api {
-            message: format!("failed to read episode ingest response: {e}"),
-            status_code: Some(status.as_u16()),
-        })?;
-        if body.iter().all(u8::is_ascii_whitespace) {
-            // Compatibility with an older Bifrost that returned an empty 2xx
-            // response. Ingest still succeeded; it simply supplied no state.
+        // The write has succeeded by now; what follows only adds affect state.
+        // The response is a few hundred bytes, so anything large is not ours.
+        if resp
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES)
+        {
+            warn!("EpisodeClient: ingest response too large to carry runtime state; ignoring it");
             return Ok(None);
         }
-
-        let response: ProcessEpisodeResponse =
-            serde_json::from_slice(&body).map_err(|e| MindroidError::Api {
-                message: format!("invalid episode ingest response: {e}"),
-                status_code: Some(status.as_u16()),
-            })?;
-        Ok(response.runtime_state)
-    }
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct RuntimeStateKey {
-    agent_id: String,
-    user_id: String,
-}
-
-impl RuntimeStateKey {
-    fn from_context(ctx: &Context) -> Self {
-        Self {
-            agent_id: ctx.agent_config.agent_id.clone(),
-            user_id: ctx.message.sender_id.clone(),
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                warn!("EpisodeClient: ingest succeeded but its response could not be read: {e}");
+                return Ok(None);
+            }
+        };
+        if body.len() as u64 > MAX_RESPONSE_BYTES || body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        match serde_json::from_slice::<ProcessEpisodeResponse>(&body) {
+            Ok(response) => Ok(response.runtime_state),
+            Err(e) => {
+                warn!("EpisodeClient: ingest succeeded but its response was not decodable: {e}");
+                Ok(None)
+            }
         }
     }
 }
 
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// The agent's affect, as last reported by the server. One value per stage:
+/// the persona service holds one affect row per agent, so every sender of a
+/// multi-user agent reads the same mood.
 #[derive(Default)]
 struct RuntimeStateCache {
-    entries: RwLock<HashMap<RuntimeStateKey, RuntimeStateEnvelope>>,
+    state: RwLock<Option<RuntimeStateEnvelope>>,
 }
 
 enum AcceptOutcome {
@@ -177,40 +176,29 @@ enum AcceptOutcome {
 }
 
 impl RuntimeStateCache {
-    async fn accept(&self, key: RuntimeStateKey, state: RuntimeStateEnvelope) -> AcceptOutcome {
+    async fn accept(&self, state: RuntimeStateEnvelope, now: DateTime<Utc>) -> AcceptOutcome {
         if let Err(reason) = state.validate() {
             return AcceptOutcome::Invalid(reason);
         }
 
-        let mut entries = self.entries.write().await;
-        if let Some(current) = entries.get(&key)
-            && (state.state_version < current.state_version
-                || (state.state_version == current.state_version
-                    && state.computed_at < current.computed_at))
+        let mut current = self.state.write().await;
+        if let Some(held) = current.as_ref()
+            && !held.is_expired_at(now)
+            && (state.state_version < held.state_version
+                || (state.state_version == held.state_version
+                    && state.computed_at < held.computed_at))
         {
             return AcceptOutcome::Stale;
         }
-
-        // Keep this per-stage cache bounded in long-running multi-user agents.
-        // Expired entries are only expression fallbacks, so they are safe to
-        // evict once the cache crosses the same threshold as PersonaCache.
-        if entries.len() > 200 {
-            let now = Utc::now();
-            entries.retain(|_, entry| entry.decayed_at(now).is_some());
-        }
-        entries.insert(key, state);
+        *current = Some(state);
         AcceptOutcome::Accepted
     }
 
-    async fn current(
-        &self,
-        key: &RuntimeStateKey,
-        at: DateTime<Utc>,
-    ) -> Option<RuntimeAffectSnapshot> {
-        self.entries
+    async fn current(&self, at: DateTime<Utc>) -> Option<RuntimeAffectSnapshot> {
+        self.state
             .read()
             .await
-            .get(key)
+            .as_ref()
             .and_then(|state| state.decayed_at(at))
     }
 }
@@ -304,16 +292,15 @@ impl EpisodeIngestStage {
         }
     }
 
-    /// Put the latest valid, locally decayed affect for this agent/user into
-    /// the run-scoped pipeline context.
+    /// Put the agent's latest valid, locally decayed affect into the run-scoped
+    /// pipeline context.
     ///
     /// `Context::reset_output` clears run-scoped extensions. Call this again
     /// after such a reset when ingest and persona execution use separate
     /// pipeline runs.
     pub async fn apply_runtime_state(&self, ctx: &mut Context) {
         let _ = ctx.take_ext::<RuntimeAffectSnapshot>();
-        let key = RuntimeStateKey::from_context(ctx);
-        if let Some(affect) = self.runtime_states.current(&key, Utc::now()).await {
+        if let Some(affect) = self.runtime_states.current(Utc::now()).await {
             ctx.set_ext(affect);
         }
     }
@@ -354,8 +341,7 @@ impl PipelineStage for EpisodeIngestStage {
             Ok(runtime_state) => {
                 debug!("EpisodeIngestStage: ingested inbound {}", ctx.message.id);
                 if let Some(state) = runtime_state {
-                    let key = RuntimeStateKey::from_context(ctx);
-                    match self.runtime_states.accept(key, state).await {
+                    match self.runtime_states.accept(state, Utc::now()).await {
                         AcceptOutcome::Accepted => {
                             debug!("EpisodeIngestStage: accepted runtime affect state")
                         }
@@ -475,9 +461,6 @@ struct ProcessEpisodeRequest<'a> {
 
 #[derive(Deserialize)]
 struct ProcessEpisodeResponse {
-    #[serde(default, rename = "message_processed")]
-    _message_processed: bool,
-    #[serde(default)]
     runtime_state: Option<RuntimeStateEnvelope>,
 }
 
@@ -872,49 +855,100 @@ mod tests {
     #[tokio::test]
     async fn runtime_cache_rejects_older_versions() {
         let cache = RuntimeStateCache::default();
-        let key = RuntimeStateKey {
-            agent_id: "agent-1".into(),
-            user_id: "user-1".into(),
-        };
         let now = Utc::now();
 
         assert!(matches!(
-            cache.accept(key.clone(), runtime_state(2, now)).await,
+            cache.accept(runtime_state(2, now), now).await,
             AcceptOutcome::Accepted
         ));
         assert!(matches!(
             cache
-                .accept(
-                    key.clone(),
-                    runtime_state(1, now + chrono::Duration::seconds(1))
-                )
+                .accept(runtime_state(1, now + chrono::Duration::seconds(1)), now)
+                .await,
+            AcceptOutcome::Stale
+        ));
+        assert!(matches!(
+            cache
+                .accept(runtime_state(2, now - chrono::Duration::seconds(1)), now)
                 .await,
             AcceptOutcome::Stale
         ));
 
-        let current = cache.current(&key, now).await.unwrap();
-        assert_eq!(current.state_version, 2);
+        assert_eq!(cache.current(now).await.unwrap().state_version, 2);
     }
 
     #[tokio::test]
-    async fn runtime_cache_isolated_by_agent_and_user() {
+    async fn runtime_cache_is_agent_global_across_senders() {
+        // Persona holds one affect row per agent; a newer version accepted on
+        // one sender's turn is what every other sender reads.
         let cache = RuntimeStateCache::default();
         let now = Utc::now();
-        let user_one = RuntimeStateKey {
-            agent_id: "agent-1".into(),
-            user_id: "user-1".into(),
-        };
-        let user_two = RuntimeStateKey {
-            agent_id: "agent-1".into(),
-            user_id: "user-2".into(),
-        };
 
-        let mut second = runtime_state(4, now);
-        second.affect.pleasure = -0.8;
-        cache.accept(user_one.clone(), runtime_state(3, now)).await;
-        cache.accept(user_two.clone(), second).await;
+        let mut newer = runtime_state(4, now);
+        newer.affect.pleasure = -0.8;
+        cache.accept(runtime_state(3, now), now).await;
+        cache.accept(newer, now).await;
 
-        assert!(cache.current(&user_one, now).await.unwrap().pleasure > 0.0);
-        assert!(cache.current(&user_two, now).await.unwrap().pleasure < 0.0);
+        let seen = cache.current(now).await.unwrap();
+        assert_eq!(seen.state_version, 4);
+        assert!(seen.pleasure < 0.0);
+    }
+
+    #[tokio::test]
+    async fn runtime_cache_replaces_an_expired_state_regardless_of_version() {
+        // A hostile or buggy version number must not pin the cache forever.
+        let cache = RuntimeStateCache::default();
+        let now = Utc::now();
+        cache.accept(runtime_state(i64::MAX, now), now).await;
+
+        let later = now + chrono::Duration::seconds(120);
+        assert!(cache.current(later).await.is_none(), "60 s ttl has lapsed");
+        assert!(matches!(
+            cache.accept(runtime_state(1, later), later).await,
+            AcceptOutcome::Accepted
+        ));
+        assert_eq!(cache.current(later).await.unwrap().state_version, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_runtime_state_clears_a_snapshot_once_the_state_expires() {
+        let (mut ctx, url) = failing_ctx("hello");
+        let stage = EpisodeIngestStage::new(
+            &url,
+            Arc::new(StaticAuth::new("t")),
+            CredentialKind::EndUser,
+        );
+        let now = Utc::now();
+        stage
+            .runtime_states
+            .accept(
+                runtime_state(1, now - chrono::Duration::seconds(3_600)),
+                now - chrono::Duration::seconds(3_600),
+            )
+            .await;
+        ctx.set_ext(RuntimeAffectSnapshot {
+            pleasure: 0.9,
+            arousal: 0.0,
+            dominance: 0.0,
+            state_version: 1,
+        });
+
+        stage.apply_runtime_state(&mut ctx).await;
+
+        assert!(
+            ctx.get_ext::<RuntimeAffectSnapshot>().is_none(),
+            "an expired state must not leave yesterday's mood in the prompt"
+        );
+    }
+
+    #[test]
+    fn process_response_without_runtime_state_decodes_to_none() {
+        for body in [
+            r#"{"message_processed": true}"#,
+            r#"{"runtime_state": null}"#,
+        ] {
+            let response: ProcessEpisodeResponse = serde_json::from_str(body).unwrap();
+            assert!(response.runtime_state.is_none(), "{body}");
+        }
     }
 }

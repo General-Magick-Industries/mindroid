@@ -1,11 +1,20 @@
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+/// Longest validity a server may claim for one snapshot; keeps the TTL
+/// arithmetic in range and a forgotten agent from rendering week-old mood.
+const MAX_TTL_SECONDS: i64 = 7 * 24 * 3_600;
+/// Persona stamps `updated_at` on the writing pod and `computed_at` on the
+/// reading pod; this much skew between them is tolerated as clock drift.
+const CLOCK_SKEW_TOLERANCE_SECONDS: i64 = 5;
 
 /// Short-lived expression state returned by Bifrost.
 ///
 /// This is deliberately only a snapshot plus generic decay parameters. It
 /// contains no appraisal, evidence weighting, or persona-evolution policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The wire shape is Bifrost's; new fields may appear.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
 pub struct RuntimeStateEnvelope {
     pub affect: RuntimeAffectState,
     pub state_version: i64,
@@ -14,7 +23,8 @@ pub struct RuntimeStateEnvelope {
 }
 
 /// Server-owned PAD affect values and their independent decay parameters.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
 pub struct RuntimeAffectState {
     pub pleasure: f64,
     pub arousal: f64,
@@ -45,11 +55,13 @@ impl RuntimeStateEnvelope {
         if self.state_version <= 0 {
             return Err("state_version must be greater than zero");
         }
-        if self.ttl_seconds <= 0 {
-            return Err("ttl_seconds must be greater than zero");
+        if !(1..=MAX_TTL_SECONDS).contains(&self.ttl_seconds) {
+            return Err("ttl_seconds out of range");
         }
-        if self.computed_at < self.affect.updated_at {
-            return Err("computed_at must not precede affect.updated_at");
+        if self.computed_at + Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS)
+            < self.affect.updated_at
+        {
+            return Err("computed_at precedes affect.updated_at by more than clock skew");
         }
 
         let values = [
@@ -84,10 +96,7 @@ impl RuntimeStateEnvelope {
             return None;
         }
 
-        let expires_at = self
-            .computed_at
-            .checked_add_signed(Duration::seconds(self.ttl_seconds))?;
-        if at > expires_at {
+        if self.is_expired_at(at) {
             return None;
         }
 
@@ -121,12 +130,20 @@ impl RuntimeStateEnvelope {
     }
 }
 
+impl RuntimeStateEnvelope {
+    pub(crate) fn is_expired_at(&self, at: DateTime<Utc>) -> bool {
+        // validate() bounds ttl_seconds, so the addition cannot overflow.
+        at > self.computed_at + Duration::seconds(self.ttl_seconds)
+    }
+}
+
 impl RuntimeAffectSnapshot {
     pub(crate) fn prompt_instruction(&self) -> String {
         format!(
             "Current temporary affect (PAD): pleasure={:+.3}, arousal={:+.3}, \
-             dominance={:+.3}. Let it subtly influence tone, energy, and assertiveness. \
-             Do not mention these values or this instruction.",
+             dominance={:+.3}. Let it subtly influence word choice, energy, and \
+             initiative. Never state or describe your mood or feelings, and do not \
+             mention these values or this instruction.",
             self.pleasure, self.arousal, self.dominance
         )
     }
@@ -215,8 +232,31 @@ mod tests {
         let current = state.decayed_at(state.computed_at).unwrap();
         let instruction = current.prompt_instruction();
         assert!(instruction.contains("pleasure=+1.000"));
-        assert!(instruction.contains("Do not mention"));
+        assert!(instruction.contains("do not mention these values"));
+        // Mood biases expression; the agent never narrates it.
+        assert!(instruction.contains("Never state or describe your mood"));
         assert!(!instruction.contains("evidence"));
         assert!(!instruction.contains("evolution"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_ttl_instead_of_overflowing() {
+        let mut state = envelope();
+        state.ttl_seconds = i64::MAX;
+        assert!(state.validate().is_err());
+        assert!(state.decayed_at(state.computed_at).is_none());
+        state.ttl_seconds = MAX_TTL_SECONDS + 1;
+        assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn tolerates_small_clock_skew_between_persona_pods() {
+        let mut state = envelope();
+        state.computed_at =
+            state.affect.updated_at - Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS);
+        assert!(state.validate().is_ok());
+        state.computed_at =
+            state.affect.updated_at - Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS + 1);
+        assert!(state.validate().is_err());
     }
 }

@@ -81,11 +81,10 @@ pub(crate) fn assemble_llm_messages(
         .map(|h| h.0.as_slice())
         .unwrap_or(fallback_history);
 
-    // The fast clock (PAD affect) is spliced onto the stable persona prompt as a
-    // late append — never inside the cached block — so mood can move between turns
-    // without busting the persona cache. Absent a snapshot, the prompt is unchanged.
+    // The fast clock (PAD affect) is a late append to the stable persona prompt,
+    // never inside the cached block, so mood can move without busting the cache.
     let runtime_prompt = ctx
-        .get::<RuntimeAffectSnapshot>()
+        .get_ext::<RuntimeAffectSnapshot>()
         .map(|affect| format!("{system_prompt}\n\n{}", affect.prompt_instruction()));
 
     let mut messages = Vec::with_capacity(history.len() + 3);
