@@ -58,6 +58,15 @@ impl RuntimeStateEnvelope {
         if !(1..=MAX_TTL_SECONDS).contains(&self.ttl_seconds) {
             return Err("ttl_seconds out of range");
         }
+        // Every later addition on computed_at is at most MAX_TTL_SECONDS, so one
+        // check here keeps them all in chrono's range.
+        if self
+            .computed_at
+            .checked_add_signed(Duration::seconds(MAX_TTL_SECONDS))
+            .is_none()
+        {
+            return Err("computed_at out of range");
+        }
         if self.computed_at + Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS)
             < self.affect.updated_at
         {
@@ -85,6 +94,12 @@ impl RuntimeStateEnvelope {
             return Err("affect half-lives must be greater than zero");
         }
         Ok(())
+    }
+
+    pub(crate) fn is_expired_at(&self, at: DateTime<Utc>) -> bool {
+        self.computed_at
+            .checked_add_signed(Duration::seconds(self.ttl_seconds))
+            .is_none_or(|expires_at| at > expires_at)
     }
 
     /// Evaluate all three axes at `at`, respecting the server-provided TTL.
@@ -127,13 +142,6 @@ impl RuntimeStateEnvelope {
             ),
             state_version: self.state_version,
         })
-    }
-}
-
-impl RuntimeStateEnvelope {
-    pub(crate) fn is_expired_at(&self, at: DateTime<Utc>) -> bool {
-        // validate() bounds ttl_seconds, so the addition cannot overflow.
-        at > self.computed_at + Duration::seconds(self.ttl_seconds)
     }
 }
 
@@ -237,6 +245,46 @@ mod tests {
         assert!(instruction.contains("Never state or describe your mood"));
         assert!(!instruction.contains("evidence"));
         assert!(!instruction.contains("evolution"));
+    }
+
+    #[test]
+    fn rejects_a_computed_at_near_the_end_of_time() {
+        // chrono's RFC3339 parser accepts extended years; the additions in
+        // validate/is_expired_at must refuse rather than overflow.
+        let json = r#"{"affect":{"pleasure":0.1,"arousal":0.1,"dominance":0.1,
+            "baseline_pleasure":0.0,"baseline_arousal":0.0,"baseline_dominance":0.0,
+            "pleasure_half_life_seconds":600,"arousal_half_life_seconds":600,
+            "dominance_half_life_seconds":600,"updated_at":"+262142-12-25T00:00:00Z"},
+            "state_version":1,"computed_at":"+262142-12-31T23:59:58Z","ttl_seconds":60}"#;
+        let state: RuntimeStateEnvelope = serde_json::from_str(json).unwrap();
+        assert!(state.validate().is_err());
+        assert!(state.decayed_at(state.computed_at).is_none());
+    }
+
+    #[test]
+    fn rejects_non_positive_state_version_and_ttl() {
+        for version in [0, -1] {
+            let mut state = envelope();
+            state.state_version = version;
+            assert!(state.validate().is_err(), "state_version {version}");
+        }
+        for ttl in [0, -60] {
+            let mut state = envelope();
+            state.ttl_seconds = ttl;
+            assert!(state.validate().is_err(), "ttl {ttl}");
+        }
+    }
+
+    #[test]
+    fn decay_converges_to_baseline_without_nan_at_very_large_elapsed() {
+        let mut state = envelope();
+        state.ttl_seconds = MAX_TTL_SECONDS;
+        let far = state.computed_at + Duration::seconds(MAX_TTL_SECONDS);
+        let current = state.decayed_at(far).unwrap();
+        for value in [current.pleasure, current.arousal, current.dominance] {
+            assert!(value.is_finite());
+        }
+        assert!((current.pleasure - state.affect.baseline_pleasure).abs() < 1e-9);
     }
 
     #[test]

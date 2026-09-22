@@ -146,7 +146,12 @@ impl EpisodeClient {
                 return Ok(None);
             }
         };
-        if body.len() as u64 > MAX_RESPONSE_BYTES || body.iter().all(u8::is_ascii_whitespace) {
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            warn!("EpisodeClient: ingest response too large to carry runtime state; ignoring it");
+            return Ok(None);
+        }
+        // An older Bifrost answered with an empty 2xx.
+        if body.iter().all(u8::is_ascii_whitespace) {
             return Ok(None);
         }
         match serde_json::from_slice::<ProcessEpisodeResponse>(&body) {
@@ -919,13 +924,14 @@ mod tests {
             CredentialKind::EndUser,
         );
         let now = Utc::now();
-        stage
-            .runtime_states
-            .accept(
-                runtime_state(1, now - chrono::Duration::seconds(3_600)),
-                now - chrono::Duration::seconds(3_600),
-            )
-            .await;
+        let then = now - chrono::Duration::seconds(3_600);
+        assert!(matches!(
+            stage
+                .runtime_states
+                .accept(runtime_state(1, then), then)
+                .await,
+            AcceptOutcome::Accepted
+        ));
         ctx.set_ext(RuntimeAffectSnapshot {
             pleasure: 0.9,
             arousal: 0.0,
