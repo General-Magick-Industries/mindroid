@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::auth::Auth;
@@ -12,6 +14,7 @@ use crate::error::{MindroidError, Result};
 use crate::models::ChannelType;
 use crate::models::CredentialKind;
 use crate::models::Message;
+use crate::persona::{RuntimeAffectSnapshot, RuntimeStateEnvelope};
 use crate::pipeline::PipelineStage;
 
 /// Shared HTTP client for the episode-ingest endpoint.
@@ -77,7 +80,11 @@ impl EpisodeClient {
     ///
     /// `agent_id` names the memory owner on the service-user route and is
     /// omitted on the end-user route (the token subject owns).
-    async fn ingest(&self, agent_id: &str, msg: &EpisodeMessage<'_>) -> Result<()> {
+    async fn ingest(
+        &self,
+        agent_id: &str,
+        msg: &EpisodeMessage<'_>,
+    ) -> Result<Option<RuntimeStateEnvelope>> {
         // Defense in depth: the builder already refuses a non-TLS base_url at
         // startup, but a directly-constructed client has not been through it.
         crate::core::net::require_secure_url(
@@ -123,7 +130,81 @@ impl EpisodeClient {
                 status_code: Some(status.as_u16()),
             });
         }
-        Ok(())
+        // The write has succeeded by now; what follows only adds affect state.
+        // The response is a few hundred bytes, so anything large is not ours.
+        if resp
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES)
+        {
+            warn!("EpisodeClient: ingest response too large to carry runtime state; ignoring it");
+            return Ok(None);
+        }
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                warn!("EpisodeClient: ingest succeeded but its response could not be read: {e}");
+                return Ok(None);
+            }
+        };
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            warn!("EpisodeClient: ingest response too large to carry runtime state; ignoring it");
+            return Ok(None);
+        }
+        // An older Bifrost answered with an empty 2xx.
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        match serde_json::from_slice::<ProcessEpisodeResponse>(&body) {
+            Ok(response) => Ok(response.runtime_state),
+            Err(e) => {
+                warn!("EpisodeClient: ingest succeeded but its response was not decodable: {e}");
+                Ok(None)
+            }
+        }
+    }
+}
+
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// The agent's affect, as last reported by the server. One value per stage:
+/// the persona service holds one affect row per agent, so every sender of a
+/// multi-user agent reads the same mood.
+#[derive(Default)]
+struct RuntimeStateCache {
+    state: RwLock<Option<RuntimeStateEnvelope>>,
+}
+
+enum AcceptOutcome {
+    Accepted,
+    Stale,
+    Invalid(&'static str),
+}
+
+impl RuntimeStateCache {
+    async fn accept(&self, state: RuntimeStateEnvelope, now: DateTime<Utc>) -> AcceptOutcome {
+        if let Err(reason) = state.validate() {
+            return AcceptOutcome::Invalid(reason);
+        }
+
+        let mut current = self.state.write().await;
+        if let Some(held) = current.as_ref()
+            && !held.is_expired_at(now)
+            && (state.state_version < held.state_version
+                || (state.state_version == held.state_version
+                    && state.computed_at < held.computed_at))
+        {
+            return AcceptOutcome::Stale;
+        }
+        *current = Some(state);
+        AcceptOutcome::Accepted
+    }
+
+    async fn current(&self, at: DateTime<Utc>) -> Option<RuntimeAffectSnapshot> {
+        self.state
+            .read()
+            .await
+            .as_ref()
+            .and_then(|state| state.decayed_at(at))
     }
 }
 
@@ -149,6 +230,7 @@ struct EpisodeMessage<'a> {
 pub struct EpisodeIngestStage {
     client: EpisodeClient,
     scope: IngestScope,
+    runtime_states: RuntimeStateCache,
 }
 
 impl EpisodeIngestStage {
@@ -157,6 +239,7 @@ impl EpisodeIngestStage {
         Self {
             client: EpisodeClient::new(base_url, identity, credential_kind),
             scope: IngestScope::All,
+            runtime_states: RuntimeStateCache::default(),
         }
     }
 
@@ -213,6 +296,19 @@ impl EpisodeIngestStage {
             IngestScope::DirectOnly => ctx.message.channel_type == ChannelType::Direct,
         }
     }
+
+    /// Put the agent's latest valid, locally decayed affect into the run-scoped
+    /// pipeline context.
+    ///
+    /// `Context::reset_output` clears run-scoped extensions. Call this again
+    /// after such a reset when ingest and persona execution use separate
+    /// pipeline runs.
+    pub async fn apply_runtime_state(&self, ctx: &mut Context) {
+        let _ = ctx.take_ext::<RuntimeAffectSnapshot>();
+        if let Some(affect) = self.runtime_states.current(Utc::now()).await {
+            ctx.set_ext(affect);
+        }
+    }
 }
 
 #[async_trait]
@@ -227,6 +323,7 @@ impl PipelineStage for EpisodeIngestStage {
                 "EpisodeIngestStage: not ingesting {} ({:?}, scope {:?})",
                 ctx.message.id, ctx.message.message_type, self.scope
             );
+            self.apply_runtime_state(ctx).await;
             return Ok(());
         }
 
@@ -246,9 +343,25 @@ impl PipelineStage for EpisodeIngestStage {
         };
 
         match self.client.ingest(&ctx.agent_config.agent_id, &msg).await {
-            Ok(()) => debug!("EpisodeIngestStage: ingested inbound {}", ctx.message.id),
+            Ok(runtime_state) => {
+                debug!("EpisodeIngestStage: ingested inbound {}", ctx.message.id);
+                if let Some(state) = runtime_state {
+                    match self.runtime_states.accept(state, Utc::now()).await {
+                        AcceptOutcome::Accepted => {
+                            debug!("EpisodeIngestStage: accepted runtime affect state")
+                        }
+                        AcceptOutcome::Stale => {
+                            debug!("EpisodeIngestStage: ignored stale runtime affect state")
+                        }
+                        AcceptOutcome::Invalid(reason) => warn!(
+                            "EpisodeIngestStage: ignored invalid runtime affect state: {reason}"
+                        ),
+                    }
+                }
+            }
             Err(e) => warn!("EpisodeIngestStage: ingest failed (continuing): {e}"),
         }
+        self.apply_runtime_state(ctx).await;
         Ok(())
     }
 }
@@ -327,7 +440,7 @@ impl PipelineStage for EpisodeReplyIngestStage {
         };
 
         match self.client.ingest(&ctx.agent_config.agent_id, &msg).await {
-            Ok(()) => debug!("EpisodeReplyIngestStage: ingested reply {reply_id}"),
+            Ok(_) => debug!("EpisodeReplyIngestStage: ingested reply {reply_id}"),
             Err(e) => warn!("EpisodeReplyIngestStage: ingest failed (continuing): {e}"),
         }
         Ok(())
@@ -351,15 +464,41 @@ struct ProcessEpisodeRequest<'a> {
     skip_persona: bool,
 }
 
+#[derive(Deserialize)]
+struct ProcessEpisodeResponse {
+    runtime_state: Option<RuntimeStateEnvelope>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::static_id::StaticAuth;
     use crate::config::AgentConfig;
     use crate::models::{Message, MessageType};
+    use crate::persona::RuntimeAffectState;
 
     fn client(credential_kind: CredentialKind) -> EpisodeClient {
         EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), credential_kind)
+    }
+
+    fn runtime_state(version: i64, computed_at: DateTime<Utc>) -> RuntimeStateEnvelope {
+        RuntimeStateEnvelope {
+            affect: RuntimeAffectState {
+                pleasure: 0.8,
+                arousal: 0.4,
+                dominance: -0.2,
+                baseline_pleasure: 0.0,
+                baseline_arousal: 0.0,
+                baseline_dominance: 0.0,
+                pleasure_half_life_seconds: 600,
+                arousal_half_life_seconds: 1_200,
+                dominance_half_life_seconds: 1_800,
+                updated_at: computed_at,
+            },
+            state_version: version,
+            computed_at,
+            ttl_seconds: 60,
+        }
     }
 
     /// A context whose ingest is guaranteed to fail: port 1 is unreachable.
@@ -685,5 +824,137 @@ mod tests {
         );
         let on = serde_json::to_value(req(None, true)).unwrap();
         assert_eq!(on["skip_persona"], true);
+    }
+
+    #[test]
+    fn process_response_decodes_runtime_state_envelope() {
+        let response: ProcessEpisodeResponse = serde_json::from_str(
+            r#"{
+                "message_processed": true,
+                "runtime_state": {
+                    "affect": {
+                        "pleasure": 0.8,
+                        "arousal": 0.4,
+                        "dominance": -0.2,
+                        "baseline_pleasure": 0.0,
+                        "baseline_arousal": 0.0,
+                        "baseline_dominance": 0.0,
+                        "pleasure_half_life_seconds": 600,
+                        "arousal_half_life_seconds": 1200,
+                        "dominance_half_life_seconds": 1800,
+                        "updated_at": "2026-08-13T10:00:00Z"
+                    },
+                    "state_version": 9,
+                    "computed_at": "2026-08-13T10:00:01Z",
+                    "ttl_seconds": 60
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let state = response.runtime_state.unwrap();
+        assert_eq!(state.state_version, 9);
+        assert_eq!(state.affect.arousal_half_life_seconds, 1_200);
+    }
+
+    #[tokio::test]
+    async fn runtime_cache_rejects_older_versions() {
+        let cache = RuntimeStateCache::default();
+        let now = Utc::now();
+
+        assert!(matches!(
+            cache.accept(runtime_state(2, now), now).await,
+            AcceptOutcome::Accepted
+        ));
+        assert!(matches!(
+            cache
+                .accept(runtime_state(1, now + chrono::Duration::seconds(1)), now)
+                .await,
+            AcceptOutcome::Stale
+        ));
+        assert!(matches!(
+            cache
+                .accept(runtime_state(2, now - chrono::Duration::seconds(1)), now)
+                .await,
+            AcceptOutcome::Stale
+        ));
+
+        assert_eq!(cache.current(now).await.unwrap().state_version, 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_cache_is_agent_global_across_senders() {
+        // Persona holds one affect row per agent; a newer version accepted on
+        // one sender's turn is what every other sender reads.
+        let cache = RuntimeStateCache::default();
+        let now = Utc::now();
+
+        let mut newer = runtime_state(4, now);
+        newer.affect.pleasure = -0.8;
+        cache.accept(runtime_state(3, now), now).await;
+        cache.accept(newer, now).await;
+
+        let seen = cache.current(now).await.unwrap();
+        assert_eq!(seen.state_version, 4);
+        assert!(seen.pleasure < 0.0);
+    }
+
+    #[tokio::test]
+    async fn runtime_cache_replaces_an_expired_state_regardless_of_version() {
+        // A hostile or buggy version number must not pin the cache forever.
+        let cache = RuntimeStateCache::default();
+        let now = Utc::now();
+        cache.accept(runtime_state(i64::MAX, now), now).await;
+
+        let later = now + chrono::Duration::seconds(120);
+        assert!(cache.current(later).await.is_none(), "60 s ttl has lapsed");
+        assert!(matches!(
+            cache.accept(runtime_state(1, later), later).await,
+            AcceptOutcome::Accepted
+        ));
+        assert_eq!(cache.current(later).await.unwrap().state_version, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_runtime_state_clears_a_snapshot_once_the_state_expires() {
+        let (mut ctx, url) = failing_ctx("hello");
+        let stage = EpisodeIngestStage::new(
+            &url,
+            Arc::new(StaticAuth::new("t")),
+            CredentialKind::EndUser,
+        );
+        let now = Utc::now();
+        let then = now - chrono::Duration::seconds(3_600);
+        assert!(matches!(
+            stage
+                .runtime_states
+                .accept(runtime_state(1, then), then)
+                .await,
+            AcceptOutcome::Accepted
+        ));
+        ctx.set_ext(RuntimeAffectSnapshot {
+            pleasure: 0.9,
+            arousal: 0.0,
+            dominance: 0.0,
+            state_version: 1,
+        });
+
+        stage.apply_runtime_state(&mut ctx).await;
+
+        assert!(
+            ctx.get_ext::<RuntimeAffectSnapshot>().is_none(),
+            "an expired state must not leave yesterday's mood in the prompt"
+        );
+    }
+
+    #[test]
+    fn process_response_without_runtime_state_decodes_to_none() {
+        for body in [
+            r#"{"message_processed": true}"#,
+            r#"{"runtime_state": null}"#,
+        ] {
+            let response: ProcessEpisodeResponse = serde_json::from_str(body).unwrap();
+            assert!(response.runtime_state.is_none(), "{body}");
+        }
     }
 }

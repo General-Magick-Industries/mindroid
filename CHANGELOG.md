@@ -113,6 +113,17 @@ truncated.
 
 ### Added
 
+- **Live affect on the MagickMind persona prompt.** `EpisodeIngestStage` reads
+  the `runtime_state` envelope Bifrost returns from episode ingest (PAD affect,
+  baseline, per-axis half-lives, `state_version`, TTL), keeps the agent's latest
+  version, decays it locally with `Utc::now()`, and the persona stages append a
+  `Current temporary affect (PAD)…` line after the cached persona prompt.
+  Absent or invalid state leaves the prompt unchanged. Hosts that run ingest and
+  the reply on separate pipeline contexts call
+  `EpisodeIngestStage::apply_runtime_state` after `Context::reset_output`.
+  `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
+  and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
+
 - **Remote tool calls have a timeout.** `RemoteTool::timeout` sets how long a
   call waits for its client, defaulting to `DEFAULT_REMOTE_CALL_TIMEOUT` (5
   minutes) and clamped to `MIN_REMOTE_CALL_TIMEOUT`..=`MAX_REMOTE_CALL_TIMEOUT`
