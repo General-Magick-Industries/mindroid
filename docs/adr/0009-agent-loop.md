@@ -47,6 +47,12 @@ AgentLoop::new(body)          // runs per iteration
 
 One `Context` spans every phase, so run scope is the loop's state.
 
+`finish` runs in full after a settled, halted or capped loop — `halted` is lifted
+for the phase and put back, since `Pipeline::run` would otherwise stop it after
+one stage — and not at all after a cancellation, which stops every pipeline at
+its next stage boundary. A body error ends the turn in both `run` and
+`run_streaming`; neither reaches `finish`.
+
 A body stage requests another pass by setting `Continue` in run scope. The loop
 clears it before each pass, so the request cannot latch, and a body that never
 asks runs exactly once — which is today's behaviour. `ctx.halted` keeps its
@@ -102,8 +108,15 @@ on purpose.
 
 ## Consequences
 
-- Compaction, approval, retry and per-round routing become ordinary stages in
-  the body. `TranscriptCompaction` ships as the first of them.
+- Compaction, approval and per-round routing become ordinary stages in the
+  body. `TranscriptCompaction` ships as the first of them; it pins the system
+  prompt, the newest user message and the newest round, and seeds the transcript
+  itself so the first call is compacted too. Per-round retry is not yet one of
+  them: `RetryStage::reset_output` clears run scope wholesale, transcript
+  included.
+- `LlmRound` and `ToolRound` must share one registry handle
+  (`LlmRound::tool_round`); built apart, a runtime tool swap reaches one stage
+  and not the other.
 - `ends_turn` becomes "the round stops asking for another pass" rather than a
   flag an executor interprets, so the XML/JSON divergence on it does not
   reappear in the split stages.

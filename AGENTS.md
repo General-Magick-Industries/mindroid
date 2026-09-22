@@ -90,7 +90,9 @@ This is what makes compaction, approval, retry and per-round model routing ordin
 stages: they sit *inside* the reasoning loop rather than around an executor that owns
 its own. `LlmRound` + `ToolRound` are the native tool round split for this.
 `TranscriptCompaction` drops whole rounds, never half of one: splitting an assistant
-`tool_calls` turn from its results makes the provider reject the request.
+`tool_calls` turn from its results makes the provider reject the request. It pins the
+system prompt, the newest user message and the newest round. `finish` runs in full
+after a halt or the cap, and not at all after a cancellation.
 
 **Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
 deadline, same correlation gate — but a split round cannot run the gate inline the way
@@ -101,11 +103,13 @@ model. Artifact re-attachment and `ToolCall`/`ToolResult` stream events are stil
 `ToolExecutorStage`-only.
 
 ```rust
+let llm = LlmRound::new(client, registry);
+let tools = llm.tool_round();   // shares the registry handle; never build the pair apart
 AgentLoop::new(
     Pipeline::new()
         .add_stage(TranscriptCompaction::from_tokens(60_000))
-        .add_stage(LlmRound::new(client, registry.clone()))
-        .add_stage(ToolRound::new(registry)),
+        .add_stage(llm)
+        .add_stage(tools),
 )
 .with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
 .with_finish(Pipeline::new().add_stage(PostProcessor))
