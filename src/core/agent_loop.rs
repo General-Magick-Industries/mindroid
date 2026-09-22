@@ -100,11 +100,13 @@ pub struct LoopOutcome {
 /// # Example
 ///
 /// ```rust,ignore
+/// let llm = LlmRound::new(client, registry);
+/// let tools = llm.tool_round();
 /// let agent = AgentLoop::new(
 ///     Pipeline::new()
 ///         .add_stage(TranscriptCompaction::from_tokens(60_000))
-///         .add_stage(LlmRound::new(client, registry.clone()))
-///         .add_stage(ToolRound::new(registry)),
+///         .add_stage(llm)
+///         .add_stage(tools),
 /// )
 /// .with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
 /// .with_finish(Pipeline::new().add_stage(PostProcessor::new()));
@@ -144,7 +146,11 @@ impl AgentLoop {
     }
 
     /// Stages that run once after the last pass — including when the loop
-    /// halted, hit the cap, or was cancelled.
+    /// halted or hit the cap, and including when the halt was a refusal (an
+    /// unclaimed `tool_result`, say), so a stage here must tolerate a turn
+    /// that produced nothing. A cancelled loop skips `finish`: cancellation
+    /// stops every pipeline at its next stage boundary, and a phase that ran
+    /// one stage of three is worse than one that ran none.
     pub fn with_finish(mut self, finish: Pipeline) -> Self {
         self.finish = finish;
         self
@@ -196,6 +202,12 @@ impl AgentLoop {
             }
             iterations += 1;
 
+            // A token cancelled mid-pass stops the pipeline at its next stage
+            // boundary and returns `Ok` with nothing set — indistinguishable
+            // from a settled pass unless the token is checked here too.
+            if ctx.cancel.is_cancelled() {
+                break StopReason::Cancelled;
+            }
             if ctx.halted {
                 break StopReason::Halted;
             }
@@ -222,43 +234,75 @@ impl AgentLoop {
         Box::pin(async_stream::stream! {
             let started = Instant::now();
 
-            if let Err(e) = self.setup.run(ctx).await {
-                yield StreamEvent::Error { message: e.to_string() };
-                return;
-            }
-            if ctx.halted {
-                return;
-            }
+            let mut carried = match self.setup.run(ctx).await {
+                Ok(text) => text,
+                Err(e) => {
+                    yield StreamEvent::Error { message: e.to_string() };
+                    return;
+                }
+            };
 
             let mut iterations = 0;
             let mut spent: Option<TokenUsage> = None;
-            while iterations < self.max_iterations && !ctx.cancel.is_cancelled() {
-                ctx.take::<Continue>();
-                ctx.emit_event(PipelineEvent::LoopIterationStarted { iteration: iterations });
+            let reason = if ctx.halted {
+                StopReason::Halted
+            } else {
+                loop {
+                    if ctx.cancel.is_cancelled() {
+                        break StopReason::Cancelled;
+                    }
+                    if iterations >= self.max_iterations {
+                        info!("AgentLoop: reached max iterations ({})", self.max_iterations);
+                        break StopReason::MaxIterations;
+                    }
 
-                {
-                    let mut pass = self.body.run_streaming(ctx);
-                    while let Some(event) = pass.next().await {
-                        match event {
-                            StreamEvent::Complete { usage, .. } => spent = add_usage(spent, usage),
-                            other => yield other,
+                    ctx.take::<Continue>();
+                    ctx.emit_event(PipelineEvent::LoopIterationStarted { iteration: iterations });
+
+                    // `Pipeline::run_streaming` ends its stream on an error; the
+                    // turn ends with it, as `run` does by propagating the `Err`,
+                    // rather than going on to `finish` and a success-shaped
+                    // `Complete`.
+                    let mut failed = false;
+                    {
+                        let mut pass = self.body.run_streaming(ctx);
+                        while let Some(event) = pass.next().await {
+                            match event {
+                                StreamEvent::Complete { usage, .. } => spent = add_usage(spent, usage),
+                                StreamEvent::Error { message } => {
+                                    failed = true;
+                                    yield StreamEvent::Error { message };
+                                }
+                                other => yield other,
+                            }
                         }
                     }
+                    if failed {
+                        ctx.take::<Continue>();
+                        return;
+                    }
+                    iterations += 1;
+
+                    // The streaming pipeline leaves the pass's text on the context
+                    // rather than returning it; carry it the way `run` does.
+                    if let Some(text) = ctx.response.take() {
+                        carried = Some(text);
+                    }
+
+                    if ctx.cancel.is_cancelled() {
+                        break StopReason::Cancelled;
+                    }
+                    if ctx.halted {
+                        break StopReason::Halted;
+                    }
+                    if ctx.take::<Continue>().is_none() {
+                        break StopReason::Settled;
+                    }
                 }
-                iterations += 1;
+            };
 
-                if ctx.halted || ctx.take::<Continue>().is_none() {
-                    break;
-                }
-            }
-
-            // See `wrap_up`: a halted or capped pass can leave a request behind.
-            ctx.take::<Continue>();
-
-            // `Pipeline::run` takes the response, so even an empty `finish`
-            // drains it — the turn's text has to come back from the call.
-            let content = match self.finish.run(ctx).await {
-                Ok(finished) => finished.or_else(|| ctx.response.take()).unwrap_or_default(),
+            let content = match self.run_finish(ctx, carried, reason).await {
+                Ok(text) => text.unwrap_or_default(),
                 Err(e) => {
                     yield StreamEvent::Error { message: e.to_string() };
                     return;
@@ -268,21 +312,20 @@ impl AgentLoop {
                 iterations,
                 elapsed: started.elapsed(),
             });
-            debug!("AgentLoop::run_streaming settled after {iterations} iteration(s)");
+            debug!("AgentLoop::run_streaming {reason:?} after {iterations} iteration(s)");
 
             yield StreamEvent::Complete { content, usage: spent };
         })
     }
 
-    /// Restore the carried response, run `finish` over it, and report.
-    async fn wrap_up(
+    /// Restore the carried response, run `finish` over it, and take the turn's
+    /// text.
+    async fn run_finish(
         &self,
         ctx: &mut Context,
         carried: Option<String>,
         reason: StopReason,
-        iterations: usize,
-        started: Instant,
-    ) -> Result<LoopOutcome> {
+    ) -> Result<Option<String>> {
         // A pass that halted or hit the cap can leave its request behind. Left
         // there it is a stale instruction to whoever reads run scope next —
         // an enclosing loop would take it as its own and run again.
@@ -291,7 +334,30 @@ impl AgentLoop {
         // `finish` post-processes the turn's response, so it has to be back on
         // the context before those stages run.
         ctx.response = carried;
-        let response = self.finish.run(ctx).await?.or_else(|| ctx.response.take());
+
+        if reason == StopReason::Cancelled {
+            return Ok(ctx.response.take());
+        }
+
+        // `halted` is sticky and `Pipeline::run` stops after any stage that
+        // sees it, so `finish` would run exactly one stage. Lift it for the
+        // phase and put it back — the halt still means what it meant.
+        let halted = std::mem::replace(&mut ctx.halted, false);
+        let finished = self.finish.run(ctx).await;
+        ctx.halted |= halted;
+        Ok(finished?.or_else(|| ctx.response.take()))
+    }
+
+    /// Run `finish` and report.
+    async fn wrap_up(
+        &self,
+        ctx: &mut Context,
+        carried: Option<String>,
+        reason: StopReason,
+        iterations: usize,
+        started: Instant,
+    ) -> Result<LoopOutcome> {
+        let response = self.run_finish(ctx, carried, reason).await?;
 
         let elapsed = started.elapsed();
         ctx.emit_event(PipelineEvent::LoopCompleted {
@@ -584,6 +650,83 @@ mod tests {
         assert_eq!(finish_hits.load(Ordering::SeqCst), 1);
     }
 
+    /// `halted` is sticky and `Pipeline::run` stops after any stage that sees
+    /// it, so a one-stage `finish` cannot tell whether the phase ran in full.
+    #[tokio::test]
+    async fn finish_runs_every_stage_after_a_halt() {
+        struct Halt;
+
+        #[async_trait]
+        impl PipelineStage for Halt {
+            fn name(&self) -> &str {
+                "halt"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.halted = true;
+                Ok(())
+            }
+        }
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let mut ctx = ctx();
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(Halt))
+            .with_finish(
+                Pipeline::new()
+                    .add_stage(Marker("post-process", first.clone()))
+                    .add_stage(Marker("persist", second.clone())),
+            )
+            .run(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reason, StopReason::Halted);
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            1,
+            "the second finish stage ran"
+        );
+        assert!(ctx.halted, "the halt still means what it meant");
+    }
+
+    /// A token cancelled during a pass stops the pipeline at the next stage
+    /// boundary and returns `Ok` with nothing set — the same shape as a pass
+    /// that settled. The loop must check the token, not infer from silence.
+    #[tokio::test]
+    async fn a_cancellation_mid_pass_is_reported_and_skips_finish() {
+        struct CancelsItself;
+
+        #[async_trait]
+        impl PipelineStage for CancelsItself {
+            fn name(&self) -> &str {
+                "cancels-itself"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.response = Some("partial".into());
+                ctx.cancel.cancel();
+                Ok(())
+            }
+        }
+
+        let finish_hits = Arc::new(AtomicUsize::new(0));
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(CancelsItself))
+            .with_finish(Pipeline::new().add_stage(Marker("finish", finish_hits.clone())))
+            .run(&mut ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reason, StopReason::Cancelled);
+        assert_eq!(outcome.iterations, 1);
+        assert_eq!(
+            finish_hits.load(Ordering::SeqCst),
+            0,
+            "a cancelled turn does not run a phase that would stop after one stage"
+        );
+    }
+
     /// A halt in setup must not run the body at all.
     #[tokio::test]
     async fn a_halt_in_setup_skips_the_body() {
@@ -862,6 +1005,140 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(StreamEvent::Complete { content, .. }) if content == "pass 3"
+        ));
+    }
+
+    struct Fails;
+
+    #[async_trait]
+    impl PipelineStage for Fails {
+        fn name(&self) -> &str {
+            "fails"
+        }
+
+        async fn process(&self, _ctx: &mut Context) -> Result<()> {
+            Err(crate::error::MindroidError::pipeline("boom"))
+        }
+    }
+
+    /// `run` propagates a body error and runs nothing after it. Streaming must
+    /// mean the same thing: the stream ends on the `Error`, with no further
+    /// pass and no success-shaped `Complete` carrying an earlier pass's text.
+    #[tokio::test]
+    async fn a_body_error_ends_the_stream_without_a_complete() {
+        struct AsksThenFails(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl PipelineStage for AsksThenFails {
+            fn name(&self) -> &str {
+                "asks-then-fails"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ctx.response = Some("stale".into());
+                ctx.set(Continue);
+                Ok(())
+            }
+        }
+
+        let passes = Arc::new(AtomicUsize::new(0));
+        let finish_hits = Arc::new(AtomicUsize::new(0));
+        let agent = AgentLoop::new(
+            Pipeline::new()
+                .add_stage(AsksThenFails(passes.clone()))
+                .add_stage(Fails),
+        )
+        .with_finish(Pipeline::new().add_stage(Marker("finish", finish_hits.clone())));
+
+        let mut ctx = ctx();
+        let events: Vec<_> = agent.run_streaming(&mut ctx).collect().await;
+
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "no pass after the error");
+        assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Complete { .. })),
+            "{events:?}"
+        );
+        assert_eq!(finish_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            ctx.get_run::<Continue>().is_none(),
+            "no request left behind"
+        );
+    }
+
+    /// An admission refusal is a setup halt, so this is a common path: the
+    /// stream must still wrap up rather than end with nothing at all.
+    #[tokio::test]
+    async fn a_setup_halt_still_completes_the_stream() {
+        struct Halt;
+
+        #[async_trait]
+        impl PipelineStage for Halt {
+            fn name(&self) -> &str {
+                "halt"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.set(Continue);
+                ctx.halted = true;
+                Ok(())
+            }
+        }
+
+        let finish_hits = Arc::new(AtomicUsize::new(0));
+        let (body, seen) = rounds(3);
+        let agent = AgentLoop::new(body)
+            .with_setup(Pipeline::new().add_stage(Halt))
+            .with_finish(Pipeline::new().add_stage(Marker("finish", finish_hits.clone())));
+
+        let mut ctx = ctx();
+        let events: Vec<_> = agent.run_streaming(&mut ctx).collect().await;
+
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        assert_eq!(finish_hits.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Complete { content, .. }] if content.is_empty()
+        ));
+        assert!(ctx.get_run::<Continue>().is_none());
+    }
+
+    /// Streaming leaves each pass's text on the context rather than returning
+    /// it; the carry has to be replicated or a silent final pass ends the turn
+    /// with nothing.
+    #[tokio::test]
+    async fn streaming_carries_the_last_response_over_a_silent_pass() {
+        struct SpeaksThenLoopsOnce(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl PipelineStage for SpeaksThenLoopsOnce {
+            fn name(&self) -> &str {
+                "speaks-then-silent"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ctx.response = Some("the answer".into());
+                    ctx.set(Continue);
+                } else {
+                    ctx.response = None;
+                }
+                Ok(())
+            }
+        }
+
+        let agent = AgentLoop::new(
+            Pipeline::new().add_stage(SpeaksThenLoopsOnce(Arc::new(AtomicUsize::new(0)))),
+        );
+        let mut ctx = ctx();
+        let events: Vec<_> = agent.run_streaming(&mut ctx).collect().await;
+
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Complete { content, .. }) if content == "the answer"
         ));
     }
 }
