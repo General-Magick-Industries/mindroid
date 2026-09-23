@@ -157,7 +157,8 @@ impl EpisodeClient {
         match serde_json::from_slice::<ProcessEpisodeResponse>(&body) {
             Ok(response) => Ok(response.runtime_state),
             Err(e) => {
-                warn!("EpisodeClient: ingest succeeded but its response was not decodable: {e}");
+                let text = crate::core::net::error_excerpt(&e.to_string());
+                warn!("EpisodeClient: ingest succeeded but its response was not decodable: {text}");
                 Ok(None)
             }
         }
@@ -176,6 +177,10 @@ struct RuntimeStateCache {
 
 enum AcceptOutcome {
     Accepted,
+    /// Stored, but already past its TTL on arrival: this host's clock is more
+    /// than one TTL ahead of the persona service's, so no affect will ever
+    /// render until that is fixed.
+    AcceptedExpired,
     Stale,
     Invalid(&'static str),
 }
@@ -195,8 +200,16 @@ impl RuntimeStateCache {
         {
             return AcceptOutcome::Stale;
         }
+        let arrived_expired = state.is_expired_at(now);
         *current = Some(state);
+        if arrived_expired {
+            return AcceptOutcome::AcceptedExpired;
+        }
         AcceptOutcome::Accepted
+    }
+
+    async fn is_held(&self) -> bool {
+        self.state.read().await.is_some()
     }
 
     async fn current(&self, at: DateTime<Utc>) -> Option<RuntimeAffectSnapshot> {
@@ -305,8 +318,12 @@ impl EpisodeIngestStage {
     /// pipeline runs.
     pub async fn apply_runtime_state(&self, ctx: &mut Context) {
         let _ = ctx.take_ext::<RuntimeAffectSnapshot>();
-        if let Some(affect) = self.runtime_states.current(Utc::now()).await {
-            ctx.set_ext(affect);
+        match self.runtime_states.current(Utc::now()).await {
+            Some(affect) => ctx.set_ext(affect),
+            None if self.runtime_states.is_held().await => {
+                debug!("EpisodeIngestStage: held runtime affect state has expired; none applied")
+            }
+            None => debug!("EpisodeIngestStage: no runtime affect state to apply"),
         }
     }
 }
@@ -350,6 +367,9 @@ impl PipelineStage for EpisodeIngestStage {
                         AcceptOutcome::Accepted => {
                             debug!("EpisodeIngestStage: accepted runtime affect state")
                         }
+                        AcceptOutcome::AcceptedExpired => warn!(
+                            "EpisodeIngestStage: runtime affect state was already expired on                              arrival; check clock skew against the persona service"
+                        ),
                         AcceptOutcome::Stale => {
                             debug!("EpisodeIngestStage: ignored stale runtime affect state")
                         }
@@ -479,6 +499,49 @@ mod tests {
 
     fn client(credential_kind: CredentialKind) -> EpisodeClient {
         EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), credential_kind)
+    }
+
+    #[tokio::test]
+    async fn an_envelope_expired_on_arrival_is_stored_but_reported() {
+        let cache = RuntimeStateCache::default();
+        let now = Utc::now();
+        // Host clock more than one ttl ahead of the server's.
+        let state = runtime_state(1, now - chrono::Duration::seconds(120));
+        assert!(matches!(
+            cache.accept(state, now).await,
+            AcceptOutcome::AcceptedExpired
+        ));
+        assert!(cache.is_held().await, "stored despite being expired");
+        assert!(cache.current(now).await.is_none(), "nothing renders");
+    }
+
+    #[tokio::test]
+    async fn out_of_range_affect_is_rejected_as_invalid() {
+        let cache = RuntimeStateCache::default();
+        let now = Utc::now();
+
+        let mut over = runtime_state(1, now);
+        over.affect.pleasure = 1.5;
+        assert!(matches!(
+            cache.accept(over, now).await,
+            AcceptOutcome::Invalid(_)
+        ));
+
+        let mut under = runtime_state(1, now);
+        under.affect.baseline_dominance = -1.5;
+        assert!(matches!(
+            cache.accept(under, now).await,
+            AcceptOutcome::Invalid(_)
+        ));
+
+        let mut zero_half_life = runtime_state(1, now);
+        zero_half_life.affect.arousal_half_life_seconds = 0;
+        assert!(matches!(
+            cache.accept(zero_half_life, now).await,
+            AcceptOutcome::Invalid(_)
+        ));
+
+        assert!(!cache.is_held().await, "nothing invalid was stored");
     }
 
     fn runtime_state(version: i64, computed_at: DateTime<Utc>) -> RuntimeStateEnvelope {
