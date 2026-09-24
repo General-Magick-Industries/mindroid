@@ -92,7 +92,9 @@ its own. `LlmRound` + `ToolRound` are the native tool round split for this.
 `TranscriptCompaction` drops whole rounds, never half of one: splitting an assistant
 `tool_calls` turn from its results makes the provider reject the request. It pins the
 system prompt, the newest user message and the newest round. `finish` runs in full
-after a halt or the cap, and not at all after a cancellation.
+after a halt or the cap, and not at all after a cancellation, a body error, or a
+message admission control refused. A pass's `Error` ends the turn — stricter than
+`Pipeline::run_streaming`, which forwards it and carries on.
 
 **Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
 deadline, same correlation gate — but a split round cannot run the gate inline the way
