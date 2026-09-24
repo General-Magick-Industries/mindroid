@@ -51,7 +51,15 @@ One `Context` spans every phase, so run scope is the loop's state.
 for the phase and put back, since `Pipeline::run` would otherwise stop it after
 one stage — and not at all after a cancellation, which stops every pipeline at
 its next stage boundary. A body error ends the turn in both `run` and
-`run_streaming`; neither reaches `finish`.
+`run_streaming`; neither reaches `finish`. Admission control (ADR-0008) is the
+remaining exception: it is re-checked at the head of every phase, so a refused
+message runs no finish stages at all, which is what refusing it means.
+
+An `Error` yielded by a pass is likewise fatal to the loop, where
+`Pipeline::run_streaming` forwards it and runs its post-streaming stages. That
+is deliberate — it makes streaming agree with `run`, which propagates the `Err`
+— but it is stricter than a `StreamingStage` author would expect, so it is
+documented on `run_streaming`.
 
 A body stage requests another pass by setting `Continue` in run scope. The loop
 clears it before each pass, so the request cannot latch, and a body that never
