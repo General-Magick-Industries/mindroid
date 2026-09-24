@@ -146,11 +146,19 @@ impl AgentLoop {
     }
 
     /// Stages that run once after the last pass — including when the loop
-    /// halted or hit the cap, and including when the halt was a refusal (an
-    /// unclaimed `tool_result`, say), so a stage here must tolerate a turn
-    /// that produced nothing. A cancelled loop skips `finish`: cancellation
-    /// stops every pipeline at its next stage boundary, and a phase that ran
-    /// one stage of three is worse than one that ran none.
+    /// halted or hit the cap, so a stage here must tolerate a turn that
+    /// produced nothing: an unclaimed `tool_result` refused by `LlmRound`
+    /// halts with no response, and `finish` still runs in full over it.
+    ///
+    /// Two exits do not reach these stages. A cancelled loop skips `finish`,
+    /// because cancellation stops every pipeline at its next stage boundary
+    /// and a phase that ran one stage of three is worse than one that ran
+    /// none; a body error ends the turn the same way `run` does by
+    /// propagating it. And a message refused by admission control (ADR-0008)
+    /// runs *zero* finish stages however the loop exited — `Pipeline::run`
+    /// re-checks admission at the head of every phase, so the refusal repeats
+    /// there. Control traffic no stage could consume persists nothing, which
+    /// is the point of refusing it.
     pub fn with_finish(mut self, finish: Pipeline) -> Self {
         self.finish = finish;
         self
@@ -230,6 +238,15 @@ impl AgentLoop {
     /// A pass's own `Complete` is swallowed and its usage folded into the
     /// turn's; the turn emits one `Complete` at the end, reporting what the
     /// whole loop spent rather than only its last round.
+    ///
+    /// **An `Error` from a pass ends the turn**, which is stricter than
+    /// [`Pipeline::run_streaming`]: there a streaming stage's `Error` is
+    /// forwarded and the post-streaming stages still run, so the pipeline
+    /// completes with whatever was collected. Here it is the end — no further
+    /// pass, no `finish`, no `Complete` — matching [`run`](Self::run), which
+    /// propagates the `Err` and reaches none of them. A `StreamingStage` that
+    /// treats its own `Error` as recoverable does not get that latitude inside
+    /// a loop body.
     pub fn run_streaming<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         Box::pin(async_stream::stream! {
             let started = Instant::now();
@@ -725,6 +742,33 @@ mod tests {
             0,
             "a cancelled turn does not run a phase that would stop after one stage"
         );
+    }
+
+    /// Admission control (ADR-0008) is re-checked at the head of every phase,
+    /// so a refused message reaches no stage of any of them — `finish`
+    /// included. Refusing control traffic means persisting nothing for it.
+    #[tokio::test]
+    async fn an_admission_refusal_runs_no_stage_of_any_phase() {
+        let mut msg = Message::new("<tool_call>whatever</tool_call>", "u1", "c1");
+        msg.message_type = crate::MessageType::ToolCall;
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+
+        let setup_hits = Arc::new(AtomicUsize::new(0));
+        let finish_hits = Arc::new(AtomicUsize::new(0));
+        let (body, seen) = rounds(3);
+
+        let outcome = AgentLoop::new(body)
+            .with_setup(Pipeline::new().add_stage(Marker("setup", setup_hits.clone())))
+            .with_finish(Pipeline::new().add_stage(Marker("finish", finish_hits.clone())))
+            .run(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(setup_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        assert_eq!(finish_hits.load(Ordering::SeqCst), 0, "finish too");
+        assert_eq!(outcome.reason, StopReason::Halted);
+        assert_eq!(outcome.response, None);
     }
 
     /// A halt in setup must not run the body at all.
