@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::core::content::ContentPart;
@@ -404,6 +404,17 @@ impl LlmMessage {
         // No text part found, push a new one
         self.content.push(ContentPart::text(s));
     }
+}
+
+/// Deserialize a `null` JSON value as `T::default()` instead of failing.
+pub(crate) fn deserialize_null_as_default<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Deserializes content that may be either a plain String (old format)

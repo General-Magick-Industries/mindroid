@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::auth::Auth;
+use crate::core::models::deserialize_null_as_default;
 use crate::core::net::{error_excerpt, require_secure_url, secure_json_client};
 use crate::error::{MindroidError, Result};
 use crate::models::CredentialKind;
@@ -347,33 +348,20 @@ fn render_episodes(episodes: &[Episode]) -> String {
         .join("\n\n")
 }
 
-/// Bifrost serializes an empty list as `null`, so every field takes `null` as
-/// its default rather than failing the whole window.
+/// Bifrost is written in Go, which serializes an empty list as `null`.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct RangeResponse {
-    #[serde(
-        default,
-        deserialize_with = "crate::persona::models::deserialize_null_as_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     data: Vec<Episode>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct Episode {
-    #[serde(
-        default,
-        deserialize_with = "crate::persona::models::deserialize_null_as_default"
-    )]
+    #[serde(default)]
     topic: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::persona::models::deserialize_null_as_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     subtopics: Vec<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::persona::models::deserialize_null_as_default"
-    )]
+    #[serde(default)]
     summarized_conversation: String,
 }
 
@@ -433,7 +421,7 @@ Summary: Agreed to start seedlings indoors."
     }
 
     #[test]
-    fn an_empty_window_parses_when_bifrost_sends_null() {
+    fn a_null_window_parses_as_empty() {
         let body: RangeResponse = serde_json::from_value(json!({ "data": null })).unwrap();
         assert!(body.data.is_empty());
     }
