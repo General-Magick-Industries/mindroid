@@ -1215,4 +1215,30 @@ mod tests {
         let specs = LlmClient::tool_specs(&registry);
         assert_eq!(specs.len(), 1);
     }
+
+    #[tokio::test]
+    async fn a_tool_the_host_hides_is_not_described_to_the_model() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = completion(json!({"role": "assistant", "content": "hi"}));
+        let server = serve_completions(listener, vec![reply]);
+
+        let registry = ToolRegistry::new()
+            .register(Deliver)
+            .register(crate::tools::RemoteTool::new("query_corpus", "search"));
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
+        let mut ctx = fresh_ctx();
+        ctx.set(crate::tools::TurnTools::default().hide("query_corpus"));
+        stage.process(&mut ctx).await.unwrap();
+
+        let bodies = server.await.unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let offered: Vec<&str> = sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert_eq!(offered, ["deliver"]);
+    }
 }
