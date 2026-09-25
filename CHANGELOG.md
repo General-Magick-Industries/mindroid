@@ -8,14 +8,6 @@ listed under **Breaking Changes** with a migration note.
 
 ## [Unreleased]
 
-### Added
-
-- `ToolExecutorStage::with_parallel_tool_calls(bool)`: when a model asks for
-  several tools in one response, run them at the same time instead of one
-  after another. Results go back in the order the model asked for them. Off by
-  default, so the stage behaves exactly as before until a caller opts in; turn
-  it on only for a registry whose tools do not depend on running in order.
-
 ### Breaking Changes
 
 #### 1. Tool-protocol traffic is declared, not sniffed
@@ -121,6 +113,12 @@ truncated.
 
 ### Added
 
+- `ToolExecutorStage::with_parallel_tool_calls(bool)`: when a model asks for
+  several tools in one response, run them at the same time instead of one
+  after another, at most `MAX_PARALLEL_TOOL_CALLS` (8) at once. Results go back
+  in the order the model asked for them, and the request is unchanged. Off by
+  default, so the stage behaves exactly as before until a caller opts in; turn
+  it on only for a registry whose tools do not depend on running in order.
 - **Remote tool calls have a timeout.** `RemoteTool::timeout` sets how long a
   call waits for its client, defaulting to `DEFAULT_REMOTE_CALL_TIMEOUT` (5
   minutes) and clamped to `MIN_REMOTE_CALL_TIMEOUT`..=`MAX_REMOTE_CALL_TIMEOUT`

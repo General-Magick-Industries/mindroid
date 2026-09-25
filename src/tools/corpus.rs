@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::core::models::deserialize_null_as_default;
 use crate::core::net::{error_excerpt, note_auth_status, require_secure_url, secure_json_client};
 use crate::error::{MindroidError, Result};
 use crate::models::CredentialKind;
@@ -286,11 +287,12 @@ fn render_results(resp: &QueryResponse) -> String {
     truncate_on_char_boundary(&text, MAX_RESULT_BYTES).to_string()
 }
 
+/// Bifrost is Go: a nil slice arrives as `null`.
 #[derive(Deserialize)]
 struct QueryResponse {
     #[serde(default)]
     result: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     chunks: Vec<Chunk>,
 }
 
@@ -589,6 +591,14 @@ mod tests {
         assert_eq!(render_results(&chunks_only), "a\n---\nb");
 
         let empty: QueryResponse = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(render_results(&empty), "No results found in that corpus.");
+    }
+
+    /// A query that retrieves nothing comes back with `"chunks": null`.
+    #[test]
+    fn an_empty_query_parses_the_null_chunks_bifrost_sends() {
+        let empty: QueryResponse =
+            serde_json::from_value(json!({ "result": "", "chunks": null })).unwrap();
         assert_eq!(render_results(&empty), "No results found in that corpus.");
     }
 
