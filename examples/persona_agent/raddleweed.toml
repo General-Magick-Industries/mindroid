@@ -1,5 +1,5 @@
 # Persona-driven agent configuration
-# Run with: cargo run --example persona_agent --features full -- --config examples/persona_agent/raddleweed.toml
+# Run with: cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/raddleweed.toml
 
 [agent]
 agent_id = "example-agent-id"

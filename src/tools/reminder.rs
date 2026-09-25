@@ -74,7 +74,7 @@ impl Tool for SetReminderTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String> {
+    async fn execute(&self, args: Value, _ctx: &crate::tools::ToolContext) -> Result<String> {
         let message = args
             .get("message")
             .and_then(|v| v.as_str())
@@ -169,7 +169,10 @@ mod tests {
         let tool = SetReminderTool::new(store.clone());
 
         let args = json!({ "message": "Take a break", "delay_seconds": 60 });
-        let result = tool.execute(args).await.unwrap();
+        let result = tool
+            .execute(args, &crate::tools::ToolContext::default())
+            .await
+            .unwrap();
 
         assert!(result.contains("Take a break"));
         assert!(result.contains("60 seconds"));

@@ -1,13 +1,6 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-/// Deserialize a `null` JSON value as `T::default()` instead of failing.
-fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
+use crate::core::models::deserialize_null_as_default;
 
 /// Flexible trait value — exactly one field should be set per instance.
 ///

@@ -65,6 +65,8 @@ impl OmniSession {
         let has_local_turn_detection =
             matches!(&self.config.turn_detection, TurnDetection::Local(_));
         let has_local_barge_in = matches!(&self.config.barge_in, BargeInMode::LocalVad);
+        // Only read under `transport-audio`, like the VAD channels below.
+        #[cfg_attr(not(feature = "transport-audio"), allow(unused_variables))]
         let use_local_vad = has_local_turn_detection || has_local_barge_in;
 
         // 5. Set up the VAD inference offload.
@@ -103,8 +105,11 @@ impl OmniSession {
                             // Raw bytes → i16 (little-endian, as produced by CPAL).
                             let i16_samples: Vec<i16> = chunk
                                 .data
-                                .chunks_exact(2)
-                                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .copied()
+                                .map(i16::from_le_bytes)
                                 .collect();
                             // f32 copy for AudioFrontend::process.
                             let f32_samples: Vec<f32> = i16_samples
@@ -320,7 +325,8 @@ impl OmniSession {
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| MindroidError::pipeline(format!("tool not found: {name}")))?;
-        tool.execute(args).await
+        tool.execute(args, &crate::tools::ToolContext::default())
+            .await
     }
 
     /// Test-only entry point that injects a pre-populated VAD results channel,
@@ -850,7 +856,11 @@ mod tests {
             serde_json::json!({ "type": "object", "properties": {} })
         }
 
-        async fn execute(&self, args: Value) -> crate::error::Result<String> {
+        async fn execute(
+            &self,
+            args: Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
             Ok(args.to_string())
         }
     }

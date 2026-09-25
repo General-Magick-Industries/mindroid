@@ -21,7 +21,7 @@
 //! Make sure Ollama is running locally, then:
 //!
 //! ```sh
-//! cargo run --bin local_persona --features "persona,llm-local" -- \
+//! cargo run -p mindroid-example-local-persona --bin local_persona -- \
 //!     --config examples/local_persona/config.toml
 //! ```
 //!

@@ -1,3 +1,5 @@
+#[cfg(feature = "artifacts")]
+pub mod artifacts;
 #[cfg(feature = "llm-hosted")]
 pub mod magickmind;
 #[cfg(feature = "persistence")]
