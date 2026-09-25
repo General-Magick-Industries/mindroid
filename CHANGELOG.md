@@ -10,6 +10,44 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
+  (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
+  WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
+  passthrough.
+- `OmniSession` memory wiring: `.memory()` + `.conversation()` seed prior turns
+  as text history at `run()` and persist each turn's final transcript in event
+  order, the agent's reply threaded to the user's saved message.
+- `OmniEvent::Usage` per turn from both providers, plus `OmniSession::usage()`.
+- `OmniSession::builder().transcriber(stt)`: transcribe the user's utterances on this
+  side (captured between speech-start and the new `OmniEvent::UserSpeechEnded`), run
+  when the session closes, persisted in turn order ahead of the reply.
+- `omni::gate::VoiceGate`: open a session on detected speech, close it on silence,
+  reopen on the next speech; `SileroDetector` for the local VAD.
+- `OpenAiSttConfig.language` (ISO-639-1) — set it; without a hint short clips are
+  transcribed in random languages.
+- `CpalAudio::new_split` / `into_parts`.
+- `omni::stage` (feature `transport-audio`): `OmniStage` runs a realtime provider
+  in the LLM slot of a turn pipeline, `LiveAudioSink` streams the reply as it is
+  generated rather than after it completes, and `VOICE_INSTRUCTION` adapts a
+  persona written for text so it answers as speech.
+- `SessionControl`, handed to every tool through `ToolContext`: a tool can end
+  the session, honoured at `TurnComplete` so a spoken goodbye plays out first.
+- `VoiceGateBuilder::provider_closes()`: never close on silence, for a provider
+  that owns turn-taking. `idle_timeout` is now `Option<Duration>`; the default is
+  unchanged at `Some(15s)`.
+- Gemini `TurnDetection::Manual`: the provider brackets the user's turn with
+  `activityStart`/`activityEnd`. The server VAD was already disabled in the setup
+  frame, but nothing marked the boundaries, so the model never answered.
+
+### Fixed
+
+- The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
+  `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
+  configured `transcriber` produced nothing while the provider's own input
+  transcript was already suppressed — the user's turn was lost outright.
+  `FrontendEvent::SpeechStarted` now opens the slice and `UtteranceComplete`
+  closes it. Note that under `TurnDetection::Server` the frontend only completes
+  an utterance at `max_utterance`, so boundaries there are still coarse.
 - `ToolExecutorStage::with_parallel_tool_calls(bool)`: when a model asks for
   several tools in one response, run them at the same time instead of one
   after another. Results go back in the order the model asked for them. Off by
@@ -17,6 +55,25 @@ listed under **Breaking Changes** with a migration note.
   it on only for a registry whose tools do not depend on running in order.
 
 ### Breaking Changes
+
+#### 0. `OmniEvent` and `OmniConfig` grew for realtime providers
+
+`OmniEvent::Transcript` gained a required `source: TranscriptSource` field;
+`OmniEvent` gained `SessionEnding`, `ResumptionHandle` and `Usage` and is now
+`#[non_exhaustive]`; `OmniConfig` gained `history: Vec<HistoryTurn>`.
+
+```rust
+// before
+OmniEvent::Transcript { text, is_final }
+match event { OmniEvent::AudioChunk(_) => …, /* every variant */ }
+OmniConfig { turn_detection, barge_in, system_prompt, tools_schema, voice }
+// after
+OmniEvent::Transcript { text, is_final, source: TranscriptSource::Output }
+match event { OmniEvent::AudioChunk(_) => …, _ => {} }   // wildcard arm required
+OmniConfig { history: Vec::new(), ..OmniConfig::default() }
+```
+
+`is_final: true` now means the complete text for that turn and source.
 
 #### 1. Tool-protocol traffic is declared, not sniffed
 
