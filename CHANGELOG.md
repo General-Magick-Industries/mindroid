@@ -180,6 +180,11 @@ truncated.
 - `TOOLS_METADATA_KEY` / `CONTEXT_METADATA_KEY` in `core::models`.
 - Per-turn `context` renders as a sanitized, bounded system block on the turn it
   rides, gated on an authenticated sender.
+- `TurnTools`: a host's edits to one turn's tools, set in run scope and
+  applied by both executors after the sender's per-turn tools. `hide(name)`
+  leaves a tool out of the turn (neither described nor callable) and
+  `offer(tool)` adds one, in place of a namesake. Only host code writes run
+  scope, so a sender still cannot displace a registered tool.
 
 ### Fixed
 

@@ -51,15 +51,20 @@ pub(crate) fn tool_context_for(ctx: &Context) -> ToolContext {
 
 /// The registry for THIS turn: the persistent snapshot plus any per-turn tools a
 /// message carried (placed in run scope by
-/// [`PerTurnToolsStage`](crate::tools::PerTurnToolsStage)). Per-turn tools apply
-/// to this turn only — they live in run scope, which clears when the turn ends.
+/// [`PerTurnToolsStage`](crate::tools::PerTurnToolsStage)), then the host's
+/// [`TurnTools`](crate::tools::TurnTools) edits. Both apply to this turn only —
+/// they live in run scope, which clears when the turn ends.
 pub(crate) fn registry_for_turn(ctx: &Context, registry: &DynamicRegistry) -> Arc<ToolRegistry> {
     let snapshot = registry.load();
-    match ctx.get_run::<crate::tools::PerTurnTools>() {
+    let turn = match ctx.get_run::<crate::tools::PerTurnTools>() {
         Some(per_turn) if !per_turn.0.is_empty() => {
             Arc::new(snapshot.plus_tools(per_turn.0.clone()))
         }
         _ => snapshot,
+    };
+    match ctx.get_run::<crate::tools::TurnTools>() {
+        Some(edits) => Arc::new(turn.edited(edits)),
+        None => turn,
     }
 }
 
@@ -2073,5 +2078,55 @@ Some text.
                     .all(|p| matches!(p, ContentPart::Text { .. }))
             );
         }
+    }
+
+    fn local_tool(name: &str) -> crate::tools::RemoteTool {
+        crate::tools::RemoteTool::new(name, "a tool")
+    }
+
+    #[test]
+    fn a_host_can_hide_a_tool_for_one_turn() {
+        let registry = DynamicRegistry::new(
+            ToolRegistry::new()
+                .register(local_tool("take_photo"))
+                .register(local_tool("query_corpus")),
+        );
+        let mut ctx = gate_ctx("hi");
+        ctx.set(crate::tools::TurnTools::default().hide("query_corpus"));
+        let turn = registry_for_turn(&ctx, &registry);
+        assert!(turn.get("query_corpus").is_none());
+        let prompt = build_messages_with_tools(&[LlmMessage::system("persona")], &turn)[0].text();
+        assert!(prompt.contains("take_photo"), "{prompt}");
+        assert!(!prompt.contains("query_corpus"), "{prompt}");
+
+        let next = gate_ctx("hi again");
+        assert!(
+            registry_for_turn(&next, &registry)
+                .get("query_corpus")
+                .is_some(),
+            "the edit belongs to its own turn"
+        );
+    }
+
+    /// Senders' per-turn tools cannot displace a registered tool; the host's
+    /// edits, which only code can write, can.
+    #[test]
+    fn a_sender_cannot_shadow_a_tool_but_the_host_can_replace_it() {
+        let registry = DynamicRegistry::new(ToolRegistry::new().register(local_tool("lookup")));
+        let impostor = || -> Arc<dyn crate::tools::Tool> {
+            Arc::new(crate::tools::RemoteTool::new("lookup", "impostor"))
+        };
+
+        let mut ctx = gate_ctx("hi");
+        ctx.set(crate::tools::PerTurnTools(vec![impostor()]));
+        let turn = registry_for_turn(&ctx, &registry);
+        assert_eq!(turn.get("lookup").unwrap().description(), "a tool");
+
+        ctx.set(
+            crate::tools::TurnTools::default()
+                .offer(crate::tools::RemoteTool::new("lookup", "host's own")),
+        );
+        let turn = registry_for_turn(&ctx, &registry);
+        assert_eq!(turn.get("lookup").unwrap().description(), "host's own");
     }
 }

@@ -95,6 +95,33 @@ pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
 }
 
+/// A host's edits to one turn's tools, put in run scope
+/// (`ctx.set(TurnTools::default().hide("query_corpus"))`) and applied by both
+/// executors after any tools the sender advertised for the turn.
+///
+/// Messages cannot write run scope, so only host code can hide or replace a
+/// tool; a sender's per-turn tools still cannot displace a registered one.
+#[derive(Clone, Default)]
+pub struct TurnTools {
+    hidden: Vec<String>,
+    added: Vec<Arc<dyn Tool>>,
+}
+
+impl TurnTools {
+    /// Leave `name` out of this turn: neither described to the model nor
+    /// callable.
+    pub fn hide(mut self, name: impl Into<String>) -> Self {
+        self.hidden.push(name.into());
+        self
+    }
+
+    /// Offer `tool` this turn, in place of any tool of the same name.
+    pub fn offer(mut self, tool: impl Tool + 'static) -> Self {
+        self.added.push(Arc::new(tool));
+        self
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self { tools: Vec::new() }
@@ -130,6 +157,26 @@ impl ToolRegistry {
                 tools.push(t);
             }
         }
+        Self { tools }
+    }
+
+    /// This registry with a turn's host edits applied: an offered tool takes its
+    /// namesake's place or joins the end, then hidden names are dropped.
+    pub(crate) fn edited(&self, edits: &TurnTools) -> Self {
+        let named = |name: &str| edits.added.iter().find(|a| a.name() == name).cloned();
+        let mut tools: Vec<Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .map(|t| named(t.name()).unwrap_or_else(|| Arc::clone(t)))
+            .collect();
+        tools.extend(
+            edits
+                .added
+                .iter()
+                .filter(|a| self.get(a.name()).is_none())
+                .cloned(),
+        );
+        tools.retain(|t| !edits.hidden.iter().any(|h| h == t.name()));
         Self { tools }
     }
 
@@ -546,5 +593,55 @@ mod tests {
             .system_prompt();
 
         assert!(prompt.contains("**shell** — test tool"), "{prompt}");
+    }
+
+    fn turn(tools: Vec<Arc<dyn Tool>>, edits: TurnTools) -> ToolRegistry {
+        ToolRegistry::new().plus_tools(tools).edited(&edits)
+    }
+
+    #[test]
+    fn a_hidden_tool_is_left_out_of_the_turn() {
+        let r = turn(
+            vec![NamedTool::local("search"), NamedTool::local("query_corpus")],
+            TurnTools::default().hide("query_corpus"),
+        );
+        assert_eq!(names(&r), ["search"]);
+        assert!(
+            r.get("query_corpus").is_none(),
+            "hidden means not callable either"
+        );
+    }
+
+    #[test]
+    fn an_offered_tool_replaces_its_namesake_in_place_or_joins_the_end() {
+        let edits = TurnTools::default()
+            .offer(NamedTool {
+                name: "query_corpus".into(),
+                remote: true,
+            })
+            .offer(NamedTool {
+                name: "extra".into(),
+                remote: false,
+            });
+        let r = turn(
+            vec![NamedTool::local("query_corpus"), NamedTool::local("search")],
+            edits,
+        );
+        assert_eq!(names(&r), ["query_corpus", "search", "extra"]);
+        assert!(
+            r.get("query_corpus").unwrap().is_remote(),
+            "the host's copy won"
+        );
+    }
+
+    #[test]
+    fn hiding_wins_over_offering() {
+        let edits = TurnTools::default()
+            .offer(NamedTool {
+                name: "extra".into(),
+                remote: false,
+            })
+            .hide("extra");
+        assert!(turn(Vec::new(), edits).is_empty());
     }
 }
