@@ -1,7 +1,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Deserialize a `null` JSON value as `T::default()` instead of failing.
-fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+pub(crate) fn deserialize_null_as_default<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Default + Deserialize<'de>,
