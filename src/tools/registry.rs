@@ -101,23 +101,29 @@ pub struct ToolRegistry {
 ///
 /// Messages cannot write run scope, so only host code can hide or replace a
 /// tool; a sender's per-turn tools still cannot displace a registered one.
+///
+/// `set` replaces any edits already made this turn. A stage adding to another
+/// stage's edits extends them and writes them back:
+/// `let edits = ctx.take::<TurnTools>().unwrap_or_default().hide(..); ctx.set(edits);`
 #[derive(Clone, Default)]
 pub struct TurnTools {
     hidden: Vec<String>,
-    added: Vec<Arc<dyn Tool>>,
+    offered: Vec<Arc<dyn Tool>>,
 }
 
 impl TurnTools {
     /// Leave `name` out of this turn: neither described to the model nor
-    /// callable.
+    /// callable, whatever is offered under it.
     pub fn hide(mut self, name: impl Into<String>) -> Self {
         self.hidden.push(name.into());
         self
     }
 
-    /// Offer `tool` this turn, in place of any tool of the same name.
+    /// Offer `tool` this turn, in place of any tool of the same name, including
+    /// one offered earlier.
     pub fn offer(mut self, tool: impl Tool + 'static) -> Self {
-        self.added.push(Arc::new(tool));
+        self.offered.retain(|t| t.name() != tool.name());
+        self.offered.push(Arc::new(tool));
         self
     }
 }
@@ -163,7 +169,7 @@ impl ToolRegistry {
     /// This registry with a turn's host edits applied: an offered tool takes its
     /// namesake's place or joins the end, then hidden names are dropped.
     pub(crate) fn edited(&self, edits: &TurnTools) -> Self {
-        let named = |name: &str| edits.added.iter().find(|a| a.name() == name).cloned();
+        let named = |name: &str| edits.offered.iter().find(|a| a.name() == name).cloned();
         let mut tools: Vec<Arc<dyn Tool>> = self
             .tools
             .iter()
@@ -171,7 +177,7 @@ impl ToolRegistry {
             .collect();
         tools.extend(
             edits
-                .added
+                .offered
                 .iter()
                 .filter(|a| self.get(a.name()).is_none())
                 .cloned(),
@@ -632,6 +638,23 @@ mod tests {
             r.get("query_corpus").unwrap().is_remote(),
             "the host's copy won"
         );
+    }
+
+    #[test]
+    fn a_later_offer_of_the_same_name_wins() {
+        let tool = |name: &str, remote| NamedTool {
+            name: name.into(),
+            remote,
+        };
+        let edits = TurnTools::default()
+            .offer(tool("extra", false))
+            .offer(tool("extra", true))
+            .offer(tool("search", false))
+            .offer(tool("search", true));
+        let r = turn(vec![NamedTool::local("search")], edits);
+        assert_eq!(names(&r), ["search", "extra"]);
+        assert!(r.get("extra").unwrap().is_remote());
+        assert!(r.get("search").unwrap().is_remote());
     }
 
     #[test]

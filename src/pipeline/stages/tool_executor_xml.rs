@@ -2099,13 +2099,24 @@ Some text.
         assert!(prompt.contains("take_photo"), "{prompt}");
         assert!(!prompt.contains("query_corpus"), "{prompt}");
 
-        let next = gate_ctx("hi again");
+        ctx.reset_output();
         assert!(
-            registry_for_turn(&next, &registry)
+            registry_for_turn(&ctx, &registry)
                 .get("query_corpus")
                 .is_some(),
             "the edit belongs to its own turn"
         );
+    }
+
+    #[test]
+    fn a_host_can_hide_a_tool_the_sender_offered() {
+        let registry = DynamicRegistry::new(ToolRegistry::new());
+        let mut ctx = gate_ctx("hi");
+        ctx.set(crate::tools::PerTurnTools(vec![Arc::new(
+            crate::tools::RemoteTool::new("take_photo", "Capture one"),
+        )]));
+        ctx.set(crate::tools::TurnTools::default().hide("take_photo"));
+        assert!(registry_for_turn(&ctx, &registry).is_empty());
     }
 
     /// Senders' per-turn tools cannot displace a registered tool; the host's
