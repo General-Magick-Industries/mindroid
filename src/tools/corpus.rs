@@ -287,6 +287,7 @@ fn render_results(resp: &QueryResponse) -> String {
     truncate_on_char_boundary(&text, MAX_RESULT_BYTES).to_string()
 }
 
+/// Bifrost is Go: a nil slice arrives as `null`.
 #[derive(Deserialize)]
 struct QueryResponse {
     #[serde(default)]

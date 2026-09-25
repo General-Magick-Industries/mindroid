@@ -348,7 +348,7 @@ fn render_episodes(episodes: &[Episode]) -> String {
         .join("\n\n")
 }
 
-/// Bifrost is written in Go, which serializes an empty list as `null`.
+/// Bifrost is Go: a nil slice arrives as `null`.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct RangeResponse {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
