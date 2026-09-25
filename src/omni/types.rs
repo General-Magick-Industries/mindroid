@@ -1,6 +1,7 @@
 use crate::core::error::MindroidError;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Re-export pure voice primitives from the neutral `voice` module.
 pub use crate::voice::types::{BargeInMode, TurnDetection, VadConfig};
@@ -109,6 +110,24 @@ impl Default for OmniConfig {
             voice: None,
             history: Vec::new(),
         }
+    }
+}
+
+/// A handle the session puts in every tool's [`ToolContext`](crate::tools::ToolContext)
+/// so a tool can end the session — after the current turn, so a spoken goodbye
+/// still plays out.
+#[derive(Debug, Clone, Default)]
+pub struct SessionControl {
+    end: Arc<AtomicBool>,
+}
+
+impl SessionControl {
+    pub fn end_after_turn(&self) {
+        self.end.store(true, Ordering::Relaxed);
+    }
+
+    pub fn end_requested(&self) -> bool {
+        self.end.load(Ordering::Relaxed)
     }
 }
 

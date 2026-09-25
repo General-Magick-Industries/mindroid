@@ -26,6 +26,28 @@ listed under **Breaking Changes** with a migration note.
 - `OpenAiSttConfig.language` (ISO-639-1) — set it; without a hint short clips are
   transcribed in random languages.
 - `CpalAudio::new_split` / `into_parts`.
+- `omni::stage` (feature `transport-audio`): `OmniStage` runs a realtime provider
+  in the LLM slot of a turn pipeline, `LiveAudioSink` streams the reply as it is
+  generated rather than after it completes, and `VOICE_INSTRUCTION` adapts a
+  persona written for text so it answers as speech.
+- `SessionControl`, handed to every tool through `ToolContext`: a tool can end
+  the session, honoured at `TurnComplete` so a spoken goodbye plays out first.
+- `VoiceGateBuilder::provider_closes()`: never close on silence, for a provider
+  that owns turn-taking. `idle_timeout` is now `Option<Duration>`; the default is
+  unchanged at `Some(15s)`.
+- Gemini `TurnDetection::Manual`: the provider brackets the user's turn with
+  `activityStart`/`activityEnd`. The server VAD was already disabled in the setup
+  frame, but nothing marked the boundaries, so the model never answered.
+
+### Fixed
+
+- The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
+  `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
+  configured `transcriber` produced nothing while the provider's own input
+  transcript was already suppressed — the user's turn was lost outright.
+  `FrontendEvent::SpeechStarted` now opens the slice and `UtteranceComplete`
+  closes it. Note that under `TurnDetection::Server` the frontend only completes
+  an utterance at `max_utterance`, so boundaries there are still coarse.
 
 ### Breaking Changes
 

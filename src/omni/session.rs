@@ -5,8 +5,8 @@ use crate::memory::Memory;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
-    AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionState,
-    TranscriptSource, TurnDetection, Usage,
+    AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionControl,
+    SessionState, TranscriptSource, TurnDetection, Usage,
 };
 use crate::pipeline::stages::stt::SttProvider;
 use crate::tools::{Tool, ToolContext};
@@ -117,7 +117,14 @@ impl UtteranceCapture {
         }
     }
 
+    /// Open the utterance slice. The first caller wins: local VAD sees speech
+    /// onset before the provider reports a barge-in, and re-marking there would
+    /// clip the start off the very utterance being captured. Consumed by
+    /// [`take_wav`](Self::take_wav).
     fn mark_start(&mut self) {
+        if self.start.is_some() {
+            return;
+        }
         let lead = self.bytes_per_sec() * Self::LEAD_MS / 1000;
         self.start = Some(self.total.saturating_sub(lead));
     }
@@ -176,6 +183,7 @@ pub struct OmniSession {
     pending_transcriptions: Vec<(oneshot::Sender<Option<String>>, Vec<u8>)>,
     stt_tasks: JoinSet<()>,
     usage_total: Usage,
+    control: SessionControl,
 }
 
 fn history_turn(message: Message, agent_id: &str) -> Option<HistoryTurn> {
@@ -212,6 +220,7 @@ impl OmniSession {
 
     fn tool_context(&self) -> ToolContext {
         let mut ctx = ToolContext::default();
+        ctx.set(self.control.clone());
         if let Some(conv) = &self.conversation {
             ctx.channel_id = conv.channel_id.clone();
             ctx.sender_id = conv.sender_id.clone();
@@ -595,14 +604,26 @@ impl OmniSession {
                                             self.state = SessionState::Listening;
                                         }
                                         FrontendEvent::UtteranceComplete { .. } => {
+                                            // Close the utterance slice first. Only the OpenAI
+                                            // provider emits `UserSpeechEnded`; on Gemini this
+                                            // is the sole boundary the shadow transcriber ever
+                                            // sees, so without it the user's turn is dropped.
+                                            Self::queue_transcription(
+                                                &self.transcriber,
+                                                &self.persist_tx,
+                                                &mut self.capture,
+                                                &mut self.pending_transcriptions,
+                                            );
                                             // Local turn detection: tell the provider that
                                             // the user's turn is complete so it can start
                                             // generating a response.
                                             self.provider.end_audio_stream().await?;
                                         }
                                         FrontendEvent::SpeechStarted => {
-                                            // Speech onset — no session-level action needed;
-                                            // the frontend tracks state internally.
+                                            // Speech onset: open the utterance slice for the
+                                            // shadow transcriber. Without one the capture is
+                                            // never pushed to, so this is a no-op.
+                                            self.capture.mark_start();
                                         }
                                     }
                                 }
@@ -710,6 +731,12 @@ impl OmniSession {
                             if let Some(ref sink) = self.audio_sink {
                                 sink.flush().await?;
                             }
+                            if self.control.end_requested() {
+                                tracing::info!("session ended by a tool after the turn");
+                                self.state = SessionState::Closed;
+                                let _ = self.provider.disconnect().await;
+                                break;
+                            }
                             self.state = SessionState::Listening;
                         }
                         Some(OmniEvent::Error(e)) => {
@@ -788,6 +815,9 @@ impl OmniSession {
         self.state = SessionState::Connecting;
         self.provider.connect(&self.config).await?;
         self.state = SessionState::Listening;
+        // Mirror `run()`: without the writer there is no `persist_tx`, and
+        // `queue_transcription` returns before it ever reaches the capture.
+        self.start_writer();
 
         let mut provider_events = self.provider.events();
         let mut audio_stream = self.audio_source.as_ref().map(|s| s.stream());
@@ -855,9 +885,17 @@ impl OmniSession {
                                         self.state = SessionState::Listening;
                                     }
                                     FrontendEvent::UtteranceComplete { .. } => {
+                                        Self::queue_transcription(
+                                            &self.transcriber,
+                                            &self.persist_tx,
+                                            &mut self.capture,
+                                            &mut self.pending_transcriptions,
+                                        );
                                         self.provider.end_audio_stream().await?;
                                     }
-                                    FrontendEvent::SpeechStarted => {}
+                                    FrontendEvent::SpeechStarted => {
+                                        self.capture.mark_start();
+                                    }
                                 }
                             }
                         }
@@ -873,6 +911,11 @@ impl OmniSession {
                     }
                 } => {
                     if let Some(chunk) = chunk {
+                        // Mirror `run_inner`: the capture is what the shadow
+                        // transcriber slices an utterance out of.
+                        if self.transcriber.is_some() {
+                            self.capture.push(&chunk);
+                        }
                         self.provider.send_audio(chunk).await?;
                     } else {
                         audio_stream = None;
@@ -912,6 +955,12 @@ impl OmniSession {
                             if let Some(ref sink) = self.audio_sink {
                                 sink.flush().await?;
                             }
+                            if self.control.end_requested() {
+                                tracing::info!("session ended by a tool after the turn");
+                                self.state = SessionState::Closed;
+                                let _ = self.provider.disconnect().await;
+                                break;
+                            }
                             self.state = SessionState::Listening;
                         }
                         Some(OmniEvent::Error(e)) => {
@@ -937,6 +986,11 @@ impl OmniSession {
                 }
             }
         }
+        // Mirror `run()`, which calls this outside `run_inner` so the loop's
+        // borrows of `self` are already released.
+        drop(audio_stream);
+        drop(provider_events);
+        self.finish_persistence().await;
         Ok(())
     }
 }
@@ -1131,6 +1185,7 @@ impl OmniSessionBuilder {
             pending_transcriptions: Vec::new(),
             stt_tasks: JoinSet::new(),
             usage_total: Usage::default(),
+            control: SessionControl::default(),
         })
     }
 }
@@ -1176,6 +1231,26 @@ mod tests {
             bits_per_sample: 16,
         });
         let _ = cap.take_wav();
+    }
+
+    /// Local VAD marks speech onset; the provider's barge-in signal arrives later
+    /// for the same utterance. Re-anchoring there would drop the opening words.
+    #[test]
+    fn mark_start_does_not_re_anchor_an_open_utterance() {
+        let mut cap = super::UtteranceCapture::new();
+        let chunk = |n: u8| super::AudioChunk {
+            data: vec![n; 16_000], // 0.5 s at 16 kHz mono
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        cap.push(&chunk(1));
+        cap.mark_start(); // local VAD: speech onset
+        cap.push(&chunk(2));
+        cap.mark_start(); // provider: barge-in, later — must not move the anchor
+        let wav = cap.take_wav().expect("long enough");
+        assert_eq!(wav.len(), 44 + 32_000, "slice still starts at the onset");
+        assert_eq!(wav[44], 1, "kept the audio from before the second mark");
     }
 
     use super::*;
@@ -1542,6 +1617,76 @@ mod tests {
         assert_eq!(chunks[0].data, vec![1]);
         assert_eq!(chunks[1].data, vec![2]);
         assert_eq!(chunks[2].data, vec![3]);
+    }
+
+    struct HangUpTool;
+
+    #[async_trait]
+    impl Tool for HangUpTool {
+        fn name(&self) -> &str {
+            "hang_up"
+        }
+
+        fn description(&self) -> &str {
+            "Ends the session"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
+            ctx.get::<SessionControl>()
+                .expect("the session hands every tool a SessionControl")
+                .end_after_turn();
+            Ok("closing after this turn".into())
+        }
+    }
+
+    /// The tool asks for the end; the session honours it only once the turn the
+    /// model is speaking has completed, so the goodbye plays out.
+    #[tokio::test]
+    async fn a_tool_can_end_the_session_after_the_turn() {
+        let (provider, tx) = RecordingProvider::new();
+        let disconnected = Arc::clone(&provider.disconnected);
+        let mut session = OmniSession::builder()
+            .provider(provider)
+            .tool(HangUpTool)
+            .build()
+            .unwrap();
+
+        let driver = tokio::spawn(async move {
+            tx.send(OmniEvent::ToolCall {
+                id: "c1".into(),
+                name: "hang_up".into(),
+                args: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+            tx.send(OmniEvent::Transcript {
+                text: "Goodbye!".into(),
+                is_final: true,
+                source: TranscriptSource::Output,
+            })
+            .await
+            .unwrap();
+            tx.send(OmniEvent::TurnComplete).await.unwrap();
+            // The stream stays open: the session must leave on its own.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(tx);
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.run())
+            .await
+            .expect("session should end at the TurnComplete, not wait for the stream")
+            .unwrap();
+        assert_eq!(session.state(), SessionState::Closed);
+        assert!(*disconnected.lock().unwrap());
+        driver.abort();
     }
 
     /// A ToolCall event executes the named tool and sends back the result.
@@ -1925,6 +2070,135 @@ mod tests {
         assert!(
             *eos_count.lock().unwrap() >= 1,
             "end_audio_stream should be called at least once on local UtteranceComplete"
+        );
+    }
+
+    /// The shadow transcriber's utterance boundaries come from the local audio
+    /// frontend: speech onset opens the slice, `UtteranceComplete` closes it and
+    /// queues the turn. Only the OpenAI provider emits `UserSpeechEnded`, so
+    /// without these two the Gemini path queued nothing at all while
+    /// `run_inner` was already suppressing the provider's own input transcript —
+    /// the user's turn was lost outright.
+    #[cfg(feature = "transport-audio")]
+    #[tokio::test]
+    async fn local_vad_boundaries_queue_the_user_turn_for_the_transcriber() {
+        use crate::pipeline::stages::stt::SttProvider;
+        use crate::voice::types::VadConfig;
+        use std::time::Duration;
+
+        struct FakeStt {
+            seen: Arc<Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl SttProvider for FakeStt {
+            async fn transcribe(&self, audio: &[u8]) -> Result<String, MindroidError> {
+                self.seen.lock().unwrap().push(audio.len());
+                Ok("hello there".to_string())
+            }
+        }
+
+        struct RecordingMemory {
+            saved: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        #[async_trait]
+        impl Memory for RecordingMemory {
+            async fn save_message(
+                &self,
+                _channel: &str,
+                sender: &str,
+                content: &str,
+                _reply_to: Option<&str>,
+            ) -> Result<Option<String>, MindroidError> {
+                self.saved
+                    .lock()
+                    .unwrap()
+                    .push((sender.to_string(), content.to_string()));
+                Ok(Some("m1".to_string()))
+            }
+
+            async fn get_history(
+                &self,
+                _channel: &str,
+                _limit: usize,
+            ) -> Result<Vec<Message>, MindroidError> {
+                Ok(Vec::new())
+            }
+
+            async fn clear_history(&self, _channel: &str) -> Result<(), MindroidError> {
+                Ok(())
+            }
+        }
+
+        // Same shape as `test_local_turn_complete_calls_end_audio_stream`:
+        // silence = 38 x 32 ms, pad = 10 x 32 ms.
+        let vad_cfg = VadConfig {
+            speech_threshold: 0.5,
+            speech_end_threshold: 0.3,
+            silence_duration: Duration::from_millis(38 * 32),
+            speech_pad: Duration::from_millis(10 * 32),
+            min_speech: Duration::from_millis(300),
+            max_utterance: Duration::from_secs(30),
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let (provider, tx) = RecordingProvider::new();
+
+        // Half a second of mic audio, so the captured slice clears `MIN_MS`.
+        let chunks: Vec<AudioChunk> = (0..5)
+            .map(|_| AudioChunk {
+                data: vec![7u8; 3_200],
+                sample_rate: 16_000,
+                channels: 1,
+                bits_per_sample: 16,
+            })
+            .collect();
+
+        let mut session = OmniSession::builder()
+            .provider(provider)
+            .audio_source(FixedAudioSource { chunks })
+            .transcriber(Arc::new(FakeStt {
+                seen: Arc::clone(&seen),
+            }))
+            .memory(Arc::new(RecordingMemory {
+                saved: Arc::clone(&saved),
+            }))
+            .conversation("chan", "user-1", "agent-1")
+            .barge_in(BargeInMode::Disabled)
+            .turn_detection(TurnDetection::Local(vad_cfg))
+            .build()
+            .unwrap();
+
+        let (vad_tx, vad_rx) = mpsc::channel::<(Vec<f32>, f32)>(64);
+        let session_task = tokio::spawn(async move {
+            session.run_with_vad_rx(vad_rx).await.expect("run succeeds");
+        });
+
+        let speech = vec![0.1f32; 512];
+        let silence = vec![0.0f32; 512];
+        for _ in 0..12 {
+            vad_tx.send((speech.clone(), 0.8)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..38 {
+            vad_tx.send((silence.clone(), 0.1)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        drop(vad_tx);
+        drop(tx);
+        session_task.await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one utterance should reach the STT");
+        assert!(seen[0] > 44, "the WAV should carry samples, not just a header");
+
+        let saved = saved.lock().unwrap();
+        assert!(
+            saved.iter().any(|(s, c)| s == "user-1" && c == "hello there"),
+            "the transcribed turn should persist as the user's, got {saved:?}"
         );
     }
 }

@@ -48,7 +48,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
 | `omni-gemini` | `tokio-tungstenite`, `base64` | `GeminiLiveProvider`, `GeminiLiveConfig`, `gemini::tool_declarations` |
 | `omni-openai` | `tokio-tungstenite`, `base64` | `OpenAiRealtimeProvider`, `OpenAiRealtimeConfig`, `openai_realtime::tool_declarations` |
-| `transport-audio` | `cpal`, `hound`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage` |
+| `transport-audio` | `cpal`, `hound`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage`, `OmniStage`, `LiveAudioSink` |
 | `speech` | `reqwest` | `OpenAiStt`, `DeepgramTts`, etc. |
 | `apikey` | `reqwest` | `ApiKeyAuth` |
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |

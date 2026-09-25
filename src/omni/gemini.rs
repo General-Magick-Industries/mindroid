@@ -3,6 +3,7 @@
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -180,6 +181,11 @@ pub struct GeminiLiveProvider {
     /// [`OmniProvider::send_tool_result`] is only handed the call id.
     pending_calls: Arc<DashMap<String, String>>,
     tasks: JoinSet<()>,
+    /// `TurnDetection::Manual`: the client marks turn boundaries with
+    /// `activityStart`/`activityEnd` instead of relying on the server VAD.
+    manual: AtomicBool,
+    /// An `activityStart` has been sent and its `activityEnd` has not.
+    activity_open: AtomicBool,
 }
 
 impl GeminiLiveProvider {
@@ -190,6 +196,8 @@ impl GeminiLiveProvider {
             events: None,
             pending_calls: Arc::new(DashMap::new()),
             tasks: JoinSet::new(),
+            manual: AtomicBool::new(false),
+            activity_open: AtomicBool::new(false),
         }
     }
 
@@ -252,6 +260,11 @@ impl OmniProvider for GeminiLiveProvider {
                 "refusing to send the API key over plaintext ws://; set allow_insecure for a local fake",
             ));
         }
+        self.manual.store(
+            matches!(config.turn_detection, TurnDetection::Manual),
+            Ordering::Relaxed,
+        );
+        self.activity_open.store(false, Ordering::Relaxed);
         let (ws, _) = connect_async(self.config.url())
             .await
             .map_err(|e| transport(format!("Gemini Live connect failed: {e}")))?;
@@ -318,6 +331,9 @@ impl OmniProvider for GeminiLiveProvider {
                 let Some(value) = frame_to_json(frame) else {
                     continue;
                 };
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(frame = %elide_audio(&value), "gemini frame");
+                }
                 for event in parse_server_message(&value, &pending, &mut acc) {
                     if event_tx.send(event).await.is_err() {
                         return;
@@ -332,6 +348,18 @@ impl OmniProvider for GeminiLiveProvider {
     }
 
     async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
+        if self.manual.load(Ordering::Relaxed) && !self.activity_open.swap(true, Ordering::Relaxed)
+        {
+            // Clear the flag if the start never reached the wire, or the retry
+            // skips it and `end_audio_stream` sends an unmatched `activityEnd`.
+            if let Err(e) = self
+                .send_json(json!({ "realtimeInput": { "activityStart": {} } }))
+                .await
+            {
+                self.activity_open.store(false, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
         self.send_json(json!({
             "realtimeInput": {
                 "audio": {
@@ -374,7 +402,16 @@ impl OmniProvider for GeminiLiveProvider {
         .await
     }
 
+    /// Ends the user's turn: `activityEnd` under manual detection (the server VAD
+    /// is off, so this is what makes the model answer), `audioStreamEnd` otherwise.
     async fn end_audio_stream(&self) -> Result<(), MindroidError> {
+        if self.manual.load(Ordering::Relaxed) {
+            if self.activity_open.swap(false, Ordering::Relaxed) {
+                self.send_json(json!({ "realtimeInput": { "activityEnd": {} } }))
+                    .await?;
+            }
+            return Ok(());
+        }
         self.send_json(json!({ "realtimeInput": { "audioStreamEnd": true } }))
             .await
     }
@@ -433,6 +470,22 @@ fn frame_to_json(frame: WsMessage) -> Option<Value> {
         _ => return None,
     };
     serde_json::from_slice(&bytes).ok()
+}
+
+/// The frame with every `inlineData.data` replaced by its byte length, for logs.
+fn elide_audio(value: &Value) -> Value {
+    let mut v = value.clone();
+    if let Some(parts) = v
+        .pointer_mut("/serverContent/modelTurn/parts")
+        .and_then(Value::as_array_mut)
+    {
+        for part in parts {
+            if let Some(data) = part.pointer_mut("/inlineData/data") {
+                *data = json!(format!("<{} b64 chars>", data.as_str().map_or(0, str::len)));
+            }
+        }
+    }
+    v
 }
 
 /// Map one Gemini server frame onto zero or more [`OmniEvent`]s.
@@ -765,6 +818,46 @@ mod tests {
 
         let frame = seen.recv().await.expect("audioStreamEnd frame");
         assert_eq!(frame["realtimeInput"]["audioStreamEnd"], true);
+    }
+
+    #[tokio::test]
+    async fn manual_detection_brackets_the_audio_with_activity_markers() {
+        let (url, mut seen) = spawn_fake_gemini(|_| vec![]).await;
+        let config = GeminiLiveConfig::new("test-key")
+            .with_endpoint(url)
+            .with_allow_insecure(true);
+        let mut provider = GeminiLiveProvider::new(config);
+        provider
+            .connect(&OmniConfig {
+                turn_detection: TurnDetection::Manual,
+                ..OmniConfig::default()
+            })
+            .await
+            .unwrap();
+        let _setup = seen.recv().await;
+        let chunk = AudioChunk {
+            data: vec![0, 0],
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+
+        provider.send_audio(chunk.clone()).await.unwrap();
+        provider.send_audio(chunk).await.unwrap();
+        provider.end_audio_stream().await.unwrap();
+
+        let frames: Vec<Value> = [
+            seen.recv().await.unwrap(),
+            seen.recv().await.unwrap(),
+            seen.recv().await.unwrap(),
+            seen.recv().await.unwrap(),
+        ]
+        .into();
+        assert!(frames[0]["realtimeInput"]["activityStart"].is_object());
+        assert!(frames[1]["realtimeInput"]["audio"].is_object());
+        assert!(frames[2]["realtimeInput"]["audio"].is_object());
+        assert!(frames[3]["realtimeInput"]["activityEnd"].is_object());
+        assert!(frames[3]["realtimeInput"].get("audioStreamEnd").is_none());
     }
 
     /// The round trip the trait signature makes easy to get wrong: `send_tool_result`

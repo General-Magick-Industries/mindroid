@@ -4,7 +4,9 @@
 //! detected speech opens an [`OmniSession`], replaying the last moment of audio so
 //! the opening words are not lost. After [`idle_timeout`](VoiceGateBuilder::idle_timeout)
 //! without speech the session is closed, which flushes its transcripts to memory;
-//! the next speech opens a fresh session that seeds that history back in.
+//! the next speech opens a fresh session that seeds that history back in. With
+//! [`provider_closes`](VoiceGateBuilder::provider_closes) the gate only ever opens:
+//! the session lives until the provider ends it, and the next speech reopens.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -155,7 +157,7 @@ pub struct VoiceGate {
     transcriber: Option<Arc<dyn SttProvider>>,
     tool_ctx_init: Option<ToolContextInit>,
     vad: VadConfig,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     preroll: Duration,
     cancel: CancellationToken,
 }
@@ -189,7 +191,6 @@ impl VoiceGate {
         tracing::info!("voice gate: waiting for speech");
 
         loop {
-            let idle_at = last_speech + self.idle_timeout;
             tokio::select! {
                 biased;
 
@@ -217,7 +218,14 @@ impl VoiceGate {
                     tracing::info!("voice gate: waiting for speech");
                 }
 
-                _ = tokio::time::sleep_until(idle_at), if live.is_some() => {
+                // No idle timeout means the session closes only when the provider
+                // ends it: the arm is still declared, but `pending()` never resolves.
+                _ = async {
+                    match self.idle_timeout {
+                        Some(d) => tokio::time::sleep_until(last_speech + d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if live.is_some() => {
                     Self::close(&mut live, "idle").await;
                     if let Some(v) = vad.as_mut() {
                         v.reset();
@@ -342,7 +350,7 @@ pub struct VoiceGateBuilder {
     transcriber: Option<Arc<dyn SttProvider>>,
     tool_ctx_init: Option<ToolContextInit>,
     vad: VadConfig,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     preroll: Duration,
     cancel: Option<CancellationToken>,
 }
@@ -362,7 +370,7 @@ impl Default for VoiceGateBuilder {
             transcriber: None,
             tool_ctx_init: None,
             vad: VadConfig::default(),
-            idle_timeout: Duration::from_secs(15),
+            idle_timeout: Some(Duration::from_secs(15)),
             preroll: Duration::from_secs(1),
             cancel: None,
         }
@@ -447,7 +455,14 @@ impl VoiceGateBuilder {
 
     /// Silence after the last detected speech that closes the session. Default 15 s.
     pub fn idle_timeout(mut self, d: Duration) -> Self {
-        self.idle_timeout = d;
+        self.idle_timeout = Some(d);
+        self
+    }
+
+    /// Never close on silence: the session ends only when the provider ends it
+    /// (or the gate is cancelled). Local speech still opens the next one.
+    pub fn provider_closes(mut self) -> Self {
+        self.idle_timeout = None;
         self
     }
 
