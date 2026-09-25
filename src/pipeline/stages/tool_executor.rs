@@ -22,7 +22,6 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, FunctionCall,
 };
 use async_trait::async_trait;
-use futures::future::join_all;
 use futures::stream::{self, BoxStream, StreamExt};
 use std::sync::Arc;
 use tracing::debug;
@@ -43,6 +42,10 @@ use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 /// calling instead of prompt-XML. Drop-in replacement for
 /// [`XmlToolExecutorStage`](super::XmlToolExecutorStage); see the module docs for
 /// when to prefer it.
+/// How many of a response's tool calls run at once when parallel calls are on.
+/// Bounded (ADR-0001) so a model that emits dozens cannot fan all of them out.
+pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+
 #[derive(Clone)]
 pub struct ToolExecutorStage {
     client: LlmClient,
@@ -76,9 +79,12 @@ impl ToolExecutorStage {
     }
 
     /// Run the calls a model asks for in one response at the same time rather
-    /// than one after another. Results go back in the order they were asked
-    /// for either way. Off by default: turn it on only when the registry's
-    /// tools do not depend on running in order.
+    /// than one after another, up to [`MAX_PARALLEL_TOOL_CALLS`] at once.
+    /// Results go back in the order they were asked for either way. This only
+    /// changes how the stage runs the calls: the request does not send
+    /// `parallel_tool_calls`. Off by default: turn it on only when every tool
+    /// the registry may hold, including ones a manifest or a turn adds, can run
+    /// out of order.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel_tool_calls = parallel;
         self
@@ -400,19 +406,19 @@ impl ToolExecutorStage {
         let mut ends_turn = false;
 
         let calls = &outcome.tool_calls;
-        let executions: Vec<_> = if self.parallel_tool_calls {
-            join_all(
-                calls
-                    .iter()
-                    .map(|call| execute_local(registry, tool_ctx, call)),
-            )
-            .await
+        let at_once = if self.parallel_tool_calls {
+            MAX_PARALLEL_TOOL_CALLS
         } else {
-            stream::iter(calls)
-                .then(|call| execute_local(registry, tool_ctx, call))
-                .collect()
-                .await
+            1
         };
+        // Built up front, not in a `Stream::map`: a closure returning this
+        // borrowing future there fails the stage's `Send` bound (a known
+        // higher-ranked lifetime limitation in rustc).
+        let pending: Vec<_> = calls
+            .iter()
+            .map(|call| execute_local(registry, tool_ctx, call))
+            .collect();
+        let executions: Vec<_> = stream::iter(pending).buffered(at_once).collect().await;
 
         for (call, executed) in calls.iter().zip(executions) {
             events.push(StreamEvent::ToolCall {
@@ -568,6 +574,9 @@ impl StreamingStage for ToolExecutorStage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+
     use super::*;
     use crate::tools::Tool;
     use serde_json::json;
@@ -839,9 +848,9 @@ mod tests {
     /// Sleeps for `delay`, recording how many calls were running at once.
     struct Slow {
         name: &'static str,
-        delay: std::time::Duration,
-        running: Arc<std::sync::atomic::AtomicUsize>,
-        peak: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -856,7 +865,6 @@ mod tests {
             json!({"type": "object", "properties": {}})
         }
         async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
-            use std::sync::atomic::Ordering::SeqCst;
             let now = self.running.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(now, SeqCst);
             tokio::time::sleep(self.delay).await;
@@ -865,31 +873,35 @@ mod tests {
         }
     }
 
-    /// Runs one round asking for a slow and a quick call, then an answer.
-    /// Returns the peak number of calls in flight and the tool results the
-    /// second request carried, in the order it carried them.
-    async fn slow_and_quick_round(parallel: Option<bool>) -> (usize, Vec<(String, String)>) {
-        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let slow = |name, ms| Slow {
+    fn slow(
+        name: &'static str,
+        ms: u64,
+        running: &Arc<AtomicUsize>,
+        peak: &Arc<AtomicUsize>,
+    ) -> Slow {
+        Slow {
             name,
-            delay: std::time::Duration::from_millis(ms),
-            running: Arc::clone(&running),
-            peak: Arc::clone(&peak),
-        };
-        let registry = ToolRegistry::new()
-            .register(slow("slow", 80))
-            .register(slow("quick", 10));
+            delay: Duration::from_millis(ms),
+            running: Arc::clone(running),
+            peak: Arc::clone(peak),
+        }
+    }
 
-        let first = completion(json!({
-            "role": "assistant",
-            "tool_calls": [
-                {"id": "call-slow", "type": "function",
-                 "function": {"name": "slow", "arguments": "{}"}},
-                {"id": "call-quick", "type": "function",
-                 "function": {"name": "quick", "arguments": "{}"}}
-            ]
-        }));
+    /// Runs one round asking for `calls` (id, tool name), then an answer.
+    /// Returns the tool results the second request carried, in its order.
+    async fn one_round(
+        registry: ToolRegistry,
+        calls: &[(&str, &str)],
+        parallel: Option<bool>,
+    ) -> Vec<(String, String)> {
+        let tool_calls: Vec<serde_json::Value> = calls
+            .iter()
+            .map(|(id, name)| {
+                json!({"id": id, "type": "function",
+                       "function": {"name": name, "arguments": "{}"}})
+            })
+            .collect();
+        let first = completion(json!({"role": "assistant", "tool_calls": tool_calls}));
         let second = completion(json!({"role": "assistant", "content": "done"}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -906,7 +918,7 @@ mod tests {
 
         let bodies = server.await.unwrap();
         let replayed: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
-        let results = replayed["messages"]
+        replayed["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -917,8 +929,25 @@ mod tests {
                     m["content"].as_str().unwrap_or_default().to_string(),
                 )
             })
-            .collect();
-        (peak.load(std::sync::atomic::Ordering::SeqCst), results)
+            .collect()
+    }
+
+    /// A slow call and a quick one. Returns the peak in flight and the results.
+    async fn slow_and_quick_round(parallel: Option<bool>) -> (usize, Vec<(String, String)>) {
+        let (running, peak): (Arc<AtomicUsize>, Arc<AtomicUsize>) = Default::default();
+        let registry = ToolRegistry::new()
+            .register(slow("slow", 80, &running, &peak))
+            .register(slow("quick", 10, &running, &peak));
+        let calls = [("call-slow", "slow"), ("call-quick", "quick")];
+        let results = one_round(registry, &calls, parallel).await;
+        (peak.load(SeqCst), results)
+    }
+
+    fn slow_then_quick() -> Vec<(String, String)> {
+        vec![
+            ("call-slow".to_string(), "slow done".to_string()),
+            ("call-quick".to_string(), "quick done".to_string()),
+        ]
     }
 
     /// The quick call finishes first, yet its result is still sent second:
@@ -927,13 +956,7 @@ mod tests {
     async fn parallel_tool_calls_run_a_round_at_once_and_answer_in_order() {
         let (peak, results) = slow_and_quick_round(Some(true)).await;
         assert_eq!(peak, 2, "both calls were running at the same time");
-        assert_eq!(
-            results,
-            [
-                ("call-slow".to_string(), "slow done".to_string()),
-                ("call-quick".to_string(), "quick done".to_string())
-            ]
-        );
+        assert_eq!(results, slow_then_quick());
     }
 
     #[tokio::test]
@@ -941,8 +964,23 @@ mod tests {
         for parallel in [None, Some(false)] {
             let (peak, results) = slow_and_quick_round(parallel).await;
             assert_eq!(peak, 1, "{parallel:?}: never more than one call running");
-            assert_eq!(results.len(), 2);
+            assert_eq!(results, slow_then_quick(), "{parallel:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_never_run_more_than_the_cap_at_once() {
+        let (running, peak): (Arc<AtomicUsize>, Arc<AtomicUsize>) = Default::default();
+        let registry = ToolRegistry::new().register(slow("slow", 30, &running, &peak));
+        let ids: Vec<String> = (0..MAX_PARALLEL_TOOL_CALLS + 2)
+            .map(|n| format!("call-{n}"))
+            .collect();
+        let calls: Vec<(&str, &str)> = ids.iter().map(|id| (id.as_str(), "slow")).collect();
+
+        let results = one_round(registry, &calls, Some(true)).await;
+        assert_eq!(peak.load(SeqCst), MAX_PARALLEL_TOOL_CALLS);
+        let answered: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(answered, ids, "every call answered, in the order asked");
     }
 
     #[tokio::test]
