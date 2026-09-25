@@ -38,14 +38,14 @@ use crate::models::StreamEvent;
 use crate::pipeline::{PipelineStage, StreamingStage};
 use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
-/// A streaming pipeline stage that gives the LLM tools via NATIVE function
-/// calling instead of prompt-XML. Drop-in replacement for
-/// [`XmlToolExecutorStage`](super::XmlToolExecutorStage); see the module docs for
-/// when to prefer it.
 /// How many of a response's tool calls run at once when parallel calls are on.
 /// Bounded (ADR-0001) so a model that emits dozens cannot fan all of them out.
 pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 
+/// A streaming pipeline stage that gives the LLM tools via NATIVE function
+/// calling instead of prompt-XML. Drop-in replacement for
+/// [`XmlToolExecutorStage`](super::XmlToolExecutorStage); see the module docs for
+/// when to prefer it.
 #[derive(Clone)]
 pub struct ToolExecutorStage {
     client: LlmClient,
@@ -414,11 +414,11 @@ impl ToolExecutorStage {
         // Built up front, not in a `Stream::map`: a closure returning this
         // borrowing future there fails the stage's `Send` bound (a known
         // higher-ranked lifetime limitation in rustc).
-        let pending: Vec<_> = calls
+        let runs: Vec<_> = calls
             .iter()
             .map(|call| execute_local(registry, tool_ctx, call))
             .collect();
-        let executions: Vec<_> = stream::iter(pending).buffered(at_once).collect().await;
+        let executions: Vec<_> = stream::iter(runs).buffered(at_once).collect().await;
 
         for (call, executed) in calls.iter().zip(executions) {
             events.push(StreamEvent::ToolCall {

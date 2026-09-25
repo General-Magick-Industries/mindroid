@@ -157,7 +157,7 @@ Four differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
 mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
 events replay once the loop ends; the JSON stage re-attaches artifacts as a
 follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
-role carries text alone; and only the JSON stage honours `Tool::ends_turn`, so a
+role carries text alone; only the JSON stage honours `Tool::ends_turn`, so a
 self-delivering tool on the XML stage may be re-called, up to the iteration cap;
 and only the JSON stage can run a response's calls concurrently
 (`with_parallel_tool_calls`, at most `MAX_PARALLEL_TOOL_CALLS` at once).
