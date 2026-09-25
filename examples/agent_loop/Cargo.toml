@@ -1,0 +1,17 @@
+[package]
+name = "mindroid-example-agent-loop"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "agent_loop"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["llm-client"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

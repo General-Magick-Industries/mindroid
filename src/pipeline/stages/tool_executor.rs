@@ -176,7 +176,10 @@ enum RoundOutcome {
 
 /// Echo the assistant turn with its native calls, so the follow-up request is
 /// a valid OpenAI tool round the provider can correlate results against.
-fn assistant_turn(content: &str, calls: &[NativeToolCall]) -> Result<ChatCompletionRequestMessage> {
+pub(crate) fn assistant_turn(
+    content: &str,
+    calls: &[NativeToolCall],
+) -> Result<ChatCompletionRequestMessage> {
     let tool_calls: Vec<ChatCompletionMessageToolCalls> = calls
         .iter()
         .map(|c| {
@@ -197,7 +200,7 @@ fn assistant_turn(content: &str, calls: &[NativeToolCall]) -> Result<ChatComplet
     Ok(builder.build().map_err(err)?.into())
 }
 
-fn tool_turn(call_id: &str, result: String) -> Result<ChatCompletionRequestMessage> {
+pub(crate) fn tool_turn(call_id: &str, result: String) -> Result<ChatCompletionRequestMessage> {
     Ok(ChatCompletionRequestToolMessageArgs::default()
         .content(result)
         .tool_call_id(call_id)
@@ -566,16 +569,24 @@ impl StreamingStage for ToolExecutorStage {
     }
 }
 
+/// A scripted OpenAI-compatible endpoint for the executor and round tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::Tool;
+pub(crate) mod fake_llm {
     use serde_json::json;
+
+    /// One non-streaming completion body around `message`.
+    pub(crate) fn completion(message: serde_json::Value) -> String {
+        json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
+        })
+        .to_string()
+    }
 
     /// Serve `replies` in order, draining each request body first — replying
     /// before the client finishes writing resets the connection under load.
     /// Returns the request bodies so a test can assert on what was replayed.
-    fn serve_completions(
+    pub(crate) fn serve_completions(
         listener: tokio::net::TcpListener,
         replies: Vec<String>,
     ) -> tokio::task::JoinHandle<Vec<String>> {
@@ -620,6 +631,14 @@ mod tests {
             bodies
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake_llm::{completion, serve_completions};
+    use super::*;
+    use crate::tools::Tool;
+    use serde_json::json;
 
     fn call(id: &str, name: &str, arguments: &str) -> NativeToolCall {
         NativeToolCall {
@@ -668,14 +687,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(out.starts_with("Error: invalid arguments JSON"), "{out}");
-    }
-
-    fn completion(message: serde_json::Value) -> String {
-        json!({
-            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
-            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
-        })
-        .to_string()
     }
 
     fn stub_client(addr: std::net::SocketAddr) -> LlmClient {

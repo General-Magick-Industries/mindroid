@@ -33,6 +33,17 @@ pub enum PipelineEvent {
         #[serde(with = "duration_millis")]
         elapsed: Duration,
     },
+    /// One [`AgentLoop`](crate::core::agent_loop::AgentLoop) body pass is
+    /// starting. Emitted around the pass, not by it, so a body with no
+    /// loop-aware stage still reports its single iteration.
+    LoopIterationStarted {
+        iteration: usize,
+    },
+    LoopCompleted {
+        iterations: usize,
+        #[serde(with = "duration_millis")]
+        elapsed: Duration,
+    },
 }
 
 /// Serde helper: serialize Duration as milliseconds (u64).

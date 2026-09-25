@@ -1537,6 +1537,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mindroid-example-agent-loop"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mindroid",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mindroid-example-artifact-agent"
 version = "0.0.1"
 dependencies = [
