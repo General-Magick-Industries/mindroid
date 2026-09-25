@@ -120,7 +120,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0.5);
 
     let gate = VoiceGate::builder()
-        .provider(move || Box::new(GeminiLiveProvider::new(gemini.clone())) as Box<dyn OmniProvider>)
+        .provider(move || {
+            Box::new(GeminiLiveProvider::new(gemini.clone())) as Box<dyn OmniProvider>
+        })
         .detector(detector)
         .audio_source(source)
         .audio_sink(sink)

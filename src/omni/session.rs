@@ -2193,11 +2193,16 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "exactly one utterance should reach the STT");
-        assert!(seen[0] > 44, "the WAV should carry samples, not just a header");
+        assert!(
+            seen[0] > 44,
+            "the WAV should carry samples, not just a header"
+        );
 
         let saved = saved.lock().unwrap();
         assert!(
-            saved.iter().any(|(s, c)| s == "user-1" && c == "hello there"),
+            saved
+                .iter()
+                .any(|(s, c)| s == "user-1" && c == "hello there"),
             "the transcribed turn should persist as the user's, got {saved:?}"
         );
     }

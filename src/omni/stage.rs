@@ -561,7 +561,8 @@ fn encode_wav(pcm: &[u8], sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(pcm.len() + 44);
     let mut writer = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec)
         .map_err(|e| stage_err(format!("WAV writer: {e}")))?;
-    for pair in pcm.chunks_exact(2) {
+    let (pairs, _) = pcm.as_chunks::<2>();
+    for pair in pairs {
         writer
             .write_sample(i16::from_le_bytes([pair[0], pair[1]]))
             .map_err(|e| stage_err(format!("WAV write: {e}")))?;

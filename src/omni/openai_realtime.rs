@@ -698,6 +698,7 @@ mod tests {
         (format!("ws://{addr}/v1/realtime"), seen_rx, auth_header)
     }
 
+    #[allow(clippy::result_large_err)]
     async fn send(
         sink: &mut Sink,
         value: Value,

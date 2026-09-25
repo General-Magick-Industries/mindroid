@@ -248,6 +248,8 @@ fn build_stt(config: &MindroidConfig) -> Box<dyn mindroid::SttProvider> {
                 api_key,
                 model: model.into(),
                 base_url,
+                // Without a hint short clips come back in random languages.
+                language: Some("en".into()),
             }))
         }
     }
