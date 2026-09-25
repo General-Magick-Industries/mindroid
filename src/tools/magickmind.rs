@@ -347,19 +347,33 @@ fn render_episodes(episodes: &[Episode]) -> String {
         .join("\n\n")
 }
 
+/// Bifrost serializes an empty list as `null`, so every field takes `null` as
+/// its default rather than failing the whole window.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct RangeResponse {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::persona::models::deserialize_null_as_default"
+    )]
     data: Vec<Episode>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct Episode {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::persona::models::deserialize_null_as_default"
+    )]
     topic: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::persona::models::deserialize_null_as_default"
+    )]
     subtopics: Vec<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::persona::models::deserialize_null_as_default"
+    )]
     summarized_conversation: String,
 }
 
@@ -394,6 +408,34 @@ mod tests {
 Subtopics: tomatoes, watering
 Summary: Agreed to start seedlings indoors."
         );
+    }
+
+    #[test]
+    fn a_window_parses_the_null_lists_bifrost_sends() {
+        let body: RangeResponse = serde_json::from_value(json!({
+            "data": [{
+                "id": "e1",
+                "topic": "Casual conversation",
+                "subtopics": null,
+                "summarized_conversation": "Lynn said hi.",
+                "entities": null
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            body.data,
+            vec![Episode {
+                topic: "Casual conversation".into(),
+                subtopics: Vec::new(),
+                summarized_conversation: "Lynn said hi.".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_empty_window_parses_when_bifrost_sends_null() {
+        let body: RangeResponse = serde_json::from_value(json!({ "data": null })).unwrap();
+        assert!(body.data.is_empty());
     }
 
     // ADR-0005: the model picks WHETHER to scope, never WHERE. A refactor that

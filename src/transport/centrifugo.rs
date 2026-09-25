@@ -597,8 +597,14 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
     // older backends and non-magickmind publishers, so each copies only when
     // present. sent_by_user_name is display data (the verified identity is
     // authenticated_sender_id below); magickspace_type is PRIVATE|GROUP, read
-    // by hosts that gate replies per space.
-    for key in ["magickspace_id", "sent_by_user_name", "magickspace_type"] {
+    // by hosts that gate replies per space; reply_to_message_id says which
+    // earlier message this one answers, for hosts deciding who it is for.
+    for key in [
+        "magickspace_id",
+        "sent_by_user_name",
+        "magickspace_type",
+        "reply_to_message_id",
+    ] {
         if let Some(value) = outer
             .get(key)
             .or_else(|| inner.get(key))
@@ -1770,9 +1776,16 @@ mod tests {
                 "sender_id": "u1",
                 "sent_by_user_name": "Alice",
                 "magickspace_type": "GROUP",
+                "reply_to_message_id": "m0",
             }),
         );
         let msg = parse_push(&frame, "user:a1#a1", false).expect("valid push");
+        assert_eq!(
+            msg.metadata
+                .get("reply_to_message_id")
+                .and_then(|v| v.as_str()),
+            Some("m0")
+        );
         assert_eq!(
             msg.metadata
                 .get("sent_by_user_name")

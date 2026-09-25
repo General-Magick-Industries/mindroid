@@ -22,7 +22,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, FunctionCall,
 };
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::future::join_all;
+use futures::stream::{self, BoxStream, StreamExt};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -47,6 +48,7 @@ pub struct ToolExecutorStage {
     client: LlmClient,
     registry: DynamicRegistry,
     max_iterations: usize,
+    parallel_tool_calls: bool,
     pending: PendingRemoteCalls,
 }
 
@@ -62,6 +64,7 @@ impl ToolExecutorStage {
             client,
             registry,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            parallel_tool_calls: false,
             pending: PendingRemoteCalls::default(),
         }
     }
@@ -69,6 +72,15 @@ impl ToolExecutorStage {
     /// Override the maximum number of tool-call iterations.
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
+        self
+    }
+
+    /// Run the calls a model asks for in one response at the same time rather
+    /// than one after another. Results go back in the order they were asked
+    /// for either way. Off by default: turn it on only when the registry's
+    /// tools do not depend on running in order.
+    pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = parallel;
         self
     }
 
@@ -387,7 +399,22 @@ impl ToolExecutorStage {
         let mut load_ids: Vec<String> = Vec::new();
         let mut ends_turn = false;
 
-        for call in &outcome.tool_calls {
+        let calls = &outcome.tool_calls;
+        let executions: Vec<_> = if self.parallel_tool_calls {
+            join_all(
+                calls
+                    .iter()
+                    .map(|call| execute_local(registry, tool_ctx, call)),
+            )
+            .await
+        } else {
+            stream::iter(calls)
+                .then(|call| execute_local(registry, tool_ctx, call))
+                .collect()
+                .await
+        };
+
+        for (call, executed) in calls.iter().zip(executions) {
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
@@ -398,7 +425,6 @@ impl ToolExecutorStage {
             {
                 load_ids.push(id);
             }
-            let executed = execute_local(registry, tool_ctx, call).await;
             // Only a call that ran ends the turn: a failed one loops back so
             // the model sees the error and can retry.
             ends_turn |=
@@ -808,6 +834,115 @@ mod tests {
             "every declared tool_call_id must have a tool response: {messages:#?}"
         );
         assert_eq!(declared, 2, "the round declared two calls");
+    }
+
+    /// Sleeps for `delay`, recording how many calls were running at once.
+    struct Slow {
+        name: &'static str,
+        delay: std::time::Duration,
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for Slow {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Takes a while"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.running.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.running.fetch_sub(1, SeqCst);
+            Ok(format!("{} done", self.name))
+        }
+    }
+
+    /// Runs one round asking for a slow and a quick call, then an answer.
+    /// Returns the peak number of calls in flight and the tool results the
+    /// second request carried, in the order it carried them.
+    async fn slow_and_quick_round(parallel: Option<bool>) -> (usize, Vec<(String, String)>) {
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slow = |name, ms| Slow {
+            name,
+            delay: std::time::Duration::from_millis(ms),
+            running: Arc::clone(&running),
+            peak: Arc::clone(&peak),
+        };
+        let registry = ToolRegistry::new()
+            .register(slow("slow", 80))
+            .register(slow("quick", 10));
+
+        let first = completion(json!({
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call-slow", "type": "function",
+                 "function": {"name": "slow", "arguments": "{}"}},
+                {"id": "call-quick", "type": "function",
+                 "function": {"name": "quick", "arguments": "{}"}}
+            ]
+        }));
+        let second = completion(json!({"role": "assistant", "content": "done"}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(listener, vec![first, second]);
+
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
+        let stage = match parallel {
+            Some(on) => stage.with_parallel_tool_calls(on),
+            None => stage,
+        };
+        let mut ctx = fresh_ctx();
+        stage.process(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response.as_deref(), Some("done"));
+
+        let bodies = server.await.unwrap();
+        let replayed: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        let results = replayed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| {
+                (
+                    m["tool_call_id"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        (peak.load(std::sync::atomic::Ordering::SeqCst), results)
+    }
+
+    /// The quick call finishes first, yet its result is still sent second:
+    /// the model reads results in the order it asked for them.
+    #[tokio::test]
+    async fn parallel_tool_calls_run_a_round_at_once_and_answer_in_order() {
+        let (peak, results) = slow_and_quick_round(Some(true)).await;
+        assert_eq!(peak, 2, "both calls were running at the same time");
+        assert_eq!(
+            results,
+            [
+                ("call-slow".to_string(), "slow done".to_string()),
+                ("call-quick".to_string(), "quick done".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_runs_one_call_at_a_time_by_default() {
+        for parallel in [None, Some(false)] {
+            let (peak, results) = slow_and_quick_round(parallel).await;
+            assert_eq!(peak, 1, "{parallel:?}: never more than one call running");
+            assert_eq!(results.len(), 2);
+        }
     }
 
     #[tokio::test]

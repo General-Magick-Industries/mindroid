@@ -48,6 +48,11 @@ listed under **Breaking Changes** with a migration note.
   `FrontendEvent::SpeechStarted` now opens the slice and `UtteranceComplete`
   closes it. Note that under `TurnDetection::Server` the frontend only completes
   an utterance at `max_utterance`, so boundaries there are still coarse.
+- `ToolExecutorStage::with_parallel_tool_calls(bool)`: when a model asks for
+  several tools in one response, run them at the same time instead of one
+  after another. Results go back in the order the model asked for them. Off by
+  default, so the stage behaves exactly as before until a caller opts in; turn
+  it on only for a registry whose tools do not depend on running in order.
 
 ### Breaking Changes
 
