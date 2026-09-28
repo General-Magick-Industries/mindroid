@@ -133,6 +133,11 @@ on purpose.
   `LoopOutcome`, so the event is the only place a streaming caller sees it.
   `PipelineEvent` becomes `#[non_exhaustive]`, since each execution model adds
   events.
+- The iteration cap ends a turn with a round unanswered: the model asked for
+  tools, got their results, and never replied. `ToolExecutorStage` closes that
+  with one call offering no tools. The loop cannot make it without knowing the
+  round stages, so `finish` sees the `StopReason` in run scope for the length of
+  the phase, and `LlmRound::cap_summary` is the stage that makes the call.
 - `run_streaming` speaks a body with no streaming stage one pass at a time — the
   pass's prose as one `Chunk` when it ends — because `LlmRound` and `ToolRound`
   are ordinary stages and would otherwise leave TTS silent for the whole turn. A

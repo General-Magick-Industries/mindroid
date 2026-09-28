@@ -35,7 +35,7 @@ pub use ingest::IngestStage;
 pub use llm_processor::{GenericLlmProcessor, collect_stream};
 pub use post_processor::PostProcessor;
 #[cfg(feature = "llm-client")]
-pub use round::{LlmRound, PendingCalls, ToolRound, Transcript};
+pub use round::{CapSummary, LlmRound, PendingCalls, ToolRound, Transcript};
 #[cfg(feature = "speech")]
 pub use stt::DeepgramStt;
 #[cfg(feature = "speech")]

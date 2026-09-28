@@ -85,8 +85,9 @@ pub(crate) struct ControlResponse;
 
 /// Why the loop stopped.
 ///
-/// Reported on [`LoopOutcome`] and on [`PipelineEvent::LoopCompleted`], the
-/// only place a streaming caller sees it.
+/// Reported three ways: on [`LoopOutcome`], on
+/// [`PipelineEvent::LoopCompleted`] (the only place a streaming caller sees
+/// it), and in run scope while `finish` runs, so a stage there can act on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -164,6 +165,16 @@ impl AgentLoop {
     /// halted or hit the cap, so a stage here must tolerate a turn that
     /// produced nothing: an unclaimed `tool_result` refused by `LlmRound`
     /// halts with no response, and `finish` still runs in full over it.
+    ///
+    /// While these stages run, the loop's [`StopReason`] is in run scope
+    /// (`ctx.get_run::<StopReason>()`), so a stage can act on why the turn
+    /// ended; it is taken back afterwards, so an enclosing loop's `finish` never
+    /// reads an inner loop's reason as its own. A loop that hit the cap stopped
+    /// with a round still unanswered — the model asked for tools, got their
+    /// results, and never replied — and
+    /// [`LlmRound::cap_summary`](crate::pipeline::stages::LlmRound::cap_summary)
+    /// is the stage that closes it, as `ToolExecutorStage` does with one call
+    /// without tools.
     ///
     /// Two exits do not reach these stages. A cancelled loop skips `finish`,
     /// because cancellation stops every pipeline at its next stage boundary
@@ -398,7 +409,9 @@ impl AgentLoop {
         // sees it, so `finish` would run exactly one stage. Lift it for the
         // phase and put it back — the halt still means what it meant.
         let halted = std::mem::replace(&mut ctx.halted, false);
+        ctx.set(reason);
         let finished = self.finish.run(ctx).await;
+        ctx.take::<StopReason>();
         ctx.halted |= halted;
         Ok(finished?.or_else(|| ctx.response.take()))
     }
@@ -1409,5 +1422,38 @@ mod tests {
             .collect()
             .await;
         assert_eq!(loop_completed(&mut rx), StopReason::MaxIterations);
+    }
+
+    /// `finish` can act on why the turn ended — that is how a summary runs
+    /// only at the cap — but the reason must not outlive the phase, or an
+    /// enclosing loop's `finish` would read an inner loop's as its own.
+    #[tokio::test]
+    async fn finish_sees_the_stop_reason_and_nothing_after_does() {
+        struct Records(Arc<std::sync::Mutex<Option<StopReason>>>);
+
+        #[async_trait]
+        impl PipelineStage for Records {
+            fn name(&self) -> &str {
+                "records"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                *self.0.lock().unwrap() = ctx.get_run::<StopReason>().copied();
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (body, _) = rounds(10);
+        let mut ctx = ctx();
+        AgentLoop::new(body)
+            .with_max_iterations(2)
+            .with_finish(Pipeline::new().add_stage(Records(seen.clone())))
+            .run(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), Some(StopReason::MaxIterations));
+        assert!(ctx.get_run::<StopReason>().is_none());
     }
 }
