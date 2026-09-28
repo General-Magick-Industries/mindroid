@@ -166,11 +166,14 @@ truncated.
   Tool calls, which stream in fragments, are assembled before they run, and
   ToolCall/ToolResult events arrive per round. Prose a model writes before its
   tool calls in the same response reaches the caller too, so the reply is all
-  the prose streamed, rounds joined by a space, and a remote call's `ack` is
-  left empty. Off by default; `PipelineStage::process` is unaffected. Built on
+  the prose streamed, rounds joined by a space where one is missing, and a
+  remote call's `ack` is left empty. Off by default; `PipelineStage::process`
+  is unaffected. Built on
   `LlmClient::stream_chat_with_tools`, the streamed twin of `chat_with_tools`,
   which yields `ToolsStreamEvent`s, bounds each chunk's wait by the request
   timeout, and assembles at most `MAX_STREAMED_TOOL_CALLS` calls per response.
+  `LlmClient`'s HTTP client also sets a read timeout of the same length, so a
+  response that stalls, streamed or not, releases its connection.
 - **Remote tool calls have a timeout.** `RemoteTool::timeout` sets how long a
   call waits for its client, defaulting to `DEFAULT_REMOTE_CALL_TIMEOUT` (5
   minutes) and clamped to `MIN_REMOTE_CALL_TIMEOUT`..=`MAX_REMOTE_CALL_TIMEOUT`

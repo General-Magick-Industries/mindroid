@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-/// Bounds one non-streaming LLM request. A tool loop runs up to
-/// `DEFAULT_MAX_ITERATIONS` of these in sequence. Never apply it to a streaming
-/// client: reqwest's timeout spans the body read, which would truncate a long
-/// generation mid-stream.
+/// Bounds one non-streaming LLM request, and any wait between reads of a
+/// response, streamed or not. A tool loop runs up to `DEFAULT_MAX_ITERATIONS`
+/// of these in sequence. Never set it as reqwest's `timeout`: that spans the
+/// whole body read, which would truncate a long generation mid-stream.
 pub(crate) const LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -177,7 +177,8 @@ pub enum ToolsStreamEvent {
     Error(String),
 }
 
-/// Most tool calls one streamed response may carry.
+/// Most tool calls one streamed response may carry; a response with more
+/// ends its round with [`ToolsStreamEvent::Error`].
 pub const MAX_STREAMED_TOOL_CALLS: usize = 128;
 
 /// Tool calls assembled from a round's streamed fragments. A call arrives in
@@ -411,6 +412,7 @@ impl LlmClient {
             .default_headers(default_headers)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(LLM_CONNECT_TIMEOUT)
+            .read_timeout(LLM_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| crate::MindroidError::Other(anyhow::Error::from(e)))?;
 
@@ -558,21 +560,14 @@ impl LlmClient {
                     LLM_REQUEST_TIMEOUT.as_secs()
                 ))
             };
-            let opened = tokio::time::timeout(
-                LLM_REQUEST_TIMEOUT,
-                client
-                    .chat()
-                    .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body),
-            )
-            .await;
+            let opened = client
+                .chat()
+                .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body)
+                .await;
             let mut chunks = match opened {
-                Ok(Ok(chunks)) => chunks,
-                Ok(Err(e)) => {
+                Ok(chunks) => chunks,
+                Err(e) => {
                     yield ToolsStreamEvent::Error(format!("API error: {e}"));
-                    return;
-                }
-                Err(_) => {
-                    yield stalled();
                     return;
                 }
             };

@@ -243,6 +243,13 @@ fn err(e: impl std::fmt::Display) -> crate::MindroidError {
     }
 }
 
+/// Whether streamed prose needs a space before `next` to read as one reply.
+fn needs_space(spoken: &str, next: &str) -> bool {
+    !spoken.is_empty()
+        && !spoken.ends_with(char::is_whitespace)
+        && !next.starts_with(char::is_whitespace)
+}
+
 /// Execute one local call against the registry. Argument JSON the model
 /// produced is parsed here; a malformed payload becomes an error RESULT the
 /// model can react to, never a dropped call. `Err` carries that text.
@@ -615,7 +622,7 @@ impl StreamingStage for ToolExecutorStage {
                     while let Some(event) = round.next().await {
                         match event {
                             ToolsStreamEvent::Text(content) => {
-                                if !round_spoke && !spoken.is_empty() && !spoken.ends_with(char::is_whitespace) {
+                                if !round_spoke && needs_space(&spoken, &content) {
                                     spoken.push(' ');
                                     yield StreamEvent::Chunk { content: " ".into() };
                                 }
@@ -646,7 +653,7 @@ impl StreamingStage for ToolExecutorStage {
                     }
                     match round.outcome {
                         RoundOutcome::Final(_) => {
-                            answer = Some(LoopOutcome::Answer(spoken.clone()));
+                            answer = Some(LoopOutcome::Answer(std::mem::take(&mut spoken)));
                             break;
                         }
                         RoundOutcome::Remote(text) => {
@@ -661,7 +668,7 @@ impl StreamingStage for ToolExecutorStage {
                     None => match self.summarize(messages).await {
                         Ok(summary) => {
                             if !summary.is_empty() {
-                                if !spoken.is_empty() && !spoken.ends_with(char::is_whitespace) {
+                                if needs_space(&spoken, &summary) {
                                     spoken.push(' ');
                                     yield StreamEvent::Chunk { content: " ".into() };
                                 }
@@ -1621,6 +1628,80 @@ mod tests {
                 "chunk It is the north gate.",
                 "complete It is the north gate."
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_joins_the_summary_to_what_was_already_said() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round = sse(
+            vec![
+                json!({"role": "assistant", "content": "Checking."}),
+                json!({"tool_calls": [{
+                    "index": 0, "id": "c1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]}),
+            ],
+            "tool_calls",
+        );
+        let summary = completion(json!({"role": "assistant", "content": "It is the north gate."}));
+        let _server = serve_completions(listener, vec![round, summary]);
+
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Lookup)),
+        )
+        .with_max_iterations(1)
+        .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert_eq!(
+            streamed_events(&events),
+            [
+                "chunk Checking.",
+                "call lookup",
+                "result lookup north gate",
+                "chunk  ",
+                "chunk It is the north gate.",
+                "complete Checking. It is the north gate."
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_that_starts_with_whitespace_gets_no_extra_space() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round = sse(
+            vec![
+                json!({"role": "assistant", "content": "Let me check."}),
+                json!({"tool_calls": [{
+                    "index": 0, "id": "c1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]}),
+            ],
+            "tool_calls",
+        );
+        let answer = sse(vec![json!({"content": "\nAt the north gate."})], "stop");
+        let _server = serve_completions(listener, vec![round, answer]);
+
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Lookup)),
+        )
+        .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let _: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert_eq!(
+            ctx.response.as_deref(),
+            Some("Let me check.\nAt the north gate.")
         );
     }
 
