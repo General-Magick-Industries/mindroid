@@ -163,8 +163,9 @@ model:
 
 Both re-attach artifact bytes and clear the same remote-call correlation gate.
 Four differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
-mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
-events replay once the loop ends; the JSON stage re-attaches artifacts as a
+mid-loop, while the JSON stage's rounds are non-streaming API calls by default,
+so its events replay once the loop ends — `with_streaming(true)` streams each
+round instead, prose as it arrives and tool events per round; the JSON stage re-attaches artifacts as a
 follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
 role carries text alone; only the JSON stage honours `Tool::ends_turn`, so a
 self-delivering tool on the XML stage may be re-called, up to the iteration cap;

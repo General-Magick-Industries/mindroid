@@ -24,12 +24,12 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
-        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
-        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-        ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionRequestUserMessageContentPart, ChatCompletionTool, ChatCompletionTools,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
         CreateChatCompletionStreamResponse, FinishReason, FunctionObject, ImageUrl,
         ReasoningEffort, ResponseFormat,
     },
@@ -162,6 +162,44 @@ pub struct ToolsChatOutcome {
     pub content: String,
     pub tool_calls: Vec<NativeToolCall>,
     pub usage: Option<TokenUsage>,
+}
+
+/// One step of a streamed tool round
+/// ([`stream_chat_with_tools`](LlmClient::stream_chat_with_tools)).
+#[derive(Debug)]
+pub enum ToolsStreamEvent {
+    /// Prose, as it arrives.
+    Text(String),
+    /// The round finished: all of its prose and its tool calls, assembled.
+    Done(ToolsChatOutcome),
+    Error(String),
+}
+
+/// Fold one streamed tool-call fragment into the calls assembled so far. A call
+/// arrives in pieces keyed by `index`: its id and name first, its arguments
+/// JSON spread over later fragments.
+fn add_tool_call_fragment(
+    calls: &mut Vec<NativeToolCall>,
+    fragment: ChatCompletionMessageToolCallChunk,
+) {
+    let index = fragment.index as usize;
+    if calls.len() <= index {
+        calls.resize_with(index + 1, || NativeToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
+    }
+    let call = &mut calls[index];
+    if let Some(id) = fragment.id {
+        call.id = id;
+    }
+    if let Some(function) = fragment.function {
+        call.name
+            .push_str(function.name.as_deref().unwrap_or_default());
+        call.arguments
+            .push_str(function.arguments.as_deref().unwrap_or_default());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,29 +442,7 @@ impl LlmClient {
         tools: &[ChatCompletionTools],
         model: Option<&str>,
     ) -> crate::Result<ToolsChatOutcome> {
-        let model = model
-            .or(self.config.default_model.as_deref())
-            .unwrap_or("gpt-4o-mini");
-
-        let mut builder = CreateChatCompletionRequestArgs::default();
-        builder.model(model).messages(messages);
-        if let Some(temp) = self.config.default_temperature {
-            builder.temperature(temp);
-        }
-        if let Some(max) = self.config.default_max_tokens {
-            builder.max_completion_tokens(max);
-        }
-        if let Some(effort) = self.resolve_reasoning_effort() {
-            builder.reasoning_effort(effort);
-        }
-        let mut request = builder
-            .build()
-            .map_err(|e| Self::pipeline_err(format!("Failed to build request: {e}")))?;
-        if !tools.is_empty() {
-            request.tools = Some(tools.to_vec());
-        }
-        let body = body_with_extras(&request, &self.config.extra_body)
-            .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))?;
+        let body = self.tools_request(messages, tools, model, false)?;
 
         // The shared http client carries only a connect timeout, because a full
         // reqwest timeout spans the body read and would truncate `stream_chat`.
@@ -475,6 +491,105 @@ impl LlmClient {
                 .collect();
         }
         Ok(outcome)
+    }
+
+    /// [`chat_with_tools`](Self::chat_with_tools), streamed: prose arrives as the
+    /// model writes it, and the tool calls, which stream in fragments, are
+    /// assembled into the closing [`ToolsStreamEvent::Done`].
+    pub fn stream_chat_with_tools(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
+        model: Option<&str>,
+    ) -> BoxStream<'static, ToolsStreamEvent> {
+        let body = self.tools_request(messages, tools, model, true);
+        let client = self.client.clone();
+        Box::pin(async_stream::stream! {
+            let body = match body {
+                Ok(body) => body,
+                Err(e) => {
+                    yield ToolsStreamEvent::Error(e.to_string());
+                    return;
+                }
+            };
+            let mut chunks = match client
+                .chat()
+                .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body)
+                .await
+            {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    yield ToolsStreamEvent::Error(format!("API error: {e}"));
+                    return;
+                }
+            };
+            let mut outcome = ToolsChatOutcome::default();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        yield ToolsStreamEvent::Error(e.to_string());
+                        return;
+                    }
+                };
+                if let Some(u) = chunk.usage {
+                    outcome.usage = Some(TokenUsage {
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                        total_tokens: u.total_tokens,
+                    });
+                }
+                let Some(choice) = chunk.choices.into_iter().next() else {
+                    continue;
+                };
+                for fragment in choice.delta.tool_calls.unwrap_or_default() {
+                    add_tool_call_fragment(&mut outcome.tool_calls, fragment);
+                }
+                if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
+                    outcome.content.push_str(&text);
+                    yield ToolsStreamEvent::Text(text);
+                }
+            }
+            yield ToolsStreamEvent::Done(outcome);
+        })
+    }
+
+    /// The request body for one tool round, streamed or not.
+    fn tools_request(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
+        model: Option<&str>,
+        stream: bool,
+    ) -> crate::Result<serde_json::Value> {
+        let model = model
+            .or(self.config.default_model.as_deref())
+            .unwrap_or("gpt-4o-mini");
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder.model(model).messages(messages);
+        if let Some(temp) = self.config.default_temperature {
+            builder.temperature(temp);
+        }
+        if let Some(max) = self.config.default_max_tokens {
+            builder.max_completion_tokens(max);
+        }
+        if let Some(effort) = self.resolve_reasoning_effort() {
+            builder.reasoning_effort(effort);
+        }
+        let mut request = builder
+            .build()
+            .map_err(|e| Self::pipeline_err(format!("Failed to build request: {e}")))?;
+        if !tools.is_empty() {
+            request.tools = Some(tools.to_vec());
+        }
+        // The byot path skips the typed call's stream check, so the flag is
+        // set here.
+        if stream {
+            request.stream = Some(true);
+        }
+        body_with_extras(&request, &self.config.extra_body)
+            .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))
     }
 
     fn resolve_model<'a>(&'a self, req_model: Option<&'a str>) -> &'a str {
@@ -1075,5 +1190,39 @@ mod tests {
         assert!(has_multimodal_content(&msg.content));
         let parts = content_parts_to_openai(&msg.content);
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn streamed_tool_call_fragments_assemble_into_whole_calls() {
+        let fragment = |index, id: Option<&str>, name: Option<&str>, args: Option<&str>| {
+            serde_json::from_value::<ChatCompletionMessageToolCallChunk>(serde_json::json!({
+                "index": index,
+                "id": id,
+                "type": id.map(|_| "function"),
+                "function": {"name": name, "arguments": args}
+            }))
+            .unwrap()
+        };
+        let mut calls = Vec::new();
+        for f in [
+            fragment(0, Some("c1"), Some("lookup"), Some("")),
+            fragment(1, Some("c2"), Some("recall"), Some("{\"day\":")),
+            fragment(0, None, None, Some("{\"q\":")),
+            fragment(0, None, None, Some("\"x\"}")),
+            fragment(1, None, None, Some("\"mon\"}")),
+        ] {
+            add_tool_call_fragment(&mut calls, f);
+        }
+        let got: Vec<_> = calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("c1", "lookup", "{\"q\":\"x\"}"),
+                ("c2", "recall", "{\"day\":\"mon\"}")
+            ]
+        );
     }
 }
