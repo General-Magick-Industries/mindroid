@@ -167,38 +167,76 @@ pub struct ToolsChatOutcome {
 /// One step of a streamed tool round
 /// ([`stream_chat_with_tools`](LlmClient::stream_chat_with_tools)).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ToolsStreamEvent {
     /// Prose, as it arrives.
     Text(String),
     /// The round finished: all of its prose and its tool calls, assembled.
     Done(ToolsChatOutcome),
+    /// The round failed; nothing further follows.
     Error(String),
 }
 
-/// Fold one streamed tool-call fragment into the calls assembled so far. A call
-/// arrives in pieces keyed by `index`: its id and name first, its arguments
-/// JSON spread over later fragments.
-fn add_tool_call_fragment(
-    calls: &mut Vec<NativeToolCall>,
-    fragment: ChatCompletionMessageToolCallChunk,
-) {
-    let index = fragment.index as usize;
-    if calls.len() <= index {
-        calls.resize_with(index + 1, || NativeToolCall {
-            id: String::new(),
-            name: String::new(),
-            arguments: String::new(),
-        });
+/// Most tool calls one streamed response may carry.
+pub const MAX_STREAMED_TOOL_CALLS: usize = 128;
+
+/// Tool calls assembled from a round's streamed fragments. A call arrives in
+/// pieces keyed by `index`: its id and name first, its arguments spread over
+/// later fragments. The index is the provider's, so it keys a call rather than
+/// sizing a buffer.
+#[derive(Default)]
+struct StreamedToolCalls(Vec<(u32, NativeToolCall)>);
+
+impl StreamedToolCalls {
+    fn add(&mut self, fragment: ChatCompletionMessageToolCallChunk) -> Result<(), String> {
+        let slot = match self.0.iter().position(|(i, _)| *i == fragment.index) {
+            Some(slot) => slot,
+            None if self.0.len() >= MAX_STREAMED_TOOL_CALLS => {
+                return Err(format!(
+                    "more than {MAX_STREAMED_TOOL_CALLS} tool calls in one response"
+                ));
+            }
+            None => {
+                let call = NativeToolCall {
+                    id: String::new(),
+                    name: String::new(),
+                    arguments: String::new(),
+                };
+                self.0.push((fragment.index, call));
+                self.0.len() - 1
+            }
+        };
+        let call = &mut self.0[slot].1;
+        if let Some(id) = fragment.id {
+            call.id = id;
+        }
+        if let Some(function) = fragment.function {
+            call.name
+                .push_str(function.name.as_deref().unwrap_or_default());
+            call.arguments
+                .push_str(function.arguments.as_deref().unwrap_or_default());
+        }
+        Ok(())
     }
-    let call = &mut calls[index];
-    if let Some(id) = fragment.id {
-        call.id = id;
-    }
-    if let Some(function) = fragment.function {
-        call.name
-            .push_str(function.name.as_deref().unwrap_or_default());
-        call.arguments
-            .push_str(function.arguments.as_deref().unwrap_or_default());
+
+    /// The calls in index order. One that never got a name is dropped; one
+    /// that never got an id is given `call_{index}`, which the next request's
+    /// tool result echoes.
+    fn finish(mut self) -> Vec<NativeToolCall> {
+        self.0.sort_by_key(|(index, _)| *index);
+        self.0
+            .into_iter()
+            .filter_map(|(index, mut call)| {
+                if call.name.is_empty() {
+                    tracing::warn!("dropping a streamed tool call with no name (index {index})");
+                    return None;
+                }
+                if call.id.is_empty() {
+                    call.id = format!("call_{index}");
+                }
+                Some(call)
+            })
+            .collect()
     }
 }
 
@@ -495,7 +533,9 @@ impl LlmClient {
 
     /// [`chat_with_tools`](Self::chat_with_tools), streamed: prose arrives as the
     /// model writes it, and the tool calls, which stream in fragments, are
-    /// assembled into the closing [`ToolsStreamEvent::Done`].
+    /// assembled into the closing [`ToolsStreamEvent::Done`]. Each chunk must
+    /// arrive within `LLM_REQUEST_TIMEOUT` of the last, and a stream that ends
+    /// before the model finished is an error rather than a round.
     pub fn stream_chat_with_tools(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
@@ -512,19 +552,42 @@ impl LlmClient {
                     return;
                 }
             };
-            let mut chunks = match client
-                .chat()
-                .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body)
-                .await
-            {
-                Ok(chunks) => chunks,
-                Err(e) => {
+            let stalled = || {
+                ToolsStreamEvent::Error(format!(
+                    "no response from the model for {}s",
+                    LLM_REQUEST_TIMEOUT.as_secs()
+                ))
+            };
+            let opened = tokio::time::timeout(
+                LLM_REQUEST_TIMEOUT,
+                client
+                    .chat()
+                    .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body),
+            )
+            .await;
+            let mut chunks = match opened {
+                Ok(Ok(chunks)) => chunks,
+                Ok(Err(e)) => {
                     yield ToolsStreamEvent::Error(format!("API error: {e}"));
+                    return;
+                }
+                Err(_) => {
+                    yield stalled();
                     return;
                 }
             };
             let mut outcome = ToolsChatOutcome::default();
-            while let Some(chunk) = chunks.next().await {
+            let mut calls = StreamedToolCalls::default();
+            let mut finished = false;
+            loop {
+                let next = match tokio::time::timeout(LLM_REQUEST_TIMEOUT, chunks.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        yield stalled();
+                        return;
+                    }
+                };
+                let Some(chunk) = next else { break };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(e) => {
@@ -542,14 +605,23 @@ impl LlmClient {
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
+                finished |= choice.finish_reason.is_some();
                 for fragment in choice.delta.tool_calls.unwrap_or_default() {
-                    add_tool_call_fragment(&mut outcome.tool_calls, fragment);
+                    if let Err(e) = calls.add(fragment) {
+                        yield ToolsStreamEvent::Error(e);
+                        return;
+                    }
                 }
                 if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
                     outcome.content.push_str(&text);
                     yield ToolsStreamEvent::Text(text);
                 }
             }
+            if !finished {
+                yield ToolsStreamEvent::Error("the model's stream ended before it finished".into());
+                return;
+            }
+            outcome.tool_calls = calls.finish();
             yield ToolsStreamEvent::Done(outcome);
         })
     }
@@ -1203,16 +1275,17 @@ mod tests {
             }))
             .unwrap()
         };
-        let mut calls = Vec::new();
+        let mut calls = StreamedToolCalls::default();
         for f in [
-            fragment(0, Some("c1"), Some("lookup"), Some("")),
             fragment(1, Some("c2"), Some("recall"), Some("{\"day\":")),
+            fragment(0, Some("c1"), Some("lookup"), Some("")),
             fragment(0, None, None, Some("{\"q\":")),
             fragment(0, None, None, Some("\"x\"}")),
             fragment(1, None, None, Some("\"mon\"}")),
         ] {
-            add_tool_call_fragment(&mut calls, f);
+            calls.add(f).unwrap();
         }
+        let calls = calls.finish();
         let got: Vec<_> = calls
             .iter()
             .map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str()))
@@ -1224,5 +1297,48 @@ mod tests {
                 ("c2", "recall", "{\"day\":\"mon\"}")
             ]
         );
+    }
+
+    fn named_fragment(index: u32, name: Option<&str>) -> ChatCompletionMessageToolCallChunk {
+        serde_json::from_value(serde_json::json!({
+            "index": index,
+            "function": {"name": name, "arguments": "{}"}
+        }))
+        .unwrap()
+    }
+
+    /// The provider's index keys a call; it never sizes an allocation.
+    #[test]
+    fn a_huge_tool_call_index_is_just_a_key() {
+        let mut calls = StreamedToolCalls::default();
+        calls.add(named_fragment(u32::MAX, Some("lookup"))).unwrap();
+        let calls = calls.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, format!("call_{}", u32::MAX));
+    }
+
+    #[test]
+    fn a_response_with_too_many_tool_calls_is_refused() {
+        let mut calls = StreamedToolCalls::default();
+        for index in 0..MAX_STREAMED_TOOL_CALLS as u32 {
+            calls.add(named_fragment(index, Some("lookup"))).unwrap();
+        }
+        assert!(
+            calls
+                .add(named_fragment(
+                    MAX_STREAMED_TOOL_CALLS as u32,
+                    Some("lookup")
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_tool_call_that_never_got_a_name_is_dropped() {
+        let mut calls = StreamedToolCalls::default();
+        calls.add(named_fragment(1, None)).unwrap();
+        calls.add(named_fragment(2, Some("lookup"))).unwrap();
+        let names: Vec<_> = calls.finish().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["lookup"]);
     }
 }

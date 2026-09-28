@@ -95,9 +95,11 @@ impl ToolExecutorStage {
     /// Stream each round's prose to the caller as the model writes it, through
     /// [`StreamingStage::stream`], instead of the whole reply once the loop
     /// ends. Tool calls still run between rounds, and ToolCall/ToolResult events
-    /// arrive per round rather than all at the end. Prose a model writes before
-    /// its tool calls in the same response ("let me check") reaches the caller
-    /// too. Off by default. [`PipelineStage::process`] is unaffected.
+    /// arrive per round, after the round's calls ran. Prose a model writes
+    /// before its tool calls in the same response ("let me check") reaches the
+    /// caller too, so the reply (`ctx.response`, `Complete`) is all the prose
+    /// streamed, rounds joined by a space, and a remote call's `ack` is left
+    /// empty. Off by default. [`PipelineStage::process`] is unaffected.
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
         self
@@ -325,19 +327,21 @@ impl ToolExecutorStage {
             .client
             .chat_with_tools(messages.clone(), deps.tools, None)
             .await?;
-        self.dispatch_round(deps, messages, iteration, outcome)
+        self.dispatch_round(deps, messages, iteration, outcome, false)
             .await
     }
 
     /// Dispatch what a round came back with. Local results are appended to
     /// `messages`; a remote call or a final answer ends the loop via the
-    /// returned outcome.
+    /// returned outcome. `prose_streamed` means the round's prose already
+    /// reached the caller, so a remote call does not carry it again.
     async fn dispatch_round(
         &self,
         deps: &RoundDeps<'_>,
         messages: &mut Vec<ChatCompletionRequestMessage>,
         iteration: usize,
         outcome: ToolsChatOutcome,
+        prose_streamed: bool,
     ) -> Result<Round> {
         let RoundDeps {
             registry,
@@ -396,7 +400,12 @@ impl ToolExecutorStage {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            let (framed, call_id) = frame_remote_call(&call.name, &args, outcome.content.trim());
+            let ack = if prose_streamed {
+                ""
+            } else {
+                outcome.content.trim()
+            };
+            let (framed, call_id) = frame_remote_call(&call.name, &args, ack);
             // The trusted delivery channel is what `RemoteResultGate` claims
             // under; `tool_ctx.channel_id` is the workspace id and never matches.
             self.pending.record_for(
@@ -594,14 +603,26 @@ impl StreamingStage for ToolExecutorStage {
                     tools: &tools,
                 };
                 let mut answer = None;
+                // Everything spoken so far; the reply is all of it, since the
+                // caller already heard every round.
+                let mut spoken = String::new();
                 for iteration in 0..self.max_iterations {
                     let mut round = self
                         .client
-                        .stream_chat_with_tools(messages.clone(), &tools, None);
+                        .stream_chat_with_tools(messages.clone(), deps.tools, None);
                     let mut done = None;
+                    let mut round_spoke = false;
                     while let Some(event) = round.next().await {
                         match event {
-                            ToolsStreamEvent::Text(content) => yield StreamEvent::Chunk { content },
+                            ToolsStreamEvent::Text(content) => {
+                                if !round_spoke && !spoken.is_empty() && !spoken.ends_with(char::is_whitespace) {
+                                    spoken.push(' ');
+                                    yield StreamEvent::Chunk { content: " ".into() };
+                                }
+                                round_spoke = true;
+                                spoken.push_str(&content);
+                                yield StreamEvent::Chunk { content };
+                            }
                             ToolsStreamEvent::Done(outcome) => done = Some(outcome),
                             ToolsStreamEvent::Error(message) => {
                                 yield StreamEvent::Error { message };
@@ -613,7 +634,7 @@ impl StreamingStage for ToolExecutorStage {
                         yield StreamEvent::Error { message: "the model's stream ended without a result".into() };
                         return;
                     };
-                    let round = match self.dispatch_round(&deps, &mut messages, iteration, done).await {
+                    let round = match self.dispatch_round(&deps, &mut messages, iteration, done, true).await {
                         Ok(round) => round,
                         Err(error) => {
                             yield StreamEvent::Error { message: error.to_string() };
@@ -624,8 +645,8 @@ impl StreamingStage for ToolExecutorStage {
                         yield event;
                     }
                     match round.outcome {
-                        RoundOutcome::Final(text) => {
-                            answer = Some(LoopOutcome::Answer(text));
+                        RoundOutcome::Final(_) => {
+                            answer = Some(LoopOutcome::Answer(spoken.clone()));
                             break;
                         }
                         RoundOutcome::Remote(text) => {
@@ -635,16 +656,19 @@ impl StreamingStage for ToolExecutorStage {
                         RoundOutcome::Continue => {}
                     }
                 }
-                // The rounds' prose already went out as it arrived; only a
-                // summary written after the loop ran out is still unsent.
                 let answer = match answer {
                     Some(answer) => answer,
                     None => match self.summarize(messages).await {
                         Ok(summary) => {
                             if !summary.is_empty() {
-                                yield StreamEvent::Chunk { content: summary.clone() };
+                                if !spoken.is_empty() && !spoken.ends_with(char::is_whitespace) {
+                                    spoken.push(' ');
+                                    yield StreamEvent::Chunk { content: " ".into() };
+                                }
+                                spoken.push_str(&summary);
+                                yield StreamEvent::Chunk { content: summary };
                             }
-                            LoopOutcome::Answer(summary)
+                            LoopOutcome::Answer(spoken)
                         }
                         Err(error) => {
                             yield StreamEvent::Error { message: error.to_string() };
@@ -1556,8 +1580,12 @@ mod tests {
             })
             .collect();
         assert_eq!(chunks, ["One sec."]);
-        let response = ctx.response.unwrap();
-        assert!(response.contains("\"tool_call\""), "{response}");
+        let framed: serde_json::Value = serde_json::from_str(&ctx.response.unwrap()).unwrap();
+        assert_eq!(framed["type"], "tool_call");
+        assert_eq!(
+            framed["payload"]["ack"], "",
+            "the preamble already went out"
+        );
     }
 
     #[tokio::test]
@@ -1594,5 +1622,91 @@ mod tests {
                 "complete It is the north gate."
             ]
         );
+    }
+
+    /// What was said before a tool call is part of the reply, joined to the
+    /// answer that follows it.
+    #[tokio::test]
+    async fn streaming_keeps_the_preamble_in_the_reply() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round = sse(
+            vec![
+                json!({"role": "assistant", "content": "Let me check."}),
+                json!({"tool_calls": [{
+                    "index": 0, "id": "c1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]}),
+            ],
+            "tool_calls",
+        );
+        let answer = sse(vec![json!({"content": "At the north gate."})], "stop");
+        let _server = serve_completions(listener, vec![round, answer]);
+
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Lookup)),
+        )
+        .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert_eq!(
+            streamed_events(&events),
+            [
+                "chunk Let me check.",
+                "call lookup",
+                "result lookup north gate",
+                "chunk  ",
+                "chunk At the north gate.",
+                "complete Let me check. At the north gate."
+            ]
+        );
+        assert_eq!(
+            ctx.response.as_deref(),
+            Some("Let me check. At the north gate.")
+        );
+    }
+
+    /// A stream that stops before the model finished is an error, never a
+    /// round whose half-written calls would run.
+    #[tokio::test]
+    async fn a_stream_cut_off_mid_round_is_an_error() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cut = format!(
+            "data: {}\n\n",
+            json!({
+                "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "c1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":"}
+                }]}, "finish_reason": null}]
+            })
+        );
+        let _server = serve_completions(listener, vec![cut]);
+
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Lookup)),
+        )
+        .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCall { .. }))
+        );
+        assert!(ctx.response.is_none());
     }
 }
