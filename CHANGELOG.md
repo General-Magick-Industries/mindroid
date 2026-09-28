@@ -136,6 +136,10 @@ truncated.
 model adds its own events. A `match` on `PipelineEvent` outside this crate needs a
 wildcard arm; this is the last release in which adding an event breaks you.
 
+`LoopCompleted` carries `reason: StopReason`. `StopReason` is exported from the
+crate root and serializes in snake_case (`"max_iterations"`), so a consumer
+parsing the event stream sees it as a string field.
+
 ### Added
 
 - **Live affect on the MagickMind persona prompt.** `EpisodeIngestStage` reads
@@ -150,6 +154,29 @@ wildcard arm; this is the last release in which adding an event breaks you.
   `EpisodeIngestStage::apply_runtime_state` after `Context::reset_output`.
   `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
   and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
+- **`AgentLoop`**, an iterative execution model composed of pipelines
+  (ADR-0009): `setup` once, a `body` per pass, `finish` once, over one
+  `Context`. A body stage asks for another pass by setting `Continue`; a body
+  that never asks runs exactly once, like a plain `Pipeline`. `run` returns a
+  `LoopOutcome` carrying the `StopReason`; `run_streaming` yields each pass's
+  events and one `Complete` for the turn. A loop is also a `PipelineStage`, so
+  loops nest.
+- `LlmRound` and `ToolRound`: the native tool round split in two, so stages can
+  run between the model call and the tools. Pair them with
+  `LlmRound::tool_round()`, and wire `ToolRound::result_gate()` into `setup` —
+  `LlmRound` refuses a turn whose declared `tool_result` nothing claimed.
+  `ToolRound` runs tools through the same path as `ToolExecutorStage`, so errors
+  read the same to the model.
+- `TranscriptCompaction`: drops the oldest whole rounds once the transcript
+  passes a budget, keeping the system prompt, the newest user message and the
+  newest round.
+- `CapSummary`, from `LlmRound::cap_summary()`: a `finish` stage that asks for
+  an answer without tools when the loop stopped at its iteration cap. The loop
+  puts its `StopReason` in run scope while `finish` runs.
+- `run_streaming` speaks a body with no streaming stage one pass at a time:
+  each pass's prose becomes one `Chunk`. A response marked `ControlResponse` — a
+  framed remote call — is never spoken. `ToolRound` and both tool executors set
+  the mark; a stage of your own sets it with `ctx.set(ControlResponse)`.
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
   WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
@@ -259,6 +286,10 @@ wildcard arm; this is the last release in which adding an event breaks you.
 
 ### Fixed
 
+- Every stage that honours a remote-result claim — `ToolExecutorStage`, both
+  paths of `XmlToolExecutorStage`, and `LlmRound` — now checks that the claim
+  was granted for the message being processed, as admission control already
+  did.
 - The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
   `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
   configured `transcriber` produced nothing while the provider's own input
