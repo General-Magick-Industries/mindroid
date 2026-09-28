@@ -26,7 +26,7 @@ use crate::memory::Memory;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
 use crate::omni::session::{OmniSession, ToolContextInit};
-use crate::omni::types::{AudioChunk, OmniConfig};
+use crate::omni::types::{AudioChunk, BargeInMode, OmniConfig};
 use crate::pipeline::stages::stt::SttProvider;
 use crate::tools::{Tool, ToolContext};
 use crate::voice::types::VadConfig;
@@ -34,8 +34,10 @@ use crate::voice::vad::{VadDecision, VadStateMachine};
 
 /// Speech probability for one microphone chunk, in `[0, 1]`.
 ///
-/// Called inline on the gate's loop for every chunk, so an implementation must be
-/// cheap per call (Silero is about a millisecond per 32 ms frame).
+/// Called on a blocking worker thread, one chunk at a time and in order, so an
+/// implementation may do synchronous CPU work such as ONNX inference. It must
+/// still keep up with the microphone: chunks that arrive while the worker is busy
+/// are dropped, not queued past the channel's bound.
 pub trait SpeechDetector: Send {
     fn speech_probability(&mut self, chunk: &AudioChunk) -> f32;
 }
@@ -107,6 +109,10 @@ impl SpeechDetector for SileroDetector {
 
 type ProviderFactory = Box<dyn Fn() -> Box<dyn OmniProvider> + Send + Sync>;
 
+/// How long [`VoiceGate::close`] waits for a session to flush before abandoning it.
+/// The microphone is unpolled for this long at worst.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
 /// One session's audio, fed by the gate. `stream()` ends when the gate closes it.
 struct ChannelAudioSource {
     rx: Mutex<Option<mpsc::Receiver<AudioChunk>>>,
@@ -146,7 +152,9 @@ struct Live {
 /// speech and closed by silence. Build with [`VoiceGate::builder`].
 pub struct VoiceGate {
     provider: ProviderFactory,
-    detector: Box<dyn SpeechDetector>,
+    /// Moved to the blocking worker on the first `run()`; `build()` guarantees it
+    /// is present until then.
+    detector: Option<Box<dyn SpeechDetector>>,
     audio_source: Arc<dyn AudioSource>,
     audio_sink: Option<Arc<dyn AudioSink>>,
     tools: Vec<Arc<dyn Tool>>,
@@ -181,6 +189,31 @@ impl VoiceGate {
         let channels = source.channels();
         let bytes_per_ms = (rate as usize * 2 * channels as usize / 1000).max(1);
         let preroll_cap = bytes_per_ms * self.preroll.as_millis() as usize;
+
+        // Silero is ONNX inference: synchronous, CPU-bound, and `VadInference` is
+        // documented as blocking-only. Scoring inline on this select loop starved
+        // every other arm, and a future that never yields also stops a paused test
+        // clock from auto-advancing — which is what hung the gate tests. The worker
+        // owns the detector and hands back the chunk it scored, so the loop below
+        // still sees every chunk exactly once and in order.
+        let Some(mut detector) = self.detector.take() else {
+            return Err(MindroidError::config(
+                "VoiceGate requires a speech detector",
+            ));
+        };
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(8);
+        let (score_tx, mut score_rx) = mpsc::channel::<(AudioChunk, f32)>(8);
+        tokio::task::spawn_blocking(move || {
+            while let Some(chunk) = chunk_rx.blocking_recv() {
+                let probability = detector.speech_probability(&chunk);
+                if score_tx.blocking_send((chunk, probability)).is_err() {
+                    break;
+                }
+            }
+        });
+        // Dropped when the microphone ends, which closes the worker, which closes
+        // `score_rx` once the last in-flight chunk is scored.
+        let mut feed = Some(chunk_tx);
 
         let mut vad: Option<VadStateMachine> = None;
         let mut preroll: VecDeque<AudioChunk> = VecDeque::new();
@@ -232,14 +265,31 @@ impl VoiceGate {
                     }
                 }
 
-                chunk = mic.next() => {
-                    let Some(chunk) = chunk else {
+                chunk = mic.next(), if feed.is_some() => {
+                    match chunk {
+                        Some(chunk) => {
+                            if let Some(tx) = feed.as_ref()
+                                && tx.try_send(chunk).is_err()
+                            {
+                                tracing::warn!(
+                                    "voice gate: speech detector behind the microphone, chunk dropped"
+                                );
+                            }
+                        }
+                        // Stop feeding the worker and let it finish what it holds;
+                        // the scored arm shuts the gate down when the channel closes.
+                        None => feed = None,
+                    }
+                }
+
+                scored = score_rx.recv() => {
+                    let Some((chunk, probability)) = scored else {
                         Self::close(&mut live, "microphone closed").await;
                         return Ok(());
                     };
                     let chunk_ms = (chunk.data.len() / bytes_per_ms).max(1) as u64;
                     let sm = vad.get_or_insert_with(|| VadStateMachine::new(self.vad.clone(), chunk_ms));
-                    let decision = sm.process(self.detector.speech_probability(&chunk));
+                    let decision = sm.process(probability);
                     tracing::trace!(?decision, first = chunk.data.first(), live = live.is_some(), "voice gate chunk");
                     if matches!(decision, VadDecision::SpeechStarted | VadDecision::SpeechContinues) {
                         last_speech = Instant::now();
@@ -247,7 +297,7 @@ impl VoiceGate {
                     match live.as_ref() {
                         Some(l) => {
                             if l.tx.try_send(chunk).is_err() {
-                                tracing::debug!("voice gate: session audio queue full, chunk dropped");
+                                tracing::warn!("voice gate: session audio queue full, chunk dropped");
                             }
                         }
                         None => {
@@ -281,6 +331,13 @@ impl VoiceGate {
             let _ = tx.try_send(chunk);
         }
         let cancel = self.cancel.child_token();
+        // The gate already runs a detector on this microphone. Left at `LocalVad`
+        // the session loads a second Silero model per open and feeds both from one
+        // mic; `ServerOnly` keeps interruption, minus the duplicate.
+        let mut config = self.config.clone();
+        if matches!(config.barge_in, BargeInMode::LocalVad) {
+            config.barge_in = BargeInMode::ServerOnly;
+        }
         let mut b = OmniSession::builder()
             .provider_boxed((self.provider)())
             .audio_source(ChannelAudioSource {
@@ -289,7 +346,7 @@ impl VoiceGate {
                 channels,
             })
             .tools(self.tools.clone())
-            .config(self.config.clone())
+            .config(config)
             .cancel_token(cancel.clone());
         if let Some(s) = &self.audio_sink {
             b = b.audio_sink_shared(Arc::clone(s));
@@ -324,12 +381,25 @@ impl VoiceGate {
         tracing::info!(why, "voice gate: closing session");
         drop(l.tx);
         l.cancel.cancel();
-        while let Some(res) = l.task.join_next().await {
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(%e, "voice gate: session failed on close"),
-                Err(e) => tracing::warn!(%e, "voice gate: session task failed on close"),
+        // The microphone is not polled while this runs, so every millisecond here
+        // is capture the next session will not hear. A session ends in
+        // `finish_persistence`, which waits on the transcriber for up to 30 s, so
+        // an unbounded join can silence the gate for that long.
+        let drain = async {
+            while let Some(res) = l.task.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(%e, "voice gate: session failed on close"),
+                    Err(e) => tracing::warn!(%e, "voice gate: session task failed on close"),
+                }
             }
+        };
+        if tokio::time::timeout(CLOSE_GRACE, drain).await.is_err() {
+            tracing::warn!(
+                grace_ms = CLOSE_GRACE.as_millis(),
+                "voice gate: session did not finish closing in time; abandoning it"
+            );
+            l.task.abort_all();
         }
         tracing::info!("voice gate: waiting for speech");
     }
@@ -486,9 +556,10 @@ impl VoiceGateBuilder {
             provider: self
                 .provider
                 .ok_or_else(|| MindroidError::config("VoiceGate requires a provider factory"))?,
-            detector: self
-                .detector
-                .ok_or_else(|| MindroidError::config("VoiceGate requires a speech detector"))?,
+            detector: Some(
+                self.detector
+                    .ok_or_else(|| MindroidError::config("VoiceGate requires a speech detector"))?,
+            ),
             audio_source: self
                 .audio_source
                 .ok_or_else(|| MindroidError::config("VoiceGate requires an audio source"))?,
@@ -593,15 +664,18 @@ mod tests {
             .unwrap()
     }
 
-    // Hangs indefinitely; pre-existing, not introduced by the branch that added
-    // this attribute — verified against a pristine checkout of 649bc29. Both
-    // ignored tests are the ones that drive the gate through opening a session,
-    // and both run on a paused clock: `start_paused` only auto-advances time
-    // while every task is idle, so a worker that never yields leaves the timers
-    // frozen and the test waiting forever. Worth a real fix — a gate that can
-    // deadlock on session open matters outside the tests too.
-    #[ignore = "hangs: paused clock never advances past session open (pre-existing)"]
-    #[tokio::test(start_paused = true)]
+    /// Wall clock on purpose. Every gate run now owns a blocking detector worker,
+    /// and `start_paused` does not auto-advance while a blocking task is parked —
+    /// that, not the detector's cost, is what hung these tests. The ceiling turns a
+    /// future stall into a failure instead of a nine-minute wait.
+    async fn run_gate(g: VoiceGate) {
+        tokio::time::timeout(Duration::from_secs(20), g.run())
+            .await
+            .expect("voice gate did not finish within 20 s")
+            .expect("voice gate returned an error");
+    }
+
+    #[tokio::test]
     async fn speech_opens_one_session_and_replays_the_preroll() {
         let opened: Opened = Arc::default();
         let chunks = vec![
@@ -613,10 +687,7 @@ mod tests {
             chunk(1),
             chunk(0),
         ];
-        gate(chunks, Duration::from_secs(5), &opened)
-            .run()
-            .await
-            .unwrap();
+        run_gate(gate(chunks, Duration::from_secs(5), &opened)).await;
 
         let opened = opened.lock().unwrap();
         assert_eq!(opened.len(), 1, "exactly one session for one burst");
@@ -633,24 +704,13 @@ mod tests {
         assert!(heard.iter().any(|c| c.data[0] == 1));
     }
 
-    // Hangs indefinitely; pre-existing, not introduced by the branch that added
-    // this attribute — verified against a pristine checkout of 649bc29. Both
-    // ignored tests are the ones that drive the gate through opening a session,
-    // and both run on a paused clock: `start_paused` only auto-advances time
-    // while every task is idle, so a worker that never yields leaves the timers
-    // frozen and the test waiting forever. Worth a real fix — a gate that can
-    // deadlock on session open matters outside the tests too.
-    #[ignore = "hangs: paused clock never advances past session open (pre-existing)"]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn silence_closes_the_session_and_speech_reopens_a_new_one() {
         let opened: Opened = Arc::default();
         let mut chunks = vec![chunk(1), chunk(1)];
         chunks.extend(std::iter::repeat_n(chunk(0), 60)); // >600 ms of silence, well past the idle timeout
         chunks.extend([chunk(1), chunk(1), chunk(0)]);
-        gate(chunks, Duration::from_millis(200), &opened)
-            .run()
-            .await
-            .unwrap();
+        run_gate(gate(chunks, Duration::from_millis(200), &opened)).await;
 
         assert_eq!(
             opened.lock().unwrap().len(),
@@ -659,13 +719,10 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn silence_alone_never_opens_a_session() {
         let opened: Opened = Arc::default();
-        gate(vec![chunk(0); 5], Duration::from_secs(5), &opened)
-            .run()
-            .await
-            .unwrap();
+        run_gate(gate(vec![chunk(0); 5], Duration::from_secs(5), &opened)).await;
         assert!(opened.lock().unwrap().is_empty());
     }
 

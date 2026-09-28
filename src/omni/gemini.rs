@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use crate::core::error::MindroidError;
@@ -114,17 +116,12 @@ impl GeminiLiveConfig {
         self
     }
 
+    /// The endpoint as-is. The key travels in the `x-goog-api-key` header, not
+    /// here: a query parameter is part of the request line, so it lands in the
+    /// access log of every proxy between us and Google — and `with_endpoint`
+    /// exists precisely to put a proxy there.
     fn url(&self) -> String {
-        if self.api_key.is_empty() {
-            self.endpoint.clone()
-        } else {
-            let sep = if self.endpoint.contains('?') {
-                '&'
-            } else {
-                '?'
-            };
-            format!("{}{sep}key={}", self.endpoint, self.api_key)
-        }
+        self.endpoint.clone()
     }
 }
 
@@ -265,7 +262,18 @@ impl OmniProvider for GeminiLiveProvider {
             Ordering::Relaxed,
         );
         self.activity_open.store(false, Ordering::Relaxed);
-        let (ws, _) = connect_async(self.config.url())
+        let mut request = self
+            .config
+            .url()
+            .into_client_request()
+            .map_err(|e| transport(format!("Gemini Live bad endpoint: {e}")))?;
+        if !self.config.api_key.is_empty() {
+            let key = HeaderValue::from_str(&self.config.api_key)
+                .map_err(|_| transport("Gemini Live api key is not a valid header value"))?;
+            request.headers_mut().insert("x-goog-api-key", key);
+        }
+
+        let (ws, _) = connect_async(request)
             .await
             .map_err(|e| transport(format!("Gemini Live connect failed: {e}")))?;
         let (mut sink, mut stream) = ws.split();
@@ -605,12 +613,25 @@ fn parse_server_message(
             let Some(name) = call.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            // Gemini omits `id` for non-parallel calls; the name is then unique.
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or(name)
-                .to_string();
+            // Gemini omits `id` for non-parallel calls, where the name is unique.
+            // Two same-name calls in one turn would otherwise collide: the second
+            // `insert` would drop the first, `send_tool_result` would fail with an
+            // unknown id, and both callers propagate that with `?` — one repeated
+            // function name would end the turn. Suffix the fallback instead.
+            let id = match call.get("id").and_then(Value::as_str) {
+                Some(id) => id.to_string(),
+                None if !pending.contains_key(name) => name.to_string(),
+                None => {
+                    let mut n = 2;
+                    loop {
+                        let candidate = format!("{name}#{n}");
+                        if !pending.contains_key(&candidate) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                }
+            };
             pending.insert(id.clone(), name.to_string());
             events.push(OmniEvent::ToolCall {
                 id,
@@ -863,6 +884,55 @@ mod tests {
 
     /// The round trip the trait signature makes easy to get wrong: `send_tool_result`
     /// only receives the call id, but Gemini's `functionResponse` also needs the name.
+    /// Two id-less calls to the same function in one turn used to collide in the
+    /// pending map: the second overwrote the first, so resolving the first failed
+    /// with "unknown Gemini tool call id" and killed the whole turn.
+    #[tokio::test]
+    async fn two_id_less_calls_to_one_function_get_distinct_ids() {
+        let (mut provider, mut seen) = connected(|frame| {
+            if frame.get("realtimeInput").is_some() {
+                vec![json!({
+                    "toolCall": {
+                        "functionCalls": [
+                            { "name": "get_weather", "args": { "city": "Oslo" } },
+                            { "name": "get_weather", "args": { "city": "Bergen" } }
+                        ]
+                    }
+                })]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let _setup = seen.recv().await;
+
+        let mut events = provider.events();
+        provider.end_audio_stream().await.unwrap();
+        let _echo = seen.recv().await;
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let event = events.next().await.expect("tool call");
+            let OmniEvent::ToolCall { id, name, .. } = event else {
+                panic!("expected ToolCall, got {event:?}");
+            };
+            assert_eq!(name, "get_weather");
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1], "both calls must be separately resolvable");
+
+        // Both resolve, and each carries the function name back.
+        for id in &ids {
+            provider
+                .send_tool_result(id, json!({ "temp_c": 4 }))
+                .await
+                .unwrap();
+            let frame = seen.recv().await.expect("toolResponse frame");
+            let response = &frame["toolResponse"]["functionResponses"][0];
+            assert_eq!(response["name"], "get_weather");
+        }
+    }
+
     #[tokio::test]
     async fn tool_call_round_trip_carries_the_function_name_back() {
         let (mut provider, mut seen) = connected(|frame| {
@@ -1260,17 +1330,70 @@ mod tests {
         assert_eq!(params["properties"]["a"]["type"], "string");
     }
 
+    /// The point of moving the key to a header is that the request line is what a
+    /// proxy logs. Assert against the real upgrade request, not just `url()`.
+    // The handshake callback's error type is tungstenite's, not ours.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn the_api_key_travels_in_a_header_not_the_request_line() {
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            Request as HsRequest, Response as HsResponse,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel::<(String, Option<String>)>(1);
+
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let accepted =
+                tokio_tungstenite::accept_hdr_async(tcp, |req: &HsRequest, resp: HsResponse| {
+                    let key = req
+                        .headers()
+                        .get("x-goog-api-key")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let _ = tx.try_send((req.uri().to_string(), key));
+                    Ok(resp)
+                })
+                .await;
+            let Ok(ws) = accepted else {
+                return;
+            };
+            let (mut sink, mut stream) = ws.split();
+            let _ = send(&mut sink, json!({ "setupComplete": {} })).await;
+            while stream.next().await.is_some() {}
+        });
+
+        let config = GeminiLiveConfig::new("super-secret")
+            .with_endpoint(format!("ws://{addr}/live"))
+            .with_allow_insecure(true);
+        let mut provider = GeminiLiveProvider::new(config);
+        provider.connect(&OmniConfig::default()).await.unwrap();
+
+        let (uri, key) = rx.recv().await.expect("the server saw an upgrade request");
+        assert!(
+            !uri.contains("super-secret"),
+            "the key reached the request line: {uri}"
+        );
+        assert_eq!(key.as_deref(), Some("super-secret"));
+    }
+
     #[test]
-    fn url_appends_the_key_as_a_query_parameter() {
+    fn url_never_carries_the_key() {
         let config = GeminiLiveConfig::new("secret")
             .with_endpoint("wss://host/live")
             .with_allow_insecure(true);
-        assert_eq!(config.url(), "wss://host/live?key=secret");
+        assert_eq!(config.url(), "wss://host/live");
+        assert!(!config.url().contains("secret"));
 
         let config = GeminiLiveConfig::new("secret")
             .with_endpoint("wss://host/live?alt=1")
             .with_allow_insecure(true);
-        assert_eq!(config.url(), "wss://host/live?alt=1&key=secret");
+        assert_eq!(config.url(), "wss://host/live?alt=1");
+        assert!(!config.url().contains("secret"));
     }
 
     #[tokio::test]

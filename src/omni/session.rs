@@ -384,7 +384,9 @@ impl OmniSession {
                         None
                     }
                 };
-                tracing::info!(
+                // The user's own words: DEBUG, like every other transcript line in
+                // this file. At INFO they land in any default-configured host log.
+                tracing::debug!(
                     ms = started.elapsed().as_millis(),
                     audio_bytes = wav.len(),
                     text = text.as_deref().unwrap_or("<empty>"),
