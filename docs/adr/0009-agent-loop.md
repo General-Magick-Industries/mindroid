@@ -166,7 +166,16 @@ on purpose.
   `ToolResult` stream events; the split stages do not emit them yet.
 - `Runtime` still drives a `Pipeline`. An `AgentLoop` is run directly by the
   embedder for now; giving `MessageContext::process_and_respond` a loop to drive
-  is follow-up work, and the point at which presets can offer one.
+  is follow-up work, and the point at which presets can offer one. Until then a
+  remote-call timeout reaches a loop only when the loop is a stage of the
+  runtime's pipeline: `RemoteCallTimeout` resumes through `Runtime.pipeline`.
+- `Transcript` lives in run scope, which only `Context::reset_output` clears. An
+  embedder reusing one `Context` across turns without it carries the last
+  turn's transcript into the next — `LlmRound` continues it rather than seeding
+  from the new `llm_messages` — and a turn cancelled between `LlmRound` and
+  `ToolRound` leaves it ending on a `tool_calls` turn nothing answered, which
+  the provider rejects. `Runtime` builds a fresh `Context` per message and is
+  unaffected.
 - `Transcript` being async-openai-typed means a compaction or summarizing stage
   is written against that type rather than against `LlmMessage`. Extending
   `LlmMessage` to carry tool calls and tool results would make these stages

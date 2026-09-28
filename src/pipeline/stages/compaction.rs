@@ -53,6 +53,12 @@ pub struct TranscriptCompaction {
 impl TranscriptCompaction {
     /// Budget in serialized characters — a rough proxy for tokens (~4 chars
     /// each), deliberately cheap: an exact count needs the model's tokenizer.
+    ///
+    /// Inline media counts at its base64 length, which bears no relation to
+    /// what a provider charges for it: one inline photo can exceed the whole
+    /// budget and push every older round out. `ArtifactOffload` in `setup`
+    /// keeps the bytes out of the transcript — the model gets a reference and
+    /// views the media through `get_artifact` instead of seeing it inline.
     pub fn new(max_chars: usize) -> Self {
         Self { max_chars }
     }
@@ -88,7 +94,8 @@ impl PipelineStage for TranscriptCompaction {
     }
 }
 
-/// Serialized size of one message, used as the token proxy.
+/// Serialized size of one message, used as the token proxy. Inline media is
+/// counted as its base64 text — see [`TranscriptCompaction::new`].
 fn size_of(msg: &ChatCompletionRequestMessage) -> usize {
     serde_json::to_string(msg).map(|s| s.len()).unwrap_or(0)
 }

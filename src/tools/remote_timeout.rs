@@ -36,6 +36,37 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 ///
 /// A late result arriving after expiry is dropped as unsolicited: the claim was
 /// consumed here, so the model never sees two answers to one call.
+///
+/// # With an `AgentLoop`
+///
+/// The expiry re-enters through the **runtime's** pipeline, never through a
+/// loop driven by hand: a loop run with [`AgentLoop::run`] outside a `Runtime`
+/// gets no timeout result at all, and a runtime whose pipeline is not the loop
+/// resumes the turn somewhere the transcript never was. Put the loop in the
+/// runtime's pipeline — it is a [`PipelineStage`] — and hand the routine the
+/// outstanding calls of the `ToolRound` inside it:
+///
+/// ```ignore
+/// let llm = LlmRound::new(client, registry);
+/// let tools = llm.tool_round();
+/// let gate = tools.result_gate();
+/// let pending = tools.pending();
+/// let agent = AgentLoop::new(Pipeline::new().add_stage(llm).add_stage(tools)).with_setup(
+///     Pipeline::new()
+///         .add_stage(gate)
+///         .add_stage(SimpleContextBuilder::with_prompt(SYSTEM)),
+/// );
+/// let runtime = Runtime::builder()
+///     .routine(RemoteCallTimeout::new(pending))
+///     .pipeline(Pipeline::new().add_stage(agent))
+///     .build()?;
+/// ```
+///
+/// The synthesized result arrives already claimed, so the setup gate lets it
+/// through and `LlmRound` answers it like any returning result.
+///
+/// [`AgentLoop::run`]: crate::core::agent_loop::AgentLoop::run
+/// [`PipelineStage`]: crate::pipeline::PipelineStage
 pub struct RemoteCallTimeout {
     pending: PendingRemoteCalls,
     interval: Duration,
