@@ -128,7 +128,11 @@ on purpose.
 - `ends_turn` becomes "the round stops asking for another pass" rather than a
   flag an executor interprets, so the XML/JSON divergence on it does not
   reappear in the split stages.
-- `PipelineEvent` gains `LoopIterationStarted` and `LoopCompleted`.
+- `PipelineEvent` gains `LoopIterationStarted` and `LoopCompleted`, which
+  carries the `StopReason` — `run_streaming` returns events rather than a
+  `LoopOutcome`, so the event is the only place a streaming caller sees it.
+  `PipelineEvent` becomes `#[non_exhaustive]`, since each execution model adds
+  events.
 - `ToolRound` runs tools through the same `execute_local` as
   `ToolExecutorStage`, so a failed call reads the same to the model whichever
   executor ran it, and each call gets the same log line.
