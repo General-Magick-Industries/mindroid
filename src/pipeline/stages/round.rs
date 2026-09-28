@@ -77,7 +77,7 @@ use super::tool_executor_xml::{
     PendingRemoteCalls, RemoteResultGate, declares_tool_result, frame_remote_call,
     registry_for_turn, remote_executor_for, remote_timeout_for, tool_context_for, truncate_str,
 };
-use crate::core::agent_loop::Continue;
+use crate::core::agent_loop::{Continue, ControlResponse};
 use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall};
@@ -309,7 +309,10 @@ impl PipelineStage for ToolRound {
         if let Some(framed) = self.dispatch_remote(ctx, &registry, &calls) {
             // The client owes us a result; there is nothing to iterate on until
             // it arrives, so the turn ends here without asking for another pass.
+            // The envelope is for the client, not the listener: a loop that
+            // speaks its passes must not read it aloud.
             ctx.response = Some(framed);
+            ctx.set(ControlResponse);
             return Ok(());
         }
 
@@ -538,6 +541,10 @@ mod tests {
         assert!(
             ctx.get_run::<Continue>().is_none(),
             "the turn waits for the client, so there is nothing to iterate on"
+        );
+        assert!(
+            ctx.get_run::<ControlResponse>().is_some(),
+            "the envelope is marked so a speaking loop does not read it aloud"
         );
     }
 

@@ -105,7 +105,10 @@ after a halt or the cap, and not at all after a cancellation, a body error, or a
 message admission control refused. A pass's `Error` ends the turn — stricter than
 `Pipeline::run_streaming`, which forwards it and carries on.
 
-`LoopCompleted` carries the `StopReason`, the only place a streaming caller sees it.
+**`run_streaming` speaks a body with no streaming stage one pass at a time**: each
+pass's prose becomes one `Chunk`, never a framed remote call, so TTS works over split
+rounds. A body that has a streaming stage is left to it. `LoopCompleted` carries the
+`StopReason`, the only place a streaming caller sees it.
 
 **Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
 deadline, same correlation gate — but a split round cannot run the gate inline the way
