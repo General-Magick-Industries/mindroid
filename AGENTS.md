@@ -143,7 +143,9 @@ sub-agent wants its own `Context`: nest it through `DelegationTool`.
 
 `Runtime` still drives a `Pipeline`; an `AgentLoop` is run directly today (see
 `examples/agent_loop`). Wiring it behind `MessageContext::process_and_respond` is
-follow-up work.
+follow-up work. Until then, **a remote-call timeout reaches a loop only when the loop
+is a stage of the runtime's pipeline**: `RemoteCallTimeout` resumes through
+`Runtime.pipeline`, never through a loop driven by hand (see its docs).
 
 ### Core Traits (always available, no feature gate)
 

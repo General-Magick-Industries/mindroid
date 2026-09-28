@@ -87,6 +87,13 @@ use crate::tools::{DynamicRegistry, ToolRegistry};
 
 /// The loop's transcript, in run scope.
 ///
+/// Run scope is cleared only by [`Context::reset_output`], so a `Context`
+/// reused across turns without it carries this into the next turn: [`LlmRound`]
+/// continues it instead of seeding from the new `llm_messages`, and a turn
+/// cancelled between [`LlmRound`] and [`ToolRound`] leaves it ending on a
+/// `tool_calls` turn nothing answered, which the provider rejects. Reset between
+/// turns; `Runtime` builds a fresh `Context` per message and is unaffected.
+///
 /// Holds the shapes `LlmMessage` cannot: an assistant turn carrying
 /// `tool_calls`, and `role: tool` results keyed by `tool_call_id`.
 #[derive(Debug, Clone, Default)]
