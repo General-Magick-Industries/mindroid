@@ -83,8 +83,8 @@ For real-time bidirectional audio, `OmniSession` runs alongside `Pipeline` as a 
 things callers must get right: `OmniSession` keeps its tool list and `OmniConfig::tools_schema`
 separate, so set both from the same slice via that provider's `tool_declarations`; and the
 rates differ per provider — Gemini is 16 kHz in / 24 kHz out (`CpalAudio::new_split`),
-OpenAI is 24 kHz both ways (`CpalAudio::new`). See `docs/design/omni-support.md` §3 for
-the refactor that removes both footguns.
+OpenAI is 24 kHz both ways (`CpalAudio::new`). Both are footguns worth designing away;
+no ADR covers it yet.
 
 ### Core Traits (always available, no feature gate)
 
@@ -162,12 +162,14 @@ model:
 | `ToolExecutorStage` | the request's native `tools` field, calls return in `tool_calls` | the endpoint speaks OpenAI function calling |
 
 Both re-attach artifact bytes and clear the same remote-call correlation gate.
-Three differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
+Four differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
 mid-loop, while the JSON stage's rounds are non-streaming API calls, so its
 events replay once the loop ends; the JSON stage re-attaches artifacts as a
 follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
-role carries text alone; and only the JSON stage honours `Tool::ends_turn`, so a
-self-delivering tool on the XML stage may be re-called, up to the iteration cap.
+role carries text alone; only the JSON stage honours `Tool::ends_turn`, so a
+self-delivering tool on the XML stage may be re-called, up to the iteration cap;
+and only the JSON stage can run a response's calls concurrently
+(`with_parallel_tool_calls`, at most `MAX_PARALLEL_TOOL_CALLS` at once).
 
 **The JSON stage cannot run against Cortex.** Cortex's ReasonService is
 deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and no
@@ -285,4 +287,4 @@ src/
 
 ## Git
 
-Gita repo (own `.git`). PRs go to `General-Magick-Industries/mindroid` on GitHub. While the v2 line is in flight, feature PRs target `feat/mindroid-v2` (PR #31 carries it to `main`); pin downstream to a merge commit on that branch, never a PR head.
+Gita repo (own `.git`). PRs go to `General-Magick-Industries/mindroid` on GitHub and target `develop`; `feat/mindroid-v2` and its PR #31 are gone. Pin downstream to a merge commit on `develop`, never a PR head.
