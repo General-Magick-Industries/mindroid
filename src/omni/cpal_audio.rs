@@ -259,7 +259,11 @@ impl CpalAudioSink {
                 }
             };
 
-            info!("CpalAudioSink: rodio sink ready at {sample_rate} Hz");
+            let device = cpal::default_host()
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+                .unwrap_or_else(|| "?".into());
+            info!("CpalAudioSink: rodio sink ready at {sample_rate} Hz on '{device}'");
 
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
@@ -279,9 +283,13 @@ impl CpalAudioSink {
                             samples,
                         );
                         sink.append(source);
+                        sink.play();
                     }
                     SinkCmd::Stop => {
+                        // rodio's clear() pauses the sink; without play() every
+                        // later chunk queues silently and flush() blocks forever.
                         sink.clear();
+                        sink.play();
                     }
                     SinkCmd::Flush(done_tx) => {
                         sink.sleep_until_end();
@@ -365,8 +373,16 @@ pub struct CpalAudio {
 impl CpalAudio {
     /// Open the default input and output devices at `sample_rate`.
     pub fn new(sample_rate: u32) -> Result<Self, MindroidError> {
-        let input = CpalAudioSource::new(sample_rate)?;
-        let output = CpalAudioSink::new(sample_rate)?;
+        Self::new_split(sample_rate, sample_rate)
+    }
+
+    /// Open input and output at *different* rates.
+    ///
+    /// Realtime providers are rarely symmetric — Gemini Live captures at 16 kHz
+    /// but speaks at 24 kHz, which [`CpalAudio::new`] cannot express.
+    pub fn new_split(input_rate: u32, output_rate: u32) -> Result<Self, MindroidError> {
+        let input = CpalAudioSource::new(input_rate)?;
+        let output = CpalAudioSink::new(output_rate)?;
         Ok(Self { input, output })
     }
 
@@ -378,6 +394,13 @@ impl CpalAudio {
     /// Return a reference to the speaker sink.
     pub fn sink(&self) -> &CpalAudioSink {
         &self.output
+    }
+
+    /// Consume into owned halves, as [`OmniSessionBuilder`] requires.
+    ///
+    /// [`OmniSessionBuilder`]: crate::omni::OmniSessionBuilder
+    pub fn into_parts(self) -> (CpalAudioSource, CpalAudioSink) {
+        (self.input, self.output)
     }
 }
 
@@ -437,4 +460,46 @@ where
         err_fn,
         None,
     )
+}
+
+#[cfg(test)]
+mod mic_probe {
+    use super::*;
+    use futures::StreamExt;
+    use std::time::{Duration, Instant};
+
+    /// Prints the default mic's level every 500 ms for 4 s. Silence on a laptop mic
+    /// is roughly -60 to -45 dBFS; speech -30 to -15; playback echo is easily -25.
+    #[tokio::test]
+    #[ignore = "opens the default microphone"]
+    async fn mic_level_probe() {
+        let src = CpalAudioSource::new(48_000).expect("mic");
+        let mut stream = src.stream();
+        let start = Instant::now();
+        let (mut acc_sq, mut n, mut last) = (0f64, 0usize, Instant::now());
+        while start.elapsed() < Duration::from_secs(4) {
+            let Some(chunk) = tokio::time::timeout(Duration::from_millis(600), stream.next())
+                .await
+                .ok()
+                .flatten()
+            else {
+                break;
+            };
+            for s in chunk.data.as_chunks::<2>().0 {
+                let v = f64::from(i16::from_le_bytes(*s)) / 32768.0;
+                acc_sq += v * v;
+                n += 1;
+            }
+            if last.elapsed() >= Duration::from_millis(500) && n > 0 {
+                let rms = (acc_sq / n as f64).sqrt();
+                eprintln!(
+                    "t={:4.1}s  rms={:.4}  {:6.1} dBFS",
+                    start.elapsed().as_secs_f32(),
+                    rms,
+                    20.0 * rms.max(1e-9).log10()
+                );
+                (acc_sq, n, last) = (0.0, 0, Instant::now());
+            }
+        }
+    }
 }

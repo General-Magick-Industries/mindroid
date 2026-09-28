@@ -10,6 +10,25 @@ listed under **Breaking Changes** with a migration note.
 
 ### Breaking Changes
 
+#### 0. `OmniEvent` and `OmniConfig` grew for realtime providers
+
+`OmniEvent::Transcript` gained a required `source: TranscriptSource` field;
+`OmniEvent` gained `SessionEnding`, `ResumptionHandle` and `Usage` and is now
+`#[non_exhaustive]`; `OmniConfig` gained `history: Vec<HistoryTurn>`.
+
+```rust
+// before
+OmniEvent::Transcript { text, is_final }
+match event { OmniEvent::AudioChunk(_) => …, /* every variant */ }
+OmniConfig { turn_detection, barge_in, system_prompt, tools_schema, voice }
+// after
+OmniEvent::Transcript { text, is_final, source: TranscriptSource::Output }
+match event { OmniEvent::AudioChunk(_) => …, _ => {} }   // wildcard arm required
+OmniConfig { history: Vec::new(), ..OmniConfig::default() }
+```
+
+`is_final: true` now means the complete text for that turn and source.
+
 #### 1. Tool-protocol traffic is declared, not sniffed
 
 Tool manifests, per-turn tools and tool results were located by parsing
@@ -113,6 +132,29 @@ truncated.
 
 ### Added
 
+- `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
+  (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
+  WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
+  passthrough.
+- `OmniSession` memory wiring: `.memory()` + `.conversation()` seed prior turns
+  as text history at `run()` and persist each turn's final transcript in event
+  order, the agent's reply threaded to the user's saved message.
+- `OmniEvent::Usage` per turn from both providers, plus `OmniSession::usage()`.
+- `OmniSession::builder().transcriber(stt)`: transcribe the user's utterances on this
+  side (captured between speech-start and the new `OmniEvent::UserSpeechEnded`), run
+  when the session closes, persisted in turn order ahead of the reply.
+- `omni::gate::VoiceGate`: open a session on detected speech, close it on silence,
+  reopen on the next speech; `SileroDetector` for the local VAD.
+- `VoiceGateBuilder::provider_closes()`: never close on silence, for a provider
+  that owns turn-taking. `idle_timeout` is now `Option<Duration>`; the default is
+  unchanged at `Some(15s)`.
+- `OpenAiSttConfig.language` (ISO-639-1) — set it; without a hint short clips are
+  transcribed in random languages.
+- `CpalAudio::new_split` / `into_parts`.
+- Gemini `TurnDetection::Manual`: the provider brackets the user's turn with
+  `activityStart`/`activityEnd`. The server VAD was already disabled in the setup
+  frame, but nothing marked the boundaries, so the model never answered.
+
 - `ToolExecutorStage::with_parallel_tool_calls(bool)`: when a model asks for
   several tools in one response, run them at the same time instead of one
   after another, at most `MAX_PARALLEL_TOOL_CALLS` (8) at once. Results go back
@@ -185,6 +227,36 @@ truncated.
   scope, so a sender still cannot displace a registered tool.
 
 ### Fixed
+
+- The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
+  `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
+  configured `transcriber` produced nothing while the provider's own input
+  transcript was already suppressed — the user's turn was lost outright.
+  `FrontendEvent::SpeechStarted` now opens the slice and `UtteranceComplete`
+  closes it. Note that under `TurnDetection::Server` the frontend only completes
+  an utterance at `max_utterance`, so boundaries there are still coarse.
+- `VoiceGate` no longer starts a second speech detector per session. It passed
+  its `OmniConfig` through untouched, and the default `barge_in` is `LocalVad`,
+  so every gate-opened session loaded its own Silero on top of the gate's and
+  fed both from one microphone. The session now gets `ServerOnly` when the gate
+  owns detection. This was also the gate's deadlock: the session's blocking VAD
+  worker stops a paused test clock from auto-advancing, which hung the two gate
+  tests that open a session.
+- `VoiceGate` runs its speech detector on a blocking worker instead of inline on
+  its select loop. `VadInference` is documented blocking-only and `OmniSession`
+  already honoured that; the gate did not.
+- `VoiceGate::close` is bounded at 5 s. The microphone is not polled while a
+  session closes, and a session ends in `finish_persistence`, which waits on the
+  transcriber for up to 30 s.
+- The Gemini API key travels in the `x-goog-api-key` header rather than a `key=`
+  query parameter, which is part of the request line and so reaches the access
+  log of any proxy in between — and `with_endpoint` exists to put one there.
+- Two id-less Gemini tool calls to the same function in one turn no longer
+  collide. The fallback id was the function name, so the second call overwrote
+  the first and resolving it failed with "unknown Gemini tool call id", which
+  both callers propagate with `?` — one repeated name ended the turn.
+- The user's transcript logs at DEBUG, not INFO, matching the session's other
+  transcript lines.
 
 - `XmlToolExecutorStage` recorded an outstanding remote call under
   `ToolContext::channel_id` — the workspace id on any transport that stamps

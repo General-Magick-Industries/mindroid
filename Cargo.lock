@@ -1610,6 +1610,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mindroid-example-gemini-live"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "mindroid",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mindroid-example-local-persona"
 version = "0.0.1"
 dependencies = [
@@ -1673,6 +1688,21 @@ dependencies = [
  "anyhow",
  "mindroid",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mindroid-example-openai-realtime"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "mindroid",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
