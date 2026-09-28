@@ -105,10 +105,13 @@ after a halt or the cap, and not at all after a cancellation, a body error, or a
 message admission control refused. A pass's `Error` ends the turn — stricter than
 `Pipeline::run_streaming`, which forwards it and carries on.
 
-**`run_streaming` speaks a body with no streaming stage one pass at a time**: each
-pass's prose becomes one `Chunk`, never a framed remote call, so TTS works over split
-rounds. A body that has a streaming stage is left to it. `LoopCompleted` carries the
-`StopReason`, the only place a streaming caller sees it.
+**At the cap a turn stops with a round unanswered** — the model asked for tools, got
+the results, never replied. `finish` sees the `StopReason` in run scope, and
+`LlmRound::cap_summary()` placed there makes the one call without tools that
+`ToolExecutorStage` makes for itself. **`run_streaming` speaks a body with no streaming
+stage one pass at a time**: each pass's prose becomes one `Chunk`, never a framed remote
+call, so TTS works over split rounds. A body that has a streaming stage is left to it.
+`LoopCompleted` carries the `StopReason`, the only place a streaming caller sees it.
 
 **Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
 deadline, same correlation gate — but a split round cannot run the gate inline the way
@@ -120,7 +123,8 @@ model. Artifact re-attachment and `ToolCall`/`ToolResult` stream events are stil
 
 ```rust
 let llm = LlmRound::new(client, registry);
-let tools = llm.tool_round();   // shares the registry handle; never build the pair apart
+let tools = llm.tool_round();    // shares the registry handle; never build the pair apart
+let summary = llm.cap_summary(); // answers without tools if the loop hits its cap
 AgentLoop::new(
     Pipeline::new()
         .add_stage(TranscriptCompaction::from_tokens(60_000))
@@ -128,7 +132,7 @@ AgentLoop::new(
         .add_stage(tools),
 )
 .with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
-.with_finish(Pipeline::new().add_stage(PostProcessor))
+.with_finish(Pipeline::new().add_stage(summary).add_stage(PostProcessor))
 ```
 
 `AgentLoop` is **also a `PipelineStage`**, so it is not an either/or with `Pipeline`:

@@ -77,7 +77,7 @@ use super::tool_executor_xml::{
     PendingRemoteCalls, RemoteResultGate, declares_tool_result, frame_remote_call,
     registry_for_turn, remote_executor_for, remote_timeout_for, tool_context_for, truncate_str,
 };
-use crate::core::agent_loop::{Continue, ControlResponse};
+use crate::core::agent_loop::{Continue, ControlResponse, StopReason};
 use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall};
@@ -126,6 +126,16 @@ impl LlmRound {
     /// handle so a runtime tool swap reaches both stages or neither.
     pub fn tool_round(&self) -> ToolRound {
         ToolRound::with_dynamic_registry(self.registry.clone())
+    }
+
+    /// The [`CapSummary`] for the loop's `finish`, on this stage's client and
+    /// model. Take it after [`with_model`](Self::with_model) so the summary
+    /// runs on the same model as the rounds.
+    pub fn cap_summary(&self) -> CapSummary {
+        CapSummary {
+            client: self.client.clone(),
+            model: self.model.clone(),
+        }
     }
 
     /// Override the model for this stage (default: the client's).
@@ -197,6 +207,57 @@ impl PipelineStage for LlmRound {
         ctx.response = Some(outcome.content).filter(|c| !c.trim().is_empty());
 
         ctx.set(transcript);
+        Ok(())
+    }
+}
+
+/// Answers without tools when the loop stopped at its iteration cap.
+///
+/// A loop that hits the cap stops with a round unanswered: the model asked for
+/// tools, got their results, and never replied, so the carried response is the
+/// last round's prose — typically "let me check". `ToolExecutorStage` closes
+/// that gap itself with one call offering no tools; a split round cannot, since
+/// the cap belongs to the loop, so this is that call as a `finish` stage.
+///
+/// It reads the loop's [`StopReason`] from run scope and does nothing on any
+/// other exit: a settled turn already has its reply, and a halt means stop.
+/// An empty answer leaves the carried response in place.
+///
+/// ```rust,ignore
+/// let llm = LlmRound::new(client, registry);
+/// let tools = llm.tool_round();
+/// let summary = llm.cap_summary();
+/// AgentLoop::new(Pipeline::new().add_stage(llm).add_stage(tools))
+///     .with_finish(Pipeline::new().add_stage(summary))
+/// ```
+pub struct CapSummary {
+    client: LlmClient,
+    model: Option<String>,
+}
+
+#[async_trait]
+impl PipelineStage for CapSummary {
+    fn name(&self) -> &str {
+        "CapSummary"
+    }
+
+    async fn process(&self, ctx: &mut Context) -> Result<()> {
+        if ctx.get_run::<StopReason>() != Some(&StopReason::MaxIterations) {
+            return Ok(());
+        }
+        let Some(Transcript(messages)) = ctx.get_run::<Transcript>() else {
+            return Ok(());
+        };
+
+        debug!("CapSummary: the loop hit its cap, asking for an answer without tools");
+        // No tools on the request — the model must answer, not call.
+        let outcome = self
+            .client
+            .chat_with_tools(messages.clone(), &[], self.model.as_deref())
+            .await?;
+        if !outcome.content.trim().is_empty() {
+            ctx.response = Some(outcome.content);
+        }
         Ok(())
     }
 }
@@ -738,6 +799,88 @@ mod tests {
             "the ack is this round's, not the last pass's"
         );
         server.await.unwrap();
+    }
+
+    /// At the cap the loop stops with a round unanswered: the model asked for a
+    /// tool, got its result, and never replied. `cap_summary` in `finish` makes
+    /// the one call without tools that `ToolExecutorStage` makes for itself.
+    #[tokio::test]
+    async fn cap_summary_answers_without_tools_when_the_loop_hits_its_cap() {
+        use super::super::tool_executor::fake_llm::{completion, serve_completions};
+        use crate::core::agent_loop::AgentLoop;
+        use crate::pipeline::Pipeline;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wants_a_tool = completion(json!({
+            "role": "assistant",
+            "content": "Let me check",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "echo", "arguments": "{\"text\":\"forty-two\"}"}}]
+        }));
+        let answers = completion(json!({"role": "assistant", "content": "It is forty-two."}));
+        let server = serve_completions(listener, vec![wants_a_tool, answers]);
+
+        let (reg, hits) = mixed_registry();
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let llm = LlmRound::new(client, reg);
+        let tools = llm.tool_round();
+        let summary = llm.cap_summary();
+        let agent = AgentLoop::new(Pipeline::new().add_stage(llm).add_stage(tools))
+            .with_max_iterations(1)
+            .with_finish(Pipeline::new().add_stage(summary));
+
+        let outcome = agent.run(&mut ctx()).await.unwrap();
+        let bodies = server.await.unwrap();
+
+        assert_eq!(outcome.reason, StopReason::MaxIterations);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the round's tool still ran");
+        assert_eq!(
+            outcome.response.as_deref(),
+            Some("It is forty-two."),
+            "the turn ends on an answer, not on the round's \"Let me check\""
+        );
+        assert_eq!(bodies.len(), 2, "one round, then one summary call");
+        let request: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let offers_tools = match request.get("tools") {
+            None | Some(Value::Null) => false,
+            Some(tools) => tools.as_array().is_none_or(|t| !t.is_empty()),
+        };
+        assert!(!offers_tools, "the summary must not offer tools: {request}");
+        assert!(
+            bodies[1].contains("forty-two"),
+            "the summary sees the tool's result: {}",
+            bodies[1]
+        );
+    }
+
+    /// Every other exit either has its reply already or must not get one: a
+    /// settled turn answered, and a halt means stop.
+    #[tokio::test]
+    async fn cap_summary_does_nothing_on_any_other_exit() {
+        let (reg, _) = mixed_registry();
+        // Unroutable on purpose: reaching the network at all is a failure.
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(
+            "http://127.0.0.1:1/v1",
+        ))
+        .unwrap();
+        let summary = LlmRound::new(client, reg).cap_summary();
+
+        for reason in [None, Some(StopReason::Settled), Some(StopReason::Halted)] {
+            let mut ctx = ctx();
+            ctx.set(Transcript::default());
+            if let Some(reason) = reason {
+                ctx.set(reason);
+            }
+            ctx.response = Some("the reply".into());
+
+            summary.process(&mut ctx).await.unwrap();
+
+            assert_eq!(ctx.response.as_deref(), Some("the reply"), "{reason:?}");
+        }
     }
 
     /// A tool swapped in through the shared handle must be visible to both
