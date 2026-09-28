@@ -107,11 +107,14 @@ message admission control refused. A pass's `Error` ends the turn — stricter t
 
 **At the cap a turn stops with a round unanswered** — the model asked for tools, got
 the results, never replied. `finish` sees the `StopReason` in run scope, and
-`LlmRound::cap_summary()` placed there makes the one call without tools that
-`ToolExecutorStage` makes for itself. **`run_streaming` speaks a body with no streaming
-stage one pass at a time**: each pass's prose becomes one `Chunk`, never a framed remote
-call, so TTS works over split rounds. A body that has a streaming stage is left to it.
-`LoopCompleted` carries the `StopReason`, the only place a streaming caller sees it.
+`LlmRound::cap_summary()` placed there makes the same closing request
+`ToolExecutorStage` makes for itself, keeping the turn's text if it fails.
+**`run_streaming` speaks a body with no streaming stage one pass at a time**: each
+pass's prose becomes one `Chunk`, never a response marked with `ControlResponse::mark`
+(a framed remote call), so TTS works over split rounds; at the cap, the answer `finish`
+supplies is spoken last. A body that has a streaming stage is left to it.
+`LoopCompleted` carries the `StopReason`, the only place a streaming caller sees it, and
+both loop events carry the loop's name.
 
 **Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
 deadline, same correlation gate — but a split round cannot run the gate inline the way

@@ -43,12 +43,16 @@ pub enum PipelineEvent {
     /// starting. Emitted around the pass, not by it, so a body with no
     /// loop-aware stage still reports its single iteration.
     LoopIterationStarted {
+        /// The loop's [`with_name`](crate::core::agent_loop::AgentLoop::with_name),
+        /// so nested loops' events can be told apart.
+        loop_name: String,
         iteration: usize,
     },
     /// The loop finished, after `finish` ran. `reason` is why — the only way
     /// a [`run_streaming`](crate::core::agent_loop::AgentLoop::run_streaming)
     /// caller learns it, since that returns events, not a `LoopOutcome`.
     LoopCompleted {
+        loop_name: String,
         iterations: usize,
         #[serde(with = "duration_millis")]
         elapsed: Duration,
@@ -142,8 +146,12 @@ mod tests {
             PipelineEvent::PipelineCompleted {
                 elapsed: Duration::from_millis(100),
             },
-            PipelineEvent::LoopIterationStarted { iteration: 2 },
+            PipelineEvent::LoopIterationStarted {
+                loop_name: "planner".into(),
+                iteration: 2,
+            },
             PipelineEvent::LoopCompleted {
+                loop_name: "planner".into(),
                 iterations: 3,
                 elapsed: Duration::from_millis(250),
                 reason: StopReason::MaxIterations,
@@ -163,6 +171,7 @@ mod tests {
     #[test]
     fn loop_completed_serializes_its_reason_in_snake_case() {
         let json = serde_json::to_value(PipelineEvent::LoopCompleted {
+            loop_name: "planner".into(),
             iterations: 3,
             elapsed: Duration::from_millis(250),
             reason: StopReason::MaxIterations,
@@ -170,6 +179,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(json["event"], "loop_completed");
+        assert_eq!(json["loop_name"], "planner");
         assert_eq!(json["reason"], "max_iterations");
         assert_eq!(json["elapsed"], 250);
     }

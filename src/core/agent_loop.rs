@@ -73,19 +73,37 @@ pub const DEFAULT_LOOP_ITERATIONS: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Continue;
 
-/// Set in run scope by a body stage whose response is control traffic for the
-/// client — a framed remote call — rather than prose, so
-/// [`AgentLoop::run_streaming`] never speaks it as a `Chunk`.
+/// Marks `ctx.response` as control traffic for the client — a framed remote
+/// call — rather than prose, so [`AgentLoop::run_streaming`] never speaks it as
+/// a `Chunk`.
 ///
-/// `ToolRound`, `ToolExecutorStage` and `XmlToolExecutorStage` set it whenever
-/// they frame a remote call. A stage of your own that leaves control traffic on
-/// `ctx.response` sets it the same way: `ctx.set(ControlResponse)`.
+/// `ToolRound`, `ToolExecutorStage` and `XmlToolExecutorStage` mark every framed
+/// remote call. A stage of your own that leaves control traffic on
+/// `ctx.response` marks it the same way, after setting it:
+/// [`ControlResponse::mark`].
 ///
-/// It describes the response it travels with, so only a new pass clears it —
-/// never `finish`. A loop nested as a stage hands a framed response back to its
-/// parent's body, and a streaming parent must still see the mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControlResponse;
+/// The mark names the response it was made for, so a later stage that replaces
+/// `ctx.response` — prose after a nested loop's framed call, say — is not
+/// muted by it. A new pass clears it; `finish` never does, so a loop nested as a
+/// stage hands a framed response back to its parent's body still marked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlResponse(String);
+
+impl ControlResponse {
+    /// Mark the current `ctx.response` as control traffic. Does nothing when
+    /// there is no response yet, so set the response first.
+    pub fn mark(ctx: &mut Context) {
+        if let Some(text) = ctx.response.clone() {
+            ctx.set(ControlResponse(text));
+        }
+    }
+
+    /// Whether a mark in run scope covers `text`.
+    fn covers(ctx: &Context, text: Option<&str>) -> bool {
+        ctx.get_run::<ControlResponse>()
+            .is_some_and(|mark| text == Some(mark.0.as_str()))
+    }
+}
 
 /// Why the loop stopped.
 ///
@@ -172,13 +190,15 @@ impl AgentLoop {
     ///
     /// While these stages run, the loop's [`StopReason`] is in run scope
     /// (`ctx.get_run::<StopReason>()`), so a stage can act on why the turn
-    /// ended; it is taken back afterwards, so an enclosing loop's `finish` never
-    /// reads an inner loop's reason as its own. A loop that hit the cap stopped
-    /// with a round still unanswered — the model asked for tools, got their
-    /// results, and never replied — and
+    /// ended. It is taken back afterwards, and an enclosing loop's reason that
+    /// was already there — this loop nested in the parent's `finish` — is put
+    /// back, so neither loop reads the other's as its own.
+    ///
+    /// A loop that hit the cap stopped with a round still unanswered — the
+    /// model asked for tools, got their results, and never replied — and
     /// [`LlmRound::cap_summary`](crate::pipeline::stages::LlmRound::cap_summary)
-    /// is the stage that closes it, as `ToolExecutorStage` does with one call
-    /// without tools.
+    /// is the stage that closes it, making the same closing request
+    /// `ToolExecutorStage` makes for itself.
     ///
     /// Two exits do not reach these stages. A cancelled loop skips `finish`,
     /// because cancellation stops every pipeline at its next stage boundary
@@ -205,6 +225,20 @@ impl AgentLoop {
     /// One [`Context`] spans every phase: run scope is the loop's state, so the
     /// transcript a round appends survives into the next pass.
     pub async fn run(&self, ctx: &mut Context) -> Result<LoopOutcome> {
+        Ok(self.run_taking_mark(ctx).await?.0)
+    }
+
+    /// Run, then take the loop's [`ControlResponse`] out of run scope, reporting
+    /// whether it covered the response the loop returns. Only the stage impl,
+    /// which hands that response on to its parent, has a use for the answer.
+    async fn run_taking_mark(&self, ctx: &mut Context) -> Result<(LoopOutcome, bool)> {
+        let outcome = self.drive(ctx).await?;
+        let control = ControlResponse::covers(ctx, outcome.response.as_deref());
+        ctx.take::<ControlResponse>();
+        Ok((outcome, control))
+    }
+
+    async fn drive(&self, ctx: &mut Context) -> Result<LoopOutcome> {
         let started = Instant::now();
 
         let carried = self.setup.run(ctx).await?;
@@ -231,6 +265,7 @@ impl AgentLoop {
             ctx.take::<Continue>();
             ctx.take::<ControlResponse>();
             ctx.emit_event(PipelineEvent::LoopIterationStarted {
+                loop_name: self.name.clone(),
                 iteration: iterations,
             });
 
@@ -279,7 +314,9 @@ impl AgentLoop {
     /// prose, and a pass the cancellation token cut short. A body that does have
     /// a streaming stage is left to it: that stage already chose what to speak.
     /// Like `Pipeline::run_streaming`'s chunks, these carry the text before
-    /// `finish`; the final `Complete` carries it after.
+    /// `finish`; the final `Complete` carries it after. The one exception is the
+    /// cap: `finish` text that the last pass did not already say — a
+    /// `CapSummary` answer — is spoken as a last `Chunk`, since no pass will.
     ///
     /// **An `Error` from a pass ends the turn**, which is stricter than
     /// [`Pipeline::run_streaming`]: there a streaming stage's `Error` is
@@ -318,7 +355,10 @@ impl AgentLoop {
 
                     ctx.take::<Continue>();
                     ctx.take::<ControlResponse>();
-                    ctx.emit_event(PipelineEvent::LoopIterationStarted { iteration: iterations });
+                    ctx.emit_event(PipelineEvent::LoopIterationStarted {
+                        loop_name: self.name.clone(),
+                        iteration: iterations,
+                    });
 
                     // `Pipeline::run_streaming` ends its stream on an error; the
                     // turn ends with it, as `run` does by propagating the `Err`,
@@ -346,7 +386,8 @@ impl AgentLoop {
 
                     // The streaming pipeline leaves the pass's text on the context
                     // rather than returning it; carry it the way `run` does.
-                    let control = ctx.take::<ControlResponse>().is_some();
+                    let control = ControlResponse::covers(ctx, ctx.response.as_deref());
+                    ctx.take::<ControlResponse>();
                     if let Some(text) = ctx.response.take() {
                         if speaks_passes
                             && !control
@@ -370,6 +411,7 @@ impl AgentLoop {
                 }
             };
 
+            let last_pass = carried.clone();
             let content = match self.run_finish(ctx, carried, reason).await {
                 Ok(text) => text.unwrap_or_default(),
                 Err(e) => {
@@ -377,7 +419,21 @@ impl AgentLoop {
                     return;
                 }
             };
+            // At the cap the last pass only promised an answer, and `finish`
+            // (`CapSummary`) may supply it. That is new speech, and nothing has
+            // spoken it — `finish` is not a pass. On any other exit `finish`
+            // only rewrites what was already said, so it stays unspoken.
+            let control = ControlResponse::covers(ctx, Some(&content));
+            ctx.take::<ControlResponse>();
+            if reason == StopReason::MaxIterations
+                && !control
+                && !content.trim().is_empty()
+                && last_pass.as_deref() != Some(content.as_str())
+            {
+                yield StreamEvent::Chunk { content: content.clone() };
+            }
             ctx.emit_event(PipelineEvent::LoopCompleted {
+                loop_name: self.name.clone(),
                 iterations,
                 elapsed: started.elapsed(),
                 reason,
@@ -413,9 +469,15 @@ impl AgentLoop {
         // sees it, so `finish` would run exactly one stage. Lift it for the
         // phase and put it back — the halt still means what it meant.
         let halted = std::mem::replace(&mut ctx.halted, false);
+        // A loop nested in its parent's `finish` sets the parent's reason aside
+        // and hands it back, so the parent's later finish stages still see it.
+        let enclosing = ctx.take::<StopReason>();
         ctx.set(reason);
         let finished = self.finish.run(ctx).await;
         ctx.take::<StopReason>();
+        if let Some(reason) = enclosing {
+            ctx.set(reason);
+        }
         ctx.halted |= halted;
         Ok(finished?.or_else(|| ctx.response.take()))
     }
@@ -433,6 +495,7 @@ impl AgentLoop {
 
         let elapsed = started.elapsed();
         ctx.emit_event(PipelineEvent::LoopCompleted {
+            loop_name: self.name.clone(),
             iterations,
             elapsed,
             reason,
@@ -476,8 +539,11 @@ impl crate::pipeline::PipelineStage for AgentLoop {
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         let enclosing = ctx.take::<Continue>();
-        let outcome = self.run(ctx).await?;
+        let (outcome, control) = self.run_taking_mark(ctx).await?;
         ctx.response = outcome.response;
+        if control {
+            ControlResponse::mark(ctx);
+        }
         if let Some(request) = enclosing {
             ctx.set(request);
         }
@@ -1282,7 +1348,7 @@ mod tests {
 
             async fn process(&self, ctx: &mut Context) -> Result<()> {
                 ctx.response = Some(r#"{"type":"tool_call"}"#.into());
-                ctx.set(ControlResponse);
+                ControlResponse::mark(ctx);
                 Ok(())
             }
         }
@@ -1319,7 +1385,7 @@ mod tests {
 
             async fn process(&self, ctx: &mut Context) -> Result<()> {
                 ctx.response = Some(r#"{"type":"tool_call"}"#.into());
-                ctx.set(ControlResponse);
+                ControlResponse::mark(ctx);
                 Ok(())
             }
         }
@@ -1459,5 +1525,195 @@ mod tests {
 
         assert_eq!(*seen.lock().unwrap(), Some(StopReason::MaxIterations));
         assert!(ctx.get_run::<StopReason>().is_none());
+    }
+
+    /// Frames a remote call and marks it, as `ToolRound` does.
+    struct FramesACall;
+
+    #[async_trait]
+    impl PipelineStage for FramesACall {
+        fn name(&self) -> &str {
+            "frames-a-call"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            ctx.response = Some(r#"{"type":"tool_call"}"#.into());
+            ControlResponse::mark(ctx);
+            Ok(())
+        }
+    }
+
+    /// Leaves fixed prose as the response.
+    struct Says(&'static str);
+
+    #[async_trait]
+    impl PipelineStage for Says {
+        fn name(&self) -> &str {
+            "says"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            ctx.response = Some(self.0.into());
+            Ok(())
+        }
+    }
+
+    /// Stands in for `CapSummary`: answers only when the loop hit its cap.
+    struct AnswersAtTheCap;
+
+    #[async_trait]
+    impl PipelineStage for AnswersAtTheCap {
+        fn name(&self) -> &str {
+            "answers-at-the-cap"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            if ctx.get_run::<StopReason>() == Some(&StopReason::MaxIterations) {
+                ctx.response = Some("the answer".into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A pass the token cut short may hold half a thought; it is not spoken.
+    #[tokio::test]
+    async fn a_cancelled_pass_is_not_spoken() {
+        struct SpeaksThenCancels;
+
+        #[async_trait]
+        impl PipelineStage for SpeaksThenCancels {
+            fn name(&self) -> &str {
+                "speaks-then-cancels"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.response = Some("half a thought".into());
+                ctx.cancel.cancel();
+                Ok(())
+            }
+        }
+
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_stage(SpeaksThenCancels))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert!(chunks(&events).is_empty(), "{events:?}");
+    }
+
+    /// At the cap the last pass only promised an answer. The answer `finish`
+    /// supplies is spoken, or a voice listener never hears it.
+    #[tokio::test]
+    async fn at_the_cap_the_answer_finish_supplies_is_spoken() {
+        let (body, _) = rounds(10);
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(body)
+            .with_max_iterations(2)
+            .with_finish(Pipeline::new().add_stage(AnswersAtTheCap))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert_eq!(chunks(&events), ["round 1", "round 2", "the answer"]);
+    }
+
+    /// On any other exit `finish` rewrites what a pass already said; speaking
+    /// it again would say the answer twice.
+    #[tokio::test]
+    async fn a_settled_answer_rewritten_by_finish_is_not_spoken_again() {
+        let (body, _) = rounds(1);
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(body)
+            .with_finish(Pipeline::new().add_stage(Says("ROUND 1")))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert_eq!(chunks(&events), ["round 1"]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Complete { content, .. }) if content == "ROUND 1"
+        ));
+    }
+
+    /// A loop nested in its parent's `finish` hands the parent's reason back,
+    /// so a stage after it — a summary — still sees why the parent stopped.
+    #[tokio::test]
+    async fn a_loop_nested_in_finish_hands_back_the_parents_reason() {
+        let (outer_body, _) = rounds(10);
+        let (inner_body, _) = rounds(1);
+        let mut ctx = ctx();
+        let outcome = AgentLoop::new(outer_body)
+            .with_max_iterations(2)
+            .with_finish(
+                Pipeline::new()
+                    .add_stage(AgentLoop::new(inner_body).with_name("inner"))
+                    .add_stage(AnswersAtTheCap),
+            )
+            .run(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reason, StopReason::MaxIterations);
+        assert_eq!(
+            outcome.response.as_deref(),
+            Some("the answer"),
+            "the summary after the inner loop saw the parent's MaxIterations"
+        );
+    }
+
+    /// The mark names its response: prose a later stage writes over a nested
+    /// loop's framed call is not muted by it.
+    #[tokio::test]
+    async fn prose_after_a_nested_loops_framed_call_is_spoken() {
+        let inner = AgentLoop::new(Pipeline::new().add_stage(FramesACall)).with_name("inner");
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(
+            Pipeline::new()
+                .add_stage(inner)
+                .add_stage(Says("here is what I found")),
+        )
+        .run_streaming(&mut ctx)
+        .collect()
+        .await;
+
+        assert_eq!(chunks(&events), ["here is what I found"]);
+    }
+
+    /// `run` returns the response; the mark on it is the loop's business and
+    /// must not be left in run scope for whoever reads it next.
+    #[tokio::test]
+    async fn run_leaves_no_mark_behind() {
+        let mut ctx = ctx();
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(FramesACall))
+            .run(&mut ctx)
+            .await
+            .unwrap();
+
+        assert!(outcome.response.unwrap().contains("tool_call"));
+        assert!(ctx.get_run::<ControlResponse>().is_none());
+    }
+
+    /// `with_name` promises nested loops are distinguishable in events.
+    #[tokio::test]
+    async fn loop_events_carry_the_loop_name() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (body, _) = rounds(1);
+        AgentLoop::new(body)
+            .with_name("planner")
+            .run(&mut ctx().with_events(tx))
+            .await
+            .unwrap();
+
+        let mut names = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                PipelineEvent::LoopIterationStarted { loop_name, .. }
+                | PipelineEvent::LoopCompleted { loop_name, .. } => names.push(loop_name),
+                _ => {}
+            }
+        }
+        assert_eq!(names, ["planner", "planner"]);
     }
 }

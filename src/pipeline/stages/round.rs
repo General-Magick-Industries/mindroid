@@ -70,11 +70,11 @@
 use async_openai::types::chat::ChatCompletionRequestMessage;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use super::tool_executor::{assistant_turn, execute_local, tool_turn};
+use super::tool_executor::{assistant_turn, execute_local, tool_turn, user_turn};
 use super::tool_executor_xml::{
-    PendingRemoteCalls, RemoteResultGate, declares_tool_result, frame_remote_call,
+    PendingRemoteCalls, RemoteResultGate, SUMMARY_PROMPT, declares_tool_result, frame_remote_call,
     registry_for_turn, remote_executor_for, remote_timeout_for, tool_context_for, truncate_str,
 };
 use crate::core::agent_loop::{Continue, ControlResponse, StopReason};
@@ -222,12 +222,15 @@ impl PipelineStage for LlmRound {
 /// A loop that hits the cap stops with a round unanswered: the model asked for
 /// tools, got their results, and never replied, so the carried response is the
 /// last round's prose — typically "let me check". `ToolExecutorStage` closes
-/// that gap itself with one call offering no tools; a split round cannot, since
-/// the cap belongs to the loop, so this is that call as a `finish` stage.
+/// that gap itself; a split round cannot, since the cap belongs to the loop, so
+/// this is the executor's closing request as a `finish` stage: the transcript,
+/// the same instruction to answer from what the tools returned, and no tools.
 ///
 /// It reads the loop's [`StopReason`] from run scope and does nothing on any
 /// other exit: a settled turn already has its reply, and a halt means stop.
-/// An empty answer leaves the carried response in place.
+/// The turn already has text, so the summary only ever improves it: an empty
+/// answer or a failed request leaves the carried response in place, the
+/// failure logged rather than raised.
 ///
 /// ```rust,ignore
 /// let llm = LlmRound::new(client, registry);
@@ -254,15 +257,23 @@ impl PipelineStage for CapSummary {
         let Some(Transcript(messages)) = ctx.get_run::<Transcript>() else {
             return Ok(());
         };
+        let mut messages = messages.clone();
+        messages.push(user_turn(SUMMARY_PROMPT)?);
 
         debug!("CapSummary: the loop hit its cap, asking for an answer without tools");
         // No tools on the request — the model must answer, not call.
-        let outcome = self
+        match self
             .client
-            .chat_with_tools(messages.clone(), &[], self.model.as_deref())
-            .await?;
-        if !outcome.content.trim().is_empty() {
-            ctx.response = Some(outcome.content);
+            .chat_with_tools(messages, &[], self.model.as_deref())
+            .await
+        {
+            Ok(outcome) if !outcome.content.trim().is_empty() => {
+                ctx.response = Some(outcome.content);
+            }
+            Ok(_) => debug!("CapSummary: empty answer, keeping the last round's text"),
+            Err(e) => {
+                warn!("CapSummary: summary request failed, keeping the last round's text: {e}")
+            }
         }
         Ok(())
     }
@@ -379,7 +390,7 @@ impl PipelineStage for ToolRound {
             // The envelope is for the client, not the listener: a loop that
             // speaks its passes must not read it aloud.
             ctx.response = Some(framed);
-            ctx.set(ControlResponse);
+            ControlResponse::mark(ctx);
             return Ok(());
         }
 
@@ -896,6 +907,67 @@ mod tests {
             "the summary sees the tool's result: {}",
             bodies[1]
         );
+        assert!(
+            bodies[1].contains(&SUMMARY_PROMPT[..40]),
+            "the same closing instruction the executor sends: {}",
+            bodies[1]
+        );
+    }
+
+    fn at_the_cap_with(text: &str) -> Context {
+        let mut ctx = ctx();
+        ctx.set(StopReason::MaxIterations);
+        ctx.set(Transcript::default());
+        ctx.response = Some(text.into());
+        ctx
+    }
+
+    /// The turn already has text; a summary that cannot be had must not turn
+    /// it into an error that loses what the rounds produced.
+    #[tokio::test]
+    async fn a_failed_cap_summary_keeps_the_carried_response() {
+        let (reg, _) = mixed_registry();
+        // Unroutable on purpose: the request fails.
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(
+            "http://127.0.0.1:1/v1",
+        ))
+        .unwrap();
+        let mut ctx = at_the_cap_with("Let me check");
+
+        LlmRound::new(client, reg)
+            .cap_summary()
+            .process(&mut ctx)
+            .await
+            .expect("a failed summary is not a failed turn");
+
+        assert_eq!(ctx.response.as_deref(), Some("Let me check"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_cap_summary_keeps_the_carried_response() {
+        use super::super::tool_executor::fake_llm::{completion, serve_completions};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(
+            listener,
+            vec![completion(json!({"role": "assistant", "content": "  "}))],
+        );
+        let (reg, _) = mixed_registry();
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let mut ctx = at_the_cap_with("Let me check");
+
+        LlmRound::new(client, reg)
+            .cap_summary()
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(ctx.response.as_deref(), Some("Let me check"));
     }
 
     /// Every other exit either has its reply already or must not get one: a

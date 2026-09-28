@@ -614,10 +614,10 @@ impl PipelineStage for XmlToolExecutorStage {
 
         // A loop whose body is this stage speaks each pass; the envelope is
         // for the client, not the listener.
-        if end == LoopEnd::Remote {
-            ctx.set(crate::core::agent_loop::ControlResponse);
-        }
         ctx.response = Some(final_content);
+        if end == LoopEnd::Remote {
+            crate::core::agent_loop::ControlResponse::mark(ctx);
+        }
         Ok(())
     }
 }
@@ -774,15 +774,9 @@ impl StreamingStage for XmlToolExecutorStage {
                         load_ids.push(id);
                     }
 
-                    let result = match registry.get(&name) {
-                        Some(tool) => match tool.execute(args, &tool_ctx).await {
-                            Ok(out) => out,
-                            Err(e) => format!("Error: {e}"),
-                        },
-                        None => format!("Error: unknown tool '{name}'"),
-                    };
-
-                    tracing::debug!("XmlToolExecutorStage: tool '{}' executed → {} bytes: {:?}", name, result.len(), truncate_str(&result, 120));
+                    let result = super::tool_executor::execute_parsed(&registry, &tool_ctx, &name, args)
+                        .await
+                        .unwrap_or_else(|e| e);
 
                     yield StreamEvent::ToolResult {
                         name: name.clone(),
@@ -846,10 +840,10 @@ impl StreamingStage for XmlToolExecutorStage {
                 final_content = summary;
             }
 
-            if remote {
-                ctx.set(crate::core::agent_loop::ControlResponse);
-            }
             ctx.response = Some(final_content.clone());
+            if remote {
+                crate::core::agent_loop::ControlResponse::mark(ctx);
+            }
             yield StreamEvent::Complete { content: final_content, usage: None };
         })
     }
@@ -1064,21 +1058,9 @@ async fn run_tool_loop(
             if let Some(id) = get_artifact_id(&name, &args) {
                 load_ids.push(id);
             }
-            let result = match registry.get(&name) {
-                Some(tool) => tool
-                    .execute(args, tool_ctx)
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {e}")),
-                None => format!("Error: unknown tool '{name}'"),
-            };
-            // Same line the streaming path logs — this fallback is what hosts
-            // without a streaming consumer actually run, and it was silent.
-            tracing::debug!(
-                "XmlToolExecutorStage: tool '{}' executed → {} bytes: {:?}",
-                name,
-                result.len(),
-                truncate_str(&result, 120)
-            );
+            let result = super::tool_executor::execute_parsed(registry, tool_ctx, &name, args)
+                .await
+                .unwrap_or_else(|e| e);
             results_msg.push_str(&crate::tools::remote::tool_result_envelope(&name, &result));
         }
         #[cfg(feature = "artifacts")]

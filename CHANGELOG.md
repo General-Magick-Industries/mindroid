@@ -138,7 +138,8 @@ wildcard arm; this is the last release in which adding an event breaks you.
 
 `LoopCompleted` carries `reason: StopReason`. `StopReason` is exported from the
 crate root and serializes in snake_case (`"max_iterations"`), so a consumer
-parsing the event stream sees it as a string field.
+parsing the event stream sees it as a string field. Both loop events carry
+`loop_name`, the loop's `with_name`, so nested loops can be told apart.
 
 ### Added
 
@@ -158,13 +159,18 @@ parsing the event stream sees it as a string field.
 - `TranscriptCompaction`: drops the oldest whole rounds once the transcript
   passes a budget, keeping the system prompt, the newest user message and the
   newest round.
-- `CapSummary`, from `LlmRound::cap_summary()`: a `finish` stage that asks for
-  an answer without tools when the loop stopped at its iteration cap. The loop
-  puts its `StopReason` in run scope while `finish` runs.
+- `CapSummary`, from `LlmRound::cap_summary()`: a `finish` stage that makes
+  the executor's closing request — the same instruction to answer, no tools —
+  when the loop stopped at its iteration cap. An empty or failed answer keeps
+  the text the turn already had. The loop puts its `StopReason` in run scope
+  while `finish` runs, and a loop nested in `finish` hands the enclosing loop's
+  back.
 - `run_streaming` speaks a body with no streaming stage one pass at a time:
-  each pass's prose becomes one `Chunk`. A response marked `ControlResponse` — a
-  framed remote call — is never spoken. `ToolRound` and both tool executors set
-  the mark; a stage of your own sets it with `ctx.set(ControlResponse)`.
+  each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
+  supplies is spoken as the last one. A response marked with
+  `ControlResponse::mark` — a framed remote call — is never spoken. `ToolRound`
+  and both tool executors mark theirs; a stage of your own calls
+  `ControlResponse::mark(ctx)` after setting `ctx.response`.
 
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
