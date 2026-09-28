@@ -129,6 +129,9 @@ on purpose.
   flag an executor interprets, so the XML/JSON divergence on it does not
   reappear in the split stages.
 - `PipelineEvent` gains `LoopIterationStarted` and `LoopCompleted`.
+- `ToolRound` runs tools through the same `execute_local` as
+  `ToolExecutorStage`, so a failed call reads the same to the model whichever
+  executor ran it, and each call gets the same log line.
 - Nothing existing changes behaviour: no preset, example or embedder uses
   `AgentLoop` unless it opts in, and a body with no loop-aware stage runs once.
 - `LlmRound`/`ToolRound` keep `ToolExecutorStage`'s remote-tool wire contract

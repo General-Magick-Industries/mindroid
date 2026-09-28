@@ -72,7 +72,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::debug;
 
-use super::tool_executor::{assistant_turn, tool_turn};
+use super::tool_executor::{assistant_turn, execute_local, tool_turn};
 use super::tool_executor_xml::{
     PendingRemoteCalls, RemoteResultGate, declares_tool_result, frame_remote_call,
     registry_for_turn, remote_executor_for, remote_timeout_for, tool_context_for, truncate_str,
@@ -319,20 +319,14 @@ impl PipelineStage for ToolRound {
         for call in &calls {
             // Every declared id must be answered or the provider rejects the
             // next request, so a failure is a result, never a skipped turn.
-            let result = match registry.get(&call.name) {
-                None => format!("Error: no tool named '{}'", call.name),
-                Some(tool) => match parse_args(&call.arguments) {
-                    Err(e) => format!("Error: arguments are not valid JSON: {e}"),
-                    Ok(args) => match tool.execute(args, &tool_ctx).await {
-                        Ok(output) => {
-                            ends_turn |= tool.ends_turn();
-                            output
-                        }
-                        Err(e) => format!("Error: {e}"),
-                    },
-                },
-            };
-            transcript.0.push(tool_turn(&call.id, result)?);
+            // Only a call that ran ends the turn: a failed one loops back so the
+            // model sees the error and can retry.
+            let executed = execute_local(&registry, &tool_ctx, call).await;
+            ends_turn |=
+                executed.is_ok() && registry.get(&call.name).is_some_and(|t| t.ends_turn());
+            transcript
+                .0
+                .push(tool_turn(&call.id, executed.unwrap_or_else(|e| e))?);
         }
 
         ctx.set(transcript);
