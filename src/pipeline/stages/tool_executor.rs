@@ -230,7 +230,7 @@ pub(crate) fn tool_turn(call_id: &str, result: String) -> Result<ChatCompletionR
         .into())
 }
 
-fn user_turn(text: &str) -> Result<ChatCompletionRequestMessage> {
+pub(crate) fn user_turn(text: &str) -> Result<ChatCompletionRequestMessage> {
     Ok(ChatCompletionRequestUserMessageArgs::default()
         .content(text)
         .build()
@@ -269,24 +269,44 @@ pub(crate) async fn execute_local(
     } else {
         serde_json::from_str::<serde_json::Value>(&call.arguments)
     };
-    let outcome = match args {
-        Err(e) => Err(format!("Error: invalid arguments JSON: {e}")),
-        Ok(args) => match registry.get(&call.name) {
-            Some(tool) => tool
-                .execute(args, tool_ctx)
-                .await
-                .map_err(|e| format!("Error: {e}")),
-            None => Err(format!("Error: unknown tool '{}'", call.name)),
-        },
+    match args {
+        Ok(args) => execute_parsed(registry, tool_ctx, &call.name, args).await,
+        Err(e) => {
+            let text = format!("Error: invalid arguments JSON: {e}");
+            log_executed(&call.name, &text);
+            Err(text)
+        }
+    }
+}
+
+/// Execute one call whose arguments are already parsed — the XML executor
+/// parses its own `<tool_call>` markup and enters here. One lookup, one error
+/// format and one log line for every executor.
+pub(crate) async fn execute_parsed(
+    registry: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    name: &str,
+    args: serde_json::Value,
+) -> std::result::Result<String, String> {
+    let outcome = match registry.get(name) {
+        Some(tool) => tool
+            .execute(args, tool_ctx)
+            .await
+            .map_err(|e| format!("Error: {e}")),
+        None => Err(format!("Error: unknown tool '{name}'")),
     };
     let (Ok(text) | Err(text)) = &outcome;
+    log_executed(name, text);
+    outcome
+}
+
+fn log_executed(name: &str, text: &str) {
     debug!(
         "tool '{}' executed → {} bytes: {:?}",
-        call.name,
+        name,
         text.len(),
         truncate_str(text, 120)
     );
-    outcome
 }
 
 enum LoopOutcome {
@@ -583,10 +603,11 @@ impl PipelineStage for ToolExecutorStage {
         let (outcome, _events) = self.run_loop(ctx).await?;
         // A loop whose body is this stage speaks each pass; the envelope is
         // for the client, not the listener.
-        if outcome.is_remote() {
-            ctx.set(crate::core::agent_loop::ControlResponse);
-        }
+        let remote = outcome.is_remote();
         ctx.response = Some(outcome.into_text());
+        if remote {
+            crate::core::agent_loop::ControlResponse::mark(ctx);
+        }
         Ok(())
     }
 }
@@ -722,11 +743,12 @@ impl StreamingStage for ToolExecutorStage {
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
-                    if outcome.is_remote() {
-                        ctx.set(crate::core::agent_loop::ControlResponse);
-                    }
+                    let remote = outcome.is_remote();
                     let final_content = outcome.into_text();
                     ctx.response = Some(final_content.clone());
+                    if remote {
+                        crate::core::agent_loop::ControlResponse::mark(ctx);
+                    }
                     yield StreamEvent::Complete { content: final_content, usage: None };
                 }
             }

@@ -8,7 +8,8 @@
 //! body  : TranscriptCompaction          — before every model call
 //!         LlmRound                      — one call, records the tool calls
 //!         ToolRound                     — runs them, asks for another pass
-//! finish: PostProcessor                 — once
+//! finish: CapSummary                    — answers without tools if the cap cut it off
+//!         PostProcessor                 — once
 //! ```
 //!
 //! Run against any OpenAI-compatible endpoint:
@@ -77,6 +78,8 @@ async fn main() -> anyhow::Result<()> {
     let llm = LlmRound::new(client, registry);
     let tools = llm.tool_round();
     let result_gate = tools.result_gate();
+    // At the cap the last round only promised an answer; this asks for one.
+    let summary = llm.cap_summary();
 
     let agent = AgentLoop::new(
         Pipeline::new()
@@ -89,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
             .add_stage(result_gate)
             .add_stage(SimpleContextBuilder::with_prompt(SYSTEM)),
     )
-    .with_finish(Pipeline::new().add_stage(PostProcessor))
+    .with_finish(Pipeline::new().add_stage(summary).add_stage(PostProcessor))
     .with_max_iterations(args.max_iterations);
 
     let mut ctx = Context::new(

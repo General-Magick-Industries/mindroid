@@ -137,14 +137,20 @@ on purpose.
   tools, got their results, and never replied. `ToolExecutorStage` closes that
   with one call offering no tools. The loop cannot make it without knowing the
   round stages, so `finish` sees the `StopReason` in run scope for the length of
-  the phase, and `LlmRound::cap_summary` is the stage that makes the call.
+  the phase, and `LlmRound::cap_summary` is the stage that makes the call — the
+  executor's request, `SUMMARY_PROMPT` included. A loop nested in a parent's
+  `finish` sets the parent's reason aside and restores it. Under
+  `run_streaming` the answer is spoken as a last `Chunk`, since `finish` is not
+  a pass.
 - `run_streaming` speaks a body with no streaming stage one pass at a time — the
   pass's prose as one `Chunk` when it ends — because `LlmRound` and `ToolRound`
   are ordinary stages and would otherwise leave TTS silent for the whole turn. A
   framed remote call is never spoken: `ToolRound` and both tool executors mark it
-  as control traffic with `ControlResponse`, which is public so an embedder's own
-  stage can do the same. A body with a streaming stage is left to that stage.
-- `ToolRound` runs tools through the same `execute_local` as
+  as control traffic with `ControlResponse::mark`, which is public so an
+  embedder's own stage can do the same. The mark names the response it covers,
+  so prose a later stage writes over it is still spoken. A body with a streaming
+  stage is left to that stage.
+- `ToolRound` and `XmlToolExecutorStage` run tools through the same path as
   `ToolExecutorStage`, so a failed call reads the same to the model whichever
   executor ran it, and each call gets the same log line.
 - Nothing existing changes behaviour: no preset, example or embedder uses
