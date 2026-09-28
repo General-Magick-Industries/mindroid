@@ -130,6 +130,12 @@ Both non-streaming calls (`chat`, `chat_with_tools`) are now bounded by a
 `stream_chat` keeps its unbounded body read and long generations are not
 truncated.
 
+#### 7. `PipelineEvent` is now `#[non_exhaustive]`
+
+`AgentLoop` added `LoopIterationStarted` and `LoopCompleted`, and each execution
+model adds its own events. A `match` on `PipelineEvent` outside this crate needs a
+wildcard arm; this is the last release in which adding an event breaks you.
+
 ### Added
 
 - **Live affect on the MagickMind persona prompt.** `EpisodeIngestStage` reads

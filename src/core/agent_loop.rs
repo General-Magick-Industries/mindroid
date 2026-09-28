@@ -42,6 +42,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::core::context::Context;
@@ -73,7 +74,11 @@ pub const DEFAULT_LOOP_ITERATIONS: usize = 20;
 pub struct Continue;
 
 /// Why the loop stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Reported on [`LoopOutcome`] and on [`PipelineEvent::LoopCompleted`], the
+/// only place a streaming caller sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// No stage asked for another pass.
     Settled,
@@ -328,6 +333,7 @@ impl AgentLoop {
             ctx.emit_event(PipelineEvent::LoopCompleted {
                 iterations,
                 elapsed: started.elapsed(),
+                reason,
             });
             debug!("AgentLoop::run_streaming {reason:?} after {iterations} iteration(s)");
 
@@ -380,6 +386,7 @@ impl AgentLoop {
         ctx.emit_event(PipelineEvent::LoopCompleted {
             iterations,
             elapsed,
+            reason,
         });
         info!("AgentLoop settled: {reason:?} after {iterations} iteration(s) in {elapsed:.2?}");
 
@@ -1184,5 +1191,38 @@ mod tests {
             events.last(),
             Some(StreamEvent::Complete { content, .. }) if content == "the answer"
         ));
+    }
+
+    fn loop_completed(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PipelineEvent>) -> StopReason {
+        let mut reason = None;
+        while let Ok(event) = rx.try_recv() {
+            if let PipelineEvent::LoopCompleted { reason: r, .. } = event {
+                assert!(reason.replace(r).is_none(), "one LoopCompleted per turn");
+            }
+        }
+        reason.expect("the loop reports its completion")
+    }
+
+    /// `run_streaming` returns events, not a `LoopOutcome`, so the event is
+    /// the only place a streaming caller learns why the loop stopped.
+    #[tokio::test]
+    async fn loop_completed_reports_why_the_loop_stopped() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (body, _) = rounds(1);
+        AgentLoop::new(body)
+            .run(&mut ctx().with_events(tx))
+            .await
+            .unwrap();
+        assert_eq!(loop_completed(&mut rx), StopReason::Settled);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (body, _) = rounds(10);
+        let mut ctx = ctx().with_events(tx);
+        let _: Vec<_> = AgentLoop::new(body)
+            .with_max_iterations(2)
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+        assert_eq!(loop_completed(&mut rx), StopReason::MaxIterations);
     }
 }
