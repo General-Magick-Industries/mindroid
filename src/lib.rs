@@ -66,7 +66,9 @@ pub use config::{
     AgentConfig, MindroidConfig, ModelConfig, OpenToolConfig, ProviderConfig, ShellToolConfig,
     ToolsConfig,
 };
-pub use core::agent_loop::{AgentLoop, Continue, DEFAULT_LOOP_ITERATIONS, LoopOutcome, StopReason};
+pub use core::agent_loop::{
+    AgentLoop, Continue, ControlResponse, DEFAULT_LOOP_ITERATIONS, LoopOutcome, StopReason,
+};
 pub use core::content::{ContentPart, ContentSource};
 pub use core::context::Context;
 pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};

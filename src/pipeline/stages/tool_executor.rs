@@ -581,6 +581,11 @@ impl PipelineStage for ToolExecutorStage {
             return Ok(());
         }
         let (outcome, _events) = self.run_loop(ctx).await?;
+        // A loop whose body is this stage speaks each pass; the envelope is
+        // for the client, not the listener.
+        if outcome.is_remote() {
+            ctx.set(crate::core::agent_loop::ControlResponse);
+        }
         ctx.response = Some(outcome.into_text());
         Ok(())
     }
@@ -716,6 +721,9 @@ impl StreamingStage for ToolExecutorStage {
                     // never spoken prose — Chunk feeds TTS (ADR-0008).
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
+                    }
+                    if outcome.is_remote() {
+                        ctx.set(crate::core::agent_loop::ControlResponse);
                     }
                     let final_content = outcome.into_text();
                     ctx.response = Some(final_content.clone());
@@ -1345,6 +1353,59 @@ mod tests {
         assert!(
             complete.contains("\"type\":\"tool_call\""),
             "Complete must still carry the envelope: {complete}"
+        );
+    }
+
+    /// As a loop body this stage runs through `process`, so the body has no
+    /// streaming stage and the loop speaks each pass itself. The envelope has
+    /// to be marked, or the loop reads it aloud.
+    #[tokio::test]
+    async fn a_speaking_loop_does_not_read_this_stages_remote_call_aloud() {
+        use futures::StreamExt;
+
+        let reply = json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1", "type": "function",
+                        "function": {"name": "take_photo", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(listener, vec![reply]);
+
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
+        let agent = crate::core::agent_loop::AgentLoop::new(
+            crate::pipeline::Pipeline::new().add_stage(stage),
+        );
+
+        let mut ctx = fresh_ctx();
+        let events: Vec<StreamEvent> = agent.run_streaming(&mut ctx).collect().await;
+        server.await.unwrap();
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Chunk { .. })),
+            "the envelope must not be spoken: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(StreamEvent::Complete { content, .. }) if content.contains("\"type\":\"tool_call\"")
+            ),
+            "the turn still delivers the envelope: {events:?}"
         );
     }
 
