@@ -582,7 +582,7 @@ impl PipelineStage for XmlToolExecutorStage {
             store: self.artifact_store(),
             scope: ctx.message.channel_id.clone(),
         };
-        let (mut messages, mut final_content, hit_max) = run_tool_loop(
+        let (mut messages, mut final_content, end) = run_tool_loop(
             LoopDeps {
                 client: &self.client,
                 registry: &registry,
@@ -599,7 +599,7 @@ impl PipelineStage for XmlToolExecutorStage {
         )
         .await?;
 
-        if hit_max {
+        if end == LoopEnd::HitMax {
             messages.push(LlmMessage::user(SUMMARY_PROMPT.to_string()));
             let mut llm_stream = self.client.stream_chat_tracked(ChatRequest {
                 messages: &messages,
@@ -622,6 +622,11 @@ impl PipelineStage for XmlToolExecutorStage {
             final_content = summary;
         }
 
+        // A loop whose body is this stage speaks each pass; the envelope is
+        // for the client, not the listener.
+        if end == LoopEnd::Remote {
+            ctx.set(crate::core::agent_loop::ControlResponse);
+        }
         ctx.response = Some(final_content);
         Ok(())
     }
@@ -660,6 +665,7 @@ impl StreamingStage for XmlToolExecutorStage {
 
             let mut final_content = String::new();
             let mut hit_max = false;
+            let mut remote = false;
 
             for iteration in 0..self.max_iterations {
                 debug!("XmlToolExecutorStage: iteration {}", iteration + 1);
@@ -765,6 +771,7 @@ impl StreamingStage for XmlToolExecutorStage {
                         remote_timeout_for(&registry, name),
                     );
                     final_content = framed;
+                    remote = true;
                     break;
                 }
 
@@ -868,6 +875,9 @@ impl StreamingStage for XmlToolExecutorStage {
                 final_content = summary;
             }
 
+            if remote {
+                ctx.set(crate::core::agent_loop::ControlResponse);
+            }
             ctx.response = Some(final_content.clone());
             yield StreamEvent::Complete { content: final_content, usage: None };
         })
@@ -1011,15 +1021,27 @@ struct LoopDeps<'a> {
     artifacts: &'a ArtifactReinjection,
 }
 
-/// Returns `(messages, final_content, hit_max)`:
+/// How [`run_tool_loop`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopEnd {
+    /// The model answered without calling a tool.
+    Answered,
+    /// `max_iterations` stopped the loop; `final_content` is empty.
+    HitMax,
+    /// A remote call was framed as `final_content` for the client to run.
+    Remote,
+}
+
+/// Returns `(messages, final_content, end)`:
 /// - `messages` is the updated conversation (including all tool rounds).
-/// - `final_content` is the LLM's last plain-text response (empty if `hit_max`).
-/// - `hit_max` is `true` when the loop was stopped by `max_iterations`.
+/// - `final_content` is the LLM's last plain-text response, or the framed
+///   remote call when `end` is [`LoopEnd::Remote`].
+/// - `end` is how the loop stopped.
 async fn run_tool_loop(
     deps: LoopDeps<'_>,
     tool_ctx: &ToolContext,
     mut messages: Vec<LlmMessage>,
-) -> Result<(Vec<LlmMessage>, String, bool)> {
+) -> Result<(Vec<LlmMessage>, String, LoopEnd)> {
     let LoopDeps {
         client,
         registry,
@@ -1032,7 +1054,7 @@ async fn run_tool_loop(
         artifacts,
     } = deps;
     let mut final_content = String::new();
-    let mut hit_max = false;
+    let mut end = LoopEnd::Answered;
 
     for iteration in 0..max_iterations {
         let mut llm_stream = client.stream_chat_tracked(ChatRequest {
@@ -1086,6 +1108,7 @@ async fn run_tool_loop(
                 remote_timeout_for(registry, name),
             );
             final_content = framed;
+            end = LoopEnd::Remote;
             break;
         }
 
@@ -1128,12 +1151,12 @@ async fn run_tool_loop(
                 "XmlToolExecutorStage: reached max iterations ({})",
                 max_iterations
             );
-            hit_max = true;
+            end = LoopEnd::HitMax;
             break;
         }
     }
 
-    Ok((messages, final_content, hit_max))
+    Ok((messages, final_content, end))
 }
 
 /// Read an artifact id from a tool call's args BEFORE `execute` consumes `args`.
@@ -1355,6 +1378,49 @@ mod tests {
                 sock.shutdown().await.ok();
             }
         })
+    }
+
+    /// As a loop body this stage runs through `process`, so the loop speaks
+    /// each pass itself; the framed call has to be marked or it is read aloud.
+    #[tokio::test]
+    async fn a_speaking_loop_does_not_read_this_stages_remote_call_aloud() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_sse(
+            listener,
+            vec![r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#.into()],
+        );
+
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(registry),
+        );
+        let agent = crate::core::agent_loop::AgentLoop::new(
+            crate::pipeline::Pipeline::new().add_stage(stage),
+        );
+
+        let mut ctx = gate_ctx("hi");
+        let events: Vec<StreamEvent> = agent.run_streaming(&mut ctx).collect().await;
+        server.await.unwrap();
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Chunk { .. })),
+            "the envelope must not be spoken: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(StreamEvent::Complete { content, .. }) if content.contains("\"type\":\"tool_call\"")
+            ),
+            "the turn still delivers the envelope: {events:?}"
+        );
     }
 
     /// The XML stage's non-streaming `process` recorded an outstanding remote

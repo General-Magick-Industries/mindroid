@@ -77,11 +77,15 @@ pub struct Continue;
 /// client — a framed remote call — rather than prose, so
 /// [`AgentLoop::run_streaming`] never speaks it as a `Chunk`.
 ///
+/// `ToolRound`, `ToolExecutorStage` and `XmlToolExecutorStage` set it whenever
+/// they frame a remote call. A stage of your own that leaves control traffic on
+/// `ctx.response` sets it the same way: `ctx.set(ControlResponse)`.
+///
 /// It describes the response it travels with, so only a new pass clears it —
 /// never `finish`. A loop nested as a stage hands a framed response back to its
 /// parent's body, and a streaming parent must still see the mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ControlResponse;
+pub struct ControlResponse;
 
 /// Why the loop stopped.
 ///

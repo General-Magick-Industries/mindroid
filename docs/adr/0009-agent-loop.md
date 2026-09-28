@@ -141,8 +141,9 @@ on purpose.
 - `run_streaming` speaks a body with no streaming stage one pass at a time — the
   pass's prose as one `Chunk` when it ends — because `LlmRound` and `ToolRound`
   are ordinary stages and would otherwise leave TTS silent for the whole turn. A
-  framed remote call is never spoken: `ToolRound` marks it as control traffic in
-  run scope. A body with a streaming stage is left to that stage.
+  framed remote call is never spoken: `ToolRound` and both tool executors mark it
+  as control traffic with `ControlResponse`, which is public so an embedder's own
+  stage can do the same. A body with a streaming stage is left to that stage.
 - `ToolRound` runs tools through the same `execute_local` as
   `ToolExecutorStage`, so a failed call reads the same to the model whichever
   executor ran it, and each call gets the same log line.
