@@ -13,7 +13,6 @@ pub mod stt;
 mod tool_executor;
 mod tool_executor_xml;
 #[cfg(feature = "transport-audio")]
-pub(crate) use tool_executor_xml::{registry_for_turn, tool_context_for};
 #[cfg(feature = "llm-client")]
 pub mod tts;
 

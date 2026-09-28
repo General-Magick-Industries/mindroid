@@ -5,8 +5,8 @@ use crate::memory::Memory;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
-    AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionControl,
-    SessionState, TranscriptSource, TurnDetection, Usage,
+    AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionState,
+    TranscriptSource, TurnDetection, Usage,
 };
 use crate::pipeline::stages::stt::SttProvider;
 use crate::tools::{Tool, ToolContext};
@@ -183,7 +183,6 @@ pub struct OmniSession {
     pending_transcriptions: Vec<(oneshot::Sender<Option<String>>, Vec<u8>)>,
     stt_tasks: JoinSet<()>,
     usage_total: Usage,
-    control: SessionControl,
 }
 
 fn history_turn(message: Message, agent_id: &str) -> Option<HistoryTurn> {
@@ -220,7 +219,6 @@ impl OmniSession {
 
     fn tool_context(&self) -> ToolContext {
         let mut ctx = ToolContext::default();
-        ctx.set(self.control.clone());
         if let Some(conv) = &self.conversation {
             ctx.channel_id = conv.channel_id.clone();
             ctx.sender_id = conv.sender_id.clone();
@@ -733,12 +731,6 @@ impl OmniSession {
                             if let Some(ref sink) = self.audio_sink {
                                 sink.flush().await?;
                             }
-                            if self.control.end_requested() {
-                                tracing::info!("session ended by a tool after the turn");
-                                self.state = SessionState::Closed;
-                                let _ = self.provider.disconnect().await;
-                                break;
-                            }
                             self.state = SessionState::Listening;
                         }
                         Some(OmniEvent::Error(e)) => {
@@ -956,12 +948,6 @@ impl OmniSession {
                         Some(OmniEvent::TurnComplete) => {
                             if let Some(ref sink) = self.audio_sink {
                                 sink.flush().await?;
-                            }
-                            if self.control.end_requested() {
-                                tracing::info!("session ended by a tool after the turn");
-                                self.state = SessionState::Closed;
-                                let _ = self.provider.disconnect().await;
-                                break;
                             }
                             self.state = SessionState::Listening;
                         }
@@ -1187,7 +1173,6 @@ impl OmniSessionBuilder {
             pending_transcriptions: Vec::new(),
             stt_tasks: JoinSet::new(),
             usage_total: Usage::default(),
-            control: SessionControl::default(),
         })
     }
 }
@@ -1619,76 +1604,6 @@ mod tests {
         assert_eq!(chunks[0].data, vec![1]);
         assert_eq!(chunks[1].data, vec![2]);
         assert_eq!(chunks[2].data, vec![3]);
-    }
-
-    struct HangUpTool;
-
-    #[async_trait]
-    impl Tool for HangUpTool {
-        fn name(&self) -> &str {
-            "hang_up"
-        }
-
-        fn description(&self) -> &str {
-            "Ends the session"
-        }
-
-        fn parameters_schema(&self) -> Value {
-            serde_json::json!({ "type": "object", "properties": {} })
-        }
-
-        async fn execute(
-            &self,
-            _args: Value,
-            ctx: &crate::tools::ToolContext,
-        ) -> crate::error::Result<String> {
-            ctx.get::<SessionControl>()
-                .expect("the session hands every tool a SessionControl")
-                .end_after_turn();
-            Ok("closing after this turn".into())
-        }
-    }
-
-    /// The tool asks for the end; the session honours it only once the turn the
-    /// model is speaking has completed, so the goodbye plays out.
-    #[tokio::test]
-    async fn a_tool_can_end_the_session_after_the_turn() {
-        let (provider, tx) = RecordingProvider::new();
-        let disconnected = Arc::clone(&provider.disconnected);
-        let mut session = OmniSession::builder()
-            .provider(provider)
-            .tool(HangUpTool)
-            .build()
-            .unwrap();
-
-        let driver = tokio::spawn(async move {
-            tx.send(OmniEvent::ToolCall {
-                id: "c1".into(),
-                name: "hang_up".into(),
-                args: serde_json::json!({}),
-            })
-            .await
-            .unwrap();
-            tx.send(OmniEvent::Transcript {
-                text: "Goodbye!".into(),
-                is_final: true,
-                source: TranscriptSource::Output,
-            })
-            .await
-            .unwrap();
-            tx.send(OmniEvent::TurnComplete).await.unwrap();
-            // The stream stays open: the session must leave on its own.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            drop(tx);
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), session.run())
-            .await
-            .expect("session should end at the TurnComplete, not wait for the stream")
-            .unwrap();
-        assert_eq!(session.state(), SessionState::Closed);
-        assert!(*disconnected.lock().unwrap());
-        driver.abort();
     }
 
     /// A ToolCall event executes the named tool and sends back the result.

@@ -132,12 +132,6 @@ truncated.
 - `OpenAiSttConfig.language` (ISO-639-1) — set it; without a hint short clips are
   transcribed in random languages.
 - `CpalAudio::new_split` / `into_parts`.
-- `omni::stage` (feature `transport-audio`): `OmniStage` runs a realtime provider
-  in the LLM slot of a turn pipeline, `LiveAudioSink` streams the reply as it is
-  generated rather than after it completes, and `VOICE_INSTRUCTION` adapts a
-  persona written for text so it answers as speech.
-- `SessionControl`, handed to every tool through `ToolContext`: a tool can end
-  the session, honoured at `TurnComplete` so a spoken goodbye plays out first.
 - Gemini `TurnDetection::Manual`: the provider brackets the user's turn with
   `activityStart`/`activityEnd`. The server VAD was already disabled in the setup
   frame, but nothing marked the boundaries, so the model never answered.

@@ -7,8 +7,6 @@ pub mod mock;
 pub mod openai_realtime;
 pub mod provider;
 pub mod session;
-#[cfg(feature = "transport-audio")]
-pub mod stage;
 pub mod types;
 pub mod vad;
 
@@ -25,8 +23,6 @@ pub use gemini::{GeminiLiveConfig, GeminiLiveProvider};
 pub use openai_realtime::{OpenAiRealtimeConfig, OpenAiRealtimeProvider};
 pub use provider::OmniProvider;
 pub use session::{OmniSession, OmniSessionBuilder};
-#[cfg(feature = "transport-audio")]
-pub use stage::{LiveAudioSink, OmniBackend, OmniStage, OmniTurnUsage, VOICE_INSTRUCTION};
 pub use types::*;
 pub use vad::{VadDecision, VadState, VadStateMachine};
 
