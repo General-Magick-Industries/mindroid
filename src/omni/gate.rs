@@ -26,7 +26,7 @@ use crate::memory::Memory;
 use crate::omni::audio::{AudioSink, AudioSource};
 use crate::omni::provider::OmniProvider;
 use crate::omni::session::{OmniSession, ToolContextInit};
-use crate::omni::types::{AudioChunk, BargeInMode, OmniConfig};
+use crate::omni::types::{AudioChunk, BargeInMode, OmniConfig, TurnDetection};
 use crate::pipeline::stages::stt::SttProvider;
 use crate::tools::{Tool, ToolContext};
 use crate::voice::types::VadConfig;
@@ -327,13 +327,28 @@ impl VoiceGate {
         n: usize,
     ) -> Result<Live, MindroidError> {
         let (tx, rx) = mpsc::channel(256);
+        let mut lost = 0usize;
         for chunk in replay {
-            let _ = tx.try_send(chunk);
+            if tx.try_send(chunk).is_err() {
+                lost += 1;
+            }
+        }
+        if lost > 0 {
+            tracing::warn!(
+                lost,
+                "voice gate: preroll longer than the session queue; the opening words were truncated"
+            );
         }
         let cancel = self.cancel.child_token();
         // The gate already runs a detector on this microphone. Left at `LocalVad`
         // the session loads a second Silero model per open and feeds both from one
         // mic; `ServerOnly` keeps interruption, minus the duplicate.
+        //
+        // This one is rewritten rather than refused because `LocalVad` is the
+        // default: refusing it would reject every caller who never named a
+        // barge-in mode. `TurnDetection::Local` is always an explicit choice and
+        // carries a `VadConfig` this would have to discard, so `build` rejects
+        // that instead of silently changing what the caller asked for.
         let mut config = self.config.clone();
         if matches!(config.barge_in, BargeInMode::LocalVad) {
             config.barge_in = BargeInMode::ServerOnly;
@@ -552,6 +567,20 @@ impl VoiceGateBuilder {
     /// Returns [`MindroidError::Config`] when the provider factory, detector or
     /// audio source is missing.
     pub fn build(self) -> Result<VoiceGate, MindroidError> {
+        // `OmniSession` starts its own Silero whenever turn detection *or* barge-in
+        // is local (`session.rs`, "Determine whether local VAD paths are active").
+        // The gate already owns a detector on the same microphone, and a second one
+        // is both wasted inference and a parked blocking worker. Barge-in is handled
+        // per-session in `open`; turn detection cannot be, because rewriting it to
+        // `Server` would hand turn-taking to the provider and throw away the
+        // caller's `VadConfig` without saying so.
+        if matches!(self.config.turn_detection, TurnDetection::Local(_)) {
+            return Err(MindroidError::config(
+                "VoiceGate owns local speech detection, so a session cannot also run \
+                 TurnDetection::Local — use TurnDetection::Server or ::Manual, or drive \
+                 OmniSession directly without the gate",
+            ));
+        }
         Ok(VoiceGate {
             provider: self
                 .provider
@@ -741,6 +770,45 @@ mod tests {
         let p = d.speech_probability(&silence);
         assert!(p < 0.3, "silence scored {p}");
         assert!(SileroDetector::new(44_100).is_err());
+    }
+
+    /// The gate owns detection on this microphone. A session that also ran local
+    /// turn detection would load a second Silero and park a second blocking
+    /// worker — the pair that deadlocked the gate in the first place.
+    #[test]
+    fn local_turn_detection_is_refused() {
+        let opened: Opened = Arc::default();
+        // `VoiceGate` is not `Debug`, so `unwrap_err` is unavailable here.
+        let built = VoiceGate::builder()
+            .provider(factory(&opened))
+            .detector(Scripted)
+            .audio_source(Paced {
+                chunks: vec![],
+                gap: Duration::from_millis(10),
+            })
+            .config(OmniConfig {
+                turn_detection: TurnDetection::Local(VadConfig::default()),
+                ..OmniConfig::default()
+            })
+            .build();
+        let Err(err) = built else {
+            panic!("TurnDetection::Local must be refused");
+        };
+        assert!(
+            err.to_string().contains("TurnDetection::Local"),
+            "the error must name what to change; got: {err}"
+        );
+    }
+
+    /// The default config must still build and open — `barge_in` defaults to
+    /// `LocalVad` and is rewritten per session rather than rejected, so the
+    /// common path must not hit the refusal above. `open` spawns the session
+    /// task, hence the runtime.
+    #[tokio::test]
+    async fn the_default_config_is_accepted_and_still_opens() {
+        let opened: Opened = Arc::default();
+        let g = gate(vec![], Duration::from_secs(5), &opened);
+        assert!(g.open(16_000, 1, vec![], 1).is_ok());
     }
 
     #[test]

@@ -10,6 +10,25 @@ listed under **Breaking Changes** with a migration note.
 
 ### Breaking Changes
 
+#### 0. `OmniEvent` and `OmniConfig` grew for realtime providers
+
+`OmniEvent::Transcript` gained a required `source: TranscriptSource` field;
+`OmniEvent` gained `SessionEnding`, `ResumptionHandle` and `Usage` and is now
+`#[non_exhaustive]`; `OmniConfig` gained `history: Vec<HistoryTurn>`.
+
+```rust
+// before
+OmniEvent::Transcript { text, is_final }
+match event { OmniEvent::AudioChunk(_) => …, /* every variant */ }
+OmniConfig { turn_detection, barge_in, system_prompt, tools_schema, voice }
+// after
+OmniEvent::Transcript { text, is_final, source: TranscriptSource::Output }
+match event { OmniEvent::AudioChunk(_) => …, _ => {} }   // wildcard arm required
+OmniConfig { history: Vec::new(), ..OmniConfig::default() }
+```
+
+`is_final: true` now means the complete text for that turn and source.
+
 #### 1. Tool-protocol traffic is declared, not sniffed
 
 Tool manifests, per-turn tools and tool results were located by parsing
@@ -136,7 +155,6 @@ truncated.
   `activityStart`/`activityEnd`. The server VAD was already disabled in the setup
   frame, but nothing marked the boundaries, so the model never answered.
 
-
 - `ToolExecutorStage::with_parallel_tool_calls(bool)`: when a model asks for
   several tools in one response, run them at the same time instead of one
   after another, at most `MAX_PARALLEL_TOOL_CALLS` (8) at once. Results go back
@@ -239,7 +257,6 @@ truncated.
   both callers propagate with `?` — one repeated name ended the turn.
 - The user's transcript logs at DEBUG, not INFO, matching the session's other
   transcript lines.
-
 
 - `XmlToolExecutorStage` recorded an outstanding remote call under
   `ToolContext::channel_id` — the workspace id on any transport that stamps
