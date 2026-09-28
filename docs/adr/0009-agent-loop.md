@@ -133,6 +133,11 @@ on purpose.
   `LoopOutcome`, so the event is the only place a streaming caller sees it.
   `PipelineEvent` becomes `#[non_exhaustive]`, since each execution model adds
   events.
+- `run_streaming` speaks a body with no streaming stage one pass at a time — the
+  pass's prose as one `Chunk` when it ends — because `LlmRound` and `ToolRound`
+  are ordinary stages and would otherwise leave TTS silent for the whole turn. A
+  framed remote call is never spoken: `ToolRound` marks it as control traffic in
+  run scope. A body with a streaming stage is left to that stage.
 - `ToolRound` runs tools through the same `execute_local` as
   `ToolExecutorStage`, so a failed call reads the same to the model whichever
   executor ran it, and each call gets the same log line.

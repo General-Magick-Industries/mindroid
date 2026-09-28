@@ -272,6 +272,11 @@ impl Pipeline {
         Ok(ctx.response.take())
     }
 
+    /// Whether one of this pipeline's stages streams its own events.
+    pub(crate) fn has_streaming_stage(&self) -> bool {
+        self.streaming_idx.is_some()
+    }
+
     /// Run the pipeline with streaming. Returns a stream of `StreamEvent`s.
     ///
     /// Pre-streaming stages run before the first event is yielded.

@@ -73,6 +73,16 @@ pub const DEFAULT_LOOP_ITERATIONS: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Continue;
 
+/// Set in run scope by a body stage whose response is control traffic for the
+/// client — a framed remote call — rather than prose, so
+/// [`AgentLoop::run_streaming`] never speaks it as a `Chunk`.
+///
+/// It describes the response it travels with, so only a new pass clears it —
+/// never `finish`. A loop nested as a stage hands a framed response back to its
+/// parent's body, and a streaming parent must still see the mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlResponse;
+
 /// Why the loop stopped.
 ///
 /// Reported on [`LoopOutcome`] and on [`PipelineEvent::LoopCompleted`], the
@@ -204,6 +214,7 @@ impl AgentLoop {
             }
 
             ctx.take::<Continue>();
+            ctx.take::<ControlResponse>();
             ctx.emit_event(PipelineEvent::LoopIterationStarted {
                 iteration: iterations,
             });
@@ -244,6 +255,17 @@ impl AgentLoop {
     /// turn's; the turn emits one `Complete` at the end, reporting what the
     /// whole loop spent rather than only its last round.
     ///
+    /// **A body with no streaming stage is spoken one pass at a time.**
+    /// `LlmRound` and `ToolRound` are ordinary stages, so a pass through them
+    /// yields no `Chunk` of its own, and TTS would hear nothing for the whole
+    /// turn. The loop yields each such pass's prose as one `Chunk` when the pass
+    /// ends — after its tools ran, since the pass is the unit. It skips a
+    /// response a stage marked as control traffic (a framed remote call), empty
+    /// prose, and a pass the cancellation token cut short. A body that does have
+    /// a streaming stage is left to it: that stage already chose what to speak.
+    /// Like `Pipeline::run_streaming`'s chunks, these carry the text before
+    /// `finish`; the final `Complete` carries it after.
+    ///
     /// **An `Error` from a pass ends the turn**, which is stricter than
     /// [`Pipeline::run_streaming`]: there a streaming stage's `Error` is
     /// forwarded and the post-streaming stages still run, so the pipeline
@@ -255,6 +277,7 @@ impl AgentLoop {
     pub fn run_streaming<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         Box::pin(async_stream::stream! {
             let started = Instant::now();
+            let speaks_passes = !self.body.has_streaming_stage();
 
             let mut carried = match self.setup.run(ctx).await {
                 Ok(text) => text,
@@ -279,6 +302,7 @@ impl AgentLoop {
                     }
 
                     ctx.take::<Continue>();
+                    ctx.take::<ControlResponse>();
                     ctx.emit_event(PipelineEvent::LoopIterationStarted { iteration: iterations });
 
                     // `Pipeline::run_streaming` ends its stream on an error; the
@@ -307,7 +331,15 @@ impl AgentLoop {
 
                     // The streaming pipeline leaves the pass's text on the context
                     // rather than returning it; carry it the way `run` does.
+                    let control = ctx.take::<ControlResponse>().is_some();
                     if let Some(text) = ctx.response.take() {
+                        if speaks_passes
+                            && !control
+                            && !ctx.cancel.is_cancelled()
+                            && !text.trim().is_empty()
+                        {
+                            yield StreamEvent::Chunk { content: text.clone() };
+                        }
                         carried = Some(text);
                     }
 
@@ -1191,6 +1223,159 @@ mod tests {
             events.last(),
             Some(StreamEvent::Complete { content, .. }) if content == "the answer"
         ));
+    }
+
+    fn chunks(events: &[StreamEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Chunk { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `LlmRound` and `ToolRound` are ordinary stages, so a body built from
+    /// them streams nothing of its own; without the loop speaking each pass,
+    /// TTS hears nothing for the whole turn.
+    #[tokio::test]
+    async fn a_body_with_no_streaming_stage_is_spoken_one_pass_at_a_time() {
+        let (body, _) = rounds(3);
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(body).run_streaming(&mut ctx).collect().await;
+
+        assert_eq!(chunks(&events), ["round 1", "round 2", "round 3"]);
+        let complete = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Complete { .. }))
+            .expect("the turn completes");
+        assert_eq!(complete, events.len() - 1, "every chunk precedes Complete");
+    }
+
+    /// A framed remote call is an envelope for the client, not prose.
+    #[tokio::test]
+    async fn a_control_response_is_never_spoken() {
+        struct Frames;
+
+        #[async_trait]
+        impl PipelineStage for Frames {
+            fn name(&self) -> &str {
+                "frames"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.response = Some(r#"{"type":"tool_call"}"#.into());
+                ctx.set(ControlResponse);
+                Ok(())
+            }
+        }
+
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_stage(Frames))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert!(chunks(&events).is_empty(), "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Complete { content, .. }) if content.contains("tool_call")
+        ));
+        assert!(
+            ctx.get_run::<ControlResponse>().is_none(),
+            "the marker is per pass and must not outlive the loop"
+        );
+    }
+
+    /// An inner loop that frames a remote call hands the envelope back to its
+    /// parent's body as that pass's response; a streaming parent must not speak
+    /// it just because the inner loop's `finish` has run.
+    #[tokio::test]
+    async fn a_nested_loops_control_response_is_not_spoken_by_its_parent() {
+        struct Frames;
+
+        #[async_trait]
+        impl PipelineStage for Frames {
+            fn name(&self) -> &str {
+                "frames"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.response = Some(r#"{"type":"tool_call"}"#.into());
+                ctx.set(ControlResponse);
+                Ok(())
+            }
+        }
+
+        let inner = AgentLoop::new(Pipeline::new().add_stage(Frames)).with_name("inner");
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_stage(inner))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert!(chunks(&events).is_empty(), "{events:?}");
+    }
+
+    /// A pass with nothing to say says nothing — no empty utterance for TTS.
+    #[tokio::test]
+    async fn blank_prose_is_not_spoken() {
+        struct Blank;
+
+        #[async_trait]
+        impl PipelineStage for Blank {
+            fn name(&self) -> &str {
+                "blank"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.response = Some("  ".into());
+                Ok(())
+            }
+        }
+
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_stage(Blank))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert!(chunks(&events).is_empty(), "{events:?}");
+    }
+
+    /// A streaming stage already decided what to speak; the loop adding its
+    /// own chunk would say everything twice.
+    #[tokio::test]
+    async fn a_streaming_body_is_not_spoken_twice() {
+        struct Streams;
+
+        #[async_trait]
+        impl PipelineStage for Streams {
+            fn name(&self) -> &str {
+                "streams"
+            }
+
+            async fn process(&self, _ctx: &mut Context) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::pipeline::StreamingStage for Streams {
+            fn stream<'a>(&'a self, _ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+                Box::pin(async_stream::stream! {
+                    yield StreamEvent::Chunk { content: "streamed".into() };
+                    yield StreamEvent::Complete { content: "streamed".into(), usage: None };
+                })
+            }
+        }
+
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_streaming_stage(Streams))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+
+        assert_eq!(chunks(&events), ["streamed"]);
     }
 
     fn loop_completed(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PipelineEvent>) -> StopReason {
