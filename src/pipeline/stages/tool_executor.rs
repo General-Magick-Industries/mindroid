@@ -256,7 +256,10 @@ fn needs_space(spoken: &str, next: &str) -> bool {
 /// Execute one local call against the registry. Argument JSON the model
 /// produced is parsed here; a malformed payload becomes an error RESULT the
 /// model can react to, never a dropped call. `Err` carries that text.
-async fn execute_local(
+///
+/// Shared with [`ToolRound`](super::ToolRound), so a failed call reads the same
+/// to the model whichever executor ran it.
+pub(crate) async fn execute_local(
     registry: &ToolRegistry,
     tool_ctx: &ToolContext,
     call: &NativeToolCall,
@@ -278,7 +281,7 @@ async fn execute_local(
     };
     let (Ok(text) | Err(text)) = &outcome;
     debug!(
-        "ToolExecutorStage: tool '{}' executed → {} bytes: {:?}",
+        "tool '{}' executed → {} bytes: {:?}",
         call.name,
         text.len(),
         truncate_str(text, 120)
