@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
-use crate::llm_client::{ChatRequest, LlmClient};
+use crate::llm_client::{ChatRequest, LlmClient, TrackedStreamEvent};
 use crate::models::{LlmMessage, Role, StreamEvent};
 use crate::pipeline::{PipelineStage, StreamingStage};
 
@@ -605,7 +605,7 @@ impl PipelineStage for XmlToolExecutorStage {
 
         if hit_max {
             messages.push(LlmMessage::user(SUMMARY_PROMPT.to_string()));
-            let mut llm_stream = self.client.stream_chat(ChatRequest {
+            let mut llm_stream = self.client.stream_chat_tracked(ChatRequest {
                 messages: &messages,
                 model: None,
                 temperature: None,
@@ -613,7 +613,7 @@ impl PipelineStage for XmlToolExecutorStage {
                 stream: true,
                 response_format: None,
             });
-            final_content = collect_llm_text(&mut llm_stream).await?;
+            (final_content, _) = collect_llm_text(&mut llm_stream).await?;
         }
 
         ctx.response = Some(final_content);
@@ -665,7 +665,7 @@ impl StreamingStage for XmlToolExecutorStage {
                 // stream_chat converts messages into owned OpenAI types immediately
                 // and returns a BoxStream<'static, StreamEvent>, so the borrow of
                 // `messages` ends as soon as stream_chat returns — before any .await.
-                let mut llm_stream = self.client.stream_chat(ChatRequest {
+                let mut llm_stream = self.client.stream_chat_tracked(ChatRequest {
                     messages: &messages,
                     model: None,
                     temperature: None,
@@ -675,6 +675,7 @@ impl StreamingStage for XmlToolExecutorStage {
                 });
 
                 let mut response_text = String::new();
+                let mut finished = false;
                 // Collect chunks without yielding — we don't know yet whether this
                 // iteration is a tool-call round or the final answer. Chunks are only
                 // forwarded to the caller once we confirm no tool calls are present.
@@ -682,21 +683,22 @@ impl StreamingStage for XmlToolExecutorStage {
 
                 while let Some(event) = llm_stream.next().await {
                     match event {
-                        StreamEvent::Chunk { ref content } => {
-                            response_text.push_str(content);
-                            collected_chunks.push(content.clone());
+                        TrackedStreamEvent::Event(StreamEvent::Chunk { content }) => {
+                            response_text.push_str(&content);
+                            collected_chunks.push(content);
                         }
-                        StreamEvent::Complete { ref content, .. } => {
+                        TrackedStreamEvent::Complete { content, finished: done, .. } => {
                             if !content.is_empty() {
-                                response_text = content.clone();
+                                response_text = content;
                             }
+                            finished = done;
                             // Don't yield Complete yet — we may still have tool rounds.
                         }
-                        StreamEvent::Error { .. } => {
+                        TrackedStreamEvent::Event(event @ StreamEvent::Error { .. }) => {
                             yield event;
                             return;
                         }
-                        other => {
+                        TrackedStreamEvent::Event(other) => {
                             yield other;
                         }
                     }
@@ -719,6 +721,11 @@ impl StreamingStage for XmlToolExecutorStage {
                     calls.len(),
                     calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
                 );
+
+                if let Some(why) = cut_off_mid_call(finished, &response_text, calls.len()) {
+                    yield StreamEvent::Error { message: why.into() };
+                    return;
+                }
 
                 if calls.is_empty() {
                     // No tool calls — this is the final answer. Now it's safe to
@@ -917,30 +924,48 @@ fn repair_json(s: &str) -> String {
     result
 }
 
-/// Drain a streaming LLM response into a plain `String`, returning an error on
-/// `StreamEvent::Error`. Used by both the non-streaming and streaming paths to
-/// avoid repeating the same match loop.
+/// Drain a streaming LLM response into a plain `String` and whether the model
+/// finished it, returning an error on `StreamEvent::Error`. Used by both the
+/// non-streaming and streaming paths to avoid repeating the same match loop.
 async fn collect_llm_text(
-    stream: &mut (impl futures::Stream<Item = StreamEvent> + Unpin),
-) -> Result<String> {
+    stream: &mut (impl futures::Stream<Item = TrackedStreamEvent> + Unpin),
+) -> Result<(String, bool)> {
     let mut text = String::new();
+    let mut finished = false;
     while let Some(event) = stream.next().await {
         match event {
-            StreamEvent::Chunk { content } => text.push_str(&content),
-            StreamEvent::Complete { content, .. } if !content.is_empty() => {
-                text = content;
+            TrackedStreamEvent::Event(StreamEvent::Chunk { content }) => text.push_str(&content),
+            TrackedStreamEvent::Complete {
+                content,
+                finished: done,
+                ..
+            } => {
+                if !content.is_empty() {
+                    text = content;
+                }
+                finished = done;
             }
-            StreamEvent::Error { message } => {
+            TrackedStreamEvent::Event(StreamEvent::Error { message }) => {
                 return Err(MindroidError::Pipeline {
                     stage: "XmlToolExecutorStage".into(),
                     message,
                     source: None,
                 });
             }
-            _ => {}
+            TrackedStreamEvent::Event(_) => {}
         }
     }
-    Ok(text)
+    Ok((text, finished))
+}
+
+/// Why a response is not a round to act on: the model was cut off (its token
+/// limit, or a stream that closed without a finish reason) after it had begun
+/// a tool call. A call it completed may belong to a plan it never finished
+/// writing, and one it did not complete would be spoken as prose. A cut-off
+/// response of prose alone is delivered as far as it got.
+fn cut_off_mid_call(finished: bool, text: &str, calls: usize) -> Option<&'static str> {
+    (!finished && (calls > 0 || text.contains("<tool_call")))
+        .then_some("the model's response was cut off partway through a tool call")
 }
 
 /// Run the tool-call iteration loop without streaming events to callers.
@@ -993,7 +1018,7 @@ async fn run_tool_loop(
     let mut hit_max = false;
 
     for iteration in 0..max_iterations {
-        let mut llm_stream = client.stream_chat(ChatRequest {
+        let mut llm_stream = client.stream_chat_tracked(ChatRequest {
             messages: &messages,
             model: None,
             temperature: None,
@@ -1002,7 +1027,7 @@ async fn run_tool_loop(
             response_format: None,
         });
 
-        let response_text = collect_llm_text(&mut llm_stream).await?;
+        let (response_text, finished) = collect_llm_text(&mut llm_stream).await?;
 
         tracing::info!(
             "XmlToolExecutorStage: iteration {} response ({} chars): {:?}",
@@ -1016,6 +1041,13 @@ async fn run_tool_loop(
             .into_iter()
             .map(|c| (c.name, c.arguments))
             .collect();
+        if let Some(why) = cut_off_mid_call(finished, &response_text, calls.len()) {
+            return Err(MindroidError::Pipeline {
+                stage: "XmlToolExecutorStage".into(),
+                message: why.into(),
+                source: None,
+            });
+        }
         if calls.is_empty() {
             final_content = response_text;
             break;
@@ -1244,16 +1276,29 @@ mod tests {
     use crate::tools::DEFAULT_REMOTE_CALL_TIMEOUT;
     use serde_json::json;
 
-    /// Serve one SSE chat completion per reply, then close. async-openai reads
-    /// an ordinary `data:` event stream, so a raw socket is enough to drive the
-    /// streaming client the non-streaming `process` path uses underneath.
+    /// Serve one SSE chat completion per reply, each finished with `stop`, then
+    /// close. async-openai reads an ordinary `data:` event stream, so a raw
+    /// socket is enough to drive the streaming client the non-streaming
+    /// `process` path uses underneath.
     fn serve_sse(
         listener: tokio::net::TcpListener,
         replies: Vec<String>,
     ) -> tokio::task::JoinHandle<()> {
+        serve_sse_ending(
+            listener,
+            replies.into_iter().map(|r| (r, Some("stop"))).collect(),
+        )
+    }
+
+    /// [`serve_sse`], with each reply's finish reason chosen; `None` closes the
+    /// stream without one.
+    fn serve_sse_ending(
+        listener: tokio::net::TcpListener,
+        replies: Vec<(String, Option<&'static str>)>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for reply in replies {
+            for (reply, finish) in replies {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 // Drain the request before replying, or the peer sees a reset.
                 let mut req = Vec::new();
@@ -1282,7 +1327,7 @@ mod tests {
                 }
                 let chunk = json!({
                     "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
-                    "choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": null}]
+                    "choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": finish}]
                 });
                 let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
                 let resp = format!(
@@ -2139,5 +2184,173 @@ Some text.
         );
         let turn = registry_for_turn(&ctx, &registry);
         assert_eq!(turn.get("lookup").unwrap().description(), "host's own");
+    }
+
+    /// Counts its runs, so a test can tell a call that ran from one refused.
+    struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl crate::tools::Tool for Counted {
+        fn name(&self) -> &str {
+            "lookup"
+        }
+        fn description(&self) -> &str {
+            "Look it up"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {"q": {"type": "string"}}})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("north gate".into())
+        }
+    }
+
+    const WHOLE_CALL: &str = r#"<tool_call>{"name": "lookup", "args": {"q": "x"}}</tool_call>"#;
+
+    /// Stream one reply ending with `finish` through a stage holding a counted
+    /// `lookup`, returning its events, how many calls ran, and the response.
+    async fn stream_ending(
+        reply: &str,
+        finish: Option<&'static str>,
+    ) -> (Vec<StreamEvent>, usize, Option<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_ending(listener, vec![(reply.to_string(), finish)]);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(ToolRegistry::new().register(Counted(ran.clone()))),
+        )
+        .with_max_iterations(1);
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "u", "ch")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+        (
+            events,
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            ctx.response,
+        )
+    }
+
+    fn ends_in_error(events: &[StreamEvent]) -> bool {
+        matches!(events.last(), Some(StreamEvent::Error { .. }))
+    }
+
+    /// Cut off at the token limit, a response runs none of its calls, not
+    /// even one that arrived whole.
+    #[tokio::test]
+    async fn a_response_cut_off_at_the_token_limit_runs_no_calls() {
+        let reply = format!(r#"{WHOLE_CALL} <tool_call>{{"name": "lookup", "args": {{"q": "#);
+        let (events, ran, _) = stream_ending(&reply, Some("length")).await;
+        assert!(ends_in_error(&events), "{events:?}");
+        assert_eq!(ran, 0);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCall { .. }))
+        );
+    }
+
+    /// A stream that closed without a finish reason is not trusted with a call.
+    #[tokio::test]
+    async fn a_call_in_a_stream_with_no_finish_reason_does_not_run() {
+        let (events, ran, _) = stream_ending(WHOLE_CALL, None).await;
+        assert!(ends_in_error(&events), "{events:?}");
+        assert_eq!(ran, 0);
+    }
+
+    /// A half-written call is an error, never tool syntax spoken as prose.
+    #[tokio::test]
+    async fn a_half_written_call_is_not_spoken() {
+        let reply = r#"Sure. <tool_call>{"name": "lookup", "args": {"q": "#;
+        let (events, ran, response) = stream_ending(reply, Some("length")).await;
+        assert!(ends_in_error(&events), "{events:?}");
+        assert_eq!(ran, 0);
+        assert!(!events.iter().any(
+            |e| matches!(e, StreamEvent::Chunk { content } if content.contains("<tool_call"))
+        ));
+        assert!(response.is_none());
+    }
+
+    /// Prose cut off at the token limit is delivered as far as it got.
+    #[tokio::test]
+    async fn prose_cut_off_at_the_token_limit_is_delivered() {
+        let (events, _, response) = stream_ending("The gate is at the", Some("length")).await;
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Complete { content, .. }) if content == "The gate is at the"),
+            "{events:?}"
+        );
+        assert_eq!(response.as_deref(), Some("The gate is at the"));
+    }
+
+    /// Not every endpoint sends a finish reason, so prose without one still
+    /// arrives.
+    #[tokio::test]
+    async fn prose_with_no_finish_reason_is_delivered() {
+        let (events, _, response) = stream_ending("The north gate.", None).await;
+        assert!(!ends_in_error(&events), "{events:?}");
+        assert_eq!(response.as_deref(), Some("The north gate."));
+    }
+
+    /// A filtered response is an error, not an empty reply delivered as one.
+    #[tokio::test]
+    async fn a_filtered_response_is_an_error() {
+        let (events, _, response) = stream_ending("", Some("content_filter")).await;
+        assert!(ends_in_error(&events), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Complete { .. }))
+        );
+        assert!(response.is_none());
+    }
+
+    /// The non-streaming `process` path holds the same line.
+    #[tokio::test]
+    async fn process_refuses_a_call_cut_off_at_the_token_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_ending(listener, vec![(WHOLE_CALL.to_string(), Some("length"))]);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(ToolRegistry::new().register(Counted(ran.clone()))),
+        );
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "u", "ch")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        let err = stage.process(&mut ctx).await.unwrap_err();
+        assert!(err.to_string().contains("cut off"), "{err}");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `GenericLlmProcessor` reads `stream_chat` directly, so a filtered
+    /// response reaches it as an error too.
+    #[tokio::test]
+    async fn the_plain_processor_reports_a_filtered_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_ending(listener, vec![(String::new(), Some("content_filter"))]);
+        let stage = crate::pipeline::stages::GenericLlmProcessor::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+        );
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "u", "ch")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        assert!(stage.process(&mut ctx).await.is_err());
+        assert!(ctx.response.is_none());
     }
 }

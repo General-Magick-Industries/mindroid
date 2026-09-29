@@ -177,6 +177,19 @@ pub enum ToolsStreamEvent {
     Error(String),
 }
 
+/// One step of [`LlmClient::stream_chat_tracked`].
+pub(crate) enum TrackedStreamEvent {
+    /// Anything but the close, as [`LlmClient::stream_chat`] yields it.
+    Event(StreamEvent),
+    /// The close. `finished` is false when the model was cut off at its token
+    /// limit or the stream closed without a finish reason.
+    Complete {
+        content: String,
+        usage: Option<TokenUsage>,
+        finished: bool,
+    },
+}
+
 /// Most tool calls one streamed response may carry; a response with more
 /// ends its round with [`ToolsStreamEvent::Error`].
 pub const MAX_STREAMED_TOOL_CALLS: usize = 128;
@@ -862,7 +875,25 @@ impl LlmClient {
     // ── Streaming ────────────────────────────────────────────────────────
 
     /// Send a streaming chat request. Returns a `BoxStream<'static, StreamEvent>`.
+    ///
+    /// A response the provider filtered is an [`StreamEvent::Error`], never an
+    /// empty reply. One cut off at the token limit, or whose stream closed
+    /// without a finish reason, still completes with what arrived.
     pub fn stream_chat(&self, req: ChatRequest<'_>) -> BoxStream<'static, StreamEvent> {
+        Box::pin(self.stream_chat_tracked(req).map(|event| match event {
+            TrackedStreamEvent::Event(event) => event,
+            TrackedStreamEvent::Complete { content, usage, .. } => {
+                StreamEvent::Complete { content, usage }
+            }
+        }))
+    }
+
+    /// [`stream_chat`](Self::stream_chat), whose closing event also says whether
+    /// the model finished, for a caller that must not act on a cut-off reply.
+    pub(crate) fn stream_chat_tracked(
+        &self,
+        req: ChatRequest<'_>,
+    ) -> BoxStream<'static, TrackedStreamEvent> {
         let messages = Self::convert_messages(req.messages);
         let model = self.resolve_model(req.model).to_string();
         let temperature = self.resolve_temperature(req.temperature);
@@ -881,9 +912,9 @@ impl LlmClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    yield StreamEvent::Error {
+                    yield TrackedStreamEvent::Event(StreamEvent::Error {
                         message: format!("Failed to build request: {e}"),
-                    };
+                    });
                     return;
                 }
             };
@@ -904,9 +935,9 @@ impl LlmClient {
             let body = match body_with_extras(&request, &extra_body) {
                 Ok(b) => b,
                 Err(e) => {
-                    yield StreamEvent::Error {
+                    yield TrackedStreamEvent::Event(StreamEvent::Error {
                         message: format!("Failed to serialize request: {e}"),
-                    };
+                    });
                     return;
                 }
             };
@@ -920,9 +951,9 @@ impl LlmClient {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    yield StreamEvent::Error {
+                    yield TrackedStreamEvent::Event(StreamEvent::Error {
                         message: format!("API error: {e}"),
-                    };
+                    });
                     return;
                 }
             };
@@ -933,7 +964,7 @@ impl LlmClient {
             while let Some(result) = response_stream.next().await {
                 match result {
                     Err(e) => {
-                        yield StreamEvent::Error { message: format!("{e}") };
+                        yield TrackedStreamEvent::Event(StreamEvent::Error { message: format!("{e}") });
                         return;
                     }
                     Ok(chunk) => {
@@ -952,31 +983,49 @@ impl LlmClient {
                                 && !content.is_empty()
                             {
                                 accumulated.push_str(content);
-                                yield StreamEvent::Chunk {
+                                yield TrackedStreamEvent::Event(StreamEvent::Chunk {
                                     content: content.clone(),
-                                };
+                                });
                             }
 
                             // Check for terminal finish reasons
                             match choice.finish_reason {
                                 Some(FinishReason::Stop) | Some(FinishReason::ToolCalls) => {
-                                    yield StreamEvent::Complete {
+                                    yield TrackedStreamEvent::Complete {
                                         content: accumulated.clone(),
                                         usage: final_usage.clone(),
+                                        finished: true,
                                     };
                                     return;
                                 }
-                                _ => {}
+                                Some(FinishReason::Length) => {
+                                    yield TrackedStreamEvent::Complete {
+                                        content: accumulated.clone(),
+                                        usage: final_usage.clone(),
+                                        finished: false,
+                                    };
+                                    return;
+                                }
+                                Some(reason) => {
+                                    let message = unfinished(reason, false)
+                                        .unwrap_or("the model's response ended unexpectedly")
+                                        .to_string();
+                                    yield TrackedStreamEvent::Event(StreamEvent::Error { message });
+                                    return;
+                                }
+                                None => {}
                             }
                         }
                     }
                 }
             }
 
-            // Stream ended without explicit stop
-            yield StreamEvent::Complete {
+            // Stream ended without explicit stop. Not every endpoint sends a
+            // finish reason, so the text still completes, marked unfinished.
+            yield TrackedStreamEvent::Complete {
                 content: accumulated,
                 usage: final_usage,
+                finished: false,
             };
         };
 
