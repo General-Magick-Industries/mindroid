@@ -166,12 +166,13 @@ Four differences to know: the XML stage yields `ToolCall`/`ToolResult` live,
 mid-loop, while the JSON stage's rounds are non-streaming API calls by default,
 so its events replay once the loop ends — `with_streaming(true)` streams each
 round instead, prose as it arrives (including prose written alongside a tool
-call, which the XML stage holds back) and tool events per round; the JSON stage re-attaches artifacts as a
-follow-up `user` turn rather than on the tool result, because OpenAI's `tool`
-role carries text alone; only the JSON stage honours `Tool::ends_turn`, so a
-self-delivering tool on the XML stage may be re-called, up to the iteration cap;
-and only the JSON stage can run a response's calls concurrently
-(`with_parallel_tool_calls`, at most `MAX_PARALLEL_TOOL_CALLS` at once).
+call, which the XML stage holds back) and tool events per round; the JSON
+stage re-attaches artifacts as a follow-up `user` turn rather than on the tool
+result, because OpenAI's `tool` role carries text alone; only the JSON stage
+honours `Tool::ends_turn`, so a self-delivering tool on the XML stage may be
+re-called, up to the iteration cap; and only the JSON stage can run a
+response's calls concurrently (`with_parallel_tool_calls`, at most
+`MAX_PARALLEL_TOOL_CALLS` at once).
 
 **The JSON stage cannot run against Cortex.** Cortex's ReasonService is
 deliberately not an OpenAI drop-in — its `ChatMessage` has no `tool` role and no

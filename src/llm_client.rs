@@ -181,6 +181,22 @@ pub enum ToolsStreamEvent {
 /// ends its round with [`ToolsStreamEvent::Error`].
 pub const MAX_STREAMED_TOOL_CALLS: usize = 128;
 
+/// Why a response that ended with `reason` is not a round to act on, or `None`
+/// when the model finished it. Only `stop` and `tool_calls` are finishes: at
+/// `length` the model was cut off mid-write, so a call it completed may belong
+/// to a plan it never finished composing, and at `content_filter` the provider
+/// withheld the reply.
+fn unfinished(reason: FinishReason) -> Option<&'static str> {
+    match reason {
+        FinishReason::Stop | FinishReason::ToolCalls => None,
+        FinishReason::Length => Some("the model hit its token limit before it finished"),
+        FinishReason::ContentFilter => Some("the provider's content filter stopped the response"),
+        FinishReason::FunctionCall => {
+            Some("the model answered with a legacy function_call, which this client does not read")
+        }
+    }
+}
+
 /// Tool calls assembled from a round's streamed fragments. A call arrives in
 /// pieces keyed by `index`: its id and name first, its arguments spread over
 /// later fragments. The index is the provider's, so it keys a call rather than
@@ -484,9 +500,9 @@ impl LlmClient {
     ) -> crate::Result<ToolsChatOutcome> {
         let body = self.tools_request(messages, tools, model, false)?;
 
-        // The shared http client carries only a connect timeout, because a full
-        // reqwest timeout spans the body read and would truncate `stream_chat`.
-        // Non-streaming calls bound themselves here instead.
+        // The shared http client bounds the connect and each read, not the whole
+        // request: a total reqwest timeout spans the body read and would
+        // truncate `stream_chat`. Non-streaming calls bound themselves here.
         let response: CreateChatCompletionResponse =
             tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create_byot(body))
                 .await
@@ -509,6 +525,10 @@ impl LlmClient {
             ..Default::default()
         };
         if let Some(choice) = response.choices.into_iter().next() {
+            // A missing reason is accepted here: a non-streamed body is whole.
+            if let Some(why) = choice.finish_reason.and_then(unfinished) {
+                return Err(Self::pipeline_err(why.to_string()));
+            }
             outcome.content = choice.message.content.unwrap_or_default();
             outcome.tool_calls = choice
                 .message
@@ -537,7 +557,10 @@ impl LlmClient {
     /// model writes it, and the tool calls, which stream in fragments, are
     /// assembled into the closing [`ToolsStreamEvent::Done`]. Each chunk must
     /// arrive within `LLM_REQUEST_TIMEOUT` of the last, and a stream that ends
-    /// before the model finished is an error rather than a round.
+    /// before the model finished — cut off, out of tokens, or filtered — is an
+    /// error rather than a round. The outcome's `usage` is always `None`: the
+    /// request does not ask for `stream_options.include_usage`, which not every
+    /// OpenAI-compatible endpoint accepts.
     pub fn stream_chat_with_tools(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
@@ -590,17 +613,16 @@ impl LlmClient {
                         return;
                     }
                 };
-                if let Some(u) = chunk.usage {
-                    outcome.usage = Some(TokenUsage {
-                        prompt_tokens: u.prompt_tokens,
-                        completion_tokens: u.completion_tokens,
-                        total_tokens: u.total_tokens,
-                    });
-                }
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
-                finished |= choice.finish_reason.is_some();
+                if let Some(reason) = choice.finish_reason {
+                    if let Some(why) = unfinished(reason) {
+                        yield ToolsStreamEvent::Error(why.into());
+                        return;
+                    }
+                    finished = true;
+                }
                 for fragment in choice.delta.tool_calls.unwrap_or_default() {
                     if let Err(e) = calls.add(fragment) {
                         yield ToolsStreamEvent::Error(e);
@@ -798,9 +820,9 @@ impl LlmClient {
         let body = body_with_extras(&request, &self.config.extra_body)
             .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))?;
 
-        // The shared http client carries only a connect timeout, because a full
-        // reqwest timeout spans the body read and would truncate `stream_chat`.
-        // Non-streaming calls bound themselves here instead.
+        // The shared http client bounds the connect and each read, not the whole
+        // request: a total reqwest timeout spans the body read and would
+        // truncate `stream_chat`. Non-streaming calls bound themselves here.
         let response: CreateChatCompletionResponse =
             tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create_byot(body))
                 .await

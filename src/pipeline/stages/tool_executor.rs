@@ -584,6 +584,14 @@ impl PipelineStage for ToolExecutorStage {
     }
 }
 
+/// Record what a streamed turn already said before it failed. The caller
+/// heard those chunks, so the turn's history should hold them too.
+fn keep_spoken(ctx: &mut Context, spoken: &str) {
+    if !spoken.is_empty() {
+        ctx.response = Some(spoken.to_string());
+    }
+}
+
 impl StreamingStage for ToolExecutorStage {
     fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         Box::pin(async_stream::stream! {
@@ -632,18 +640,21 @@ impl StreamingStage for ToolExecutorStage {
                             }
                             ToolsStreamEvent::Done(outcome) => done = Some(outcome),
                             ToolsStreamEvent::Error(message) => {
+                                keep_spoken(ctx, &spoken);
                                 yield StreamEvent::Error { message };
                                 return;
                             }
                         }
                     }
                     let Some(done) = done else {
+                        keep_spoken(ctx, &spoken);
                         yield StreamEvent::Error { message: "the model's stream ended without a result".into() };
                         return;
                     };
                     let round = match self.dispatch_round(&deps, &mut messages, iteration, done, true).await {
                         Ok(round) => round,
                         Err(error) => {
+                            keep_spoken(ctx, &spoken);
                             yield StreamEvent::Error { message: error.to_string() };
                             return;
                         }
@@ -678,6 +689,7 @@ impl StreamingStage for ToolExecutorStage {
                             LoopOutcome::Answer(spoken)
                         }
                         Err(error) => {
+                            keep_spoken(ctx, &spoken);
                             yield StreamEvent::Error { message: error.to_string() };
                             return;
                         }
@@ -1789,5 +1801,126 @@ mod tests {
                 .any(|e| matches!(e, StreamEvent::ToolCall { .. }))
         );
         assert!(ctx.response.is_none());
+    }
+
+    /// A response cut off at the token limit is not a finished plan: none of
+    /// its calls run, not even the ones that arrived whole.
+    #[tokio::test]
+    async fn a_round_cut_off_at_the_token_limit_runs_no_calls() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round = sse(
+            vec![json!({"role": "assistant", "tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}},
+                {"index": 1, "id": "c2", "type": "function",
+                 "function": {"name": "lookup", "arguments": "{\"q\":"}}
+            ]})],
+            "length",
+        );
+        let _server = serve_completions(listener, vec![round]);
+
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Lookup)),
+        )
+        .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCall { .. }))
+        );
+    }
+
+    /// A filtered response is an error, not an empty reply delivered as one.
+    #[tokio::test]
+    async fn a_filtered_round_is_an_error() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round = sse(vec![json!({"role": "assistant"})], "content_filter");
+        let _server = serve_completions(listener, vec![round]);
+
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()))
+            .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Complete { .. }))
+        );
+        assert!(ctx.response.is_none());
+    }
+
+    /// The non-streamed round holds the same line on the token limit.
+    #[tokio::test]
+    async fn a_whole_response_cut_off_at_the_token_limit_is_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "length", "message": {
+                "role": "assistant", "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]
+            }}]
+        })
+        .to_string();
+        let _server = serve_completions(listener, vec![reply]);
+
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Lookup)),
+        );
+        let mut ctx = fresh_ctx();
+        let err = stage.process(&mut ctx).await.unwrap_err();
+        assert!(err.to_string().contains("token limit"), "{err}");
+    }
+
+    /// Prose already spoken before a stream failed stays in the turn's reply,
+    /// so history matches what the caller heard.
+    #[tokio::test]
+    async fn a_stream_that_fails_after_speaking_keeps_what_was_said() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cut = format!(
+            "data: {}\n\n",
+            json!({
+                "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "The gate is"},
+                    "finish_reason": null}]
+            })
+        );
+        let _server = serve_completions(listener, vec![cut]);
+
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()))
+            .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert_eq!(ctx.response.as_deref(), Some("The gate is"));
     }
 }
