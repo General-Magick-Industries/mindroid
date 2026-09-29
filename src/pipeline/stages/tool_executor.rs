@@ -1923,4 +1923,50 @@ mod tests {
         );
         assert_eq!(ctx.response.as_deref(), Some("The gate is"));
     }
+
+    /// Prose cut off at the token limit, with no call in it, is delivered as
+    /// far as it got rather than failing the turn.
+    #[tokio::test]
+    async fn a_prose_round_cut_off_at_the_token_limit_is_delivered() {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round = sse(
+            vec![json!({"role": "assistant", "content": "The gate is at the"})],
+            "length",
+        );
+        let _server = serve_completions(listener, vec![round]);
+
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()))
+            .with_streaming(true);
+        let mut ctx = fresh_ctx();
+        let events: Vec<_> = stage.stream(&mut ctx).collect().await;
+
+        assert_eq!(
+            streamed_events(&events),
+            ["chunk The gate is at the", "complete The gate is at the"]
+        );
+        assert_eq!(ctx.response.as_deref(), Some("The gate is at the"));
+    }
+
+    /// The non-streamed round delivers truncated prose the same way.
+    #[tokio::test]
+    async fn a_whole_prose_response_cut_off_at_the_token_limit_is_delivered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "length", "message": {
+                "role": "assistant", "content": "The gate is at the"
+            }}]
+        })
+        .to_string();
+        let _server = serve_completions(listener, vec![reply]);
+
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()));
+        let mut ctx = fresh_ctx();
+        stage.process(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response.as_deref(), Some("The gate is at the"));
+    }
 }

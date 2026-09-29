@@ -182,13 +182,15 @@ pub enum ToolsStreamEvent {
 pub const MAX_STREAMED_TOOL_CALLS: usize = 128;
 
 /// Why a response that ended with `reason` is not a round to act on, or `None`
-/// when the model finished it. Only `stop` and `tool_calls` are finishes: at
-/// `length` the model was cut off mid-write, so a call it completed may belong
-/// to a plan it never finished composing, and at `content_filter` the provider
+/// when it is. `stop` and `tool_calls` are finishes. At `length` the model was
+/// cut off mid-write: a call it completed may belong to a plan it never
+/// finished composing, so a round carrying calls is refused, while a round of
+/// prose alone is delivered as far as it got. At `content_filter` the provider
 /// withheld the reply.
-fn unfinished(reason: FinishReason) -> Option<&'static str> {
+fn unfinished(reason: FinishReason, has_calls: bool) -> Option<&'static str> {
     match reason {
         FinishReason::Stop | FinishReason::ToolCalls => None,
+        FinishReason::Length if !has_calls => None,
         FinishReason::Length => Some("the model hit its token limit before it finished"),
         FinishReason::ContentFilter => Some("the provider's content filter stopped the response"),
         FinishReason::FunctionCall => {
@@ -526,7 +528,15 @@ impl LlmClient {
         };
         if let Some(choice) = response.choices.into_iter().next() {
             // A missing reason is accepted here: a non-streamed body is whole.
-            if let Some(why) = choice.finish_reason.and_then(unfinished) {
+            let has_calls = choice
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty());
+            if let Some(why) = choice
+                .finish_reason
+                .and_then(|reason| unfinished(reason, has_calls))
+            {
                 return Err(Self::pipeline_err(why.to_string()));
             }
             outcome.content = choice.message.content.unwrap_or_default();
@@ -557,8 +567,8 @@ impl LlmClient {
     /// model writes it, and the tool calls, which stream in fragments, are
     /// assembled into the closing [`ToolsStreamEvent::Done`]. Each chunk must
     /// arrive within `LLM_REQUEST_TIMEOUT` of the last, and a stream that ends
-    /// before the model finished — cut off, out of tokens, or filtered — is an
-    /// error rather than a round. The outcome's `usage` is always `None`: the
+    /// before the model finished — cut off, filtered, or out of tokens partway
+    /// through a tool call — is an error rather than a round. The outcome's `usage` is always `None`: the
     /// request does not ask for `stream_options.include_usage`, which not every
     /// OpenAI-compatible endpoint accepts.
     pub fn stream_chat_with_tools(
@@ -596,7 +606,7 @@ impl LlmClient {
             };
             let mut outcome = ToolsChatOutcome::default();
             let mut calls = StreamedToolCalls::default();
-            let mut finished = false;
+            let mut finish = None;
             loop {
                 let next = match tokio::time::timeout(LLM_REQUEST_TIMEOUT, chunks.next()).await {
                     Ok(next) => next,
@@ -616,13 +626,7 @@ impl LlmClient {
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
-                if let Some(reason) = choice.finish_reason {
-                    if let Some(why) = unfinished(reason) {
-                        yield ToolsStreamEvent::Error(why.into());
-                        return;
-                    }
-                    finished = true;
-                }
+                finish = finish.or(choice.finish_reason);
                 for fragment in choice.delta.tool_calls.unwrap_or_default() {
                     if let Err(e) = calls.add(fragment) {
                         yield ToolsStreamEvent::Error(e);
@@ -634,11 +638,17 @@ impl LlmClient {
                     yield ToolsStreamEvent::Text(text);
                 }
             }
-            if !finished {
+            let Some(reason) = finish else {
                 yield ToolsStreamEvent::Error("the model's stream ended before it finished".into());
                 return;
-            }
+            };
+            // Any call begun counts, even one too partial to survive `finish`.
+            let has_calls = !calls.0.is_empty();
             outcome.tool_calls = calls.finish();
+            if let Some(why) = unfinished(reason, has_calls) {
+                yield ToolsStreamEvent::Error(why.into());
+                return;
+            }
             yield ToolsStreamEvent::Done(outcome);
         })
     }
