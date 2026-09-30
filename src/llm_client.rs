@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-/// Bounds one non-streaming LLM request. A tool loop runs up to
-/// `DEFAULT_MAX_ITERATIONS` of these in sequence. Never apply it to a streaming
-/// client: reqwest's timeout spans the body read, which would truncate a long
-/// generation mid-stream.
+/// Bounds one non-streaming LLM request, and any wait between reads of a
+/// response, streamed or not. A tool loop runs up to `DEFAULT_MAX_ITERATIONS`
+/// of these in sequence. Never set it as reqwest's `timeout`: that spans the
+/// whole body read, which would truncate a long generation mid-stream.
 pub(crate) const LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,12 +24,12 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
-        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
-        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-        ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionRequestUserMessageContentPart, ChatCompletionTool, ChatCompletionTools,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
         CreateChatCompletionStreamResponse, FinishReason, FunctionObject, ImageUrl,
         ReasoningEffort, ResponseFormat,
     },
@@ -162,6 +162,101 @@ pub struct ToolsChatOutcome {
     pub content: String,
     pub tool_calls: Vec<NativeToolCall>,
     pub usage: Option<TokenUsage>,
+}
+
+/// One step of a streamed tool round
+/// ([`stream_chat_with_tools`](LlmClient::stream_chat_with_tools)).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ToolsStreamEvent {
+    /// Prose, as it arrives.
+    Text(String),
+    /// The round finished: all of its prose and its tool calls, assembled.
+    Done(ToolsChatOutcome),
+    /// The round failed; nothing further follows.
+    Error(String),
+}
+
+/// Most tool calls one streamed response may carry; a response with more
+/// ends its round with [`ToolsStreamEvent::Error`].
+pub const MAX_STREAMED_TOOL_CALLS: usize = 128;
+
+/// Why a response that ended with `reason` is not a round to act on, or `None`
+/// when it is. `stop` and `tool_calls` are finishes. At `length` the model was
+/// cut off mid-write: a call it completed may belong to a plan it never
+/// finished composing, so a round carrying calls is refused, while a round of
+/// prose alone is delivered as far as it got. At `content_filter` the provider
+/// withheld the reply.
+fn unfinished(reason: FinishReason, has_calls: bool) -> Option<&'static str> {
+    match reason {
+        FinishReason::Stop | FinishReason::ToolCalls => None,
+        FinishReason::Length if !has_calls => None,
+        FinishReason::Length => Some("the model hit its token limit before it finished"),
+        FinishReason::ContentFilter => Some("the provider's content filter stopped the response"),
+        FinishReason::FunctionCall => {
+            Some("the model answered with a legacy function_call, which this client does not read")
+        }
+    }
+}
+
+/// Tool calls assembled from a round's streamed fragments. A call arrives in
+/// pieces keyed by `index`: its id and name first, its arguments spread over
+/// later fragments. The index is the provider's, so it keys a call rather than
+/// sizing a buffer.
+#[derive(Default)]
+struct StreamedToolCalls(Vec<(u32, NativeToolCall)>);
+
+impl StreamedToolCalls {
+    fn add(&mut self, fragment: ChatCompletionMessageToolCallChunk) -> Result<(), String> {
+        let slot = match self.0.iter().position(|(i, _)| *i == fragment.index) {
+            Some(slot) => slot,
+            None if self.0.len() >= MAX_STREAMED_TOOL_CALLS => {
+                return Err(format!(
+                    "more than {MAX_STREAMED_TOOL_CALLS} tool calls in one response"
+                ));
+            }
+            None => {
+                let call = NativeToolCall {
+                    id: String::new(),
+                    name: String::new(),
+                    arguments: String::new(),
+                };
+                self.0.push((fragment.index, call));
+                self.0.len() - 1
+            }
+        };
+        let call = &mut self.0[slot].1;
+        if let Some(id) = fragment.id {
+            call.id = id;
+        }
+        if let Some(function) = fragment.function {
+            call.name
+                .push_str(function.name.as_deref().unwrap_or_default());
+            call.arguments
+                .push_str(function.arguments.as_deref().unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// The calls in index order. One that never got a name is dropped; one
+    /// that never got an id is given `call_{index}`, which the next request's
+    /// tool result echoes.
+    fn finish(mut self) -> Vec<NativeToolCall> {
+        self.0.sort_by_key(|(index, _)| *index);
+        self.0
+            .into_iter()
+            .filter_map(|(index, mut call)| {
+                if call.name.is_empty() {
+                    tracing::warn!("dropping a streamed tool call with no name (index {index})");
+                    return None;
+                }
+                if call.id.is_empty() {
+                    call.id = format!("call_{index}");
+                }
+                Some(call)
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +430,7 @@ impl LlmClient {
             .default_headers(default_headers)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(LLM_CONNECT_TIMEOUT)
+            .read_timeout(LLM_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| crate::MindroidError::Other(anyhow::Error::from(e)))?;
 
@@ -404,33 +500,11 @@ impl LlmClient {
         tools: &[ChatCompletionTools],
         model: Option<&str>,
     ) -> crate::Result<ToolsChatOutcome> {
-        let model = model
-            .or(self.config.default_model.as_deref())
-            .unwrap_or("gpt-4o-mini");
+        let body = self.tools_request(messages, tools, model, false)?;
 
-        let mut builder = CreateChatCompletionRequestArgs::default();
-        builder.model(model).messages(messages);
-        if let Some(temp) = self.config.default_temperature {
-            builder.temperature(temp);
-        }
-        if let Some(max) = self.config.default_max_tokens {
-            builder.max_completion_tokens(max);
-        }
-        if let Some(effort) = self.resolve_reasoning_effort() {
-            builder.reasoning_effort(effort);
-        }
-        let mut request = builder
-            .build()
-            .map_err(|e| Self::pipeline_err(format!("Failed to build request: {e}")))?;
-        if !tools.is_empty() {
-            request.tools = Some(tools.to_vec());
-        }
-        let body = body_with_extras(&request, &self.config.extra_body)
-            .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))?;
-
-        // The shared http client carries only a connect timeout, because a full
-        // reqwest timeout spans the body read and would truncate `stream_chat`.
-        // Non-streaming calls bound themselves here instead.
+        // The shared http client bounds the connect and each read, not the whole
+        // request: a total reqwest timeout spans the body read and would
+        // truncate `stream_chat`. Non-streaming calls bound themselves here.
         let response: CreateChatCompletionResponse =
             tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create_byot(body))
                 .await
@@ -453,6 +527,18 @@ impl LlmClient {
             ..Default::default()
         };
         if let Some(choice) = response.choices.into_iter().next() {
+            // A missing reason is accepted here: a non-streamed body is whole.
+            let has_calls = choice
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty());
+            if let Some(why) = choice
+                .finish_reason
+                .and_then(|reason| unfinished(reason, has_calls))
+            {
+                return Err(Self::pipeline_err(why.to_string()));
+            }
             outcome.content = choice.message.content.unwrap_or_default();
             outcome.tool_calls = choice
                 .message
@@ -475,6 +561,134 @@ impl LlmClient {
                 .collect();
         }
         Ok(outcome)
+    }
+
+    /// [`chat_with_tools`](Self::chat_with_tools), streamed: prose arrives as the
+    /// model writes it, and the tool calls, which stream in fragments, are
+    /// assembled into the closing [`ToolsStreamEvent::Done`]. Each chunk must
+    /// arrive within `LLM_REQUEST_TIMEOUT` of the last, and a stream that ends
+    /// before the model finished — cut off, filtered, or out of tokens partway
+    /// through a tool call — is an error rather than a round. The outcome's `usage` is always `None`: the
+    /// request does not ask for `stream_options.include_usage`, which not every
+    /// OpenAI-compatible endpoint accepts.
+    pub fn stream_chat_with_tools(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
+        model: Option<&str>,
+    ) -> BoxStream<'static, ToolsStreamEvent> {
+        let body = self.tools_request(messages, tools, model, true);
+        let client = self.client.clone();
+        Box::pin(async_stream::stream! {
+            let body = match body {
+                Ok(body) => body,
+                Err(e) => {
+                    yield ToolsStreamEvent::Error(e.to_string());
+                    return;
+                }
+            };
+            let stalled = || {
+                ToolsStreamEvent::Error(format!(
+                    "no response from the model for {}s",
+                    LLM_REQUEST_TIMEOUT.as_secs()
+                ))
+            };
+            let opened = client
+                .chat()
+                .create_stream_byot::<_, CreateChatCompletionStreamResponse>(body)
+                .await;
+            let mut chunks = match opened {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    yield ToolsStreamEvent::Error(format!("API error: {e}"));
+                    return;
+                }
+            };
+            let mut outcome = ToolsChatOutcome::default();
+            let mut calls = StreamedToolCalls::default();
+            let mut finish = None;
+            loop {
+                let next = match tokio::time::timeout(LLM_REQUEST_TIMEOUT, chunks.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        yield stalled();
+                        return;
+                    }
+                };
+                let Some(chunk) = next else { break };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        yield ToolsStreamEvent::Error(e.to_string());
+                        return;
+                    }
+                };
+                let Some(choice) = chunk.choices.into_iter().next() else {
+                    continue;
+                };
+                finish = finish.or(choice.finish_reason);
+                for fragment in choice.delta.tool_calls.unwrap_or_default() {
+                    if let Err(e) = calls.add(fragment) {
+                        yield ToolsStreamEvent::Error(e);
+                        return;
+                    }
+                }
+                if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
+                    outcome.content.push_str(&text);
+                    yield ToolsStreamEvent::Text(text);
+                }
+            }
+            let Some(reason) = finish else {
+                yield ToolsStreamEvent::Error("the model's stream ended before it finished".into());
+                return;
+            };
+            // Any call begun counts, even one too partial to survive `finish`.
+            let has_calls = !calls.0.is_empty();
+            outcome.tool_calls = calls.finish();
+            if let Some(why) = unfinished(reason, has_calls) {
+                yield ToolsStreamEvent::Error(why.into());
+                return;
+            }
+            yield ToolsStreamEvent::Done(outcome);
+        })
+    }
+
+    /// The request body for one tool round, streamed or not.
+    fn tools_request(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
+        model: Option<&str>,
+        stream: bool,
+    ) -> crate::Result<serde_json::Value> {
+        let model = model
+            .or(self.config.default_model.as_deref())
+            .unwrap_or("gpt-4o-mini");
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder.model(model).messages(messages);
+        if let Some(temp) = self.config.default_temperature {
+            builder.temperature(temp);
+        }
+        if let Some(max) = self.config.default_max_tokens {
+            builder.max_completion_tokens(max);
+        }
+        if let Some(effort) = self.resolve_reasoning_effort() {
+            builder.reasoning_effort(effort);
+        }
+        let mut request = builder
+            .build()
+            .map_err(|e| Self::pipeline_err(format!("Failed to build request: {e}")))?;
+        if !tools.is_empty() {
+            request.tools = Some(tools.to_vec());
+        }
+        // The byot path skips the typed call's stream check, so the flag is
+        // set here.
+        if stream {
+            request.stream = Some(true);
+        }
+        body_with_extras(&request, &self.config.extra_body)
+            .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))
     }
 
     fn resolve_model<'a>(&'a self, req_model: Option<&'a str>) -> &'a str {
@@ -616,9 +830,9 @@ impl LlmClient {
         let body = body_with_extras(&request, &self.config.extra_body)
             .map_err(|e| Self::pipeline_err(format!("Failed to serialize request: {e}")))?;
 
-        // The shared http client carries only a connect timeout, because a full
-        // reqwest timeout spans the body read and would truncate `stream_chat`.
-        // Non-streaming calls bound themselves here instead.
+        // The shared http client bounds the connect and each read, not the whole
+        // request: a total reqwest timeout spans the body read and would
+        // truncate `stream_chat`. Non-streaming calls bound themselves here.
         let response: CreateChatCompletionResponse =
             tokio::time::timeout(LLM_REQUEST_TIMEOUT, self.client.chat().create_byot(body))
                 .await
@@ -1075,5 +1289,83 @@ mod tests {
         assert!(has_multimodal_content(&msg.content));
         let parts = content_parts_to_openai(&msg.content);
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn streamed_tool_call_fragments_assemble_into_whole_calls() {
+        let fragment = |index, id: Option<&str>, name: Option<&str>, args: Option<&str>| {
+            serde_json::from_value::<ChatCompletionMessageToolCallChunk>(serde_json::json!({
+                "index": index,
+                "id": id,
+                "type": id.map(|_| "function"),
+                "function": {"name": name, "arguments": args}
+            }))
+            .unwrap()
+        };
+        let mut calls = StreamedToolCalls::default();
+        for f in [
+            fragment(1, Some("c2"), Some("recall"), Some("{\"day\":")),
+            fragment(0, Some("c1"), Some("lookup"), Some("")),
+            fragment(0, None, None, Some("{\"q\":")),
+            fragment(0, None, None, Some("\"x\"}")),
+            fragment(1, None, None, Some("\"mon\"}")),
+        ] {
+            calls.add(f).unwrap();
+        }
+        let calls = calls.finish();
+        let got: Vec<_> = calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("c1", "lookup", "{\"q\":\"x\"}"),
+                ("c2", "recall", "{\"day\":\"mon\"}")
+            ]
+        );
+    }
+
+    fn named_fragment(index: u32, name: Option<&str>) -> ChatCompletionMessageToolCallChunk {
+        serde_json::from_value(serde_json::json!({
+            "index": index,
+            "function": {"name": name, "arguments": "{}"}
+        }))
+        .unwrap()
+    }
+
+    /// The provider's index keys a call; it never sizes an allocation.
+    #[test]
+    fn a_huge_tool_call_index_is_just_a_key() {
+        let mut calls = StreamedToolCalls::default();
+        calls.add(named_fragment(u32::MAX, Some("lookup"))).unwrap();
+        let calls = calls.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, format!("call_{}", u32::MAX));
+    }
+
+    #[test]
+    fn a_response_with_too_many_tool_calls_is_refused() {
+        let mut calls = StreamedToolCalls::default();
+        for index in 0..MAX_STREAMED_TOOL_CALLS as u32 {
+            calls.add(named_fragment(index, Some("lookup"))).unwrap();
+        }
+        assert!(
+            calls
+                .add(named_fragment(
+                    MAX_STREAMED_TOOL_CALLS as u32,
+                    Some("lookup")
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_tool_call_that_never_got_a_name_is_dropped() {
+        let mut calls = StreamedToolCalls::default();
+        calls.add(named_fragment(1, None)).unwrap();
+        calls.add(named_fragment(2, Some("lookup"))).unwrap();
+        let names: Vec<_> = calls.finish().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["lookup"]);
     }
 }

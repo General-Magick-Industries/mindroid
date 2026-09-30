@@ -6,12 +6,17 @@
 //! are used.
 
 use async_trait::async_trait;
+use mindroid::memory::Memory;
+use mindroid::models::{Message, SenderType};
 use mindroid::omni::mock::{MockAudioSink, MockAudioSource, MockOmniProvider};
 use mindroid::omni::session::OmniSession;
-use mindroid::omni::types::{AudioChunk, OmniEvent, SessionState};
+use mindroid::omni::types::{
+    AudioChunk, OmniConfig, OmniEvent, Role, SessionState, TranscriptSource,
+};
+use mindroid::pipeline::stages::stt::SttProvider;
 use mindroid::tools::Tool;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -365,12 +370,14 @@ async fn transcript_events_ignored_gracefully() {
     tx.send(OmniEvent::Transcript {
         text: "hello there".to_string(),
         is_final: true,
+        source: TranscriptSource::Input,
     })
     .await
     .unwrap();
     tx.send(OmniEvent::Transcript {
         text: "intermediate".to_string(),
         is_final: false,
+        source: TranscriptSource::Output,
     })
     .await
     .unwrap();
@@ -387,6 +394,186 @@ async fn transcript_events_ignored_gracefully() {
 }
 
 // ── Test 8: Builder without provider fails ────────────────────────────────────
+
+// ── RecordingMemory — seeds fixed history, records every save ────────────────
+
+/// (channel, sender, content, reply_to)
+type SavedTurn = (String, String, String, Option<String>);
+
+struct RecordingMemory {
+    history: Vec<Message>,
+    saved: Arc<Mutex<Vec<SavedTurn>>>,
+}
+
+#[async_trait]
+impl Memory for RecordingMemory {
+    async fn save_message(
+        &self,
+        channel_id: &str,
+        sender_id: &str,
+        content: &str,
+        reply_to_id: Option<&str>,
+    ) -> mindroid::Result<Option<String>> {
+        let mut saved = self.saved.lock().unwrap();
+        saved.push((
+            channel_id.into(),
+            sender_id.into(),
+            content.into(),
+            reply_to_id.map(str::to_string),
+        ));
+        Ok(Some(format!("msg-{}", saved.len())))
+    }
+
+    async fn get_history(
+        &self,
+        _channel_id: &str,
+        _limit: usize,
+    ) -> mindroid::Result<Vec<Message>> {
+        Ok(self.history.clone())
+    }
+
+    async fn clear_history(&self, _channel_id: &str) -> mindroid::Result<()> {
+        Ok(())
+    }
+}
+
+/// Prior turns come out of memory as text history before the provider connects,
+/// with roles derived from who sent them.
+#[tokio::test]
+async fn history_is_seeded_from_memory_before_connect() {
+    let mut agent_turn = Message::new("hello", "agent", "chan");
+    agent_turn.sender_type = SenderType::Agent;
+    let memory = RecordingMemory {
+        history: vec![Message::new("hi", "user", "chan"), agent_turn],
+        saved: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let (provider, tx) = MockOmniProvider::new();
+    let mut session = OmniSession::builder()
+        .provider(provider)
+        .memory(Arc::new(memory))
+        .conversation("chan", "user", "agent")
+        .build()
+        .unwrap();
+    drop(tx);
+    session.run().await.unwrap();
+
+    let history = &session.config().history;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].role, Role::User);
+    assert_eq!(history[0].text, "hi");
+    assert_eq!(history[1].role, Role::Model);
+    assert_eq!(history[1].text, "hello");
+}
+
+async fn seed_and_read_prompt(history: Vec<Message>, base_prompt: Option<&str>) -> Option<String> {
+    let (provider, tx) = MockOmniProvider::new();
+    let config = OmniConfig {
+        system_prompt: base_prompt.map(str::to_string),
+        ..OmniConfig::default()
+    };
+    let mut session = OmniSession::builder()
+        .provider(provider)
+        .config(config)
+        .memory(Arc::new(RecordingMemory {
+            history,
+            saved: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .conversation("chan", "user", "agent")
+        .build()
+        .unwrap();
+    drop(tx);
+    session.run().await.unwrap();
+    session.config().system_prompt.clone()
+}
+
+/// A session resumed after a long gap tells the model it is a new session; a fresh
+/// one moments after the last turn does not.
+#[tokio::test]
+async fn a_gap_since_the_last_turn_is_flagged_to_the_model() {
+    let mut old = Message::new("earlier", "user", "chan");
+    old.timestamp = chrono::Utc::now() - chrono::Duration::minutes(20);
+    let after_gap = seed_and_read_prompt(vec![old], Some("You are a helper.")).await;
+    let after_gap = after_gap.expect("prompt present");
+    assert!(
+        after_gap.starts_with("You are a helper."),
+        "keeps the base prompt"
+    );
+    assert!(
+        after_gap.contains("new session"),
+        "flags the resume: {after_gap}"
+    );
+    assert!(
+        after_gap.contains("20 minutes"),
+        "names the gap: {after_gap}"
+    );
+
+    let recent = Message::new("just now", "user", "chan"); // timestamp = now
+    let continuous = seed_and_read_prompt(vec![recent], Some("You are a helper."))
+        .await
+        .expect("prompt present");
+    assert_eq!(
+        continuous, "You are a helper.",
+        "no note for a natural pause"
+    );
+}
+
+/// Only final transcripts are persisted, in event order, each under the right
+/// sender, with the agent's turn threaded to the user's saved message id.
+#[tokio::test]
+async fn final_transcripts_are_persisted_under_the_right_sender() {
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let memory = RecordingMemory {
+        history: Vec::new(),
+        saved: Arc::clone(&saved),
+    };
+
+    let (provider, tx) = MockOmniProvider::new();
+    let mut session = OmniSession::builder()
+        .provider(provider)
+        .memory(Arc::new(memory))
+        .conversation("chan", "user", "agent")
+        .build()
+        .unwrap();
+
+    let t = |text: &str, is_final: bool, source: TranscriptSource| OmniEvent::Transcript {
+        text: text.into(),
+        is_final,
+        source,
+    };
+    tx.send(t("what time", true, TranscriptSource::Input))
+        .await
+        .unwrap();
+    tx.send(t("It's", false, TranscriptSource::Output))
+        .await
+        .unwrap();
+    tx.send(t("It's noon.", true, TranscriptSource::Output))
+        .await
+        .unwrap();
+    tx.send(OmniEvent::TurnComplete).await.unwrap();
+    drop(tx);
+    session.run().await.unwrap();
+
+    let saved = saved.lock().unwrap();
+    assert_eq!(
+        *saved,
+        vec![
+            (
+                "chan".to_string(),
+                "user".to_string(),
+                "what time".to_string(),
+                None
+            ),
+            (
+                "chan".to_string(),
+                "agent".to_string(),
+                "It's noon.".to_string(),
+                Some("msg-1".to_string())
+            ),
+        ],
+        "finals only, in event order, with the reply threaded to the user's message"
+    );
+}
 
 #[test]
 fn builder_requires_provider() {
@@ -434,4 +621,90 @@ async fn multiple_tool_calls_in_sequence() {
         assert_eq!(results[i as usize].0, format!("call-{i}"));
     }
     assert_eq!(session.state(), SessionState::Closed);
+}
+
+struct SlowStt;
+
+#[async_trait]
+impl SttProvider for SlowStt {
+    async fn transcribe(&self, audio: &[u8]) -> mindroid::Result<String> {
+        assert_eq!(
+            &audio[..4],
+            b"RIFF",
+            "session must hand the transcriber a WAV"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        Ok("what time".to_string())
+    }
+}
+
+/// With our own transcriber, the user turn is stored before the reply even though
+/// the transcript resolves after the reply's final transcript has arrived.
+#[tokio::test]
+async fn own_transcription_keeps_the_user_turn_ahead_of_the_reply() {
+    let (provider, tx) = MockOmniProvider::new();
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let memory = RecordingMemory {
+        history: Vec::new(),
+        saved: Arc::clone(&saved),
+    };
+    let source = MockAudioSource::with_sample_rate(
+        vec![AudioChunk {
+            data: vec![0; 16_000],
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 16,
+        }],
+        16_000,
+    );
+    let mut session = OmniSession::builder()
+        .provider(provider)
+        .audio_source(source)
+        .memory(Arc::new(memory))
+        .conversation("chan", "user", "agent")
+        .transcriber(Arc::new(SlowStt))
+        .build()
+        .unwrap();
+
+    let t = |text: &str, source: TranscriptSource| OmniEvent::Transcript {
+        text: text.to_string(),
+        is_final: true,
+        source,
+    };
+    tx.send(OmniEvent::Interrupted).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tx.send(OmniEvent::UserSpeechEnded).await.unwrap();
+    tx.send(t(
+        "ignored: provider input transcript",
+        TranscriptSource::Input,
+    ))
+    .await
+    .unwrap();
+    tx.send(t("It's noon.", TranscriptSource::Output))
+        .await
+        .unwrap();
+    tx.send(OmniEvent::TurnComplete).await.unwrap();
+    drop(tx);
+
+    session.run().await.unwrap();
+
+    let saved = saved.lock().unwrap();
+    assert_eq!(
+        *saved,
+        vec![
+            (
+                "chan".to_string(),
+                "user".to_string(),
+                "what time".to_string(),
+                None
+            ),
+            (
+                "chan".to_string(),
+                "agent".to_string(),
+                "It's noon.".to_string(),
+                Some("msg-1".to_string()),
+            ),
+        ],
+        "user turn from our transcriber first, provider input transcript ignored, reply threaded"
+    );
 }

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::auth::Auth;
+use crate::core::models::deserialize_null_as_default;
 use crate::core::net::{error_excerpt, require_secure_url, secure_json_client};
 use crate::error::{MindroidError, Result};
 use crate::models::CredentialKind;
@@ -347,9 +348,10 @@ fn render_episodes(episodes: &[Episode]) -> String {
         .join("\n\n")
 }
 
+/// Bifrost is Go: a nil slice arrives as `null`.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct RangeResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     data: Vec<Episode>,
 }
 
@@ -357,7 +359,7 @@ struct RangeResponse {
 struct Episode {
     #[serde(default)]
     topic: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     subtopics: Vec<String>,
     #[serde(default)]
     summarized_conversation: String,
@@ -394,6 +396,34 @@ mod tests {
 Subtopics: tomatoes, watering
 Summary: Agreed to start seedlings indoors."
         );
+    }
+
+    #[test]
+    fn a_window_parses_the_null_lists_bifrost_sends() {
+        let body: RangeResponse = serde_json::from_value(json!({
+            "data": [{
+                "id": "e1",
+                "topic": "Casual conversation",
+                "subtopics": null,
+                "summarized_conversation": "Lynn said hi.",
+                "entities": null
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            body.data,
+            vec![Episode {
+                topic: "Casual conversation".into(),
+                subtopics: Vec::new(),
+                summarized_conversation: "Lynn said hi.".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_null_window_parses_as_empty() {
+        let body: RangeResponse = serde_json::from_value(json!({ "data": null })).unwrap();
+        assert!(body.data.is_empty());
     }
 
     // ADR-0005: the model picks WHETHER to scope, never WHERE. A refactor that

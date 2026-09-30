@@ -29,6 +29,8 @@ members = [
     "examples/remote_tool",
     "examples/artifact_agent",
     "examples/corpus_probe",
+    "examples/gemini_live",
+    "examples/openai_realtime",
 ]
 resolver = "3"
 
@@ -50,6 +52,10 @@ mindroid = { path = "." }
 default = ["llm-local"]
 # Transports
 transport-ws = ["dep:tokio-tungstenite", "dep:base64"]
+# Gemini Live realtime provider (OmniSession). Separate from transport-ws:
+# neither the Centrifugo transport nor Gemini should drag the other in.
+omni-gemini = ["dep:tokio-tungstenite", "dep:base64"]
+omni-openai = ["dep:tokio-tungstenite", "dep:base64"]
 transport-audio = ["dep:cpal", "dep:hound", "dep:base64", "dep:voice_activity_detector", "dep:rodio"]
 # LLM (base64 needed for inline image encoding + ingest)
 llm-client = ["dep:async-openai", "dep:reqwest", "dep:base64"]
@@ -73,7 +79,7 @@ artifacts = ["llm-client", "dep:base64", "dep:libc"]
 # client for one service.
 magickmind = ["artifacts", "persona", "dep:reqwest"]
 # All features
-full = ["transport-ws", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity", "artifacts", "magickmind"]
+full = ["transport-ws", "omni-gemini", "omni-openai", "transport-audio", "llm-local", "llm-hosted", "speech", "apikey", "persistence", "persona", "llm-client", "identity", "artifacts", "magickmind"]
 
 [dependencies]
 # Core (always required)

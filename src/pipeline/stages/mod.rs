@@ -12,6 +12,7 @@ pub mod stt;
 #[cfg(feature = "llm-client")]
 mod tool_executor;
 mod tool_executor_xml;
+#[cfg(feature = "transport-audio")]
 #[cfg(feature = "llm-client")]
 pub mod tts;
 
@@ -37,7 +38,7 @@ pub use stt::OpenAiStt;
 pub use stt::OpenAiSttConfig;
 pub use stt::{SttProvider, SttStage};
 #[cfg(feature = "llm-client")]
-pub use tool_executor::ToolExecutorStage;
+pub use tool_executor::{MAX_PARALLEL_TOOL_CALLS, ToolExecutorStage};
 #[cfg(feature = "llm-client")]
 pub use tool_executor_xml::{
     ExpiredRemoteCall, ExpiryReason, ParsedToolCall, PendingRemoteCalls, RemoteResultGate,
