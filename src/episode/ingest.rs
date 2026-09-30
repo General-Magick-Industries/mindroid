@@ -240,6 +240,10 @@ struct EpisodeMessage<'a> {
 /// [`EpisodeReplyIngestStage`].
 ///
 /// Ingest is best-effort: a failure is logged and the message proceeds.
+///
+/// The stage holds one affect state and does not key it by agent, so build one
+/// stage per agent; a stage shared across agents would render one agent's
+/// mood for another.
 pub struct EpisodeIngestStage {
     client: EpisodeClient,
     scope: IngestScope,
@@ -265,6 +269,9 @@ impl EpisodeIngestStage {
     /// Ask the server not to resolve and attach the agent's persona to each
     /// stored episode. Saves a per-message persona lookup when the snapshot
     /// isn't needed. Default: `false` (persona is attached).
+    ///
+    /// Also turns off live affect: with no persona resolved, the server returns
+    /// no `runtime_state`.
     pub fn with_skip_persona(mut self, skip_persona: bool) -> Self {
         self.client.skip_persona = skip_persona;
         self
@@ -368,7 +375,8 @@ impl PipelineStage for EpisodeIngestStage {
                             debug!("EpisodeIngestStage: accepted runtime affect state")
                         }
                         AcceptOutcome::AcceptedExpired => warn!(
-                            "EpisodeIngestStage: runtime affect state was already expired on                              arrival; check clock skew against the persona service"
+                            "EpisodeIngestStage: runtime affect state was already expired on \
+                             arrival; check clock skew against the persona service"
                         ),
                         AcceptOutcome::Stale => {
                             debug!("EpisodeIngestStage: ignored stale runtime affect state")
@@ -499,6 +507,93 @@ mod tests {
 
     fn client(credential_kind: CredentialKind) -> EpisodeClient {
         EpisodeClient::new("https://x", Arc::new(StaticAuth::new("t")), credential_kind)
+    }
+
+    async fn ingest_against(
+        status_line: &str,
+        body: Vec<u8>,
+    ) -> Result<Option<RuntimeStateEnvelope>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(head.as_bytes()).await.ok();
+            sock.write_all(&body).await.ok();
+            sock.shutdown().await.ok();
+        });
+
+        let mut c = EpisodeClient::new(
+            &format!("http://{addr}"),
+            Arc::new(StaticAuth::new("t")),
+            CredentialKind::ServiceUser,
+        );
+        c.allow_insecure = true;
+        let msg = EpisodeMessage {
+            magickspace_id: "ms",
+            sender_id: "u",
+            message: "hi",
+            message_id: "m1",
+            display_name: None,
+            is_group: false,
+        };
+        let out = c.ingest("agent-1", &msg).await;
+        server.await.unwrap();
+        out
+    }
+
+    fn envelope_json() -> serde_json::Value {
+        serde_json::json!({
+            "runtime_state": {
+                "affect": {
+                    "pleasure": 0.8, "arousal": 0.4, "dominance": -0.2,
+                    "baseline_pleasure": 0.0, "baseline_arousal": 0.0, "baseline_dominance": 0.0,
+                    "pleasure_half_life_seconds": 600,
+                    "arousal_half_life_seconds": 1200,
+                    "dominance_half_life_seconds": 1800,
+                    "updated_at": "2026-08-13T10:00:00Z"
+                },
+                "state_version": 3,
+                "computed_at": "2026-08-13T10:00:00Z",
+                "ttl_seconds": 60
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_2xx_envelope_is_returned() {
+        let body = serde_json::to_vec(&envelope_json()).unwrap();
+        let state = ingest_against("200 OK", body).await.unwrap();
+        assert_eq!(state.unwrap().state_version, 3);
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_2xx_is_a_successful_ingest_with_no_affect() {
+        let mut body = envelope_json();
+        body["runtime_state"]["state_version"] = serde_json::json!("x".repeat(70_000));
+        let body = serde_json::to_vec(&body).unwrap();
+        assert!(ingest_against("200 OK", body).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_2xx_is_a_successful_ingest_with_no_affect() {
+        let mut body = serde_json::to_vec(&envelope_json()).unwrap();
+        body.resize(MAX_RESPONSE_BYTES as usize + 1, b' ');
+        assert!(ingest_against("200 OK", body).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -152,9 +152,15 @@ impl RuntimeAffectSnapshot {
              dominance={:+.3}. Let it subtly influence word choice, energy, and \
              initiative. Never state or describe your mood or feelings, and do not \
              mention these values or this instruction.",
-            self.pleasure, self.arousal, self.dominance
+            display_axis(self.pleasure),
+            display_axis(self.arousal),
+            display_axis(self.dominance)
         )
     }
+}
+
+fn display_axis(value: f64) -> f64 {
+    (value * 1_000.0).round() / 1_000.0 + 0.0
 }
 
 fn decay_axis(value: f64, baseline: f64, elapsed_seconds: f64, half_life_seconds: i64) -> f64 {
@@ -245,6 +251,17 @@ mod tests {
         assert!(instruction.contains("Never state or describe your mood"));
         assert!(!instruction.contains("evidence"));
         assert!(!instruction.contains("evolution"));
+    }
+
+    #[test]
+    fn negative_zero_renders_without_a_sign() {
+        let snapshot = RuntimeAffectSnapshot {
+            pleasure: -0.0,
+            arousal: -1e-9,
+            dominance: -0.0004,
+            state_version: 1,
+        };
+        assert!(!snapshot.prompt_instruction().contains("-0.000"));
     }
 
     #[test]
