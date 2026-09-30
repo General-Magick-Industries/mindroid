@@ -4,8 +4,8 @@ use serde::Deserialize;
 /// Longest validity a server may claim for one snapshot; keeps the TTL
 /// arithmetic in range and a forgotten agent from rendering week-old mood.
 const MAX_TTL_SECONDS: i64 = 7 * 24 * 3_600;
-/// Persona stamps `updated_at` on the writing pod and `computed_at` on the
-/// reading pod; this much skew between them is tolerated as clock drift.
+/// Clock drift tolerated between persona's writing pod (`updated_at`), its
+/// reading pod (`computed_at`), and this host.
 const CLOCK_SKEW_TOLERANCE_SECONDS: i64 = 5;
 
 /// Short-lived expression state returned by Bifrost.
@@ -92,6 +92,17 @@ impl RuntimeStateEnvelope {
             || self.affect.dominance_half_life_seconds <= 0
         {
             return Err("affect half-lives must be greater than zero");
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate`], and refuse a state computed in this host's future:
+    /// decay would clamp to the stored value and the state would outrank a
+    /// same-version refresh until it expires.
+    pub(crate) fn validate_at(&self, now: DateTime<Utc>) -> std::result::Result<(), &'static str> {
+        self.validate()?;
+        if self.computed_at > now + Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS) {
+            return Err("computed_at is ahead of this host's clock by more than clock skew");
         }
         Ok(())
     }
@@ -312,6 +323,18 @@ mod tests {
         assert!(state.decayed_at(state.computed_at).is_none());
         state.ttl_seconds = MAX_TTL_SECONDS + 1;
         assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_state_computed_in_this_hosts_future() {
+        let state = envelope();
+        let skew = Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS);
+        assert!(state.validate_at(state.computed_at - skew).is_ok());
+        assert!(
+            state
+                .validate_at(state.computed_at - skew - Duration::seconds(1))
+                .is_err()
+        );
     }
 
     #[test]

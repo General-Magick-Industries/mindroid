@@ -134,11 +134,13 @@ truncated.
 
 - **Live affect on the MagickMind persona prompt.** `EpisodeIngestStage` reads
   the `runtime_state` envelope Bifrost returns from episode ingest (PAD affect,
-  baseline, per-axis half-lives, `state_version`, TTL), keeps the agent's latest
-  version, decays it locally with `Utc::now()`, and the persona stages append a
-  `Current temporary affect (PAD)…` line after the cached persona prompt.
-  Absent or invalid state leaves the prompt unchanged. Hosts that run ingest and
-  the reply on separate pipeline contexts call
+  baseline, per-axis half-lives, `state_version`, TTL), keeps the latest version
+  per agent and sender, decays it locally with `Utc::now()`, and the persona
+  stages append a `Current temporary affect (PAD)…` line after the cached
+  persona prompt. A sender with no state of its own gets the agent's, which
+  `EpisodeReplyIngestStage::with_runtime_state_of(&inbound)` records from reply
+  ingest. Absent or invalid state leaves the prompt unchanged. Hosts that run
+  ingest and the reply on separate pipeline contexts call
   `EpisodeIngestStage::apply_runtime_state` after `Context::reset_output`.
   `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
   and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
