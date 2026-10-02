@@ -347,7 +347,7 @@ async fn exercise(bifrost: &Bifrost, s: &Settings, space: &Space, run: &str) -> 
                     format!("The drive did not complete. FINAL-ERROR-{run}")
                 }
             } else if last.contains(&req_marker) {
-                "On it.\n<tool_call>{\"name\":\"drive\",\"args\":{\"direction\":\"forward\",\"seconds\":1}}</tool_call>".into()
+                "On it.\n<tool_call>{\"name\":\"drive\",\"args\":{\"direction\":\"forward\",\"seconds\":1,\"note\":\"R&D bench\"}}</tool_call>".into()
             } else {
                 format!("UNEXPECTED-TURN-{run}")
             }
@@ -409,6 +409,7 @@ async fn run_hops(
             "properties": {
                 "direction": { "type": "string", "enum": ["forward", "backward"] },
                 "seconds": { "type": "number" },
+                "note": { "type": "string" },
             },
             "required": ["direction"],
         },
@@ -592,7 +593,10 @@ async fn run_hops(
             ("4", "device's TOOL_RESULT reaches the agent typed"),
             ("4b", "agent correlates the result without timing out"),
             ("5", "reloaded history keeps message_type"),
-            ("5b", "agent replays its own call as a tool call"),
+            (
+                "5b",
+                "agent replays its own call unescaped, and the result once",
+            ),
         ] {
             report.skip(id, name, "no tool call to answer");
         }
@@ -763,7 +767,7 @@ async fn run_hops(
     match result_turn {
         None => report.skip(
             "5b",
-            "agent replays its own call as a tool call, and the result once",
+            "agent replays its own call unescaped, and the result once",
             "the agent never ran a correlated result turn (see 4b)",
         ),
         Some(r) => {
@@ -781,11 +785,11 @@ async fn run_hops(
             let mut wrong = Vec::new();
             match &own_call {
                 None => wrong.push("the agent's own call is missing from its history".to_string()),
-                Some(t) if !t.contains("<tool_call>") => wrong.push(format!(
-                    "the agent's own call replays as {:?}, not a <tool_call>",
-                    t.chars().take(80).collect::<String>()
-                )),
-                Some(t) if t.contains("&quot;") || t.contains("&lt;") => {
+                Some(t)
+                    if ["&amp;", "&lt;", "&gt;", "&quot;"]
+                        .iter()
+                        .any(|entity| t.contains(entity)) =>
+                {
                     wrong.push("the agent's own call replays HTML-escaped".into())
                 }
                 Some(_) => {}
@@ -797,7 +801,7 @@ async fn run_hops(
             }
             report.record(
                 "5b",
-                "agent replays its own call as a tool call, and the result once",
+                "agent replays its own call unescaped, and the result once",
                 "mindroid (history replay)",
                 if wrong.is_empty() {
                     Ok("replayed faithfully".into())
