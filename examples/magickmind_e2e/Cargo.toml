@@ -1,0 +1,23 @@
+[package]
+name = "mindroid-example-magickmind-e2e"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "magickmind_e2e"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tokio-util = "0.7"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures = { workspace = true }
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
