@@ -457,7 +457,9 @@ pub struct EpisodesConfig {
     pub allow_insecure: bool,
     /// Ask the server not to resolve the agent's persona for each ingested
     /// message. The server otherwise attaches a persona snapshot per message,
-    /// which costs a lookup. Default: false (persona attached).
+    /// which costs a lookup. Default: false (persona attached). Setting it also
+    /// turns off live affect on the persona prompt, since the server then
+    /// returns no `runtime_state`.
     pub skip_persona: bool,
     /// Which inbound messages are ingested. Default: [`IngestScope::All`].
     pub scope: IngestScope,

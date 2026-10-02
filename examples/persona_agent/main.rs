@@ -212,7 +212,10 @@ async fn main() -> anyhow::Result<()> {
         .add_stage(SharedStage(Arc::clone(&persona_stage)))
         .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
         .add_stage(PostProcessor);
-    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage()? {
+    if let Some(mut reply_ingest) = builder.build_episode_reply_ingest_stage()? {
+        if let Some(inbound) = &inbound_ingest {
+            reply_ingest = reply_ingest.with_runtime_state_of(inbound);
+        }
         respond = respond.add_stage(reply_ingest);
     }
     let respond_pipeline =
@@ -302,6 +305,11 @@ async fn main() -> anyhow::Result<()> {
                 // stage splices between the system prompt and the user message.
                 pctx.reset_output();
                 pctx.set_ext(ConversationHistory(history));
+                // reset_output cleared the run-scoped affect; rehydrate it
+                // from the ingest stage so the persona stage can express it.
+                if let Some(ingest) = &inbound_ingest {
+                    ingest.apply_runtime_state(&mut pctx).await;
+                }
 
                 match ctx.run_with_context(&respond, &mut pctx).await {
                     Ok(None) => {
