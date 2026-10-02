@@ -351,6 +351,18 @@ truncated.
   Run scope outlives one `Pipeline::run` and `run_with_context` shares a
   `Context` across runs, so a bare marker let one genuine claim exempt every
   later declared result on a reused `Context`.
+- **`XmlToolExecutorStage` acts on a streamed call only once the model finished
+  it.** A response cut off at its token limit could run the calls that arrived
+  whole and speak a half-written `<tool_call` as prose. Any round, the
+  max-iterations summary included, that was cut off after it began a call is
+  now an error. Prose cut off at the limit is still delivered as far as it got.
+  `stream_chat` reports a `content_filter` or other abnormal finish reason as
+  `StreamEvent::Error` rather than an empty reply. **Behaviour change:** a
+  stream that closes without any `finish_reason` counts as unfinished, so an
+  OpenAI-compatible endpoint or proxy that never sends one can no longer run
+  XML tool calls. Its prose still arrives, but every call is refused with "cut
+  off partway through a tool call". Point such deployments at a conformant
+  endpoint.
 
 ## [0.0.2-a.1] — 2026-08-06
 
