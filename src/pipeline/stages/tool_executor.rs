@@ -723,8 +723,12 @@ impl StreamingStage for ToolExecutorStage {
                         }
                     },
                 };
+                let remote = answer.is_remote();
                 let final_content = answer.into_text();
                 ctx.response = Some(final_content.clone());
+                if remote {
+                    crate::core::agent_loop::ControlResponse::mark(ctx);
+                }
                 yield StreamEvent::Complete { content: final_content, usage: None };
                 return;
             }
@@ -1722,6 +1726,11 @@ mod tests {
             })
             .collect();
         assert_eq!(chunks, ["One sec."]);
+        assert!(
+            ctx.get_run::<crate::core::agent_loop::ControlResponse>()
+                .is_some(),
+            "a framed call is control traffic"
+        );
         let framed: serde_json::Value = serde_json::from_str(&ctx.response.unwrap()).unwrap();
         assert_eq!(framed["type"], "tool_call");
         assert_eq!(

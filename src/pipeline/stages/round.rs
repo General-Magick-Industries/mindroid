@@ -201,7 +201,8 @@ impl PipelineStage for LlmRound {
             truncate_str(&outcome.content, 200)
         );
 
-        if !outcome.tool_calls.is_empty() {
+        let has_calls = !outcome.tool_calls.is_empty();
+        if has_calls {
             transcript
                 .0
                 .push(assistant_turn(&outcome.content, &outcome.tool_calls)?);
@@ -209,8 +210,14 @@ impl PipelineStage for LlmRound {
         }
 
         // Unconditional: whatever was on the context belongs to an earlier
-        // pass, and `ToolRound` reads this round's prose from here.
-        ctx.response = Some(outcome.content).filter(|c| !c.trim().is_empty());
+        // pass, and `ToolRound` reads this round's prose from here. The
+        // settling round is pinned even when empty, as the executor's `Final`
+        // is, or the loop's carry answers with an earlier pass's prose.
+        ctx.response = if has_calls {
+            Some(outcome.content).filter(|c| !c.trim().is_empty())
+        } else {
+            Some(outcome.content)
+        };
 
         ctx.set(transcript);
         Ok(())
@@ -851,6 +858,42 @@ mod tests {
             "the ack is this round's, not the last pass's"
         );
         server.await.unwrap();
+    }
+
+    /// The settling round is the turn's answer, empty or not. Left `None`, the
+    /// loop's carry would answer with the tool round's "Let me check".
+    #[tokio::test]
+    async fn an_empty_final_round_is_the_answer_not_the_earlier_prose() {
+        use super::super::tool_executor::fake_llm::{completion, serve_completions};
+        use crate::core::agent_loop::AgentLoop;
+        use crate::pipeline::Pipeline;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wants_a_tool = completion(json!({
+            "role": "assistant",
+            "content": "Let me check",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "echo", "arguments": "{\"text\":\"x\"}"}}]
+        }));
+        let says_nothing = completion(json!({"role": "assistant", "content": ""}));
+        let server = serve_completions(listener, vec![wants_a_tool, says_nothing]);
+
+        let (reg, _) = mixed_registry();
+        let client = LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+            "http://{addr}/v1"
+        )))
+        .unwrap();
+        let llm = LlmRound::new(client, reg);
+        let tools = llm.tool_round();
+        let agent = AgentLoop::new(Pipeline::new().add_stage(llm).add_stage(tools));
+
+        let outcome = agent.run(&mut ctx()).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(outcome.reason, StopReason::Settled);
+        assert_eq!(outcome.iterations, 2);
+        assert_eq!(outcome.response.as_deref(), Some(""));
     }
 
     /// At the cap the loop stops with a round unanswered: the model asked for a
