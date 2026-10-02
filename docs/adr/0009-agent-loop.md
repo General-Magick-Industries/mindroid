@@ -132,9 +132,8 @@ on purpose.
   body. `TranscriptCompaction` ships as the first of them; it pins every system
   message, the newest user message and the newest round, never keeps a history
   reply without its question, and seeds the transcript itself so the first call
-  is compacted too. Per-round retry is not yet one of
-  them: `RetryStage::reset_output` clears run scope wholesale, transcript
-  included.
+  is compacted too. Per-round retry is not yet one of them:
+  `RetryStage::reset_output` clears run scope wholesale, transcript included.
 - `LlmRound` and `ToolRound` must share one registry handle
   (`LlmRound::tool_round`); built apart, a runtime tool swap reaches one stage
   and not the other.
