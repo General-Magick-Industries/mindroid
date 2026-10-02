@@ -42,9 +42,9 @@ use crate::pipeline::PipelineStage;
 /// cut through the history never keeps a reply without the user turn it
 /// answers.
 ///
-/// What always survives is not counted against the budget, so a transcript
-/// whose system messages alone exceed it goes out over budget rather than
-/// without its instructions.
+/// What always survives is spent from the budget first and never dropped to
+/// meet it, so a transcript whose pinned messages alone exceed the budget goes
+/// out over it rather than without its instructions.
 ///
 /// On the first pass the transcript does not exist yet — [`LlmRound`] seeds
 /// it — so this stage seeds it the same way, from `ctx.llm_messages`. Without
@@ -209,7 +209,9 @@ fn compact(
             .filter(|&i| !pinned(i) && keep[i])
             .take_while(|&i| !opened_by_user(&blocks[i]))
             .collect();
-        orphaned.into_iter().for_each(|i| keep[i] = false);
+        for i in orphaned {
+            keep[i] = false;
+        }
     }
 
     head.extend(

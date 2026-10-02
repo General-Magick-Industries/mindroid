@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-use crate::core::agent_loop::Refused;
+use crate::core::agent_loop::{ControlResponse, Refused};
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::llm_client::{ChatRequest, LlmClient};
@@ -617,7 +617,7 @@ impl PipelineStage for XmlToolExecutorStage {
         // for the client, not the listener.
         ctx.response = Some(final_content);
         if end == LoopEnd::Remote {
-            crate::core::agent_loop::ControlResponse::mark(ctx);
+            ControlResponse::mark(ctx);
         }
         Ok(())
     }
@@ -843,7 +843,7 @@ impl StreamingStage for XmlToolExecutorStage {
 
             ctx.response = Some(final_content.clone());
             if remote {
-                crate::core::agent_loop::ControlResponse::mark(ctx);
+                ControlResponse::mark(ctx);
             }
             yield StreamEvent::Complete { content: final_content, usage: None };
         })
@@ -1297,6 +1297,8 @@ mod tests {
     /// each pass itself; the framed call has to be marked or it is read aloud.
     #[tokio::test]
     async fn a_speaking_loop_does_not_read_this_stages_remote_call_aloud() {
+        use crate::core::agent_loop::AgentLoop;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = serve_sse(
@@ -1313,9 +1315,7 @@ mod tests {
             .unwrap(),
             Arc::new(registry),
         );
-        let agent = crate::core::agent_loop::AgentLoop::new(
-            crate::pipeline::Pipeline::new().add_stage(stage),
-        );
+        let agent = AgentLoop::new(crate::pipeline::Pipeline::new().add_stage(stage));
 
         let mut ctx = gate_ctx("hi");
         let events: Vec<StreamEvent> = agent.run_streaming(&mut ctx).collect().await;

@@ -113,9 +113,8 @@ impl ControlResponse {
 /// stage should have consumed (an unsolicited or expired `tool_result`, one
 /// that reached the model unclaimed, control traffic admission control turned
 /// away, a tool manifest `ManifestStage` rejected), so persisting it would
-/// hand the next turn what was refused. A loop
-/// that halts with this set stops with [`StopReason::Refused`] and runs no
-/// `finish` stage.
+/// hand the next turn what was refused. A loop that halts with this set stops
+/// with [`StopReason::Refused`] and runs no `finish` stage.
 ///
 /// It rides in run scope beside `ctx.halted` and propagates outward with it,
 /// so a loop nested as a stage refuses its parent's turn too. The mark names
@@ -813,22 +812,8 @@ mod tests {
 
     #[tokio::test]
     async fn halting_stops_the_loop_but_still_finishes() {
-        struct Halt;
-
-        #[async_trait]
-        impl PipelineStage for Halt {
-            fn name(&self) -> &str {
-                "halt"
-            }
-
-            async fn process(&self, ctx: &mut Context) -> Result<()> {
-                ctx.halted = true;
-                Ok(())
-            }
-        }
-
         let finish_hits = Arc::new(AtomicUsize::new(0));
-        let outcome = AgentLoop::new(Pipeline::new().add_stage(Halt))
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(PlainHalt))
             .with_finish(Pipeline::new().add_stage(Marker("finish", finish_hits.clone())))
             .run(&mut ctx())
             .await
@@ -843,24 +828,10 @@ mod tests {
     /// it, so a one-stage `finish` cannot tell whether the phase ran in full.
     #[tokio::test]
     async fn finish_runs_every_stage_after_a_halt() {
-        struct Halt;
-
-        #[async_trait]
-        impl PipelineStage for Halt {
-            fn name(&self) -> &str {
-                "halt"
-            }
-
-            async fn process(&self, ctx: &mut Context) -> Result<()> {
-                ctx.halted = true;
-                Ok(())
-            }
-        }
-
         let first = Arc::new(AtomicUsize::new(0));
         let second = Arc::new(AtomicUsize::new(0));
         let mut ctx = ctx();
-        let outcome = AgentLoop::new(Pipeline::new().add_stage(Halt))
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(PlainHalt))
             .with_finish(
                 Pipeline::new()
                     .add_stage(Marker("post-process", first.clone()))
@@ -1061,23 +1032,9 @@ mod tests {
     /// A halt in setup must not run the body at all.
     #[tokio::test]
     async fn a_halt_in_setup_skips_the_body() {
-        struct Halt;
-
-        #[async_trait]
-        impl PipelineStage for Halt {
-            fn name(&self) -> &str {
-                "halt"
-            }
-
-            async fn process(&self, ctx: &mut Context) -> Result<()> {
-                ctx.halted = true;
-                Ok(())
-            }
-        }
-
         let (body, seen) = rounds(3);
         let outcome = AgentLoop::new(body)
-            .with_setup(Pipeline::new().add_stage(Halt))
+            .with_setup(Pipeline::new().add_stage(PlainHalt))
             .run(&mut ctx())
             .await
             .unwrap();

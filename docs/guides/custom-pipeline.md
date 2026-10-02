@@ -132,7 +132,7 @@ let pipeline = Pipeline::new()
 - **Streaming execution** (`Pipeline::run_streaming()`):
   - Pre-stages (before the streaming stage) run via `process()`.
   - The streaming stage runs via `stream()`, yielding `StreamEvent`s.
-  - Post-stages (after the streaming stage) run via `process()` after streaming completes.
+  - Post-stages (after the streaming stage) run via `process()` after streaming completes. A stage that sets `ctx.halted`, the streaming stage included, ends the run there, as `run()` does.
   - Returns a `BoxStream<'a, StreamEvent>`.
 
 ## Full Custom Pipeline Example

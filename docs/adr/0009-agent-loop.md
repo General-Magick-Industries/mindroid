@@ -64,8 +64,8 @@ reports `StopReason::Refused` and skips `finish`, since persistence there would
 hand the next turn exactly what was refused. The marker names the message it
 refused, so a reused `Context` does not refuse the next one, and propagates
 outward with `halted`, so an enclosing loop refuses too. A stage that lifts the
-halt to recover — `BranchStage` running its fail branch — takes the marker with
-it. An accepted manifest is a plain halt: a stage consumed it.
+halt to recover takes the marker with it, as `BranchStage` does whether or not
+it has a fail branch. An accepted manifest is a plain halt: a stage consumed it.
 
 An `Error` yielded by a pass is likewise fatal to the loop, where
 `Pipeline::run_streaming` forwards it and runs its post-streaming stages. That
@@ -131,8 +131,8 @@ on purpose.
 - Compaction, approval and per-round routing become ordinary stages in the
   body. `TranscriptCompaction` ships as the first of them; it pins every system
   message, the newest user message and the newest round, never keeps a history
-  reply without its question, and seeds the transcript
-  itself so the first call is compacted too. Per-round retry is not yet one of
+  reply without its question, and seeds the transcript itself so the first call
+  is compacted too. Per-round retry is not yet one of
   them: `RetryStage::reset_output` clears run scope wholesale, transcript
   included.
 - `LlmRound` and `ToolRound` must share one registry handle

@@ -282,7 +282,8 @@ impl Pipeline {
     ///
     /// Pre-streaming stages run before the first event is yielded.
     /// Post-streaming stages run after the stream completes (their effects
-    /// are signaled via a final `Complete` event).
+    /// are signaled via a final `Complete` event). A stage that halts — the
+    /// streaming stage included — ends the run there, as in [`run`](Self::run).
     #[allow(clippy::collapsible_if)]
     pub fn run_streaming<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
         let stream = async_stream::stream! {
