@@ -102,6 +102,108 @@ Built-in implementations:
 
 ---
 
+### ArtifactStore — out-of-band media storage
+
+Chat history should stay cheap. When a user attaches media (an image, audio, a
+file), inlining the raw bytes into every turn bloats the context window and the
+token bill. `ArtifactStore` solves this: the bytes are offloaded to a pluggable
+store that returns an opaque **id**, and the conversation keeps only a compact
+reference. The model re-fetches the bytes on demand via the `get_artifact` tool.
+
+```rust
+#[async_trait]
+pub trait ArtifactStore: Send + Sync + 'static {
+    async fn save(&self, scope, data, mime_type) -> Result<StoredArtifact>;
+    async fn load(&self, scope: &str, id: &str) -> Result<Artifact>;
+    async fn delete(&self, scope: &str, id: &str) -> Result<()>;
+}
+```
+
+It is a pure store — `save` persists bytes and returns a reference, `load`/`delete`
+retrieve and remove by id. `save` returns a [`StoredArtifact`](#storedartifact):
+at minimum an id, optionally a metadata map the store chose to attach. A store that
+doesn't enrich returns `StoredArtifact::new(id)` — the zero-cost path.
+
+**Security:** `scope` MUST come from trusted session context (e.g.
+`ctx.message.channel_id`), never from model- or user-supplied input. The store
+enforces path containment but NOT tenant authorization — an attacker-chosen scope
+could read another tenant's artifacts.
+
+Built-in implementations:
+
+| Feature flag | Type | What it does |
+|---|---|---|
+| *(default)* | `NoArtifactStore` | No-op. Both `save` and `load` error — a fabricated id would discard the bytes and never load. |
+| `artifacts` | `LocalArtifactStore` | On-disk store, path-jailed under a base dir. Bytes + a JSON sidecar per `(scope, id)`. Caps an artifact at 64 MiB and its sidecar at 64 KiB, and on Windows refuses ids that name a device (`NUL`, `COM1`, …) — see [ADR-0006](adr/0006-artifact-path-jail.md). |
+| `magickmind` | *(reserved)* | Remote backend; a user impl calling the artifact service. Placeholder today. |
+
+#### StoredArtifact
+
+The result of `save`: the reference `id` plus any enrichment the store attached.
+
+```rust
+pub struct StoredArtifact {
+    pub id: String,
+    pub metadata: ContentMetadata,     // caption, backend facts (etag/region), hashes, entities…
+}
+```
+
+`ContentMetadata` is `serde_json::Map<String, Value>` — arbitrary, store-defined.
+A store that wants to caption or tag on save fills it; a minimal store leaves it
+empty (`StoredArtifact::new(id)`). Empty metadata is omitted from serialization, so a
+minimal store costs nothing extra in storage or tokens. There is no separate
+`description` field — a caption is just a metadata key (e.g. `metadata["caption"]`),
+visible to the model like any other.
+
+The `artifact_agent` example demonstrates this with a `DescribedLocalStore` — a
+custom `ArtifactStore` that wraps `LocalArtifactStore` (the decorator pattern) and
+returns `metadata: { "type": "locally saved artifact", "_directory": ... }` on save,
+which then rides along on the persisted `File` reference.
+
+**Metadata is visible to the model by default.** Artifact metadata is usually
+descriptive (captions, tags, entities) and meant to inform the model, so when an
+artifact reference is sent to the model its plain metadata keys are rendered into the
+reference line alongside the id. To keep a key **code-only** (backend plumbing —
+filesystem paths, S3 etags, internal ids), prefix its name with an underscore:
+`_directory`, `_etag`. Underscore-prefixed keys are never rendered. The escape-hatch
+is opt-*out*, because for artifacts exposure is the norm and hiding is the exception.
+
+#### The offload / rehydrate flow
+
+Three pieces cooperate, all built from one shared `Arc<dyn ArtifactStore>` (mirroring
+how `Identity` is shared) so the offload stage and the load tool operate on the
+same store:
+
+1. **`ArtifactManager`** — orchestration over the store. `offload()` walks a
+   message's parts, saves each inline media part, and replaces it with a
+   `ContentPart::File { source: Uri { id }, metadata }` reference, stamping in
+   whatever the store returned.
+2. **`ArtifactOffload`** (pipeline stage) — runs `offload()` on the turn. Place it
+   *early* (before the LLM, so the model never sees inline bytes) or *late* (after
+   the LLM, so only history keeps the reference). Decoupled from persistence — it
+   has no memory knowledge; `MemoryPersistence` later saves whatever the parts
+   became.
+3. **`GetArtifactTool`** (`get_artifact`) — the model calls it with an id;
+   `XmlToolExecutorStage` resolves the bytes via the store's `load` and re-injects
+   them as a multimodal `Role::Tool` message the model can see. A round
+   re-attaches at most 8 artifacts, deduplicated — every one is held in memory
+   and base64-expanded into the request — and the message names any left out.
+
+Because a reference is just a `ContentPart::File` carrying an opaque id, swapping
+the storage backend (local → remote → S3 → encrypted) changes nothing downstream —
+`get_artifact`, the LLM wire conversion, and history round-tripping all treat the
+id as an opaque token.
+
+**Not** an artifact concern: "derive text from media instead of storing it" (OCR an
+image to text, transcribe audio) is ordinary pipeline composition — a stage that
+rewrites the `ContentPart` in place (e.g. `*part = ContentPart::text(...)`),
+composed *instead of* `ArtifactOffload`. No new trait; `ArtifactStore` stays a pure
+store. (`ContentPart` is the multi-modal message-part enum — `Text`, `Image`,
+`Audio`, `Video`, `File` — where the media variants each carry a `metadata`
+`ContentMetadata` map.)
+
+---
+
 ### Observer — lifecycle hooks
 
 ```rust
@@ -626,6 +728,7 @@ All implementations are behind feature flags. The `full` feature enables everyth
 | `apikey` | `ApiKeyIdentity` |
 | `sqlite` | `SqliteMemory` |
 | `magickmind` | `MagickmindMemory` |
+| `artifacts` | `LocalArtifactStore`, `ArtifactManager`, `ArtifactOffload`, `GetArtifactTool` |
 | `log-observer` | `LogObserver` |
 | `full` | All of the above |
 

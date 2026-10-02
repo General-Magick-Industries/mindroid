@@ -22,7 +22,7 @@ use crate::tools::ToolRegistry;
 /// let registry = skills.extend_tools(ToolRegistry::from_config(&config.tools));
 /// let pipeline = Pipeline::new()
 ///     .add_stage(SimpleContextBuilder::with_prompt("You are...").with_skills(&skills))
-///     .add_streaming_stage(ToolExecutorStage::new(llm, Arc::new(registry)));
+///     .add_streaming_stage(XmlToolExecutorStage::new(llm, Arc::new(registry)));
 /// ```
 pub struct SkillSet {
     registry: Arc<RwLock<SkillRegistry>>,

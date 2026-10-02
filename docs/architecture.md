@@ -50,7 +50,7 @@ Mindroid is a modular Rust SDK for building AI agents, designed around trait-dri
 
 | Trait | Purpose | Key Methods |
 |-------|---------|-------------|
-| Transport | Message I/O | connect, disconnect, listen, send, is_connected, health_check |
+| Transport | Message I/O | connect, disconnect, listen, send, is_connected, health_check, set_health_reporter, reports_own_health |
 | PipelineStage | Processing step | process(&mut ctx) |
 | StreamingStage | Token-by-token output (extends PipelineStage) | stream(&mut ctx) → BoxStream<StreamEvent> |
 | Identity | Authentication | get_token, get_auth_headers, is_authenticated, refresh |
