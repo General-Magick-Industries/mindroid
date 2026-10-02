@@ -50,8 +50,7 @@ pub enum PipelineEvent {
     },
     /// The loop finished. `finish` ran first unless `reason` is `Cancelled` or
     /// `Refused`, which skip it, so do not read this as "the turn was
-    /// persisted".
-    /// `reason` is why — the only way a
+    /// persisted". `reason` is why — the only way a
     /// [`run_streaming`](crate::core::agent_loop::AgentLoop::run_streaming)
     /// caller learns it, since that returns events, not a `LoopOutcome`.
     LoopCompleted {

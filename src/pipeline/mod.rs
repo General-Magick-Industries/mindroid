@@ -13,6 +13,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::MessageType;
+use crate::core::agent_loop::Refused;
 use crate::core::context::Context;
 use crate::core::events::PipelineEvent;
 use crate::error::Result;
@@ -155,7 +156,7 @@ impl Pipeline {
         info!("Pipeline::run starting ({} stages)", self.stages.len());
         if let Some(reason) = unconsumable_control(ctx) {
             warn!(channel = %ctx.message.channel_id, "Refusing {reason}");
-            crate::core::agent_loop::Refused::halt(ctx);
+            Refused::halt(ctx);
             return Ok(None);
         }
         ctx.emit_event(PipelineEvent::PipelineStarted {
@@ -290,7 +291,7 @@ impl Pipeline {
             info!("Pipeline::run_streaming starting ({total_stages} stages)");
             if let Some(reason) = unconsumable_control(ctx) {
                 warn!(channel = %ctx.message.channel_id, "Refusing {reason}");
-                crate::core::agent_loop::Refused::halt(ctx);
+                Refused::halt(ctx);
                 return;
             }
             ctx.emit_event(PipelineEvent::PipelineStarted {
@@ -409,6 +410,11 @@ impl Pipeline {
                 }
             }
 
+            if ctx.halted {
+                info!("Pipeline halted by its streaming stage in {:.2?}", pipeline_start.elapsed());
+                return;
+            }
+
             // Run post-streaming stages
             let post_start = self.streaming_idx.map(|i| i + 1).unwrap_or(total_stages);
             for (i, entry) in self.stages[post_start..].iter().enumerate() {
@@ -500,6 +506,50 @@ mod tests {
         }
     }
 
+    /// A streaming stage that refuses the message, as an executor's inline
+    /// result gate does.
+    struct RefusingStream;
+
+    #[async_trait]
+    impl PipelineStage for RefusingStream {
+        fn name(&self) -> &str {
+            "refusing-stream"
+        }
+        async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
+            Refused::halt(ctx);
+            Ok(())
+        }
+    }
+
+    impl StreamingStage for RefusingStream {
+        fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+            Refused::halt(ctx);
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    /// `run` stops after any stage that halts; the streaming path has to stop
+    /// after its streaming stage too, or a persistence stage after it stores
+    /// the result the stage just dropped.
+    #[tokio::test]
+    async fn a_streaming_stage_that_halts_runs_no_stage_after_it() {
+        let called = Arc::new(AtomicBool::new(false));
+        let pipeline = Pipeline::new()
+            .add_streaming_stage(RefusingStream)
+            .add_stage(RecorderStage {
+                called: called.clone(),
+            });
+
+        let mut ctx = Context::new(
+            Arc::new(Message::new("hi", "u1", "c1")),
+            Arc::new(AgentConfig::default()),
+        );
+        let _: Vec<_> = pipeline.run_streaming(&mut ctx).collect().await;
+
+        assert!(ctx.halted);
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
     /// A stage that cancels the context.
     struct CancelStage;
 
@@ -583,6 +633,7 @@ mod tests {
         let ran = called.load(Ordering::SeqCst);
         if !ran {
             assert!(ctx.halted, "a refused message must halt the pipeline");
+            assert!(Refused::covers(&ctx), "admission halts as a refusal");
             assert_eq!(response, None, "a refused message must produce no response");
         }
 
@@ -598,6 +649,7 @@ mod tests {
         let streamed = called.load(Ordering::SeqCst);
         if !streamed {
             assert!(streaming_ctx.halted, "the streaming path must halt too");
+            assert!(Refused::covers(&streaming_ctx));
             assert_eq!(events, 0, "a refusal must not yield a StreamEvent");
         }
 

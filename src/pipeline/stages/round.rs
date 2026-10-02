@@ -77,7 +77,7 @@ use super::tool_executor_xml::{
     PendingRemoteCalls, RemoteResultGate, SUMMARY_PROMPT, declares_tool_result, frame_remote_call,
     registry_for_turn, remote_executor_for, remote_timeout_for, tool_context_for, truncate_str,
 };
-use crate::core::agent_loop::{Continue, ControlResponse, StopReason};
+use crate::core::agent_loop::{Continue, ControlResponse, Refused, StopReason};
 use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall};
@@ -104,10 +104,11 @@ pub struct PendingCalls(pub Vec<NativeToolCall>);
 
 /// One native-tool-calling round: call the model, record what it asked for.
 ///
-/// Sets `ctx.response` to the round's prose — `None` when the round had none,
-/// so a silent round never inherits an earlier pass's text as its own — and,
-/// when the model called tools, leaves [`PendingCalls`] in run scope for
-/// [`ToolRound`].
+/// Sets `ctx.response` to the round's prose and, when the model called tools,
+/// leaves [`PendingCalls`] in run scope for [`ToolRound`]. A round that called
+/// tools and said nothing leaves `None`, so `ToolRound` acks with this round's
+/// prose rather than an earlier pass's; the settling round is set even when
+/// empty, so the loop never answers with an earlier pass's text.
 pub struct LlmRound {
     client: LlmClient,
     registry: DynamicRegistry,
@@ -173,7 +174,7 @@ impl PipelineStage for LlmRound {
                 "LlmRound: refusing a turn whose declared tool_result nothing claimed \
                  — wire ToolRound::result_gate() into the loop's setup pipeline"
             );
-            crate::core::agent_loop::Refused::halt(ctx);
+            Refused::halt(ctx);
             return Ok(());
         }
 
@@ -712,7 +713,7 @@ mod tests {
 
         assert!(ctx.halted);
         assert!(
-            ctx.get_run::<crate::core::agent_loop::Refused>().is_some(),
+            Refused::covers(&ctx),
             "a refusal, so the loop's finish persists nothing"
         );
         assert!(

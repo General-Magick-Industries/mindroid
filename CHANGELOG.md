@@ -180,9 +180,14 @@ parsing the event stream sees it as a string field. Both loop events carry
   back.
 - `Refused` and `StopReason::Refused`: a refusal is a halt that skips
   `finish`. Admission control, `RemoteResultGate` dropping an unsolicited or
-  expired `tool_result`, and `LlmRound` refusing an unclaimed one halt through
-  `Refused::halt`, so persistence in `finish` never stores what was refused. A
-  plain `ctx.halted` still runs `finish` in full.
+  expired `tool_result`, `LlmRound` refusing an unclaimed one and `ManifestStage`
+  rejecting a manifest halt through `Refused::halt`, so persistence in a loop's
+  `finish` never stores what was refused. A plain `ctx.halted` still runs
+  `finish` in full. `BranchStage` lifting a halt clears the mark with it.
+- `Pipeline::run_streaming` stops after a streaming stage that halts, as
+  `Pipeline::run` stops after any stage that does. The post-streaming stages
+  used to run regardless, so a streaming executor dropping a forged
+  `tool_result` still reached a persistence stage after it.
 - `run_streaming` speaks a body with no streaming stage one pass at a time:
   each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
   supplies is spoken as the last one. A response marked with
