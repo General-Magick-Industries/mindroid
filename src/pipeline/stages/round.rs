@@ -106,9 +106,9 @@ pub struct PendingCalls(pub Vec<NativeToolCall>);
 ///
 /// Sets `ctx.response` to the round's prose and, when the model called tools,
 /// leaves [`PendingCalls`] in run scope for [`ToolRound`]. A round that called
-/// tools and said nothing leaves `None`, so `ToolRound` acks with this round's
-/// prose rather than an earlier pass's; the settling round is set even when
-/// empty, so the loop never answers with an earlier pass's text.
+/// tools with no prose (blank included) leaves `None`, so `ToolRound` never
+/// acks with an earlier pass's text; the settling round is set even when
+/// empty, so the loop's carry never answers with one either.
 pub struct LlmRound {
     client: LlmClient,
     registry: DynamicRegistry,

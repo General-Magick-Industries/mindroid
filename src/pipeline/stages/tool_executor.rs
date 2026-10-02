@@ -334,7 +334,7 @@ impl LoopOutcome {
 
     /// Make this the turn's response, marking a framed remote call as control
     /// traffic, and return the text for `Complete`.
-    fn settle(self, ctx: &mut Context) -> String {
+    fn into_response(self, ctx: &mut Context) -> String {
         let remote = self.is_remote();
         let text = self.into_text();
         ctx.response = Some(text.clone());
@@ -616,7 +616,7 @@ impl PipelineStage for ToolExecutorStage {
         let (outcome, _events) = self.run_loop(ctx).await?;
         // A loop whose body is this stage speaks each pass; the envelope is
         // for the client, not the listener.
-        outcome.settle(ctx);
+        outcome.into_response(ctx);
         Ok(())
     }
 }
@@ -732,7 +732,7 @@ impl StreamingStage for ToolExecutorStage {
                         }
                     },
                 };
-                let final_content = answer.settle(ctx);
+                let final_content = answer.into_response(ctx);
                 yield StreamEvent::Complete { content: final_content, usage: None };
                 return;
             }
@@ -751,7 +751,7 @@ impl StreamingStage for ToolExecutorStage {
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
-                    let final_content = outcome.settle(ctx);
+                    let final_content = outcome.into_response(ctx);
                     yield StreamEvent::Complete { content: final_content, usage: None };
                 }
             }
@@ -1386,6 +1386,7 @@ mod tests {
     /// to be marked, or the loop reads it aloud.
     #[tokio::test]
     async fn a_speaking_loop_does_not_read_this_stages_remote_call_aloud() {
+        use crate::core::agent_loop::AgentLoop;
         use futures::StreamExt;
 
         let reply = json!({
@@ -1411,9 +1412,7 @@ mod tests {
         let registry =
             ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
         let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(registry));
-        let agent = crate::core::agent_loop::AgentLoop::new(
-            crate::pipeline::Pipeline::new().add_stage(stage),
-        );
+        let agent = AgentLoop::new(crate::pipeline::Pipeline::new().add_stage(stage));
 
         let mut ctx = fresh_ctx();
         let events: Vec<StreamEvent> = agent.run_streaming(&mut ctx).collect().await;

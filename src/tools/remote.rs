@@ -1252,12 +1252,13 @@ mod tests {
         message
     }
 
-    async fn apply(stage: &ManifestStage, message: crate::models::Message) {
+    async fn apply(stage: &ManifestStage, message: crate::models::Message) -> Context {
         let mut ctx = Context::new(
             Arc::new(message),
             Arc::new(crate::config::AgentConfig::default()),
         );
         stage.process(&mut ctx).await.unwrap();
+        ctx
     }
 
     /// A backend that omits an empty array (Go's `omitempty` and friends) sends
@@ -1310,13 +1311,29 @@ mod tests {
                 authenticated_manifest_message(Some(json!([{"name": "remote"}]))),
             )
             .await;
-            apply(&stage, authenticated_manifest_message(Some(tools.clone()))).await;
+            let ctx = apply(&stage, authenticated_manifest_message(Some(tools.clone()))).await;
 
             assert!(
                 registry.load().get("remote").is_some(),
                 "malformed {tools} must not clear a good manifest"
             );
+            assert!(Refused::covers(&ctx), "malformed {tools} is a refusal");
         }
+    }
+
+    #[tokio::test]
+    async fn a_manifest_from_an_untrusted_sender_is_refused() {
+        let registry = DynamicRegistry::new(crate::tools::ToolRegistry::new());
+        let stage = ManifestStage::new(registry.clone()).trust_sender("other");
+
+        let ctx = apply(
+            &stage,
+            authenticated_manifest_message(Some(json!([{"name": "remote"}]))),
+        )
+        .await;
+
+        assert!(Refused::covers(&ctx));
+        assert!(registry.load().is_empty());
     }
 
     /// Per-turn tools reach the system prompt, so they carry the same
