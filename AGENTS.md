@@ -102,7 +102,8 @@ its own. `LlmRound` + `ToolRound` are the native tool round split for this.
 `tool_calls` turn from its results makes the provider reject the request. It pins the
 system prompt, the newest user message and the newest round. `finish` runs in full
 after a halt or the cap, and not at all after a cancellation, a body error, or a
-message admission control refused. A pass's `Error` ends the turn — stricter than
+refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRound`'s
+unclaimed one), so persistence never stores what was refused. A pass's `Error` ends the turn — stricter than
 `Pipeline::run_streaming`, which forwards it and carries on.
 
 **At the cap a turn stops with a round unanswered** — the model asked for tools, got

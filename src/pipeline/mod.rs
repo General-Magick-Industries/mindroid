@@ -155,7 +155,7 @@ impl Pipeline {
         info!("Pipeline::run starting ({} stages)", self.stages.len());
         if let Some(reason) = unconsumable_control(ctx) {
             warn!(channel = %ctx.message.channel_id, "Refusing {reason}");
-            ctx.halted = true;
+            crate::core::agent_loop::Refused::halt(ctx);
             return Ok(None);
         }
         ctx.emit_event(PipelineEvent::PipelineStarted {
@@ -290,7 +290,7 @@ impl Pipeline {
             info!("Pipeline::run_streaming starting ({total_stages} stages)");
             if let Some(reason) = unconsumable_control(ctx) {
                 warn!(channel = %ctx.message.channel_id, "Refusing {reason}");
-                ctx.halted = true;
+                crate::core::agent_loop::Refused::halt(ctx);
                 return;
             }
             ctx.emit_event(PipelineEvent::PipelineStarted {

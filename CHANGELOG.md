@@ -165,6 +165,11 @@ parsing the event stream sees it as a string field. Both loop events carry
   the text the turn already had. The loop puts its `StopReason` in run scope
   while `finish` runs, and a loop nested in `finish` hands the enclosing loop's
   back.
+- `Refused` and `StopReason::Refused`: a refusal is a halt that skips
+  `finish`. Admission control, `RemoteResultGate` dropping an unsolicited or
+  expired `tool_result`, and `LlmRound` refusing an unclaimed one halt through
+  `Refused::halt`, so persistence in `finish` never stores what was refused. A
+  plain `ctx.halted` still runs `finish` in full.
 - `run_streaming` speaks a body with no streaming stage one pass at a time:
   each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
   supplies is spoken as the last one. A response marked with
