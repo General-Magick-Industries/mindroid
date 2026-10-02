@@ -988,8 +988,7 @@ async fn collect_llm_text(
 /// opening tag itself (`Sure. <tool_ca`) counts as a begun call.
 fn cut_off_mid_call(finished: bool, text: &str, calls: usize) -> Option<&'static str> {
     const OPEN: &str = "<tool_call";
-    let tail = text.trim_end();
-    let opened = text.contains(OPEN) || (2..OPEN.len()).any(|n| tail.ends_with(&OPEN[..n]));
+    let opened = text.contains(OPEN) || (2..OPEN.len()).any(|n| text.ends_with(&OPEN[..n]));
     (!finished && (calls > 0 || opened))
         .then_some("the model's response was cut off partway through a tool call")
 }
@@ -2370,7 +2369,8 @@ Some text.
     #[test]
     fn a_cut_inside_the_opening_tag_is_a_begun_call() {
         assert!(cut_off_mid_call(false, "Sure. <tool_ca", 0).is_some());
-        assert!(cut_off_mid_call(false, "Sure. <t \n", 0).is_some());
+        assert!(cut_off_mid_call(false, "Sure. <t", 0).is_some());
+        assert!(cut_off_mid_call(false, "Sure. <t \n", 0).is_none());
         assert!(cut_off_mid_call(false, "Sure. <", 0).is_none());
         assert!(cut_off_mid_call(false, "a < b", 0).is_none());
         assert!(cut_off_mid_call(true, "Sure. <tool_ca", 0).is_none());
@@ -2412,6 +2412,25 @@ Some text.
             )
         );
         assert_eq!(response.as_deref(), Some("The north gate."));
+    }
+
+    /// A summary of prose alone is delivered as far as it got, whether it was
+    /// cut at the token limit or closed without a finish reason.
+    #[tokio::test]
+    async fn a_summary_of_cut_off_prose_is_delivered() {
+        for finish in [Some("length"), None] {
+            let (events, _, response) = stream_replies(vec![
+                (WHOLE_CALL.to_string(), Some("stop")),
+                ("The gate is at the".to_string(), finish),
+            ])
+            .await;
+            assert!(!ends_in_error(&events), "{finish:?}: {events:?}");
+            assert_eq!(
+                response.as_deref(),
+                Some("The gate is at the"),
+                "{finish:?}"
+            );
+        }
     }
 
     /// The non-streaming summary refuses a cut-off call too.
