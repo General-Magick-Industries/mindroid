@@ -51,9 +51,17 @@ One `Context` spans every phase, so run scope is the loop's state.
 for the phase and put back, since `Pipeline::run` would otherwise stop it after
 one stage — and not at all after a cancellation, which stops every pipeline at
 its next stage boundary. A body error ends the turn in both `run` and
-`run_streaming`; neither reaches `finish`. Admission control (ADR-0008) is the
-remaining exception: it is re-checked at the head of every phase, so a refused
-message runs no finish stages at all, which is what refusing it means.
+`run_streaming`; neither reaches `finish`.
+
+A refused turn does not reach `finish` either. A halt only says "stop": a
+relevance gate declining to engage may still want the message persisted. A
+refusal says the message is something no stage should have consumed —
+admission control (ADR-0008) turning away control traffic, `RemoteResultGate`
+dropping an unsolicited or expired `tool_result`, `LlmRound` refusing one nothing
+claimed. Those sites halt through `Refused::halt`, which also leaves a `Refused`
+marker in run scope; the loop reports `StopReason::Refused` and skips `finish`,
+since persistence there would hand the next turn exactly what was refused. The
+marker propagates outward with `halted`, so an enclosing loop refuses too.
 
 An `Error` yielded by a pass is likewise fatal to the loop, where
 `Pipeline::run_streaming` forwards it and runs its post-streaming stages. That

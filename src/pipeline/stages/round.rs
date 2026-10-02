@@ -173,7 +173,7 @@ impl PipelineStage for LlmRound {
                 "LlmRound: refusing a turn whose declared tool_result nothing claimed \
                  — wire ToolRound::result_gate() into the loop's setup pipeline"
             );
-            ctx.halted = true;
+            crate::core::agent_loop::Refused::halt(ctx);
             return Ok(());
         }
 
@@ -711,6 +711,10 @@ mod tests {
         LlmRound::new(client, reg).process(&mut ctx).await.unwrap();
 
         assert!(ctx.halted);
+        assert!(
+            ctx.get_run::<crate::core::agent_loop::Refused>().is_some(),
+            "a refusal, so the loop's finish persists nothing"
+        );
         assert!(
             ctx.get_run::<Transcript>().is_none(),
             "no round was started"
