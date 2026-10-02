@@ -23,7 +23,7 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
-use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
+use crate::tools::{DynamicRegistry, FramedRemoteCall, ToolContext, ToolRegistry};
 
 /// Clone any [`ToolContext`] a prior stage put in run scope, then overlay
 /// channel/sender from the message.
@@ -586,7 +586,7 @@ impl PipelineStage for XmlToolExecutorStage {
             store: self.artifact_store(),
             scope: ctx.message.channel_id.clone(),
         };
-        let (mut messages, mut final_content, hit_max) = run_tool_loop(
+        let (mut messages, mut final_content, hit_max, framed) = run_tool_loop(
             LoopDeps {
                 client: &self.client,
                 registry: &registry,
@@ -626,6 +626,9 @@ impl PipelineStage for XmlToolExecutorStage {
             final_content = summary;
         }
 
+        if framed {
+            ctx.set_ext(FramedRemoteCall);
+        }
         ctx.response = Some(final_content);
         Ok(())
     }
@@ -772,6 +775,7 @@ impl StreamingStage for XmlToolExecutorStage {
                         name,
                         remote_timeout_for(&registry, name),
                     );
+                    ctx.set_ext(FramedRemoteCall);
                     final_content = framed;
                     break;
                 }
@@ -1019,15 +1023,16 @@ struct LoopDeps<'a> {
     artifacts: &'a ArtifactReinjection,
 }
 
-/// Returns `(messages, final_content, hit_max)`:
+/// Returns `(messages, final_content, hit_max, framed)`:
 /// - `messages` is the updated conversation (including all tool rounds).
 /// - `final_content` is the LLM's last plain-text response (empty if `hit_max`).
 /// - `hit_max` is `true` when the loop was stopped by `max_iterations`.
+/// - `framed` is `true` when `final_content` is a framed remote call.
 async fn run_tool_loop(
     deps: LoopDeps<'_>,
     tool_ctx: &ToolContext,
     mut messages: Vec<LlmMessage>,
-) -> Result<(Vec<LlmMessage>, String, bool)> {
+) -> Result<(Vec<LlmMessage>, String, bool, bool)> {
     let LoopDeps {
         client,
         registry,
@@ -1041,6 +1046,7 @@ async fn run_tool_loop(
     } = deps;
     let mut final_content = String::new();
     let mut hit_max = false;
+    let mut framed_call = false;
 
     for iteration in 0..max_iterations {
         let mut llm_stream = client.stream_chat_tracked(ChatRequest {
@@ -1094,6 +1100,7 @@ async fn run_tool_loop(
                 remote_timeout_for(registry, name),
             );
             final_content = framed;
+            framed_call = true;
             break;
         }
 
@@ -1141,7 +1148,7 @@ async fn run_tool_loop(
         }
     }
 
-    Ok((messages, final_content, hit_max))
+    Ok((messages, final_content, hit_max, framed_call))
 }
 
 /// Read an artifact id from a tool call's args BEFORE `execute` consumes `args`.
@@ -1305,6 +1312,54 @@ mod tests {
     /// close. async-openai reads an ordinary `data:` event stream, so a raw
     /// socket is enough to drive the streaming client the non-streaming
     /// `process` path uses underneath.
+    async fn run_once(reply: &str, streaming: bool) -> Context {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_sse(listener, vec![reply.into()]);
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(registry),
+        );
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        if streaming {
+            let _: Vec<_> = StreamingStage::stream(&stage, &mut ctx).collect().await;
+        } else {
+            PipelineStage::process(&stage, &mut ctx).await.unwrap();
+        }
+        server.await.unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_streamed_remote_call_is_marked_as_framed() {
+        let ctx = run_once(
+            r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#,
+            true,
+        )
+        .await;
+        assert!(ctx.get_ext::<FramedRemoteCall>().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_plain_answer_is_not_marked_as_framed() {
+        for streaming in [false, true] {
+            let ctx = run_once("Just an answer.", streaming).await;
+            assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
+            assert!(
+                ctx.get_ext::<FramedRemoteCall>().is_none(),
+                "streaming={streaming}"
+            );
+        }
+    }
+
     fn serve_sse(
         listener: tokio::net::TcpListener,
         replies: Vec<String>,
@@ -1411,6 +1466,10 @@ mod tests {
             serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
                 .expect("the response is the tool_call envelope");
         assert_eq!(framed["type"], "tool_call");
+        assert!(
+            ctx.get_ext::<FramedRemoteCall>().is_some(),
+            "a framed call must be marked so persistence can type it"
+        );
         let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
 
         let mut result_ctx = Context::new(
