@@ -157,8 +157,9 @@ parsing the event stream sees it as a string field. Both loop events carry
   `ToolRound` runs tools through the same path as `ToolExecutorStage`, so errors
   read the same to the model.
 - `TranscriptCompaction`: drops the oldest whole rounds once the transcript
-  passes a budget, keeping the system prompt, the newest user message and the
-  newest round.
+  passes a budget, keeping every system message, the newest user message and
+  the newest round. A cut through the history never keeps a reply without the
+  user turn it answers.
 - `CapSummary`, from `LlmRound::cap_summary()`: a `finish` stage that makes
   the executor's closing request — the same instruction to answer, no tools —
   when the loop stopped at its iteration cap. An empty or failed answer keeps
