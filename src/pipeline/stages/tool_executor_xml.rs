@@ -613,7 +613,17 @@ impl PipelineStage for XmlToolExecutorStage {
                 stream: true,
                 response_format: None,
             });
-            (final_content, _) = collect_llm_text(&mut llm_stream).await?;
+            let (summary, finished) = collect_llm_text(&mut llm_stream).await?;
+            if let Some(why) =
+                cut_off_mid_call(finished, &summary, self.parser.parse(&summary).len())
+            {
+                return Err(MindroidError::Pipeline {
+                    stage: "XmlToolExecutorStage".into(),
+                    message: why.into(),
+                    source: None,
+                });
+            }
+            final_content = summary;
         }
 
         ctx.response = Some(final_content);
@@ -824,7 +834,7 @@ impl StreamingStage for XmlToolExecutorStage {
 
             if hit_max {
                 messages.push(LlmMessage::user(SUMMARY_PROMPT.to_string()));
-                let mut llm_stream = self.client.stream_chat(ChatRequest {
+                let mut llm_stream = self.client.stream_chat_tracked(ChatRequest {
                     messages: &messages,
                     model: None,
                     temperature: None,
@@ -833,23 +843,35 @@ impl StreamingStage for XmlToolExecutorStage {
                     response_format: None,
                 });
                 let mut summary = String::new();
+                let mut summary_chunks: Vec<String> = Vec::new();
+                let mut finished = false;
                 while let Some(event) = llm_stream.next().await {
                     match event {
-                        StreamEvent::Chunk { ref content } => {
-                            summary.push_str(content);
-                            yield event;
+                        TrackedStreamEvent::Event(StreamEvent::Chunk { content }) => {
+                            summary.push_str(&content);
+                            summary_chunks.push(content);
                         }
-                        StreamEvent::Complete { ref content, .. } => {
+                        TrackedStreamEvent::Complete { content, finished: done, .. } => {
                             if !content.is_empty() {
-                                summary = content.clone();
+                                summary = content;
                             }
+                            finished = done;
                         }
-                        StreamEvent::Error { .. } => {
+                        TrackedStreamEvent::Event(event @ StreamEvent::Error { .. }) => {
                             yield event;
                             return;
                         }
-                        other => yield other,
+                        TrackedStreamEvent::Event(other) => yield other,
                     }
+                }
+                if let Some(why) =
+                    cut_off_mid_call(finished, &summary, self.parser.parse(&summary).len())
+                {
+                    yield StreamEvent::Error { message: why.into() };
+                    return;
+                }
+                for chunk in summary_chunks {
+                    yield StreamEvent::Chunk { content: chunk };
                 }
                 final_content = summary;
             }
@@ -962,9 +984,13 @@ async fn collect_llm_text(
 /// limit, or a stream that closed without a finish reason) after it had begun
 /// a tool call. A call it completed may belong to a plan it never finished
 /// writing, and one it did not complete would be spoken as prose. A cut-off
-/// response of prose alone is delivered as far as it got.
+/// response of prose alone is delivered as far as it got. A cut inside the
+/// opening tag itself (`Sure. <tool_ca`) counts as a begun call.
 fn cut_off_mid_call(finished: bool, text: &str, calls: usize) -> Option<&'static str> {
-    (!finished && (calls > 0 || text.contains("<tool_call")))
+    const OPEN: &str = "<tool_call";
+    let tail = text.trim_end();
+    let opened = text.contains(OPEN) || (2..OPEN.len()).any(|n| tail.ends_with(&OPEN[..n]));
+    (!finished && (calls > 0 || opened))
         .then_some("the model's response was cut off partway through a tool call")
 }
 
@@ -2213,9 +2239,16 @@ Some text.
         reply: &str,
         finish: Option<&'static str>,
     ) -> (Vec<StreamEvent>, usize, Option<String>) {
+        stream_replies(vec![(reply.to_string(), finish)]).await
+    }
+
+    /// [`stream_ending`] over several replies, one per model round.
+    async fn stream_replies(
+        replies: Vec<(String, Option<&'static str>)>,
+    ) -> (Vec<StreamEvent>, usize, Option<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let _server = serve_sse_ending(listener, vec![(reply.to_string(), finish)]);
+        let _server = serve_sse_ending(listener, replies);
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stage = XmlToolExecutorStage::new(
             LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
@@ -2331,6 +2364,85 @@ Some text.
         let err = stage.process(&mut ctx).await.unwrap_err();
         assert!(err.to_string().contains("cut off"), "{err}");
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A cut that lands inside the opening tag is a begun call, not prose.
+    #[test]
+    fn a_cut_inside_the_opening_tag_is_a_begun_call() {
+        assert!(cut_off_mid_call(false, "Sure. <tool_ca", 0).is_some());
+        assert!(cut_off_mid_call(false, "Sure. <t \n", 0).is_some());
+        assert!(cut_off_mid_call(false, "Sure. <", 0).is_none());
+        assert!(cut_off_mid_call(false, "a < b", 0).is_none());
+        assert!(cut_off_mid_call(true, "Sure. <tool_ca", 0).is_none());
+    }
+
+    const CUT_SUMMARY: &str = r#"The gate is <tool_call>{"name": "lookup", "args": {"q": "#;
+
+    /// At max iterations the summary round holds the same line as the loop:
+    /// one cut off mid-call is an error, and none of it is spoken.
+    #[tokio::test]
+    async fn a_summary_cut_off_mid_call_is_not_spoken() {
+        let (events, ran, response) = stream_replies(vec![
+            (WHOLE_CALL.to_string(), Some("stop")),
+            (CUT_SUMMARY.to_string(), Some("length")),
+        ])
+        .await;
+        assert_eq!(ran, 1);
+        assert!(ends_in_error(&events), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Chunk { .. }))
+        );
+        assert!(response.is_none());
+    }
+
+    /// A finished summary still streams as before.
+    #[tokio::test]
+    async fn a_finished_summary_is_delivered() {
+        let (events, ran, response) = stream_replies(vec![
+            (WHOLE_CALL.to_string(), Some("stop")),
+            ("The north gate.".to_string(), Some("stop")),
+        ])
+        .await;
+        assert_eq!(ran, 1);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, StreamEvent::Chunk { content } if content == "The north gate.")
+            )
+        );
+        assert_eq!(response.as_deref(), Some("The north gate."));
+    }
+
+    /// The non-streaming summary refuses a cut-off call too.
+    #[tokio::test]
+    async fn process_refuses_a_summary_cut_off_mid_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_ending(
+            listener,
+            vec![
+                (WHOLE_CALL.to_string(), Some("stop")),
+                (CUT_SUMMARY.to_string(), Some("length")),
+            ],
+        );
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(ToolRegistry::new().register(Counted(ran.clone()))),
+        )
+        .with_max_iterations(1);
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "u", "ch")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        let err = stage.process(&mut ctx).await.unwrap_err();
+        assert!(err.to_string().contains("cut off"), "{err}");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(ctx.response.is_none());
     }
 
     /// `GenericLlmProcessor` reads `stream_chat` directly, so a filtered
