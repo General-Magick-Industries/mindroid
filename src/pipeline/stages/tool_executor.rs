@@ -579,8 +579,15 @@ impl PipelineStage for ToolExecutorStage {
             return Ok(());
         }
         let (outcome, _events) = self.run_loop(ctx).await?;
+        mark_framed(ctx, &outcome);
         ctx.response = Some(outcome.into_text());
         Ok(())
+    }
+}
+
+fn mark_framed(ctx: &mut Context, outcome: &LoopOutcome) {
+    if outcome.is_remote() {
+        ctx.set_ext(crate::tools::FramedRemoteCall);
     }
 }
 
@@ -695,6 +702,7 @@ impl StreamingStage for ToolExecutorStage {
                         }
                     },
                 };
+                mark_framed(ctx, &answer);
                 let final_content = answer.into_text();
                 ctx.response = Some(final_content.clone());
                 yield StreamEvent::Complete { content: final_content, usage: None };
@@ -715,6 +723,7 @@ impl StreamingStage for ToolExecutorStage {
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
+                    mark_framed(ctx, &outcome);
                     let final_content = outcome.into_text();
                     ctx.response = Some(final_content.clone());
                     yield StreamEvent::Complete { content: final_content, usage: None };
@@ -1236,6 +1245,7 @@ mod tests {
             serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
                 .expect("the response is the tool_call envelope");
         assert_eq!(framed["type"], "tool_call");
+        assert!(ctx.get_ext::<crate::tools::FramedRemoteCall>().is_some());
         let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
 
         let mut result_ctx = Context::new(
@@ -1599,6 +1609,7 @@ mod tests {
             })
             .collect();
         assert_eq!(chunks, ["One sec."]);
+        assert!(ctx.get_ext::<crate::tools::FramedRemoteCall>().is_some());
         let framed: serde_json::Value = serde_json::from_str(&ctx.response.unwrap()).unwrap();
         assert_eq!(framed["type"], "tool_call");
         assert_eq!(
