@@ -99,8 +99,9 @@ This is what makes compaction, approval, retry and per-round model routing ordin
 stages: they sit *inside* the reasoning loop rather than around an executor that owns
 its own. `LlmRound` + `ToolRound` are the native tool round split for this.
 `TranscriptCompaction` drops whole rounds, never half of one: splitting an assistant
-`tool_calls` turn from its results makes the provider reject the request. It pins the
-system prompt, the newest user message and the newest round. `finish` runs in full
+`tool_calls` turn from its results makes the provider reject the request. It pins every
+system message (a per-turn context block too), the newest user message and the newest
+round, and never keeps a history reply without its question. `finish` runs in full
 after a halt or the cap, and not at all after a cancellation, a body error, or a
 refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRound`'s
 unclaimed one), so persistence never stores what was refused. A pass's `Error` ends the turn — stricter than

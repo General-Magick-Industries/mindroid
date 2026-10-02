@@ -35,9 +35,12 @@ use crate::pipeline::PipelineStage;
 
 /// Drops the oldest complete rounds once the transcript exceeds a budget.
 ///
-/// Leading system messages, the newest user message and the most recent block
-/// always survive, so the agent keeps its instructions, the question it is
-/// answering and the round it is working on however tight the budget is.
+/// System messages, the newest user message and the most recent block always
+/// survive, so the agent keeps its instructions, the question it is answering
+/// and the round it is working on however tight the budget is. That includes a
+/// system message after the history, such as a per-turn context block. And a
+/// cut through the history never keeps a reply without the user turn it
+/// answers.
 ///
 /// On the first pass the transcript does not exist yet — [`LlmRound`] seeds
 /// it — so this stage seeds it the same way, from `ctx.llm_messages`. Without
@@ -146,11 +149,19 @@ fn compact(
     // round lands after it, so under pressure the question being answered is
     // otherwise the first thing to go, leaving the model a system prompt, a
     // pile of tool output, and no idea what it was asked.
+    let opened_by_user = |b: &[ChatCompletionRequestMessage]| {
+        matches!(b.first(), Some(ChatCompletionRequestMessage::User(_)))
+    };
     let newest = blocks.len().saturating_sub(1);
-    let newest_user = blocks
-        .iter()
-        .rposition(|b| matches!(b.first(), Some(ChatCompletionRequestMessage::User(_))));
-    let pinned = |i: usize| i == newest || Some(i) == newest_user;
+    let newest_user = blocks.iter().rposition(|b| opened_by_user(b));
+    let pinned = |i: usize| {
+        i == newest
+            || Some(i) == newest_user
+            || matches!(
+                blocks[i].first(),
+                Some(ChatCompletionRequestMessage::System(_))
+            )
+    };
 
     let block_size = |b: &[ChatCompletionRequestMessage]| b.iter().map(size_of).sum::<usize>();
     let fixed: usize = head.iter().map(size_of).sum::<usize>()
@@ -166,7 +177,7 @@ fn compact(
     // block does not fit, nothing older does either, so the drop is a prefix
     // of the droppable blocks rather than a scatter.
     let mut full = false;
-    let keep: Vec<bool> = (0..blocks.len())
+    let mut keep: Vec<bool> = (0..blocks.len())
         .rev()
         .map(|i| {
             if pinned(i) {
@@ -184,6 +195,21 @@ fn compact(
         .into_iter()
         .rev()
         .collect();
+
+    // The cut can land between a history question and its reply. Advance it
+    // to the next user turn, so the model is not handed an answer to a
+    // question it cannot see.
+    if let Some(question) = newest_user {
+        for i in (0..question).filter(|&i| !pinned(i)) {
+            if !keep[i] {
+                continue;
+            }
+            if opened_by_user(&blocks[i]) {
+                break;
+            }
+            keep[i] = false;
+        }
+    }
 
     head.extend(
         blocks
@@ -380,6 +406,74 @@ mod tests {
         assert!(kept_users[0].contains("current question"));
         let (calls, _) = calls_and_results(&kept);
         assert_eq!(calls.last().map(String::as_str), Some("c0"));
+    }
+
+    fn assistant(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .content(text)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    /// The newest-first scan keeps a small reply and then stops at its large
+    /// question; the reply must go with it.
+    #[test]
+    fn a_history_reply_never_outlives_its_question() {
+        let msgs = vec![
+            system("be helpful"),
+            user("old question one"),
+            assistant("old answer one"),
+            user(&"q".repeat(600)),
+            assistant("old answer two"),
+            user("current question"),
+            assistant_calling("c0"),
+            tool_result("c0", "done"),
+        ];
+
+        let kept = compact(msgs, 500);
+
+        let replies: Vec<String> = kept
+            .iter()
+            .filter_map(|m| match m {
+                ChatCompletionRequestMessage::Assistant(a) => {
+                    a.content.as_ref().map(|c| format!("{c:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !replies.iter().any(|r| r.contains("old answer")),
+            "{kept:?}"
+        );
+        let kept_users = users(&kept);
+        assert_eq!(kept_users.len(), 1, "{kept_users:?}");
+        let (calls, results) = calls_and_results(&kept);
+        assert_eq!(calls, ["c0"]);
+        assert_eq!(calls, results);
+    }
+
+    /// A system message after the history — persona's per-turn context, say —
+    /// is an instruction like the leading prompt, not a droppable block.
+    #[test]
+    fn a_system_message_after_the_history_survives() {
+        let mut msgs = vec![system("be helpful")];
+        for i in 0..4 {
+            msgs.push(user(&format!("old question {i}")));
+            msgs.push(assistant(&"y".repeat(300)));
+        }
+        msgs.push(system("Context: the user is in the kitchen"));
+        msgs.push(user("current question"));
+        msgs.extend(round("c0", &"x".repeat(300)));
+
+        for budget in [1, 400, 900] {
+            let kept = compact(msgs.clone(), budget);
+            let systems = kept
+                .iter()
+                .filter(|m| matches!(m, ChatCompletionRequestMessage::System(_)))
+                .count();
+            assert_eq!(systems, 2, "budget {budget}: {kept:?}");
+        }
     }
 
     /// Pinning the question must not scatter the drop: once a round does not
