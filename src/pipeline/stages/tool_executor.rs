@@ -463,7 +463,7 @@ impl ToolExecutorStage {
         &self,
         registry: &ToolRegistry,
         tool_ctx: &ToolContext,
-        message_channel: &str,
+        #[cfg_attr(not(feature = "artifacts"), allow(unused_variables))] message_channel: &str,
         outcome: crate::llm_client::ToolsChatOutcome,
         messages: &mut Vec<ChatCompletionRequestMessage>,
     ) -> Result<Round> {
