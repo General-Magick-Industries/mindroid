@@ -112,28 +112,38 @@ impl ControlResponse {
 /// the message persisted. A refusal is different: the message is something no
 /// stage should have consumed (an unsolicited or expired `tool_result`, one
 /// that reached the model unclaimed, control traffic admission control turned
-/// away), so persisting it would hand the next turn what was refused. A loop
+/// away, a tool manifest `ManifestStage` rejected), so persisting it would
+/// hand the next turn what was refused. A loop
 /// that halts with this set stops with [`StopReason::Refused`] and runs no
 /// `finish` stage.
 ///
 /// It rides in run scope beside `ctx.halted` and propagates outward with it,
-/// so a loop nested as a stage refuses its parent's turn too.
+/// so a loop nested as a stage refuses its parent's turn too. The mark names
+/// the message it refused, so a [`Context`] reused for the next message is not
+/// refused by it. A stage that lifts `ctx.halted` to recover from a refusal
+/// takes the mark with it, as `BranchStage` does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refused;
+pub struct Refused(String);
 
 impl Refused {
-    /// Halt the turn and mark the halt as a refusal.
+    /// Halt the turn and mark the halt as a refusal of the current message.
     pub fn halt(ctx: &mut Context) {
         ctx.halted = true;
-        ctx.set(Refused);
+        ctx.set(Refused(ctx.message.id.clone()));
     }
 
-    fn halt_reason(ctx: &Context) -> StopReason {
-        if ctx.get_run::<Refused>().is_some() {
-            StopReason::Refused
-        } else {
-            StopReason::Halted
-        }
+    /// Whether the current message was refused.
+    pub fn covers(ctx: &Context) -> bool {
+        ctx.get_run::<Refused>()
+            .is_some_and(|mark| mark.0 == ctx.message.id)
+    }
+}
+
+fn halt_reason(ctx: &Context) -> StopReason {
+    if Refused::covers(ctx) {
+        StopReason::Refused
+    } else {
+        StopReason::Halted
     }
 }
 
@@ -144,6 +154,7 @@ impl Refused {
 /// it), and in run scope while `finish` runs, so a stage there can act on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StopReason {
     /// No stage asked for another pass.
     Settled,
@@ -160,7 +171,8 @@ pub enum StopReason {
 /// The result of running an [`AgentLoop`].
 #[derive(Debug, Clone)]
 pub struct LoopOutcome {
-    /// The response left by the last pass that produced one, after `finish`.
+    /// The response left by the last pass that produced one, after `finish`
+    /// when it ran.
     pub response: Option<String>,
     pub reason: StopReason,
     /// Body passes actually executed.
@@ -241,9 +253,13 @@ impl AgentLoop {
     /// propagating it. And a refused turn ([`StopReason::Refused`]) skips it:
     /// admission control (ADR-0008) turning away control traffic, a
     /// [`RemoteResultGate`](crate::pipeline::stages::RemoteResultGate)
-    /// dropping an unsolicited or expired `tool_result`, or `LlmRound`
-    /// refusing one nothing claimed. What was refused persists nothing, which
-    /// is the point of refusing it.
+    /// dropping an unsolicited or expired `tool_result`, `LlmRound` refusing
+    /// one nothing claimed, or `ManifestStage` rejecting a manifest. What was
+    /// refused persists nothing, which is the point of refusing it.
+    ///
+    /// A refusal *inside* `finish` — a loop nested there refusing — stops the
+    /// rest of the phase, as any halt in `finish` stops it, and the loop still
+    /// reports the reason it stopped for.
     pub fn with_finish(mut self, finish: Pipeline) -> Self {
         self.finish = finish;
         self
@@ -275,11 +291,10 @@ impl AgentLoop {
 
     async fn drive(&self, ctx: &mut Context) -> Result<LoopOutcome> {
         let started = Instant::now();
-        ctx.take::<Refused>();
 
         let carried = self.setup.run(ctx).await?;
         if ctx.halted {
-            let reason = Refused::halt_reason(ctx);
+            let reason = halt_reason(ctx);
             return self.wrap_up(ctx, carried, reason, 0, started).await;
         }
 
@@ -318,7 +333,7 @@ impl AgentLoop {
                 break StopReason::Cancelled;
             }
             if ctx.halted {
-                break Refused::halt_reason(ctx);
+                break halt_reason(ctx);
             }
             if ctx.take::<Continue>().is_none() {
                 break StopReason::Settled;
@@ -365,7 +380,6 @@ impl AgentLoop {
         Box::pin(async_stream::stream! {
             let started = Instant::now();
             let speaks_passes = !self.body.has_streaming_stage();
-            ctx.take::<Refused>();
 
             let mut carried = match self.setup.run(ctx).await {
                 Ok(text) => text,
@@ -378,7 +392,7 @@ impl AgentLoop {
             let mut iterations = 0;
             let mut spent: Option<TokenUsage> = None;
             let reason = if ctx.halted {
-                Refused::halt_reason(ctx)
+                halt_reason(ctx)
             } else {
                 loop {
                     if ctx.cancel.is_cancelled() {
@@ -439,7 +453,7 @@ impl AgentLoop {
                         break StopReason::Cancelled;
                     }
                     if ctx.halted {
-                        break Refused::halt_reason(ctx);
+                        break halt_reason(ctx);
                     }
                     if ctx.take::<Continue>().is_none() {
                         break StopReason::Settled;
@@ -902,9 +916,9 @@ mod tests {
         );
     }
 
-    /// Admission control (ADR-0008) is re-checked at the head of every phase,
-    /// so a refused message reaches no stage of any of them — `finish`
-    /// included. Refusing control traffic means persisting nothing for it.
+    /// Admission control (ADR-0008) refuses the message before setup's first
+    /// stage, and a refused loop skips `finish`, so no stage of any phase runs.
+    /// Refusing control traffic means persisting nothing for it.
     #[tokio::test]
     async fn an_admission_refusal_runs_no_stage_of_any_phase() {
         let mut msg = Message::new("<tool_call>whatever</tool_call>", "u1", "c1");
@@ -993,22 +1007,55 @@ mod tests {
         assert_eq!(finish_hits.load(Ordering::SeqCst), 0);
     }
 
-    /// A refusal left in run scope by an earlier turn on a reused context
-    /// must not refuse this one.
+    struct PlainHalt;
+
+    #[async_trait]
+    impl PipelineStage for PlainHalt {
+        fn name(&self) -> &str {
+            "plain-halt"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            ctx.halted = true;
+            Ok(())
+        }
+    }
+
+    /// The mark names the message it refused, so a context reused for the
+    /// next message reads that message's plain halt as a plain halt.
     #[tokio::test]
-    async fn a_stale_refusal_does_not_refuse_the_next_turn() {
+    async fn a_refusal_of_an_earlier_message_does_not_refuse_this_one() {
         let finish_hits = Arc::new(AtomicUsize::new(0));
         let mut ctx = ctx();
-        ctx.set(Refused);
-        let (body, _) = rounds(1);
-        let outcome = AgentLoop::new(body)
+        Refused::halt(&mut ctx);
+        ctx.halted = false;
+        ctx.message = Arc::new(Message::new("next", "u1", "c1"));
+
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(PlainHalt))
             .with_finish(Pipeline::new().add_stage(Marker("persist", finish_hits.clone())))
             .run(&mut ctx)
             .await
             .unwrap();
 
-        assert_eq!(outcome.reason, StopReason::Settled);
+        assert_eq!(outcome.reason, StopReason::Halted);
         assert_eq!(finish_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// `run_streaming` keeps its own copy of the pass loop, so a refusal in
+    /// the body is checked there too, not only through `run`.
+    #[tokio::test]
+    async fn a_streamed_refusal_in_the_body_skips_finish() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let finish_hits = Arc::new(AtomicUsize::new(0));
+        let agent = AgentLoop::new(Pipeline::new().add_stage(Refuse))
+            .with_finish(Pipeline::new().add_stage(Marker("persist", finish_hits.clone())));
+
+        let mut ctx = ctx().with_events(tx);
+        let events: Vec<_> = agent.run_streaming(&mut ctx).collect().await;
+
+        assert_eq!(finish_hits.load(Ordering::SeqCst), 0);
+        assert!(matches!(events.last(), Some(StreamEvent::Complete { .. })));
+        assert_eq!(loop_completed(&mut rx), StopReason::Refused);
     }
 
     /// A halt in setup must not run the body at all.

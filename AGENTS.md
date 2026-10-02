@@ -104,8 +104,9 @@ system message (a per-turn context block too), the newest user message and the n
 round, and never keeps a history reply without its question. `finish` runs in full
 after a halt or the cap, and not at all after a cancellation, a body error, or a
 refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRound`'s
-unclaimed one), so persistence never stores what was refused. A pass's `Error` ends the turn — stricter than
-`Pipeline::run_streaming`, which forwards it and carries on.
+unclaimed one, a rejected manifest), so a loop's persistence never stores what was
+refused. A pass's `Error` ends the turn — stricter than `Pipeline::run_streaming`,
+which forwards it and carries on.
 
 **At the cap a turn stops with a round unanswered** — the model asked for tools, got
 the results, never replied. `finish` sees the `StopReason` in run scope, and
@@ -177,9 +178,9 @@ Set `ctx.halted = true` to stop the pipeline early from any stage.
 
 **Before stage 1**, `Pipeline` refuses inbound control traffic no stage can
 consume — a `TOOL_CALL`, or a `TOOL_RESULT` that is not one complete
-`<tool_result>` envelope. It halts with no response and no `PipelineEvent`.
-This is deliberate admission control, not a stage; see ADR-0008 before changing
-it.
+`<tool_result>` envelope. It halts with no response and no `PipelineEvent`, as
+a refusal (`Refused::halt`), so an `AgentLoop` skips `finish` over it. This is
+deliberate admission control, not a stage; see ADR-0008 before changing it.
 
 ### Combinators
 

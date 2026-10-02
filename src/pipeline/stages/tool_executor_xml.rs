@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::core::agent_loop::Refused;
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 use crate::llm_client::{ChatRequest, LlmClient};
@@ -375,7 +376,7 @@ impl PipelineStage for RemoteResultGate {
         // malformed frame that claimed first would kill the valid retry.
         let Some((id, name)) = crate::tools::remote::validated_tool_result(&content) else {
             warn!("Dropping a structurally invalid tool_result envelope");
-            crate::core::agent_loop::Refused::halt(ctx);
+            Refused::halt(ctx);
             return Ok(());
         };
 
@@ -389,7 +390,7 @@ impl PipelineStage for RemoteResultGate {
                 "Dropping a tool_result that answers no outstanding call \
                  (unsolicited, expired, or already claimed)"
             );
-            crate::core::agent_loop::Refused::halt(ctx);
+            Refused::halt(ctx);
             return Ok(());
         };
 

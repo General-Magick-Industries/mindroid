@@ -31,6 +31,7 @@ use super::tool_executor_xml::{
     declares_tool_result, frame_remote_call, registry_for_turn, remote_executor_for,
     tool_context_for, truncate_str,
 };
+use crate::core::agent_loop::ControlResponse;
 use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall, ToolsChatOutcome, ToolsStreamEvent};
@@ -330,6 +331,18 @@ impl LoopOutcome {
     fn is_remote(&self) -> bool {
         matches!(self, Self::Remote(_))
     }
+
+    /// Make this the turn's response, marking a framed remote call as control
+    /// traffic, and return the text for `Complete`.
+    fn settle(self, ctx: &mut Context) -> String {
+        let remote = self.is_remote();
+        let text = self.into_text();
+        ctx.response = Some(text.clone());
+        if remote {
+            ControlResponse::mark(ctx);
+        }
+        text
+    }
 }
 
 struct Round {
@@ -603,11 +616,7 @@ impl PipelineStage for ToolExecutorStage {
         let (outcome, _events) = self.run_loop(ctx).await?;
         // A loop whose body is this stage speaks each pass; the envelope is
         // for the client, not the listener.
-        let remote = outcome.is_remote();
-        ctx.response = Some(outcome.into_text());
-        if remote {
-            crate::core::agent_loop::ControlResponse::mark(ctx);
-        }
+        outcome.settle(ctx);
         Ok(())
     }
 }
@@ -723,12 +732,7 @@ impl StreamingStage for ToolExecutorStage {
                         }
                     },
                 };
-                let remote = answer.is_remote();
-                let final_content = answer.into_text();
-                ctx.response = Some(final_content.clone());
-                if remote {
-                    crate::core::agent_loop::ControlResponse::mark(ctx);
-                }
+                let final_content = answer.settle(ctx);
                 yield StreamEvent::Complete { content: final_content, usage: None };
                 return;
             }
@@ -747,12 +751,7 @@ impl StreamingStage for ToolExecutorStage {
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
-                    let remote = outcome.is_remote();
-                    let final_content = outcome.into_text();
-                    ctx.response = Some(final_content.clone());
-                    if remote {
-                        crate::core::agent_loop::ControlResponse::mark(ctx);
-                    }
+                    let final_content = outcome.settle(ctx);
                     yield StreamEvent::Complete { content: final_content, usage: None };
                 }
             }
@@ -1727,8 +1726,7 @@ mod tests {
             .collect();
         assert_eq!(chunks, ["One sec."]);
         assert!(
-            ctx.get_run::<crate::core::agent_loop::ControlResponse>()
-                .is_some(),
+            ctx.get_run::<ControlResponse>().is_some(),
             "a framed call is control traffic"
         );
         let framed: serde_json::Value = serde_json::from_str(&ctx.response.unwrap()).unwrap();

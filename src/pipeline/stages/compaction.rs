@@ -42,6 +42,10 @@ use crate::pipeline::PipelineStage;
 /// cut through the history never keeps a reply without the user turn it
 /// answers.
 ///
+/// What always survives is not counted against the budget, so a transcript
+/// whose system messages alone exceed it goes out over budget rather than
+/// without its instructions.
+///
 /// On the first pass the transcript does not exist yet — [`LlmRound`] seeds
 /// it — so this stage seeds it the same way, from `ctx.llm_messages`. Without
 /// that the history built in `setup` would reach the model uncompacted once
@@ -142,13 +146,14 @@ fn compact(
         }
     }
 
-    // Two blocks are kept whatever the budget. The newest, so a budget too
-    // small for one round degrades to "the current round only" rather than to
-    // an empty transcript, which the provider rejects outright. And the newest
-    // user message: the seed is `[system, history…, user(current)]` and every
-    // round lands after it, so under pressure the question being answered is
-    // otherwise the first thing to go, leaving the model a system prompt, a
-    // pile of tool output, and no idea what it was asked.
+    // Three kinds of block are kept whatever the budget. The newest, so a
+    // budget too small for one round degrades to "the current round only"
+    // rather than to an empty transcript, which the provider rejects outright.
+    // The newest user message: the seed is `[system, history…, user(current)]`
+    // and every round lands after it, so under pressure the question being
+    // answered is otherwise the first thing to go. And every system message,
+    // since one after the history (a per-turn context block) is as much an
+    // instruction as the leading prompt.
     let opened_by_user = |b: &[ChatCompletionRequestMessage]| {
         matches!(b.first(), Some(ChatCompletionRequestMessage::User(_)))
     };
@@ -200,15 +205,11 @@ fn compact(
     // to the next user turn, so the model is not handed an answer to a
     // question it cannot see.
     if let Some(question) = newest_user {
-        for i in (0..question).filter(|&i| !pinned(i)) {
-            if !keep[i] {
-                continue;
-            }
-            if opened_by_user(&blocks[i]) {
-                break;
-            }
-            keep[i] = false;
-        }
+        let orphaned: Vec<usize> = (0..question)
+            .filter(|&i| !pinned(i) && keep[i])
+            .take_while(|&i| !opened_by_user(&blocks[i]))
+            .collect();
+        orphaned.into_iter().for_each(|i| keep[i] = false);
     }
 
     head.extend(

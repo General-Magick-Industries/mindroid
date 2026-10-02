@@ -58,10 +58,14 @@ relevance gate declining to engage may still want the message persisted. A
 refusal says the message is something no stage should have consumed —
 admission control (ADR-0008) turning away control traffic, `RemoteResultGate`
 dropping an unsolicited or expired `tool_result`, `LlmRound` refusing one nothing
-claimed. Those sites halt through `Refused::halt`, which also leaves a `Refused`
-marker in run scope; the loop reports `StopReason::Refused` and skips `finish`,
-since persistence there would hand the next turn exactly what was refused. The
-marker propagates outward with `halted`, so an enclosing loop refuses too.
+claimed, `ManifestStage` rejecting a manifest. Those sites halt through
+`Refused::halt`, which also leaves a `Refused` marker in run scope; the loop
+reports `StopReason::Refused` and skips `finish`, since persistence there would
+hand the next turn exactly what was refused. The marker names the message it
+refused, so a reused `Context` does not refuse the next one, and propagates
+outward with `halted`, so an enclosing loop refuses too. A stage that lifts the
+halt to recover — `BranchStage` running its fail branch — takes the marker with
+it. An accepted manifest is a plain halt: a stage consumed it.
 
 An `Error` yielded by a pass is likewise fatal to the loop, where
 `Pipeline::run_streaming` forwards it and runs its post-streaming stages. That
@@ -125,8 +129,9 @@ on purpose.
 ## Consequences
 
 - Compaction, approval and per-round routing become ordinary stages in the
-  body. `TranscriptCompaction` ships as the first of them; it pins the system
-  prompt, the newest user message and the newest round, and seeds the transcript
+  body. `TranscriptCompaction` ships as the first of them; it pins every system
+  message, the newest user message and the newest round, never keeps a history
+  reply without its question, and seeds the transcript
   itself so the first call is compacted too. Per-round retry is not yet one of
   them: `RetryStage::reset_output` clears run scope wholesale, transcript
   included.

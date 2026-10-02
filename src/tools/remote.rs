@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{DynamicRegistry, Tool, ToolContext};
+use crate::core::agent_loop::Refused;
 use crate::core::context::Context;
 use crate::core::models::TOOLS_METADATA_KEY;
 use crate::core::prompt_text::{escape_markup, truncate_on_char_boundary};
@@ -336,21 +337,25 @@ impl crate::pipeline::PipelineStage for ManifestStage {
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         if ctx.message.message_type == crate::MessageType::ToolManifest {
             // Control traffic either way: a manifest we reject is still not a
-            // turn for the LLM, so every path below halts.
+            // turn for the LLM, so every path below halts, and a rejected one
+            // as a refusal.
             ctx.halted = true;
 
             let Some(authenticated_sender) = ctx.message.trusted_sender_id() else {
                 tracing::warn!("Ignoring tool manifest without an authenticated sender");
+                Refused::halt(ctx);
                 return Ok(());
             };
             if let Some(trusted) = &self.trusted_sender
                 && authenticated_sender != trusted
             {
                 tracing::warn!("Ignoring tool manifest from an untrusted sender");
+                Refused::halt(ctx);
                 return Ok(());
             }
             let Some(manifest) = ToolsManifest::declared_manifest(&ctx.message) else {
                 tracing::warn!("Ignoring tool manifest whose tools metadata was unusable");
+                Refused::halt(ctx);
                 return Ok(());
             };
 
@@ -1369,6 +1374,7 @@ mod tests {
         stage.process(&mut ctx).await.unwrap();
 
         assert!(ctx.halted);
+        assert!(Refused::covers(&ctx), "a rejected manifest is a refusal");
         assert!(registry.load().is_empty());
     }
 
@@ -1397,6 +1403,11 @@ mod tests {
         let snapshot = registry.load();
         let tool = snapshot.get("remote").unwrap();
         assert_eq!(tool.remote_executor_id(), Some("robot"));
+        assert!(ctx.halted);
+        assert!(
+            !Refused::covers(&ctx),
+            "an accepted manifest is a plain halt"
+        );
     }
 
     #[test]
