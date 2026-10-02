@@ -25,6 +25,7 @@ pub struct AgentSetup {
     pub token: String,
     pub device_id: String,
     pub llm_base_url: String,
+    pub allow_insecure: bool,
 }
 
 pub struct AgentHandle {
@@ -43,10 +44,11 @@ pub async fn start(setup: AgentSetup) -> Result<AgentHandle> {
     let auth: Arc<dyn Auth> = Arc::new(StaticAuth::new(setup.token));
     let transport = CentrifugoTransport::new(&setup.ws_url, &setup.agent_id, Arc::clone(&auth))
         .with_credential_kind(CredentialKind::EndUser)
-        .with_trust_fanout_sender(true);
+        .with_trust_fanout_sender(true)
+        .with_allow_insecure(setup.allow_insecure);
 
     let magickmind = Arc::new(
-        MagickmindClient::try_new(&setup.base_url, Arc::clone(&auth), false)?
+        MagickmindClient::try_new(&setup.base_url, Arc::clone(&auth), setup.allow_insecure)?
             .with_credential_kind(CredentialKind::EndUser),
     );
     let preparer = Arc::new(ContextPreparer::new().add_provider(

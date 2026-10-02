@@ -14,7 +14,8 @@
 //! MM_CENTRIFUGO_URL (default wss://dev-centrifugo.magickmind.ai/connection/websocket),
 //! MM_E2E_PREFIX (fixture external-id prefix, default `mindroid-e2e`),
 //! MM_E2E_PROJECT_ID, MM_E2E_WAIT_SECS (per-hop wait, default 30),
-//! MM_E2E_KEEP_SPACE=1 to keep the magickspace, MM_E2E_REPORT=<path> for a JSON report.
+//! MM_E2E_KEEP_SPACE=1 to keep the magickspace, MM_E2E_REPORT=<path> for a JSON report,
+//! MM_E2E_ALLOW_INSECURE=1 to allow http/ws URLs for a local stack.
 //! Exits 0 when every hop passes, 1 when any fails, 2 when setup fails.
 
 mod agent;
@@ -48,6 +49,7 @@ struct Settings {
     wait: Duration,
     keep_space: bool,
     report_path: Option<String>,
+    allow_insecure: bool,
 }
 
 impl Settings {
@@ -68,6 +70,7 @@ impl Settings {
             ),
             keep_space: var("MM_E2E_KEEP_SPACE").is_some_and(|v| v != "0"),
             report_path: var("MM_E2E_REPORT"),
+            allow_insecure: var("MM_E2E_ALLOW_INSECURE").is_some_and(|v| v != "0"),
         })
     }
 }
@@ -366,6 +369,7 @@ async fn exercise(bifrost: &Bifrost, s: &Settings, space: &Space, run: &str) -> 
         token: space.agent.token.clone(),
         device_id: space.device.id.clone(),
         llm_base_url: stub.base_url.clone(),
+        allow_insecure: s.allow_insecure,
     })
     .await?;
 
