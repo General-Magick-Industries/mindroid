@@ -29,7 +29,7 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// ```ignore
 /// let executor = ToolExecutorStage::new(client, registry);
 /// let runtime = Runtime::builder()
-///     .routine(RemoteCallTimeout::new(executor.pending()))
+///     .add_routine(RemoteCallTimeout::new(executor.pending()))
 ///     .pipeline(Pipeline::new().add_streaming_stage(executor))
 ///     .build()?;
 /// ```
@@ -57,7 +57,7 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 ///         .add_stage(SimpleContextBuilder::with_prompt(SYSTEM)),
 /// );
 /// let runtime = Runtime::builder()
-///     .routine(RemoteCallTimeout::new(pending))
+///     .add_routine(RemoteCallTimeout::new(pending))
 ///     .pipeline(Pipeline::new().add_stage(agent))
 ///     .build()?;
 /// ```

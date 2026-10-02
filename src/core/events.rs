@@ -48,8 +48,10 @@ pub enum PipelineEvent {
         loop_name: String,
         iteration: usize,
     },
-    /// The loop finished, after `finish` ran. `reason` is why — the only way
-    /// a [`run_streaming`](crate::core::agent_loop::AgentLoop::run_streaming)
+    /// The loop finished. `finish` ran first unless `reason` is `Cancelled`,
+    /// which skips it, so do not read this as "the turn was persisted".
+    /// `reason` is why — the only way a
+    /// [`run_streaming`](crate::core::agent_loop::AgentLoop::run_streaming)
     /// caller learns it, since that returns events, not a `LoopOutcome`.
     LoopCompleted {
         loop_name: String,

@@ -147,7 +147,7 @@ pub struct LoopOutcome {
 ///         .add_stage(tools),
 /// )
 /// .with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
-/// .with_finish(Pipeline::new().add_stage(PostProcessor::new()));
+/// .with_finish(Pipeline::new().add_stage(PostProcessor));
 ///
 /// let outcome = agent.run(&mut ctx).await?;
 /// ```
