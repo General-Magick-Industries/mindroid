@@ -697,9 +697,13 @@ async fn run_hops(
         &[],
     );
 
+    let call_sent_as = match field(&call_msg, "message_type") {
+        "" => "TOOL_CALL",
+        sent_as => sent_as,
+    };
     let want = [
         (ask_id.as_str(), "TEXT", "person's request"),
-        (call_msg_id.as_str(), "TOOL_CALL", "agent's call"),
+        (call_msg_id.as_str(), call_sent_as, "agent's call"),
         (result_id.as_str(), "TOOL_RESULT", "device's result"),
     ];
     let check_history = |items: &[Value]| -> std::result::Result<String, String> {
