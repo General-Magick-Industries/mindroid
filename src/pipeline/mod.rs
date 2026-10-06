@@ -116,6 +116,15 @@ pub(crate) fn claimed_this_message(ctx: &Context) -> bool {
         .is_some_and(|claim| claim.0 == ctx.message.id)
 }
 
+/// A refused message gets no reply. A gate that passed it before the refusal
+/// signals the pass by echoing the message into `ctx.response`, so whatever is
+/// there is dropped rather than returned.
+fn drop_refused_reply(ctx: &mut Context) {
+    if Refused::covers(ctx) {
+        ctx.response = None;
+    }
+}
+
 /// A composable, ordered pipeline of processing stages.
 ///
 /// Stages run sequentially. At most one stage may be a `StreamingStage`;
@@ -270,6 +279,7 @@ impl Pipeline {
         info!("Pipeline::run completed in {:.2?}", total);
         ctx.emit_event(PipelineEvent::PipelineCompleted { elapsed: total });
 
+        drop_refused_reply(ctx);
         Ok(ctx.response.take())
     }
 
@@ -329,6 +339,7 @@ impl Pipeline {
                     });
                     if ctx.halted {
                         info!("Pipeline halted by stage [{}/{}] '{}'", i + 1, total_stages, name);
+                        drop_refused_reply(ctx);
                         return;
                     }
                     if ctx.cancel.is_cancelled() {
@@ -344,6 +355,7 @@ impl Pipeline {
             // Skip streaming and post-streaming stages if halted
             if ctx.halted {
                 info!("Pipeline::run_streaming completed (halted) in {:.2?}", pipeline_start.elapsed());
+                drop_refused_reply(ctx);
                 return;
             }
 
@@ -413,6 +425,7 @@ impl Pipeline {
 
             if ctx.halted {
                 info!("Pipeline halted by its streaming stage in {:.2?}", pipeline_start.elapsed());
+                drop_refused_reply(ctx);
                 return;
             }
 
@@ -446,6 +459,7 @@ impl Pipeline {
                     });
                     if ctx.halted {
                         info!("Pipeline halted by stage [{}/{}] '{}'", stage_num, total_stages, name);
+                        drop_refused_reply(ctx);
                         return;
                     }
                     if ctx.cancel.is_cancelled() {

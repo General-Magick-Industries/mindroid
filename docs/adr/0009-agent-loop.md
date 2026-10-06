@@ -47,25 +47,29 @@ AgentLoop::new(body)          // runs per iteration
 
 One `Context` spans every phase, so run scope is the loop's state.
 
-`finish` runs in full after a settled, halted or capped loop — `halted` is lifted
-for the phase and put back, since `Pipeline::run` would otherwise stop it after
-one stage — and not at all after a cancellation, which stops every pipeline at
-its next stage boundary. A body error ends the turn in both `run` and
-`run_streaming`; neither reaches `finish`.
+`finish` runs in full after a settled, capped, or halted loop, unless a refusal
+halted it (below) — `halted` is lifted for the phase and put back, since
+`Pipeline::run` would otherwise stop it after one stage — and not at all after a
+cancellation, which stops every pipeline at its next stage boundary. A body
+error ends the turn in both `run` and `run_streaming`; neither reaches `finish`.
 
 A refused turn does not reach `finish` either. A halt only says "stop": a
 relevance gate declining to engage may still want the message persisted. A
-refusal says the message is something no stage should have consumed —
-admission control (ADR-0008) turning away control traffic, `RemoteResultGate`
-dropping an unsolicited or expired `tool_result`, `LlmRound` refusing one nothing
-claimed, `ManifestStage` rejecting a manifest. Those sites halt through
-`Refused::halt`, which also leaves a `Refused` marker in run scope; the loop
-reports `StopReason::Refused` and skips `finish`, since persistence there would
-hand the next turn exactly what was refused. The marker names the message it
-refused, so a reused `Context` does not refuse the next one, and propagates
-outward with `halted`, so an enclosing loop refuses too. A stage that lifts the
-halt to recover takes the marker with it, as `BranchStage` does whether or not
-it has a fail branch. An accepted manifest is a plain halt: a stage consumed it.
+refusal says the message is something no stage should have consumed — admission
+control (ADR-0008) turning away control traffic, `RemoteResultGate` dropping an
+unsolicited or expired `tool_result`, `LlmRound` refusing one nothing claimed,
+`ManifestStage` rejecting a manifest. Those sites halt through `Refused::halt`,
+which also leaves a `Refused` marker in run scope; the loop reports
+`StopReason::Refused` and skips `finish`, since persistence there would hand the
+next turn exactly what was refused. Nor does a refused turn return a response,
+from the loop or from a plain `Pipeline`: a gate that passed the message before
+the refusal echoed it into `ctx.response`, and that echo, like an earlier pass's
+prose, is not a reply to a message that was refused. The marker names the
+message it refused, so a reused `Context` does not refuse the next one, and
+propagates outward with `halted`, so an enclosing loop refuses too. A stage that
+lifts the halt to recover takes the marker with it, as `BranchStage` does
+whether or not it has a fail branch. An accepted manifest is a plain halt: a
+stage consumed it.
 
 An `Error` yielded by a pass is likewise fatal to the loop, where
 `Pipeline::run_streaming` forwards it and runs its post-streaming stages. That

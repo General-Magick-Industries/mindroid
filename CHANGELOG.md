@@ -182,7 +182,9 @@ parsing the event stream sees it as a string field. Both loop events carry
   `finish`. Admission control, `RemoteResultGate` dropping an unsolicited or
   expired `tool_result`, `LlmRound` refusing an unclaimed one and `ManifestStage`
   rejecting a manifest halt through `Refused::halt`, so persistence in a loop's
-  `finish` never stores what was refused. A plain `ctx.halted` still runs
+  `finish` never stores what was refused. A refused turn also returns no
+  response, from a loop or a plain `Pipeline`, so a gate's echo of the refused
+  message is never sent back as the reply. A plain `ctx.halted` still runs
   `finish` in full. `BranchStage` lifting a halt clears the mark with it.
 - `run_streaming` speaks a body with no streaming stage one pass at a time:
   each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
