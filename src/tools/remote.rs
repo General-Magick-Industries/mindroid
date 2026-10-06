@@ -282,11 +282,6 @@ impl ToolsManifest {
     }
 }
 
-/// Set on a turn whose response is a framed remote tool call rather than a
-/// reply, so persistence can declare it `TOOL_CALL` without parsing the body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FramedRemoteCall;
-
 /// Per-turn remote tools, placed in the pipeline RUN scope (ephemeral) so the
 /// tool executor merges them onto its registry snapshot for a single turn — then
 /// they vanish when the run scope clears. See [`PerTurnToolsStage`].

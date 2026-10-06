@@ -23,7 +23,8 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
-use crate::tools::{DynamicRegistry, FramedRemoteCall, ToolContext, ToolRegistry};
+use crate::pipeline::extensions::FramedRemoteCall;
+use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
 /// Clone any [`ToolContext`] a prior stage put in run scope, then overlay
 /// channel/sender from the message.
@@ -626,10 +627,10 @@ impl PipelineStage for XmlToolExecutorStage {
             final_content = summary;
         }
 
-        if framed {
-            ctx.set_ext(FramedRemoteCall);
-        }
         ctx.response = Some(final_content);
+        if framed {
+            FramedRemoteCall::mark(ctx);
+        }
         Ok(())
     }
 }
@@ -670,6 +671,7 @@ impl StreamingStage for XmlToolExecutorStage {
             let tool_ctx = tool_context_for(ctx);
 
             let mut final_content = String::new();
+            let mut framed_call = false;
             let mut hit_max = false;
 
             for iteration in 0..self.max_iterations {
@@ -775,8 +777,8 @@ impl StreamingStage for XmlToolExecutorStage {
                         name,
                         remote_timeout_for(&registry, name),
                     );
-                    ctx.set_ext(FramedRemoteCall);
                     final_content = framed;
+                    framed_call = true;
                     break;
                 }
 
@@ -881,6 +883,9 @@ impl StreamingStage for XmlToolExecutorStage {
             }
 
             ctx.response = Some(final_content.clone());
+            if framed_call {
+                FramedRemoteCall::mark(ctx);
+            }
             yield StreamEvent::Complete { content: final_content, usage: None };
         })
     }
@@ -1308,10 +1313,6 @@ mod tests {
     use crate::tools::DEFAULT_REMOTE_CALL_TIMEOUT;
     use serde_json::json;
 
-    /// Serve one SSE chat completion per reply, each finished with `stop`, then
-    /// close. async-openai reads an ordinary `data:` event stream, so a raw
-    /// socket is enough to drive the streaming client the non-streaming
-    /// `process` path uses underneath.
     async fn run_once(reply: &str, streaming: bool) -> Context {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1345,7 +1346,10 @@ mod tests {
             true,
         )
         .await;
-        assert!(ctx.get_ext::<FramedRemoteCall>().is_some());
+        assert!(FramedRemoteCall::covers(
+            &ctx,
+            ctx.response.as_deref().unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -1354,12 +1358,53 @@ mod tests {
             let ctx = run_once("Just an answer.", streaming).await;
             assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
             assert!(
-                ctx.get_ext::<FramedRemoteCall>().is_none(),
+                !FramedRemoteCall::covers(&ctx, "Just an answer."),
                 "streaming={streaming}"
             );
         }
     }
 
+    /// Run scope outlives one `process`, so a framed call must not type a later
+    /// answer produced on the same context.
+    #[tokio::test]
+    async fn a_later_answer_on_the_same_context_is_not_marked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_sse(
+            listener,
+            vec![
+                r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#.into(),
+                "Just an answer.".into(),
+            ],
+        );
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(registry),
+        );
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+
+        PipelineStage::process(&stage, &mut ctx).await.unwrap();
+        let framed = ctx.response.clone().unwrap();
+        assert!(FramedRemoteCall::covers(&ctx, &framed));
+
+        PipelineStage::process(&stage, &mut ctx).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
+        assert!(!FramedRemoteCall::covers(&ctx, "Just an answer."));
+    }
+
+    /// Serve one SSE chat completion per reply, each finished with `stop`, then
+    /// close. async-openai reads an ordinary `data:` event stream, so a raw
+    /// socket is enough to drive the streaming client the non-streaming
+    /// `process` path uses underneath.
     fn serve_sse(
         listener: tokio::net::TcpListener,
         replies: Vec<String>,
@@ -1467,7 +1512,7 @@ mod tests {
                 .expect("the response is the tool_call envelope");
         assert_eq!(framed["type"], "tool_call");
         assert!(
-            ctx.get_ext::<FramedRemoteCall>().is_some(),
+            FramedRemoteCall::covers(&ctx, ctx.response.as_deref().unwrap()),
             "a framed call must be marked so persistence can type it"
         );
         let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();

@@ -28,9 +28,8 @@ pub(crate) use registry::MAX_REMOTE_TOOL_PROMPT_BYTES;
 pub use registry::{DynamicRegistry, ToolRegistry, TurnTools};
 pub use reminder::{ReminderRoutine, ReminderStore, SetReminderTool, new_reminder_store};
 pub use remote::{
-    DEFAULT_REMOTE_CALL_TIMEOUT, FramedRemoteCall, MAX_REMOTE_CALL_TIMEOUT,
-    MIN_REMOTE_CALL_TIMEOUT, ManifestStage, ManifestTool, PerTurnTools, PerTurnToolsStage,
-    RemoteTool, ToolsManifest,
+    DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_CALL_TIMEOUT, MIN_REMOTE_CALL_TIMEOUT, ManifestStage,
+    ManifestTool, PerTurnTools, PerTurnToolsStage, RemoteTool, ToolsManifest,
 };
 #[cfg(feature = "llm-client")]
 pub use remote_timeout::RemoteCallTimeout;

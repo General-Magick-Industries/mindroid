@@ -35,6 +35,7 @@ use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall, ToolsChatOutcome, ToolsStreamEvent};
 use crate::models::StreamEvent;
+use crate::pipeline::extensions::FramedRemoteCall;
 use crate::pipeline::{PipelineStage, StreamingStage};
 use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
@@ -579,16 +580,19 @@ impl PipelineStage for ToolExecutorStage {
             return Ok(());
         }
         let (outcome, _events) = self.run_loop(ctx).await?;
-        mark_framed(ctx, &outcome);
-        ctx.response = Some(outcome.into_text());
+        respond_with(ctx, outcome);
         Ok(())
     }
 }
 
-fn mark_framed(ctx: &mut Context, outcome: &LoopOutcome) {
-    if outcome.is_remote() {
-        ctx.set_ext(crate::tools::FramedRemoteCall);
+fn respond_with(ctx: &mut Context, outcome: LoopOutcome) -> String {
+    let remote = outcome.is_remote();
+    let text = outcome.into_text();
+    ctx.response = Some(text.clone());
+    if remote {
+        FramedRemoteCall::mark(ctx);
     }
+    text
 }
 
 /// Record what a streamed turn already said before it failed. The caller
@@ -702,9 +706,7 @@ impl StreamingStage for ToolExecutorStage {
                         }
                     },
                 };
-                mark_framed(ctx, &answer);
-                let final_content = answer.into_text();
-                ctx.response = Some(final_content.clone());
+                let final_content = respond_with(ctx, answer);
                 yield StreamEvent::Complete { content: final_content, usage: None };
                 return;
             }
@@ -723,9 +725,7 @@ impl StreamingStage for ToolExecutorStage {
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
-                    mark_framed(ctx, &outcome);
-                    let final_content = outcome.into_text();
-                    ctx.response = Some(final_content.clone());
+                    let final_content = respond_with(ctx, outcome);
                     yield StreamEvent::Complete { content: final_content, usage: None };
                 }
             }
@@ -1245,7 +1245,10 @@ mod tests {
             serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
                 .expect("the response is the tool_call envelope");
         assert_eq!(framed["type"], "tool_call");
-        assert!(ctx.get_ext::<crate::tools::FramedRemoteCall>().is_some());
+        assert!(FramedRemoteCall::covers(
+            &ctx,
+            ctx.response.as_deref().unwrap()
+        ));
         let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
 
         let mut result_ctx = Context::new(
@@ -1316,6 +1319,7 @@ mod tests {
             complete.contains("\"type\":\"tool_call\""),
             "Complete must still carry the envelope: {complete}"
         );
+        assert!(FramedRemoteCall::covers(&ctx, complete));
     }
 
     /// `get_artifact` returns only a confirmation string, so the executor owes
@@ -1609,7 +1613,10 @@ mod tests {
             })
             .collect();
         assert_eq!(chunks, ["One sec."]);
-        assert!(ctx.get_ext::<crate::tools::FramedRemoteCall>().is_some());
+        assert!(FramedRemoteCall::covers(
+            &ctx,
+            ctx.response.as_deref().unwrap()
+        ));
         let framed: serde_json::Value = serde_json::from_str(&ctx.response.unwrap()).unwrap();
         assert_eq!(framed["type"], "tool_call");
         assert_eq!(
