@@ -66,7 +66,7 @@ pub use config::{
     AgentConfig, MindroidConfig, ModelConfig, OpenToolConfig, ProviderConfig, ShellToolConfig,
     ToolsConfig,
 };
-pub use core::content::{ContentPart, ContentSource};
+pub use core::content::{ArtifactReference, ContentPart, ContentSource};
 pub use core::context::Context;
 pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
 pub use core::events::PipelineEvent;

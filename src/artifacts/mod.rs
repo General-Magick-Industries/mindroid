@@ -11,15 +11,20 @@
 //! stage AND the load path.
 
 mod local;
+#[cfg(feature = "magickmind")]
+mod magickmind;
 mod manager;
 
 pub use local::LocalArtifactStore;
+#[cfg(feature = "magickmind")]
+pub use magickmind::MagickmindArtifactStore;
 pub use manager::ArtifactManager;
 
 use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::models::Message;
 
 /// Bytes + metadata returned by [`ArtifactStore::load`].
 #[derive(Debug, Clone)]
@@ -82,6 +87,12 @@ pub trait ArtifactStore: Send + Sync + 'static {
 
     /// Delete an artifact. Idempotent — deleting a missing id is `Ok`.
     async fn delete(&self, scope: &str, id: &str) -> Result<()>;
+
+    /// The scope `message`'s artifacts live under: the trusted delivery channel,
+    /// unless the backend re-authorizes every call (see ADR-0009).
+    fn scope_for(&self, message: &Message) -> String {
+        message.channel_id.clone()
+    }
 }
 
 /// No-op store: both `save` and `load` error. The default when artifacts are not
@@ -126,6 +137,10 @@ impl<T: ArtifactStore> ArtifactStore for Arc<T> {
 
     async fn delete(&self, scope: &str, id: &str) -> Result<()> {
         (**self).delete(scope, id).await
+    }
+
+    fn scope_for(&self, message: &Message) -> String {
+        (**self).scope_for(message)
     }
 }
 

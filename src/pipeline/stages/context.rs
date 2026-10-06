@@ -265,7 +265,9 @@ fn resolve_files(ctx: &Context) -> Vec<ResolvedFile> {
 ///
 /// Attachments come from either the [`FileInputs`] context extension (set
 /// programmatically) or `message.metadata` (written by a transport) — mirroring
-/// how audio flows through `AudioInput` / `metadata["audio_data"]`.
+/// how audio flows through `AudioInput` / `metadata["audio_data"]`. Attachment
+/// references in `metadata["artifact_data"]` are appended as `File` reference parts,
+/// which the model opens with `get_artifact`.
 ///
 /// If there are no attachments, or no user message to attach to, the stage is a
 /// no-op pass-through — so the same pipeline serves plain chat and media turns.
@@ -301,8 +303,18 @@ impl PipelineStage for AttachMedia {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        let files = resolve_files(ctx);
-        if files.is_empty() {
+        let references = ctx
+            .message
+            .metadata
+            .get(crate::core::content::ARTIFACT_DATA_METADATA_KEY)
+            .map(crate::core::content::ArtifactReference::parts_from_value)
+            .unwrap_or_default();
+        let parts: Vec<ContentPart> = resolve_files(ctx)
+            .into_iter()
+            .map(ResolvedFile::into_part)
+            .chain(references)
+            .collect();
+        if parts.is_empty() {
             debug!("AttachMedia: no attachments; pass-through");
             return Ok(());
         }
@@ -313,11 +325,7 @@ impl PipelineStage for AttachMedia {
             .rev()
             .find(|m| m.role == Role::User)
         {
-            Some(user_msg) => {
-                for f in files {
-                    user_msg.content.push(f.into_part());
-                }
-            }
+            Some(user_msg) => user_msg.content.extend(parts),
             None => debug!("AttachMedia: no user message to attach to; pass-through"),
         }
         Ok(())
@@ -356,6 +364,49 @@ mod media_tests {
         assert!(matches!(
             &msg.content[1],
             ContentPart::Image { mime_type, .. } if mime_type == "image/png"
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_media_appends_artifact_data_as_reference_parts() {
+        let mut msg = Message::new("what is in the photo?", "user", "ch");
+        msg.metadata.insert(
+            "artifact_data".into(),
+            serde_json::json!([
+                { "id": "a1", "mime_type": "image/jpeg", "file_name": "desk.jpg", "metadata": { "caption": "desk" } },
+                { "mime_type": "image/png" },
+                { "id": "a2" },
+            ]),
+        );
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+
+        SimpleContextBuilder::new().process(&mut ctx).await.unwrap();
+        AttachMedia.process(&mut ctx).await.unwrap();
+
+        let parts = &ctx.llm_messages.last().unwrap().content;
+        assert_eq!(
+            parts.len(),
+            3,
+            "text plus the two references with ids: {parts:?}"
+        );
+        match &parts[1] {
+            ContentPart::File {
+                source: ContentSource::Uri { uri },
+                mime_type,
+                filename,
+                metadata,
+            } => {
+                assert_eq!(uri, "a1");
+                assert_eq!(mime_type, "image/jpeg");
+                assert_eq!(filename.as_deref(), Some("desk.jpg"));
+                assert_eq!(metadata["caption"], "desk");
+            }
+            other => panic!("expected a File reference, got {other:?}"),
+        }
+        assert!(matches!(
+            &parts[2],
+            ContentPart::File { source: ContentSource::Uri { uri }, mime_type, .. }
+                if uri == "a2" && mime_type == "application/octet-stream"
         ));
     }
 

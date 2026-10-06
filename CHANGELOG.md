@@ -8,6 +8,18 @@ listed under **Breaking Changes** with a migration note.
 
 ## [Unreleased]
 
+### Added
+
+- `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
+  artifact service. Uploads go into a magickspace through presign, PUT and finalize;
+  loads fall back to the caller's own route for artifacts no message has attached yet.
+- `ArtifactStore::scope_for`, defaulting to the delivery channel. The offload stage
+  and both executors' artifact re-injection now ask the store for its scope; see ADR-0009.
+- `ArtifactReference`, one entry of a message's `artifact_data`. `CentrifugoTransport`
+  copies `artifact_data` into `Message::metadata`, `AttachMedia` turns it into `File`
+  reference parts on the current user turn, and `MagickmindClient::prepare_context`
+  does the same for other participants' history turns.
+
 ### Breaking Changes
 
 #### 0. `OmniEvent` and `OmniConfig` grew for realtime providers
