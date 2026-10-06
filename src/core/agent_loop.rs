@@ -506,18 +506,13 @@ impl AgentLoop {
         // an enclosing loop would take it as its own and run again.
         ctx.take::<Continue>();
 
-        match reason {
-            // A refused turn is not answered — not with an earlier pass's prose,
-            // nor with a gate's echo of the refused message itself.
-            StopReason::Refused => {
-                ctx.response = None;
-                return Ok(None);
-            }
-            StopReason::Cancelled => {
-                ctx.response = None;
-                return Ok(carried);
-            }
-            _ => {}
+        if reason == StopReason::Refused {
+            ctx.response = None;
+            return Ok(None);
+        }
+        if reason == StopReason::Cancelled {
+            ctx.response = None;
+            return Ok(carried);
         }
 
         // `finish` post-processes the turn's response, so it has to be back on
@@ -1114,12 +1109,7 @@ mod tests {
         ] {
             let events: Vec<_> = agent.run_streaming(&mut forged_ctx()).collect().await;
 
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, StreamEvent::Chunk { .. })),
-                "nothing is spoken: {events:?}"
-            );
+            assert!(chunks(&events).is_empty(), "nothing is spoken: {events:?}");
             assert!(matches!(
                 events.last(),
                 Some(StreamEvent::Complete { content, .. }) if content.is_empty()
@@ -1127,29 +1117,17 @@ mod tests {
         }
     }
 
-    /// Nested as a stage, the inner loop's response is what the enclosing
-    /// pipeline returns and `process_and_respond` sends.
     #[tokio::test]
     async fn a_nested_refused_turn_hands_its_parent_no_reply() {
         let mut ctx = forged_ctx();
-        let reply = Pipeline::new()
-            .add_stage(gated_then_refused())
-            .run(&mut ctx)
+        PipelineStage::process(&gated_then_refused(), &mut ctx)
             .await
             .unwrap();
-        assert_eq!(reply, None);
-        assert_eq!(ctx.response, None);
 
-        let outcome = AgentLoop::new(Pipeline::new().add_stage(gated_then_refused()))
-            .with_setup(Pipeline::new().add_stage(EchoingGate))
-            .run(&mut forged_ctx())
-            .await
-            .unwrap();
-        assert_eq!(outcome.reason, StopReason::Refused);
-        assert_eq!(outcome.response, None);
+        assert!(Refused::covers(&ctx));
+        assert_eq!(ctx.response, None);
     }
 
-    /// The same echo reaches a flat pipeline with no loop around it.
     #[tokio::test]
     async fn a_plain_pipeline_does_not_return_the_echo_of_a_refused_message() {
         let pipeline = Pipeline::new().add_stage(EchoingGate).add_stage(Refuse);

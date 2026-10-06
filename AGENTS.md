@@ -105,8 +105,10 @@ round, and never keeps a history reply without its question. `finish` runs in fu
 after a halt or the cap, and not at all after a cancellation, a body error, or a
 refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRound`'s
 unclaimed one, a rejected manifest), so a loop's persistence never stores what was
-refused. A pass's `Error` ends the turn — stricter than `Pipeline::run_streaming`,
-which forwards it and carries on.
+refused, and a refused turn returns no reply. A stage that lifts a refusal's halt
+takes the `Refused` mark with it, as `BranchStage` does, or a later halt in the turn
+reads as the refusal. A pass's `Error` ends the turn — stricter than
+`Pipeline::run_streaming`, which forwards it and carries on.
 
 **At the cap a turn stops with a round unanswered** — the model asked for tools, got
 the results, never replied. `finish` sees the `StopReason` in run scope, and

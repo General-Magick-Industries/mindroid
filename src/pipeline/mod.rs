@@ -116,11 +116,10 @@ pub(crate) fn claimed_this_message(ctx: &Context) -> bool {
         .is_some_and(|claim| claim.0 == ctx.message.id)
 }
 
-/// A refused message gets no reply. A gate that passed it before the refusal
-/// signals the pass by echoing the message into `ctx.response`, so whatever is
-/// there is dropped rather than returned.
+/// Gates echo the message they pass into `ctx.response`; a refused one gets no
+/// reply. A stage that lifted the halt recovered, so its reply stands.
 fn drop_refused_reply(ctx: &mut Context) {
-    if Refused::covers(ctx) {
+    if ctx.halted && Refused::covers(ctx) {
         ctx.response = None;
     }
 }
@@ -563,6 +562,98 @@ mod tests {
 
         assert!(ctx.halted);
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    struct EchoingGate;
+
+    #[async_trait]
+    impl PipelineStage for EchoingGate {
+        fn name(&self) -> &str {
+            "echoing-gate"
+        }
+        async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
+            ctx.response = Some(ctx.message.content.clone());
+            Ok(())
+        }
+    }
+
+    struct Refuse;
+
+    #[async_trait]
+    impl PipelineStage for Refuse {
+        fn name(&self) -> &str {
+            "refuse"
+        }
+        async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
+            Refused::halt(ctx);
+            Ok(())
+        }
+    }
+
+    struct QuietStream;
+
+    #[async_trait]
+    impl PipelineStage for QuietStream {
+        fn name(&self) -> &str {
+            "quiet-stream"
+        }
+        async fn process(&self, _ctx: &mut Context) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl StreamingStage for QuietStream {
+        fn stream<'a>(&'a self, _ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_anywhere_in_a_streamed_run_drops_the_gates_echo() {
+        let at_the_streaming_stage = Pipeline::new()
+            .add_stage(EchoingGate)
+            .add_streaming_stage(RefusingStream);
+        let after_the_streaming_stage = Pipeline::new()
+            .add_stage(EchoingGate)
+            .add_streaming_stage(QuietStream)
+            .add_stage(Refuse);
+
+        for pipeline in [at_the_streaming_stage, after_the_streaming_stage] {
+            let mut ctx = make_test_context();
+            let _: Vec<_> = pipeline.run_streaming(&mut ctx).collect().await;
+            assert!(Refused::covers(&ctx));
+            assert_eq!(ctx.response, None);
+        }
+    }
+
+    /// One executor refusing a result another owns, which then claims and
+    /// answers it, lifts the halt without the mark.
+    #[tokio::test]
+    async fn a_stage_that_lifts_a_refusal_keeps_its_reply() {
+        struct RefusesThenRecovers;
+
+        #[async_trait]
+        impl PipelineStage for RefusesThenRecovers {
+            fn name(&self) -> &str {
+                "refuses-then-recovers"
+            }
+            async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
+                Refused::halt(ctx);
+                ctx.halted = false;
+                ctx.response = Some("the answer".into());
+                Ok(())
+            }
+        }
+
+        let mut ctx = make_test_context();
+        let reply = Pipeline::new()
+            .add_stage(RefusesThenRecovers)
+            .run(&mut ctx)
+            .await
+            .unwrap();
+
+        assert!(Refused::covers(&ctx), "the mark was left behind");
+        assert_eq!(reply.as_deref(), Some("the answer"));
     }
 
     /// A stage that cancels the context.
