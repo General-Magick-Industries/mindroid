@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result, bail};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
+#[derive(Debug)]
 pub struct Reply {
     pub status: StatusCode,
     pub trace_id: String,
@@ -24,7 +25,6 @@ impl Reply {
     }
 }
 
-#[derive(Clone)]
 pub struct Bifrost {
     http: Client,
     base: String,
@@ -42,10 +42,11 @@ impl Bifrost {
         })
     }
 
-    pub async fn call(
+    async fn call(
         &self,
         method: Method,
         path: &str,
+        query: &[(&str, &str)],
         bearer: Option<&str>,
         body: Option<&Value>,
     ) -> Result<Reply> {
@@ -55,6 +56,9 @@ impl Bifrost {
             .http
             .request(method.clone(), format!("{}{path}", self.base))
             .header("traceparent", format!("00-{trace_id}-{span_id}-01"));
+        if !query.is_empty() {
+            req = req.query(query);
+        }
         if let Some(token) = bearer {
             req = req.bearer_auth(token);
         }
@@ -66,7 +70,16 @@ impl Bifrost {
             .await
             .with_context(|| format!("{method} {path} failed to send"))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let trace_id = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map_or(trace_id, str::to_string);
+        let text = resp
+            .text()
+            .await
+            .with_context(|| format!("{method} {path}: reading the response"))?;
         let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
         Ok(Reply {
             status,
@@ -80,6 +93,7 @@ impl Bifrost {
             .call(
                 Method::POST,
                 "/v1/auth/login",
+                &[],
                 None,
                 Some(&json!({ "email": email, "password": password })),
             )
@@ -101,7 +115,8 @@ impl Bifrost {
         let page = self
             .call(
                 Method::GET,
-                &format!("/v1/end-users?external_id={external_id}&limit=20"),
+                "/v1/end-users",
+                &[("external_id", external_id), ("limit", "20")],
                 Some(jwt),
                 None,
             )
@@ -125,6 +140,7 @@ impl Bifrost {
             .call(
                 Method::POST,
                 "/v1/end-users",
+                &[],
                 Some(jwt),
                 Some(&json!({
                     "name": name,
@@ -142,6 +158,7 @@ impl Bifrost {
             .call(
                 Method::POST,
                 "/v1/end-users/tokens",
+                &[],
                 Some(jwt),
                 Some(&json!({
                     "subject_id": subject_id,
@@ -168,6 +185,7 @@ impl Bifrost {
             .call(
                 Method::POST,
                 "/v1/magickspaces",
+                &[],
                 Some(jwt),
                 Some(&json!({
                     "name": name,
@@ -185,6 +203,7 @@ impl Bifrost {
         self.call(
             Method::DELETE,
             &format!("/v1/magickspaces/{space_id}"),
+            &[],
             Some(jwt),
             None,
         )
@@ -197,6 +216,7 @@ impl Bifrost {
         self.call(
             Method::POST,
             &format!("/v1/end-user/magickspaces/{space_id}/messages"),
+            &[],
             Some(token),
             Some(body),
         )
@@ -206,7 +226,8 @@ impl Bifrost {
     pub async fn list_messages(&self, token: &str, space_id: &str) -> Result<Reply> {
         self.call(
             Method::GET,
-            &format!("/v1/end-user/magickspaces/{space_id}/messages?limit=100&order=asc"),
+            &format!("/v1/end-user/magickspaces/{space_id}/messages"),
+            &[("limit", "100"), ("order", "asc")],
             Some(token),
             None,
         )
@@ -217,6 +238,7 @@ impl Bifrost {
         self.call(
             Method::POST,
             &format!("/v1/end-user/magickspaces/{space_id}/context"),
+            &[],
             Some(token),
             Some(&json!({ "chat_history": { "limit": 100 } })),
         )

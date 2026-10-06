@@ -31,9 +31,17 @@ pub struct AgentSetup {
 pub struct AgentHandle {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    registry: DynamicRegistry,
 }
 
 impl AgentHandle {
+    pub async fn wait_for_tool(&self, name: &str, within: Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        while self.registry.load().get(name).is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn stop(self) {
         self.cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
@@ -62,7 +70,8 @@ pub async fn start(setup: AgentSetup) -> Result<AgentHandle> {
         XmlToolExecutorStage::with_dynamic_registry(LlmClient::new(llm)?, registry.clone())
             .with_max_iterations(4);
     let manifest = Arc::new(
-        Pipeline::new().add_stage(ManifestStage::new(registry).trust_sender(&setup.device_id)),
+        Pipeline::new()
+            .add_stage(ManifestStage::new(registry.clone()).trust_sender(&setup.device_id)),
     );
 
     let mut config = MindroidConfig::default();
@@ -137,5 +146,9 @@ pub async fn start(setup: AgentSetup) -> Result<AgentHandle> {
         .await
         .map_err(|state| anyhow::anyhow!("agent never became ready: {state:?}"))
         .context("starting the mindroid agent")?;
-    Ok(AgentHandle { cancel, task })
+    Ok(AgentHandle {
+        cancel,
+        task,
+        registry,
+    })
 }
