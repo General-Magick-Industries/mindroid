@@ -1,5 +1,7 @@
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, bail};
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -31,8 +33,9 @@ impl WireObserver {
         let closed = Arc::new(Mutex::new(None));
         let close_reason = Arc::clone(&closed);
         tokio::spawn(async move {
-            let reason = pump(stream, sink, tx, ready_tx, label).await;
+            let reason = pump(stream, sink, &tx, ready_tx, label).await;
             *close_reason.lock().unwrap() = Some(reason);
+            drop(tx);
         });
 
         match tokio::time::timeout(Duration::from_secs(10), ready_rx).await {
@@ -78,7 +81,7 @@ impl WireObserver {
 async fn pump(
     mut stream: impl Stream<Item = Result<Frame, WsError>> + Unpin,
     mut sink: impl Sink<Frame> + Unpin,
-    tx: mpsc::UnboundedSender<Value>,
+    tx: &mpsc::UnboundedSender<Value>,
     ready: oneshot::Sender<Result<()>>,
     label: &'static str,
 ) -> String {

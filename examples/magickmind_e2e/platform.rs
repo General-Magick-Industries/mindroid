@@ -4,7 +4,6 @@ use anyhow::{Context as _, Result, bail};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
-#[derive(Debug)]
 pub struct Reply {
     pub status: StatusCode,
     pub trace_id: String,
@@ -70,12 +69,6 @@ impl Bifrost {
             .await
             .with_context(|| format!("{method} {path} failed to send"))?;
         let status = resp.status();
-        let trace_id = resp
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-            .map_or(trace_id, str::to_string);
         let text = resp
             .text()
             .await

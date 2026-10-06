@@ -352,10 +352,7 @@ async fn main() -> ExitCode {
         run,
     } = match setup().await {
         Ok(session) => session,
-        Err(e) => {
-            eprintln!("setup failed: {e:#}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return setup_failed(&e),
     };
 
     let outcome = exercise(&bifrost, &settings, &space, &run).await;
@@ -368,10 +365,7 @@ async fn main() -> ExitCode {
 
     let report = match outcome {
         Ok(report) => report,
-        Err(e) => {
-            eprintln!("setup failed: {e:#}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return setup_failed(&e),
     };
     report.print();
     if let Some(path) = &settings.report_path {
@@ -382,6 +376,11 @@ async fn main() -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn setup_failed(e: &anyhow::Error) -> ExitCode {
+    eprintln!("setup failed: {e:#}");
+    ExitCode::from(2)
 }
 
 async fn setup() -> Result<Session> {
@@ -426,6 +425,7 @@ async fn provision(bifrost: &Bifrost, jwt: &str, s: &Settings, run: &str) -> Res
     })
 }
 
+#[derive(Debug)]
 struct Markers {
     req: String,
     res: String,
@@ -493,15 +493,10 @@ async fn exercise(bifrost: &Bifrost, s: &Settings, space: &Space, run: &str) -> 
             magickspace_id: space.id.clone(),
             ..Report::default()
         },
-        halted: String::new(),
     };
-    harness.hops().await;
-    let (mut report, halted) = (harness.report, harness.halted);
-    report.finish(if halted.is_empty() {
-        "not reached"
-    } else {
-        &halted
-    });
+    let halted = harness.hops().await.err().map(|Halt(why)| why);
+    let mut report = harness.report;
+    report.finish(halted.as_deref().unwrap_or("not reached"));
     agent.stop().await;
     Ok(report)
 }
@@ -512,6 +507,7 @@ struct Wires {
     agent: WireObserver,
 }
 
+#[derive(Debug)]
 struct Call {
     msg_id: String,
     call_id: String,
@@ -528,37 +524,36 @@ struct Harness<'a> {
     run: &'a str,
     markers: Markers,
     report: Report,
-    halted: String,
+}
+
+#[derive(Debug)]
+struct Halt(String);
+
+type Step<T> = std::result::Result<T, Halt>;
+
+fn halt<T>(why: &str) -> Step<T> {
+    Err(Halt(why.to_string()))
 }
 
 impl Harness<'_> {
-    async fn hops(&mut self) -> Option<()> {
+    async fn hops(&mut self) -> Step<()> {
         self.manifest().await?;
         let ask_id = self.ask().await?;
         let call = self.call().await?;
         let result_id = self.answer(&call).await?;
-        self.history(&ask_id, &call, result_id.as_deref()).await?;
+        let history = self.history(&ask_id, &call, result_id.as_deref()).await;
         self.replay();
-        Some(())
+        history
     }
 
-    fn halt<T>(&mut self, why: &str) -> Option<T> {
-        self.halted = why.to_string();
-        None
+    fn reach(&mut self, hop: &str, reply: Result<Reply>) -> Step<Reply> {
+        reply.or_else(|e| {
+            self.report.record(hop, Err(format!("{e:#}"))).owner = "bifrost (unreachable)".into();
+            halt("Bifrost stopped answering")
+        })
     }
 
-    fn reach(&mut self, hop: &str, reply: Result<Reply>) -> Option<Reply> {
-        match reply {
-            Ok(reply) => Some(reply),
-            Err(e) => {
-                self.report.record(hop, Err(format!("{e:#}"))).owner =
-                    "bifrost (unreachable)".into();
-                self.halt("Bifrost stopped answering")
-            }
-        }
-    }
-
-    async fn manifest(&mut self) -> Option<()> {
+    async fn manifest(&mut self) -> Step<()> {
         let (bifrost, space, wait) = (self.bifrost, self.space, self.wait);
         let tools = json!([{
             "name": "drive",
@@ -594,7 +589,7 @@ impl Harness<'_> {
             traces.push(padded.trace_id.clone());
             if let Err(e) = accepted(&padded, "manifest with content") {
                 self.report.record("2a", Err(e)).trace(&padded.trace_id);
-                return self.halt("no manifest was accepted");
+                return halt("no manifest was accepted");
             }
         }
 
@@ -615,11 +610,13 @@ impl Harness<'_> {
         for t in &traces {
             hop.trace(t);
         }
-        self.agent.wait_for_tool("drive", wait).await;
-        Some(())
+        if hop.passed() {
+            self.agent.wait_for_tool("drive", wait).await;
+        }
+        Ok(())
     }
 
-    async fn ask(&mut self) -> Option<String> {
+    async fn ask(&mut self) -> Step<String> {
         let (bifrost, space, stub, wait) = (self.bifrost, self.space, self.stub, self.wait);
         let ask = format!("Please drive forward. {}", self.markers.req);
         let sent_ask = bifrost
@@ -634,7 +631,7 @@ impl Harness<'_> {
             Ok(id) => id,
             Err(e) => {
                 self.report.record("1", Err(e)).trace(&asked.trace_id);
-                return self.halt("the person's message was refused");
+                return halt("the person's message was refused");
             }
         };
         let delivered = self
@@ -667,7 +664,7 @@ impl Harness<'_> {
                     Err(format!("the agent never called its LLM within {wait:?}")),
                 );
             }
-            return self.halt("the agent never ran a turn");
+            return halt("the agent never ran a turn");
         };
         self.report
             .record("1b", Ok("the LLM was called with the request".into()));
@@ -687,10 +684,10 @@ impl Harness<'_> {
                 Err("the system prompt does not offer the manifest's drive tool".into())
             },
         );
-        Some(ask_id)
+        Ok(ask_id)
     }
 
-    async fn call(&mut self) -> Option<Call> {
+    async fn call(&mut self) -> Step<Call> {
         let (space, wait) = (self.space, self.wait);
         let seen = self
             .wires
@@ -710,7 +707,7 @@ impl Harness<'_> {
                         "no drive tool call from the agent reached the device {miss}"
                     )),
                 );
-                return self.halt("no tool call to answer");
+                return halt("no tool call to answer");
             }
         };
         let call = Call {
@@ -720,13 +717,16 @@ impl Harness<'_> {
                 .unwrap_or_default(),
             sent_as: field(&m, "message_type").to_string(),
         };
-        self.report
-            .record("3", expect_type(&m, &["TOOL_CALL"]))
-            .message(&call.msg_id);
-        Some(call)
+        let typed = if call.msg_id.is_empty() {
+            Err("the call reached the device with no message id".into())
+        } else {
+            expect_type(&m, &["TOOL_CALL"])
+        };
+        self.report.record("3", typed).message(&call.msg_id);
+        Ok(call)
     }
 
-    async fn answer(&mut self, call: &Call) -> Option<Option<String>> {
+    async fn answer(&mut self, call: &Call) -> Step<Option<String>> {
         let (bifrost, space, wait, run) = (self.bifrost, self.space, self.wait, self.run);
         let result = json!({
             "type": "tool_result",
@@ -814,10 +814,10 @@ impl Harness<'_> {
         if !result_ok && !hop.passed() {
             hop.owner = "downstream of hop 4".into();
         }
-        Some(result_id)
+        Ok(result_id)
     }
 
-    async fn history(&mut self, ask_id: &str, call: &Call, result_id: Option<&str>) -> Option<()> {
+    async fn history(&mut self, ask_id: &str, call: &Call, result_id: Option<&str>) -> Step<()> {
         let (bifrost, space) = (self.bifrost, self.space);
         let sent_as = [call.sent_as.as_str()];
         let call_types: &[&str] = if call.sent_as.is_empty() {
@@ -854,7 +854,7 @@ impl Harness<'_> {
             ))
         };
         self.report.record("5a", outcome).trace(&prepared.trace_id);
-        Some(())
+        Ok(())
     }
 
     fn replay(&mut self) {

@@ -58,6 +58,10 @@ async fn read_request(sock: &mut TcpStream) -> Result<(String, Vec<u8>)> {
         let head = String::from_utf8_lossy(&raw[..end]).into_owned();
         let body = end + 4;
         let len = content_length(&head)?;
+        ensure!(
+            len <= MAX_REQUEST_BYTES - body,
+            "content-length {len} exceeds {MAX_REQUEST_BYTES} bytes"
+        );
         if raw.len() >= body + len {
             return Ok((head, raw[body..body + len].to_vec()));
         }
