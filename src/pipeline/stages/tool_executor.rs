@@ -35,6 +35,7 @@ use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall, ToolsChatOutcome, ToolsStreamEvent};
 use crate::models::StreamEvent;
+use crate::pipeline::extensions::FramedRemoteCall;
 use crate::pipeline::{PipelineStage, StreamingStage};
 use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
@@ -575,13 +576,24 @@ impl PipelineStage for ToolExecutorStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        FramedRemoteCall::clear(ctx);
         if self.gate_dropped(ctx).await? {
             return Ok(());
         }
         let (outcome, _events) = self.run_loop(ctx).await?;
-        ctx.response = Some(outcome.into_text());
+        respond_with(ctx, outcome);
         Ok(())
     }
+}
+
+fn respond_with(ctx: &mut Context, outcome: LoopOutcome) -> String {
+    let remote = outcome.is_remote();
+    let text = outcome.into_text();
+    ctx.response = Some(text.clone());
+    if remote {
+        FramedRemoteCall::mark(ctx);
+    }
+    text
 }
 
 /// Record what a streamed turn already said before it failed. The caller
@@ -594,6 +606,7 @@ fn keep_spoken(ctx: &mut Context, spoken: &str) {
 
 impl StreamingStage for ToolExecutorStage {
     fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+        FramedRemoteCall::clear(ctx);
         Box::pin(async_stream::stream! {
             match self.gate_dropped(ctx).await {
                 Ok(true) => return,
@@ -695,8 +708,7 @@ impl StreamingStage for ToolExecutorStage {
                         }
                     },
                 };
-                let final_content = answer.into_text();
-                ctx.response = Some(final_content.clone());
+                let final_content = respond_with(ctx, answer);
                 yield StreamEvent::Complete { content: final_content, usage: None };
                 return;
             }
@@ -715,8 +727,7 @@ impl StreamingStage for ToolExecutorStage {
                     if !outcome.is_remote() && !outcome.text().is_empty() {
                         yield StreamEvent::Chunk { content: outcome.text().to_string() };
                     }
-                    let final_content = outcome.into_text();
-                    ctx.response = Some(final_content.clone());
+                    let final_content = respond_with(ctx, outcome);
                     yield StreamEvent::Complete { content: final_content, usage: None };
                 }
             }
@@ -894,6 +905,40 @@ mod tests {
             Arc::new(crate::models::Message::new("hi", "client", "chan1")),
             Arc::new(crate::config::AgentConfig::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_on_a_reused_context_starts_unmarked() {
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = serve_completions(
+                listener,
+                vec![completion(json!({"role": "assistant", "content": "done"}))],
+            );
+            let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()));
+            let mut ctx = fresh_ctx();
+            ctx.response = Some("a call from an earlier turn".into());
+            FramedRemoteCall::mark(&mut ctx);
+            ctx.response = None;
+
+            if streaming {
+                let _: Vec<StreamEvent> = stage.stream(&mut ctx).collect().await;
+            } else {
+                stage.process(&mut ctx).await.unwrap();
+            }
+            server.await.unwrap();
+
+            assert_eq!(
+                ctx.response.as_deref(),
+                Some("done"),
+                "streaming={streaming}"
+            );
+            assert!(
+                ctx.get_run::<FramedRemoteCall>().is_none(),
+                "streaming={streaming}"
+            );
+        }
     }
 
     /// The stub serves exactly one completion, so a loop that went back to the
@@ -1236,6 +1281,10 @@ mod tests {
             serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
                 .expect("the response is the tool_call envelope");
         assert_eq!(framed["type"], "tool_call");
+        assert!(FramedRemoteCall::covers(
+            &ctx,
+            ctx.response.as_deref().unwrap()
+        ));
         let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
 
         let mut result_ctx = Context::new(
@@ -1306,6 +1355,7 @@ mod tests {
             complete.contains("\"type\":\"tool_call\""),
             "Complete must still carry the envelope: {complete}"
         );
+        assert!(FramedRemoteCall::covers(&ctx, complete));
     }
 
     /// `get_artifact` returns only a confirmation string, so the executor owes
@@ -1599,6 +1649,10 @@ mod tests {
             })
             .collect();
         assert_eq!(chunks, ["One sec."]);
+        assert!(FramedRemoteCall::covers(
+            &ctx,
+            ctx.response.as_deref().unwrap()
+        ));
         let framed: serde_json::Value = serde_json::from_str(&ctx.response.unwrap()).unwrap();
         assert_eq!(framed["type"], "tool_call");
         assert_eq!(
