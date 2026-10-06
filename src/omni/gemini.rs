@@ -48,6 +48,9 @@ pub struct GeminiLiveConfig {
     pub endpoint: String,
     pub input_sample_rate: u32,
     pub input_transcription: bool,
+    /// BCP-47 hints for the input transcription (`languageCodes`), e.g.
+    /// `en-US`. Empty leaves Gemini to detect the language.
+    pub input_languages: Vec<String>,
     pub output_transcription: bool,
     pub session_resumption: bool,
     /// Permit a plaintext `ws://` endpoint. The key rides the URL, so this is for
@@ -63,6 +66,7 @@ impl fmt::Debug for GeminiLiveConfig {
             .field("endpoint", &self.endpoint)
             .field("input_sample_rate", &self.input_sample_rate)
             .field("input_transcription", &self.input_transcription)
+            .field("input_languages", &self.input_languages)
             .field("output_transcription", &self.output_transcription)
             .field("session_resumption", &self.session_resumption)
             .field("allow_insecure", &self.allow_insecure)
@@ -78,6 +82,7 @@ impl GeminiLiveConfig {
             endpoint: DEFAULT_ENDPOINT.to_string(),
             input_sample_rate: INPUT_SAMPLE_RATE,
             input_transcription: true,
+            input_languages: Vec::new(),
             output_transcription: true,
             session_resumption: true,
             allow_insecure: false,
@@ -107,6 +112,22 @@ impl GeminiLiveConfig {
     /// Override the WebSocket endpoint (tests point this at a local fake).
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Hint the languages the person speaks (BCP-47, e.g. `en-US`), so the input
+    /// transcription is not guessed from noise. Empty restores detection.
+    pub fn with_input_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.input_languages = languages
+            .into_iter()
+            .map(Into::into)
+            .map(|l: String| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
         self
     }
 
@@ -216,7 +237,11 @@ impl GeminiLiveProvider {
             setup["tools"] = tools.clone();
         }
         if self.config.input_transcription {
-            setup["inputAudioTranscription"] = json!({});
+            setup["inputAudioTranscription"] = if self.config.input_languages.is_empty() {
+                json!({})
+            } else {
+                json!({ "languageCodes": self.config.input_languages })
+            };
         }
         if self.config.output_transcription {
             setup["outputAudioTranscription"] = json!({});
@@ -759,6 +784,25 @@ mod tests {
         );
 
         provider.disconnect().await.unwrap();
+    }
+
+    #[test]
+    fn input_languages_hint_the_input_transcription() {
+        let setup = |config: GeminiLiveConfig| {
+            GeminiLiveProvider::new(config).setup_payload(&OmniConfig::default())["setup"]
+                ["inputAudioTranscription"]
+                .clone()
+        };
+
+        assert_eq!(setup(GeminiLiveConfig::new("k")), json!({}));
+        assert_eq!(
+            setup(GeminiLiveConfig::new("k").with_input_languages([" en-US ", "", "th-TH"])),
+            json!({ "languageCodes": ["en-US", "th-TH"] })
+        );
+        assert_eq!(
+            setup(GeminiLiveConfig::new("k").with_input_languages(Vec::<String>::new())),
+            json!({})
+        );
     }
 
     /// Local VAD must keep server detection ON (hybrid). Disabling it while the
