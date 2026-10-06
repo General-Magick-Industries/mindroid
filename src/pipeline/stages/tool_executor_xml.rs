@@ -1370,38 +1370,52 @@ mod tests {
     /// answer produced on the same context.
     #[tokio::test]
     async fn a_later_answer_on_the_same_context_is_not_marked() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = serve_sse(
-            listener,
-            vec![
-                r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#.into(),
-                "Just an answer.".into(),
-            ],
-        );
-        let registry =
-            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
-        let stage = XmlToolExecutorStage::new(
-            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
-                "http://{addr}/v1"
-            )))
-            .unwrap(),
-            Arc::new(registry),
-        );
-        let mut ctx = Context::new(
-            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
-            Arc::new(crate::config::AgentConfig::default()),
-        );
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = serve_sse(
+                listener,
+                vec![
+                    r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#.into(),
+                    "Just an answer.".into(),
+                ],
+            );
+            let registry = ToolRegistry::new()
+                .register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+            let stage = XmlToolExecutorStage::new(
+                LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                    "http://{addr}/v1"
+                )))
+                .unwrap(),
+                Arc::new(registry),
+            );
+            let mut ctx = Context::new(
+                Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+                Arc::new(crate::config::AgentConfig::default()),
+            );
+            let turn = async |ctx: &mut Context| {
+                if streaming {
+                    let _: Vec<_> = StreamingStage::stream(&stage, ctx).collect().await;
+                } else {
+                    PipelineStage::process(&stage, ctx).await.unwrap();
+                }
+            };
 
-        PipelineStage::process(&stage, &mut ctx).await.unwrap();
-        let framed = ctx.response.clone().unwrap();
-        assert!(FramedRemoteCall::covers(&ctx, &framed));
+            turn(&mut ctx).await;
+            let framed = ctx.response.clone().unwrap();
+            assert!(
+                FramedRemoteCall::covers(&ctx, &framed),
+                "streaming={streaming}"
+            );
 
-        PipelineStage::process(&stage, &mut ctx).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
-        assert!(!FramedRemoteCall::covers(&ctx, "Just an answer."));
-        assert!(ctx.get_run::<FramedRemoteCall>().is_none());
+            turn(&mut ctx).await;
+            server.await.unwrap();
+            assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
+            assert!(
+                ctx.get_run::<FramedRemoteCall>().is_none(),
+                "streaming={streaming}"
+            );
+        }
     }
 
     /// Serve one SSE chat completion per reply, each finished with `stop`, then

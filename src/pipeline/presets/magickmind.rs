@@ -153,9 +153,9 @@ impl PreparedContext {
     }
 
     /// Append the agent's own reply, escaped as a fetch replays an untyped one.
-    /// It cannot tell a framed remote call from prose, which a fetch replays as
-    /// JSON instead; prefer [`push_agent_turn`](Self::push_agent_turn) when the
-    /// turn's context is at hand.
+    /// A framed remote call, which a fetch replays as JSON, is escaped here like
+    /// prose; prefer [`push_agent_turn`](Self::push_agent_turn) when the turn's
+    /// context is at hand.
     ///
     /// For callers that cache a prepared context and answer a follow-up turn
     /// before the reply has been fetched back: a turn persists its reply after
@@ -175,9 +175,6 @@ impl PreparedContext {
     /// as a fetch would return it: a framed remote call the way a stored
     /// `TOOL_CALL` replays, any other reply as
     /// [`push_agent_reply`](Self::push_agent_reply) does.
-    ///
-    /// Prefer this when the turn's context is at hand; `push_agent_reply`
-    /// cannot tell a framed call from prose.
     pub fn push_agent_turn(&mut self, ctx: &Context, content: &str) {
         self.insert_agent_turn(replay_agent_turn(
             content,
@@ -1513,6 +1510,8 @@ mod tests {
 
         let rendered = own_call(envelope, "TOOL_CALL");
 
+        serde_json::from_str::<serde_json::Value>(&rendered)
+            .expect("folded on the JSON replay path, not the escaped fallback");
         assert!(
             !rendered.contains('\u{e0041}') && !rendered.contains('\u{202e}'),
             "{rendered:?}"

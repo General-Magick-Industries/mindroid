@@ -909,23 +909,36 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_turn_on_a_reused_context_starts_unmarked() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = serve_completions(
-            listener,
-            vec![completion(json!({"role": "assistant", "content": "done"}))],
-        );
-        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()));
-        let mut ctx = fresh_ctx();
-        ctx.response = Some("a call from an earlier turn".into());
-        FramedRemoteCall::mark(&mut ctx);
-        ctx.response = None;
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = serve_completions(
+                listener,
+                vec![completion(json!({"role": "assistant", "content": "done"}))],
+            );
+            let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()));
+            let mut ctx = fresh_ctx();
+            ctx.response = Some("a call from an earlier turn".into());
+            FramedRemoteCall::mark(&mut ctx);
+            ctx.response = None;
 
-        stage.process(&mut ctx).await.unwrap();
-        server.await.unwrap();
+            if streaming {
+                let _: Vec<StreamEvent> = stage.stream(&mut ctx).collect().await;
+            } else {
+                stage.process(&mut ctx).await.unwrap();
+            }
+            server.await.unwrap();
 
-        assert_eq!(ctx.response.as_deref(), Some("done"));
-        assert!(ctx.get_run::<FramedRemoteCall>().is_none());
+            assert_eq!(
+                ctx.response.as_deref(),
+                Some("done"),
+                "streaming={streaming}"
+            );
+            assert!(
+                ctx.get_run::<FramedRemoteCall>().is_none(),
+                "streaming={streaming}"
+            );
+        }
     }
 
     /// The stub serves exactly one completion, so a loop that went back to the
