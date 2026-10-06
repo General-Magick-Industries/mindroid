@@ -576,6 +576,7 @@ impl PipelineStage for ToolExecutorStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        FramedRemoteCall::clear(ctx);
         if self.gate_dropped(ctx).await? {
             return Ok(());
         }
@@ -605,6 +606,7 @@ fn keep_spoken(ctx: &mut Context, spoken: &str) {
 
 impl StreamingStage for ToolExecutorStage {
     fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+        FramedRemoteCall::clear(ctx);
         Box::pin(async_stream::stream! {
             match self.gate_dropped(ctx).await {
                 Ok(true) => return,
@@ -903,6 +905,27 @@ mod tests {
             Arc::new(crate::models::Message::new("hi", "client", "chan1")),
             Arc::new(crate::config::AgentConfig::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_on_a_reused_context_starts_unmarked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(
+            listener,
+            vec![completion(json!({"role": "assistant", "content": "done"}))],
+        );
+        let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()));
+        let mut ctx = fresh_ctx();
+        ctx.response = Some("a call from an earlier turn".into());
+        FramedRemoteCall::mark(&mut ctx);
+        ctx.response = None;
+
+        stage.process(&mut ctx).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(ctx.response.as_deref(), Some("done"));
+        assert!(ctx.get_run::<FramedRemoteCall>().is_none());
     }
 
     /// The stub serves exactly one completion, so a loop that went back to the

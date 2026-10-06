@@ -565,6 +565,7 @@ impl PipelineStage for XmlToolExecutorStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        FramedRemoteCall::clear(ctx);
         if declares_tool_result(ctx)
             && ctx
                 .get_run::<crate::pipeline::extensions::CorrelatedRemoteResult>()
@@ -637,6 +638,7 @@ impl PipelineStage for XmlToolExecutorStage {
 
 impl StreamingStage for XmlToolExecutorStage {
     fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+        FramedRemoteCall::clear(ctx);
         // Trusted scope for artifact re-injection (never model/user supplied).
         #[cfg(feature = "artifacts")]
         let artifacts = ArtifactReinjection {
@@ -1399,6 +1401,7 @@ mod tests {
         server.await.unwrap();
         assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
         assert!(!FramedRemoteCall::covers(&ctx, "Just an answer."));
+        assert!(ctx.get_run::<FramedRemoteCall>().is_none());
     }
 
     /// Serve one SSE chat completion per reply, each finished with `stop`, then

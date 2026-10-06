@@ -52,6 +52,11 @@ impl FramedRemoteCall {
         }
     }
 
+    /// A new turn on a reused context starts unmarked.
+    pub(crate) fn clear(ctx: &mut crate::Context) {
+        ctx.take::<Self>();
+    }
+
     pub(crate) fn covers(ctx: &crate::Context, text: &str) -> bool {
         ctx.get_run::<Self>().is_some_and(|marked| marked.0 == text)
     }

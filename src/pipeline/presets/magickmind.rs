@@ -152,8 +152,10 @@ impl PreparedContext {
         Self { messages, corpora }
     }
 
-    /// Append the agent's own reply, escaped exactly as the server-returned
-    /// copy of it would have been.
+    /// Append the agent's own reply, escaped as a fetch replays an untyped one.
+    /// It cannot tell a framed remote call from prose, which a fetch replays as
+    /// JSON instead; prefer [`push_agent_turn`](Self::push_agent_turn) when the
+    /// turn's context is at hand.
     ///
     /// For callers that cache a prepared context and answer a follow-up turn
     /// before the reply has been fetched back: a turn persists its reply after
@@ -1365,36 +1367,41 @@ mod tests {
         assert!(!MagickmindContextConfig::default().include_pelican);
     }
 
+    async fn read_request_body(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return String::new();
+            }
+            raw.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&raw).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_string)
+                    })
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if body.len() >= len {
+                    return body.to_string();
+                }
+            }
+        }
+    }
+
     async fn capture_one_post() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 4096];
-            let body = loop {
-                let n = sock.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break String::new();
-                }
-                raw.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&raw).to_string();
-                if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .map(str::to_string)
-                        })
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    if body.len() >= len {
-                        break body.to_string();
-                    }
-                }
-            };
+            let body = read_request_body(&mut sock).await;
             let reply = r#"{"id":"m1"}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
@@ -1502,7 +1509,7 @@ mod tests {
 
     #[test]
     fn a_replayed_call_folds_invisible_controls() {
-        let envelope = "{\"type\":\"tool_call\",\"payload\":{\"name\":\"drive\",\"args\":{\"note\":\"a\u{e0041}\u{202e}b\"}}}";
+        let envelope = "{\"type\":\"tool_call\",\"payload\":{\"name\":\"drive\",\"args\":{\"note\":\"a\u{e0041}\u{202e}b\",\"k\u{202e}ey\":1,\"list\":[\"c\u{e0041}d\"]}}}";
 
         let rendered = own_call(envelope, "TOOL_CALL");
 
@@ -1564,6 +1571,17 @@ mod tests {
 
         assert_eq!(cached.messages[0].text(), own_call(envelope, "TOOL_CALL"));
         assert_eq!(cached.messages[1].text(), neutralize_block("Done, R&D."));
+
+        let unmarked = Context::new(
+            Arc::new(crate::models::Message::new("hi", "u1", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        cached.push_agent_turn(&unmarked, envelope);
+        assert_eq!(
+            cached.messages[2].text(),
+            neutralize_block(envelope),
+            "a reply shaped like a call replays escaped unless the turn framed it"
+        );
     }
 
     #[test]
@@ -1596,6 +1614,16 @@ mod tests {
     }
 
     #[test]
+    fn a_lowercase_tool_result_is_still_dropped() {
+        let live = normalize_tool_result(RESULT_BODY).unwrap();
+        let mut items = stored_result(RESULT_BODY, "tool_result");
+
+        drop_inbound_turn(&mut items, "dev", &live);
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
     fn an_untyped_body_is_not_matched_as_a_tool_result() {
         let live = normalize_tool_result(RESULT_BODY).unwrap();
         let mut items = stored_result(RESULT_BODY, "TEXT");
@@ -1603,5 +1631,74 @@ mod tests {
         drop_inbound_turn(&mut items, "dev", &live);
 
         assert_eq!(items.len(), 1);
+    }
+
+    async fn serve_one_completion(reply: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let chunk = serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": "stop"}],
+        });
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request_body(&mut sock).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {chunk}\n\ndata: [DONE]\n\n"
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+        });
+        (base, server)
+    }
+
+    async fn run_turn(ctx: &mut Context, llm_reply: &str) -> (Option<String>, serde_json::Value) {
+        let (llm_base, llm) = serve_one_completion(llm_reply).await;
+        let (base, saved) = capture_one_post().await;
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        let client = Arc::new(MagickmindClient::try_new(base, identity, true).unwrap());
+        let registry =
+            crate::ToolRegistry::new().register(crate::RemoteTool::new("take_photo", "Take one"));
+        let pipeline = Pipeline::new()
+            .add_streaming_stage(crate::XmlToolExecutorStage::new(
+                LlmClient::new(LlmClientConfig::new(llm_base)).unwrap(),
+                Arc::new(registry),
+            ))
+            .add_stage(PostProcessor)
+            .add_stage(MagickmindPersistence::new(client));
+        let response = pipeline.run(ctx).await.unwrap();
+        llm.await.unwrap();
+        (response, saved.await.unwrap())
+    }
+
+    /// The executor marks the text it framed and persistence matches it after
+    /// the trim, so this pins the whole contract rather than either half.
+    #[tokio::test]
+    async fn a_framed_call_is_typed_through_the_pipeline_and_a_later_answer_is_not() {
+        let mut message = crate::models::Message::new("hi", "u1", "chan1");
+        message
+            .metadata
+            .insert("magickspace_id".into(), serde_json::json!("space-1"));
+        let agent = crate::config::AgentConfig {
+            agent_id: "a1".into(),
+            ..Default::default()
+        };
+        let mut ctx = Context::new(Arc::new(message), Arc::new(agent));
+
+        let (framed, saved) = run_turn(
+            &mut ctx,
+            r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#,
+        )
+        .await;
+        let framed = framed.expect("the framed call is the turn's response");
+        assert_eq!(saved["message_type"], "TOOL_CALL");
+        let mut cached = PreparedContext::new(Vec::new(), Vec::new());
+        cached.push_agent_turn(&ctx, &framed);
+        assert_eq!(cached.messages[0].text(), own_call(&framed, "TOOL_CALL"));
+
+        let (answer, saved) = run_turn(&mut ctx, "Just an answer.").await;
+        assert_eq!(answer.as_deref(), Some("Just an answer."));
+        assert!(saved.get("message_type").is_none(), "{saved}");
     }
 }
