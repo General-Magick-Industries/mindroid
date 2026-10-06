@@ -116,8 +116,8 @@ pub(crate) fn claimed_this_message(ctx: &Context) -> bool {
         .is_some_and(|claim| claim.0 == ctx.message.id)
 }
 
-/// Gates echo the message they pass into `ctx.response`; a refused one gets no
-/// reply. A stage that lifted the halt recovered, so its reply stands.
+/// Gates echo the message they pass into `ctx.response`; a refused message gets
+/// no reply. A stage that lifted the halt recovered, so its reply stands.
 fn drop_refused_reply(ctx: &mut Context) {
     if ctx.halted && Refused::covers(ctx) {
         ctx.response = None;
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_anywhere_in_a_streamed_run_drops_the_gates_echo() {
+    async fn a_refusal_at_or_after_the_streaming_stage_drops_the_gates_echo() {
         let at_the_streaming_stage = Pipeline::new()
             .add_stage(EchoingGate)
             .add_streaming_stage(RefusingStream);
@@ -626,8 +626,8 @@ mod tests {
         }
     }
 
-    /// One executor refusing a result another owns, which then claims and
-    /// answers it, lifts the halt without the mark.
+    /// A stage that recovers from a refusal (one executor refusing a result
+    /// another then claims and answers) can lift the halt without the mark.
     #[tokio::test]
     async fn a_stage_that_lifts_a_refusal_keeps_its_reply() {
         struct RefusesThenRecovers;

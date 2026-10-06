@@ -187,7 +187,9 @@ parsing the event stream sees it as a string field. Both loop events carry
   message is never sent back as the reply. A plain `ctx.halted` still runs
   `finish` in full. `BranchStage` lifting a halt clears the mark with it; a
   stage of your own that clears `ctx.halted` after a refusal should
-  `ctx.take::<Refused>()` too, so the turn is not reported as refused.
+  `ctx.take::<Refused>()` too, or a later halt in the turn is taken for the
+  refusal (no `finish`, no reply). Lifting the halt hands that stage
+  `ctx.response`: a gate's echo it leaves there is returned as the reply.
 - `run_streaming` speaks a body with no streaming stage one pass at a time:
   each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
   supplies is spoken as the last one. A response marked with

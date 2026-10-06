@@ -107,7 +107,8 @@ refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRou
 unclaimed one, a rejected manifest), so a loop's persistence never stores what was
 refused, and a refused turn returns no reply. A stage that lifts a refusal's halt
 takes the `Refused` mark with it, as `BranchStage` does, or a later halt in the turn
-reads as the refusal. A pass's `Error` ends the turn — stricter than
+reads as the refusal; it also owns `ctx.response` from then on, so a gate's echo left
+there goes out as the reply. A pass's `Error` ends the turn — stricter than
 `Pipeline::run_streaming`, which forwards it and carries on.
 
 **At the cap a turn stops with a round unanswered** — the model asked for tools, got
