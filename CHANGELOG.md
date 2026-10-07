@@ -286,6 +286,12 @@ truncated.
 
 ### Fixed
 
+- `get_artifact` on a HEIC, SVG or corrupt image failed the whole turn. Both
+  executors inlined anything declared `image/*`, and the provider rejects the
+  request outright for a format it cannot read. They now inline only PNG, JPEG,
+  GIF and WebP, checked by signature, and tell the model the rest cannot be
+  shown inline.
+
 - `get_artifact` calls with the id under another key. Small models copy the tool
   prompt's `{"param": …}` example and send `{"param": "<id>"}`, which loaded
   nothing. A lone string argument now counts as the id.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use crate::artifacts::{ArtifactManager, ArtifactStore};
+use crate::artifacts::{ArtifactManager, ArtifactStore, inline_image_type};
 use crate::core::content::{
     ARTIFACT_DATA_METADATA_KEY, ArtifactReference, ContentPart, ContentSource,
     MAX_ARTIFACT_REFERENCES, is_artifact_id,
@@ -91,7 +91,7 @@ impl InlineArtifacts {
             return None;
         }
         match self.store.load(scope, id).await {
-            Ok(art) => match sniff_image(&art.data) {
+            Ok(art) => match inline_image_type(&art.data) {
                 Some(sniffed) if art.data.len() <= budget.bytes => {
                     budget.bytes -= art.data.len();
                     budget.images -= 1;
@@ -116,50 +116,6 @@ impl InlineArtifacts {
                 None
             }
         }
-    }
-}
-
-/// The image formats vision endpoints accept, by signature rather than declared
-/// type: one HEIC, SVG or corrupt file inlined fails the whole request.
-fn sniff_image(data: &[u8]) -> Option<&'static str> {
-    match data {
-        [
-            0x89,
-            b'P',
-            b'N',
-            b'G',
-            0x0D,
-            0x0A,
-            0x1A,
-            0x0A,
-            _,
-            _,
-            _,
-            _,
-            b'I',
-            b'H',
-            b'D',
-            b'R',
-            ..,
-        ] => Some("image/png"),
-        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
-        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => Some("image/webp"),
-        _ => None,
     }
 }
 
@@ -553,18 +509,24 @@ mod tests {
     }
 
     #[test]
-    fn only_formats_vision_endpoints_accept_are_sniffed_as_images() {
+    fn only_formats_vision_endpoints_accept_count_as_images() {
         let png = [
             0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
         ];
-        assert_eq!(sniff_image(&png), Some("image/png"));
-        assert_eq!(sniff_image(&jpeg(&[])), Some("image/jpeg"));
-        assert_eq!(sniff_image(b"GIF89a..."), Some("image/gif"));
-        assert_eq!(sniff_image(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
-        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nnot really a png"), None);
-        assert_eq!(sniff_image(b"\0\0\0\x18ftypheic"), None);
+        assert_eq!(inline_image_type(&png), Some("image/png"));
+        assert_eq!(inline_image_type(&jpeg(&[])), Some("image/jpeg"));
+        assert_eq!(inline_image_type(b"GIF89a..."), Some("image/gif"));
         assert_eq!(
-            sniff_image(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            inline_image_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(
+            inline_image_type(b"\x89PNG\r\n\x1a\nnot really a png"),
+            None
+        );
+        assert_eq!(inline_image_type(b"\0\0\0\x18ftypheic"), None);
+        assert_eq!(
+            inline_image_type(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
             None
         );
     }
