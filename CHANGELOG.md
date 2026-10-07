@@ -13,8 +13,11 @@ listed under **Breaking Changes** with a migration note.
 - `InlineArtifacts` (feature `artifacts`): loads the images an inbound message
   attaches by reference (`artifact_data`) and puts them inline on the current user
   turn, so the model sees a photo the turn it arrives instead of calling
-  `get_artifact`. Capped at 8 images and `DEFAULT_MAX_INLINE_BYTES` (512 KiB) per
-  turn; anything else stays a reference.
+  `get_artifact`. `with_history_messages(n)` also inlines references in the `n`
+  messages before it (default 0). The current turn has first claim on
+  `with_max_images` (default 8) and `with_max_bytes` (default
+  `DEFAULT_MAX_INLINE_BYTES`, 512 KiB). Only PNG, JPEG, GIF and WebP, checked by
+  signature, are inlined; anything else stays a reference.
 
 - `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
   artifact service. Uploads go into a magickspace through presign, PUT and finalize;
