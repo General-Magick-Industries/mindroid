@@ -277,6 +277,10 @@ truncated.
 
 ### Fixed
 
+- `get_artifact` calls with the id under another key. Small models copy the tool
+  prompt's `{"param": …}` example and send `{"param": "<id>"}`, which loaded
+  nothing. A lone string argument now counts as the id.
+
 - MagickMind tool loops. `MagickmindPersistence` saves a framed remote call as
   `message_type: TOOL_CALL`; it went out untyped, so devices received it as
   chat. The type comes from a marker the tool executor binds to the exact framed

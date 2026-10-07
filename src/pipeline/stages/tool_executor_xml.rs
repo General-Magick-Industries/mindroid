@@ -1170,7 +1170,7 @@ async fn run_tool_loop(
 #[cfg(feature = "artifacts")]
 pub(crate) fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
     if name == crate::tools::GET_ARTIFACT_TOOL {
-        args.get("id").and_then(|v| v.as_str()).map(str::to_string)
+        crate::tools::get_artifact::requested_id(args).map(str::to_string)
     } else {
         None
     }
