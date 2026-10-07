@@ -50,7 +50,8 @@ protocol invariant onto its consumers.
   envelope, *unless* a `CorrelatedRemoteResult` marker is already in run scope.
 
 A refusal sets `ctx.halted` and returns no response, matching the existing
-stage-halt contract.
+stage-halt contract. It halts through `Refused::halt`, so an `AgentLoop` reports
+it as `StopReason::Refused` and runs no `finish` stage over it (ADR-0010).
 
 The exemption matters: `RemoteResultGate` strips the `call` attribute once it
 has claimed a result, and the stripped body deliberately no longer validates.

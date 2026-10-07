@@ -808,14 +808,17 @@ impl PipelineStage for MagickmindPersistence {
             return Ok(());
         }
 
-        let content = ctx.response.as_deref().unwrap_or("").to_string();
-        let message_type = FramedRemoteCall::covers(ctx, &content).then_some(TOOL_CALL_TYPE);
+        let Some(content) = ctx.response.as_deref().filter(|r| !r.trim().is_empty()) else {
+            debug!("MagickmindPersistence: no reply to send, skipping save");
+            return Ok(());
+        };
+        let message_type = FramedRemoteCall::covers(ctx, content).then_some(TOOL_CALL_TYPE);
 
         self.magickmind
             .save_typed_message(
                 magickspace_id,
                 &ctx.agent_config.agent_id,
-                &content,
+                content,
                 Some(&ctx.message.id),
                 message_type,
             )
@@ -1421,6 +1424,40 @@ mod tests {
             magickmind_ollama_pipeline(identity, "http://gateway", "http://localhost", "model")
                 .is_err()
         );
+    }
+
+    /// Saving posts to every member of the space, so a turn with no reply —
+    /// a halt that still runs `finish`, a silent settling round — sends
+    /// nothing. The client points nowhere: reaching it at all is the failure.
+    #[tokio::test]
+    async fn persistence_sends_nothing_for_a_turn_with_no_reply() {
+        use crate::config::AgentConfig;
+        use crate::core::context::Context;
+        use crate::models::Message;
+
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        let stage = MagickmindPersistence::new(Arc::new(MagickmindClient::new(
+            "http://127.0.0.1:1",
+            identity,
+        )));
+
+        for response in [
+            None,
+            Some(""),
+            Some(
+                "  
+",
+            ),
+        ] {
+            let mut ctx = Context::new(
+                Arc::new(Message::new("hi", "u1", "space-1")),
+                Arc::new(AgentConfig::default()),
+            );
+            ctx.halted = response.is_none();
+            ctx.response = response.map(str::to_string);
+
+            stage.process(&mut ctx).await.unwrap();
+        }
     }
 
     #[tokio::test]

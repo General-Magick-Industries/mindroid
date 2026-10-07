@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use crate::core::agent_loop::Refused;
 use crate::core::context::Context;
 use crate::error::{MindroidError, Result};
 
@@ -58,6 +59,7 @@ impl PipelineStage for BranchStage {
 
         if ctx.halted {
             ctx.halted = false;
+            ctx.take::<Refused>();
             if let Some(ref fail_pipeline) = self.fail {
                 fail_pipeline.run(ctx).await?;
             }
@@ -309,6 +311,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::config::AgentConfig;
+    use crate::core::agent_loop::Refused;
     use crate::core::context::Context;
     use crate::models::Message;
     use crate::pipeline::{Pipeline, PipelineStage};
@@ -414,6 +417,33 @@ mod tests {
         assert!(fail_called.load(Ordering::SeqCst), "fail branch must run");
         // halted must be reset after BranchStage consumed it
         assert!(!ctx.halted, "halted must be cleared after branch");
+    }
+
+    /// A branch that recovers from a refusal lifts the halt, so it takes the
+    /// mark too: left behind, a later plain halt would read as a refusal.
+    #[tokio::test]
+    async fn a_branch_that_lifts_a_refusal_takes_its_mark() {
+        struct RefuseGate;
+
+        #[async_trait]
+        impl PipelineStage for RefuseGate {
+            fn name(&self) -> &str {
+                "refuse-gate"
+            }
+            async fn process(&self, ctx: &mut Context) -> crate::error::Result<()> {
+                Refused::halt(ctx);
+                Ok(())
+            }
+        }
+
+        let mut ctx = make_test_context();
+        BranchStage::new("branch", RefuseGate)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert!(!ctx.halted);
+        assert!(!Refused::covers(&ctx));
     }
 
     #[tokio::test]

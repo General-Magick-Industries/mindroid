@@ -142,6 +142,17 @@ Both non-streaming calls (`chat`, `chat_with_tools`) are now bounded by a
 `stream_chat` keeps its unbounded body read and long generations are not
 truncated.
 
+#### 7. `PipelineEvent` is now `#[non_exhaustive]`
+
+`AgentLoop` added `LoopIterationStarted` and `LoopCompleted`, and each execution
+model adds its own events. A `match` on `PipelineEvent` outside this crate needs a
+wildcard arm; this is the last release in which adding an event breaks you.
+
+`LoopCompleted` carries `reason: StopReason`. `StopReason` is exported from the
+crate root and serializes in snake_case (`"max_iterations"`), so a consumer
+parsing the event stream sees it as a string field. Both loop events carry
+`loop_name`, the loop's `with_name`, so nested loops can be told apart.
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
@@ -162,6 +173,47 @@ truncated.
   `EpisodeIngestStage::apply_runtime_state` after `Context::reset_output`.
   `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
   and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
+- **`AgentLoop`**, an iterative execution model composed of pipelines
+  (ADR-0010): `setup` once, a `body` per pass, `finish` once, over one
+  `Context`. A body stage asks for another pass by setting `Continue`; a body
+  that never asks runs exactly once, like a plain `Pipeline`. `run` returns a
+  `LoopOutcome` carrying the `StopReason`; `run_streaming` yields each pass's
+  events and one `Complete` for the turn. A loop is also a `PipelineStage`, so
+  loops nest.
+- `LlmRound` and `ToolRound`: the native tool round split in two, so stages can
+  run between the model call and the tools. Pair them with
+  `LlmRound::tool_round()`, and wire `ToolRound::result_gate()` into `setup` —
+  `LlmRound` refuses a turn whose declared `tool_result` nothing claimed.
+  `ToolRound` runs tools through the same path as `ToolExecutorStage`, so errors
+  read the same to the model.
+- `TranscriptCompaction`: drops the oldest whole rounds once the transcript
+  passes a budget, keeping every system message, the newest user message and
+  the newest round. A cut through the history never keeps a reply without the
+  user turn it answers.
+- `CapSummary`, from `LlmRound::cap_summary()`: a `finish` stage that makes
+  the executor's closing request — the same instruction to answer, no tools —
+  when the loop stopped at its iteration cap. An empty or failed answer keeps
+  the text the turn already had. The loop puts its `StopReason` in run scope
+  while `finish` runs, and a loop nested in `finish` hands the enclosing loop's
+  back.
+- `Refused` and `StopReason::Refused`: a refusal is a halt that skips
+  `finish`. Admission control, `RemoteResultGate` dropping an unsolicited or
+  expired `tool_result`, `LlmRound` refusing an unclaimed one and `ManifestStage`
+  rejecting a manifest halt through `Refused::halt`, so persistence in a loop's
+  `finish` never stores what was refused. A refused turn also returns no
+  response, from a loop or a plain `Pipeline`, so a gate's echo of the refused
+  message is never sent back as the reply. A plain `ctx.halted` still runs
+  `finish` in full. `BranchStage` lifting a halt clears the mark with it; a
+  stage of your own that clears `ctx.halted` after a refusal should
+  `ctx.take::<Refused>()` too, or a later halt in the turn is taken for the
+  refusal (no `finish`, no reply). Lifting the halt hands that stage
+  `ctx.response`: a gate's echo it leaves there is returned as the reply.
+- `run_streaming` speaks a body with no streaming stage one pass at a time:
+  each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
+  supplies is spoken as the last one. A response marked with
+  `ControlResponse::mark` — a framed remote call — is never spoken. `ToolRound`
+  and both tool executors mark theirs; a stage of your own calls
+  `ControlResponse::mark(ctx)` after setting `ctx.response`.
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
   WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
@@ -284,7 +336,20 @@ truncated.
   replay reads `message_type`: the agent's own `TOOL_CALL` replays as JSON with
   `\u003c`-style escapes and folded invisible controls instead of HTML
   entities, and a live `TOOL_RESULT` no longer reaches the prompt twice.
-
+- `Pipeline::run_streaming` stops after a streaming stage that halts, as
+  `Pipeline::run` stops after any stage that does. The post-streaming stages
+  used to run regardless, so a streaming executor dropping a forged
+  `tool_result` still reached a persistence stage after it.
+- `MagickmindPersistence` no longer posts an empty agent message. Saving goes
+  through the space's send endpoint, which fans out to every member, and it
+  saved `ctx.response` unconditionally — so any turn with no reply that still
+  reached it (a gate declining inside a loop's `finish`, a silent final round)
+  broadcast an empty message. It now skips a blank response, as
+  `MemoryPersistence` already did.
+- Every stage that honours a remote-result claim — `ToolExecutorStage`, both
+  paths of `XmlToolExecutorStage`, and `LlmRound` — now checks that the claim
+  was granted for the message being processed, as admission control already
+  did.
 - The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
   `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
   configured `transcriber` produced nothing while the provider's own input

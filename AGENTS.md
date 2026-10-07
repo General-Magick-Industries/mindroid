@@ -12,6 +12,7 @@ These are load-bearing. If a change touches one, read the linked ADR in `docs/ad
 - **Concurrency = structured.** Prefer `JoinSet` / `select!` / `CancellationToken` over detached `tokio::spawn`. Fan-out collects results; it never shares `&mut Context` across tasks. → `docs/adr/0001-concurrency.md`
 - **Observability = middleware, never a mutable observer registry.** Cross-cutting concerns wrap traits (tower-style) or ride the `PipelineEvent` / callback stream. → `docs/adr/0002-observability.md`
 - **OmniSession is a separate execution model**, not an extended `Pipeline`. → `docs/adr/0003-omnisession.md`
+- **`AgentLoop` is likewise a separate execution model**, composed *of* pipelines. Iteration belongs to the loop, not to a stage that owns a private one. → `docs/adr/0010-agent-loop.md`
 - **Control traffic with no consumer never becomes prompt text.** `Pipeline` refuses it at the entrance, before any stage runs — the one sanctioned deviation from "control flow composes from stages". → `docs/adr/0008-pipeline-admission.md`
 - **Accept traits, return structs.** Every subsystem is a swappable trait; keep them small and object-safe.
 
@@ -86,6 +87,75 @@ rates differ per provider — Gemini is 16 kHz in / 24 kHz out (`CpalAudio::new_
 OpenAI is 24 kHz both ways (`CpalAudio::new`). Both are footguns worth designing away;
 no ADR covers it yet.
 
+### AgentLoop — the iterative model (ADR-0010)
+
+A `Pipeline` runs once per message. `AgentLoop` runs three of them — `setup` once,
+`body` per iteration, `finish` once — over one `Context`, so run scope is the loop's
+state. A body stage requests another pass by setting `Continue` in run scope; the loop
+clears it before each pass, so a body that never asks runs exactly once and behaves
+identically to a plain pipeline.
+
+This is what makes compaction, approval, retry and per-round model routing ordinary
+stages: they sit *inside* the reasoning loop rather than around an executor that owns
+its own. `LlmRound` + `ToolRound` are the native tool round split for this.
+`TranscriptCompaction` drops whole rounds, never half of one: splitting an assistant
+`tool_calls` turn from its results makes the provider reject the request. It pins every
+system message (a per-turn context block too), the newest user message and the newest
+round, and never keeps a history reply without its question. `finish` runs in full
+after a halt or the cap, and not at all after a cancellation, a body error, or a
+refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRound`'s
+unclaimed one, a rejected manifest), so a loop's persistence never stores what was
+refused, and a refused turn returns no reply. A stage that lifts a refusal's halt
+takes the `Refused` mark with it, as `BranchStage` does, or a later halt in the turn
+reads as the refusal; it also owns `ctx.response` from then on, so a gate's echo left
+there goes out as the reply. A pass's `Error` ends the turn — stricter than
+`Pipeline::run_streaming`, which forwards it and carries on.
+
+**At the cap a turn stops with a round unanswered** — the model asked for tools, got
+the results, never replied. `finish` sees the `StopReason` in run scope, and
+`LlmRound::cap_summary()` placed there makes the same closing request
+`ToolExecutorStage` makes for itself, keeping the turn's text if it fails.
+**`run_streaming` speaks a body with no streaming stage one pass at a time**: each
+pass's prose becomes one `Chunk`, never a response marked with `ControlResponse::mark`
+(a framed remote call), so TTS works over split rounds; at the cap, the answer `finish`
+supplies is spoken last. A body that has a streaming stage is left to it.
+`LoopCompleted` carries the `StopReason`, the only place a streaming caller sees it, and
+both loop events carry the loop's name.
+
+**Remote tools keep the same wire contract** — framed `{type: "tool_call"}`, same
+deadline, same correlation gate — but a split round cannot run the gate inline the way
+`ToolExecutorStage` does, because `LlmRound` has already called the model by then. Wire
+`ToolRound::result_gate()` into `setup`, ahead of context building. Forget it and
+`LlmRound` refuses the turn rather than letting an unclaimed `tool_result` reach the
+model. Artifact re-attachment and `ToolCall`/`ToolResult` stream events are still
+`ToolExecutorStage`-only.
+
+```rust
+let llm = LlmRound::new(client, registry);
+let tools = llm.tool_round();    // shares the registry handle; never build the pair apart
+let summary = llm.cap_summary(); // answers without tools if the loop hits its cap
+AgentLoop::new(
+    Pipeline::new()
+        .add_stage(TranscriptCompaction::from_tokens(60_000))
+        .add_stage(llm)
+        .add_stage(tools),
+)
+.with_setup(Pipeline::new().add_stage(SimpleContextBuilder::with_prompt(SYSTEM)))
+.with_finish(Pipeline::new().add_stage(summary).add_stage(PostProcessor))
+```
+
+`AgentLoop` is **also a `PipelineStage`**, so it is not an either/or with `Pipeline`:
+run it at the top of a turn, or nest one inside another loop's body (a planning loop
+feeding an executing loop). Nested loops share run scope — deliberate for phases of one
+turn, wrong for two independent agents, which would write the same `Transcript`. A real
+sub-agent wants its own `Context`: nest it through `DelegationTool`.
+
+`Runtime` still drives a `Pipeline`; an `AgentLoop` is run directly today (see
+`examples/agent_loop`). Wiring it behind `MessageContext::process_and_respond` is
+follow-up work. Until then, **a remote-call timeout reaches a loop only when the loop
+is a stage of the runtime's pipeline**: `RemoteCallTimeout` resumes through
+`Runtime.pipeline`, never through a loop driven by hand (see its docs).
+
 ### Core Traits (always available, no feature gate)
 
 | Trait | File | Key methods |
@@ -111,9 +181,9 @@ Set `ctx.halted = true` to stop the pipeline early from any stage.
 
 **Before stage 1**, `Pipeline` refuses inbound control traffic no stage can
 consume — a `TOOL_CALL`, or a `TOOL_RESULT` that is not one complete
-`<tool_result>` envelope. It halts with no response and no `PipelineEvent`.
-This is deliberate admission control, not a stage; see ADR-0008 before changing
-it.
+`<tool_result>` envelope. It halts with no response and no `PipelineEvent`, as
+a refusal (`Refused::halt`), so an `AgentLoop` skips `finish` over it. This is
+deliberate admission control, not a stage; see ADR-0008 before changing it.
 
 ### Combinators
 
