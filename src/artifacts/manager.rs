@@ -63,8 +63,9 @@ impl ArtifactManager {
     }
 
     /// Offload every inline media part in `content` to the store under `scope`,
-    /// replacing each with a bare-id `File` reference. Text / already-referenced
-    /// parts are untouched. Returns the number of parts offloaded.
+    /// replacing each with a bare-id `File` reference. An image `InlineArtifacts`
+    /// loaded becomes a reference to its artifact again, without a save. Text /
+    /// already-referenced parts are untouched. Returns the number of parts offloaded.
     pub async fn offload(&self, scope: &str, content: &mut [ContentPart]) -> Result<usize> {
         let mut count = 0;
         for part in content.iter_mut() {
@@ -104,8 +105,6 @@ impl ArtifactManager {
     }
 }
 
-/// Extract `(bytes, mime)` from an inline media part. Returns `None` for text
-/// parts, already-referenced (`Uri`) parts, or non-media.
 /// The reference an inlined image was loaded from, so it is not stored twice.
 fn inlined_reference(part: &ContentPart) -> Option<ContentPart> {
     let ContentPart::Image {
@@ -132,6 +131,8 @@ fn inlined_reference(part: &ContentPart) -> Option<ContentPart> {
     })
 }
 
+/// Extract `(bytes, mime)` from an inline media part. Returns `None` for text
+/// parts, already-referenced (`Uri`) parts, or non-media.
 fn inline_media(part: &ContentPart) -> Option<(&[u8], &str)> {
     match part {
         ContentPart::Image {

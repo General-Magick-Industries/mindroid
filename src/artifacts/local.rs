@@ -203,9 +203,6 @@ impl LocalArtifactStore {
         Ok(file)
     }
 
-    /// Capped with `take` rather than a `metadata()` pre-size: the length is
-    /// attacker-controlled, and a sparse file costs them nothing while an
-    /// up-front reservation of it aborts the process under `panic = "abort"`.
     async fn read(&self, scope: &str, id: &str, limit: u64) -> Result<Artifact> {
         let (bytes_path, sidecar_path) = self.resolve_paths(scope, id, false).await?;
 
@@ -224,6 +221,9 @@ impl LocalArtifactStore {
         })
     }
 
+    /// Capped with `take` rather than a `metadata()` pre-size: the length is
+    /// attacker-controlled, and a sparse file costs them nothing while an
+    /// up-front reservation of it aborts the process under `panic = "abort"`.
     async fn read_no_follow(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 

@@ -33,8 +33,8 @@ pub const DEFAULT_MAX_INLINE_BYTES: usize = 512 * 1024;
 ///
 /// Run it after the user turn is built; it replaces the references
 /// [`AttachMedia`](super::AttachMedia) added for the same ids. An
-/// [`ArtifactOffload`](super::ArtifactOffload) placed after it restores the
-/// original references rather than storing the images again.
+/// [`ArtifactOffload`](super::ArtifactOffload) placed after it turns the images
+/// back into references to the senders' artifacts rather than storing them again.
 pub struct InlineArtifacts {
     store: Arc<dyn ArtifactStore>,
     max_bytes: usize,
@@ -125,7 +125,10 @@ impl InlineArtifacts {
             );
             return vec![part];
         };
-        budget.bytes -= artifact.data.len();
+        let Some(left) = budget.bytes.checked_sub(artifact.data.len()) else {
+            return vec![part];
+        };
+        budget.bytes = left;
         budget.inlined += 1;
 
         let name = filename

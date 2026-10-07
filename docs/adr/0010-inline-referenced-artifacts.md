@@ -23,7 +23,8 @@ anyway, wrongly. Matching a question to an earlier photo has the same failure.
 - `InlineArtifacts` is an opt-in stage. It loads the images referenced by the inbound
   message's `artifact_data` and attaches them inline to the current user turn. With
   `with_history_messages(n)` (default 0) it does the same for references in the `n`
-  messages before it. Nothing is persisted: it changes this run's `llm_messages` only.
+  messages before it. It changes this run's `llm_messages` only, so no image bytes
+  are persisted.
 - Every load is bounded: at most `with_max_images` loads per turn, whether or not they
   inline, an id at most once, and `ArtifactStore::load_bounded` with the bytes left,
   so a store can stop reading at the limit. The current turn is served first.
@@ -31,8 +32,10 @@ anyway, wrongly. Matching a question to an earlier photo has the same failure.
   executors' `get_artifact` re-attachment: a provider rejects a whole request over one
   image it cannot read.
 - Each inlined image keeps its reference id, name and metadata as a short text label,
-  and carries its id in code-only metadata so a later `ArtifactOffload` restores the
-  original reference instead of storing a second copy.
+  and carries its id in code-only metadata so a later `ArtifactOffload` turns it back
+  into a reference to the sender's artifact instead of storing a second copy. That
+  reference keeps the id and type; the name and metadata survive in the label, which
+  a late offload persists with the turn.
 
 ## Alternatives considered
 

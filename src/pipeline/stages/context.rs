@@ -274,8 +274,8 @@ fn resolve_files(ctx: &Context) -> Vec<ResolvedFile> {
 ///
 /// # Note
 ///
-/// The LLM client sends inline `image/*` parts as base64 data URLs; other inline
-/// types are attached here but dropped during conversion.
+/// The LLM client sends inline `image/*` parts as base64 data URLs and renders a
+/// `File` as a reference line; inline audio and video are dropped during conversion.
 ///
 /// # Examples
 ///

@@ -107,7 +107,8 @@ pub trait ArtifactStore: Send + Sync + 'static {
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact>;
 
     /// Like [`load`](Self::load), but fails for an artifact over `max_bytes`. The
-    /// default loads it whole and then checks; a store that can stop early should.
+    /// default loads it whole and then checks: a store that can stop reading early
+    /// should override it, and a store wrapping another should forward it.
     async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
         let artifact = self.load(scope, id).await?;
         if artifact.data.len() > max_bytes {

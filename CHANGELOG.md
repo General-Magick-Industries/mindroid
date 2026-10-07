@@ -18,8 +18,9 @@ listed under **Breaking Changes** with a migration note.
   `with_max_images` (default 8 loads, inlined or not) and `with_max_bytes`
   (default `DEFAULT_MAX_INLINE_BYTES`, 512 KiB). Only PNG, JPEG, GIF and WebP,
   checked by signature, are inlined, each with a label carrying its id, name and
-  metadata; anything else stays a reference. A later `ArtifactOffload` restores
-  the original reference instead of storing the image again. See ADR-0010.
+  metadata; anything else stays a reference. A later `ArtifactOffload` turns an
+  inlined image back into a reference to the sender's artifact instead of storing
+  it again. See ADR-0010.
 - `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
   The default loads and then checks; `LocalArtifactStore` and
   `MagickmindArtifactStore` stop reading at the limit.
@@ -297,8 +298,8 @@ truncated.
   PNG, JPEG, GIF and WebP, checked by signature, and tell the model the rest
   cannot be shown inline. The type named in that text is validated first.
 
-- `MagickmindArtifactStore` request errors no longer include the URL, which for
-  a download is a presigned link.
+- `MagickmindArtifactStore` request and download errors no longer include the
+  URL, which for a download is a presigned link.
 
 - `get_artifact` calls with the id under another key. Small models copy the tool
   prompt's `{"param": …}` example and send `{"param": "<id>"}`, which loaded
