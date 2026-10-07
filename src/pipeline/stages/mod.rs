@@ -14,7 +14,6 @@ pub mod stt;
 #[cfg(feature = "llm-client")]
 mod tool_executor;
 mod tool_executor_xml;
-#[cfg(feature = "transport-audio")]
 #[cfg(feature = "llm-client")]
 pub mod tts;
 

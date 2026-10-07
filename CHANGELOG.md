@@ -292,6 +292,10 @@ truncated.
 
 ### Fixed
 
+- Builds without `transport-audio` failed with three unresolved `tts` imports. A
+  `cfg` attribute left behind when a re-export was removed gated `pipeline::stages::tts`
+  on `transport-audio`, while its re-exports still compiled without it.
+
 - `get_artifact` on a HEIC, SVG or other unrecognised image failed the whole
   turn. Both executors inlined anything declared `image/*`, and the provider
   rejects the request outright for a format it cannot read. They now inline only
