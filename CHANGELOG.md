@@ -8,6 +8,18 @@ listed under **Breaking Changes** with a migration note.
 
 ## [Unreleased]
 
+### Added
+
+- `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
+  artifact service. Uploads go into a magickspace through presign, PUT and finalize;
+  loads fall back to the caller's own route for artifacts no message has attached yet.
+- `ArtifactStore::scope_for`, defaulting to the delivery channel. The offload stage
+  and both executors' artifact re-injection now ask the store for its scope; see ADR-0009.
+- `ArtifactReference`, one entry of a message's `artifact_data`. `CentrifugoTransport`
+  copies `artifact_data` into `Message::metadata`, `AttachMedia` turns it into `File`
+  reference parts on the current user turn, and `MagickmindClient::prepare_context`
+  does the same for other participants' history turns.
+
 ### Breaking Changes
 
 #### 0. `OmniEvent` and `OmniConfig` grew for realtime providers
@@ -162,7 +174,7 @@ parsing the event stream sees it as a string field. Both loop events carry
   `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
   and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
 - **`AgentLoop`**, an iterative execution model composed of pipelines
-  (ADR-0009): `setup` once, a `body` per pass, `finish` once, over one
+  (ADR-0010): `setup` once, a `body` per pass, `finish` once, over one
   `Context`. A body stage asks for another pass by setting `Continue`; a body
   that never asks runs exactly once, like a plain `Pipeline`. `run` returns a
   `LoopOutcome` carrying the `StopReason`; `run_streaming` yields each pass's

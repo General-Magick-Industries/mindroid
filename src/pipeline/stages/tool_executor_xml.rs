@@ -582,8 +582,11 @@ impl PipelineStage for XmlToolExecutorStage {
         // Trusted scope for artifact re-injection (never model/user supplied).
         #[cfg(feature = "artifacts")]
         let artifacts = ArtifactReinjection {
+            scope: self.artifact_store().map_or_else(
+                || ctx.message.channel_id.clone(),
+                |s| s.scope_for(&ctx.message),
+            ),
             store: self.artifact_store(),
-            scope: ctx.message.channel_id.clone(),
         };
         let (mut messages, mut final_content, hit_max, framed) = run_tool_loop(
             LoopDeps {
@@ -642,8 +645,11 @@ impl StreamingStage for XmlToolExecutorStage {
         // Trusted scope for artifact re-injection (never model/user supplied).
         #[cfg(feature = "artifacts")]
         let artifacts = ArtifactReinjection {
+            scope: self.artifact_store().map_or_else(
+                || ctx.message.channel_id.clone(),
+                |s| s.scope_for(&ctx.message),
+            ),
             store: self.artifact_store(),
-            scope: ctx.message.channel_id.clone(),
         };
 
         Box::pin(async_stream::stream! {

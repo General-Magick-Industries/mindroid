@@ -126,6 +126,14 @@ impl ToolExecutorStage {
             .get(crate::tools::GET_ARTIFACT_TOOL)
             .and_then(|t| t.artifact_store())
     }
+
+    fn artifact_scope(&self, message: &crate::models::Message) -> String {
+        #[cfg(feature = "artifacts")]
+        if let Some(store) = self.artifact_store() {
+            return store.scope_for(message);
+        }
+        message.channel_id.clone()
+    }
 }
 
 /// Re-attach loaded artifact bytes as a follow-up USER turn.
@@ -344,8 +352,10 @@ struct Round {
 struct RoundDeps<'a> {
     registry: &'a ToolRegistry,
     tool_ctx: &'a ToolContext,
-    /// Trusted delivery channel — the correlation key and the artifact scope.
+    /// Trusted delivery channel — the remote-call correlation key.
     message_channel: &'a str,
+    /// Where re-injected artifacts load from; see `ArtifactStore::scope_for`.
+    artifact_scope: &'a str,
     trusted_sender: Option<&'a str>,
     tools: &'a [async_openai::types::chat::ChatCompletionTools],
 }
@@ -382,6 +392,7 @@ impl ToolExecutorStage {
             registry,
             tool_ctx,
             message_channel,
+            artifact_scope,
             trusted_sender,
             tools: _,
         } = *deps;
@@ -428,7 +439,7 @@ impl ToolExecutorStage {
             // complete, which the provider requires.
             let Ok(args) = args else {
                 return self
-                    .local_round(registry, tool_ctx, message_channel, outcome, messages)
+                    .local_round(registry, tool_ctx, artifact_scope, outcome, messages)
                     .await;
             };
             events.push(StreamEvent::ToolCall {
@@ -456,7 +467,7 @@ impl ToolExecutorStage {
             });
         }
 
-        self.local_round(registry, tool_ctx, message_channel, outcome, messages)
+        self.local_round(registry, tool_ctx, artifact_scope, outcome, messages)
             .await
     }
 
@@ -465,7 +476,7 @@ impl ToolExecutorStage {
         &self,
         registry: &ToolRegistry,
         tool_ctx: &ToolContext,
-        #[cfg_attr(not(feature = "artifacts"), allow(unused_variables))] message_channel: &str,
+        #[cfg_attr(not(feature = "artifacts"), allow(unused_variables))] artifact_scope: &str,
         outcome: crate::llm_client::ToolsChatOutcome,
         messages: &mut Vec<ChatCompletionRequestMessage>,
     ) -> Result<Round> {
@@ -516,7 +527,7 @@ impl ToolExecutorStage {
         if !ends_turn
             && !load_ids.is_empty()
             && let Some(store) = self.artifact_store()
-            && let Some(msg) = artifact_turn(load_ids, &store, message_channel).await
+            && let Some(msg) = artifact_turn(load_ids, &store, artifact_scope).await
         {
             messages.push(msg);
         }
@@ -541,10 +552,12 @@ impl ToolExecutorStage {
         let tool_ctx = tool_context_for(ctx);
         let tools = LlmClient::tool_specs(&registry);
         let mut messages = LlmClient::convert_messages(&ctx.llm_messages);
+        let artifact_scope = self.artifact_scope(&ctx.message);
         let deps = RoundDeps {
             registry: &registry,
             tool_ctx: &tool_ctx,
             message_channel: &ctx.message.channel_id,
+            artifact_scope: &artifact_scope,
             trusted_sender: ctx.message.trusted_sender_id(),
             tools: &tools,
         };
@@ -646,11 +659,13 @@ impl StreamingStage for ToolExecutorStage {
                 let tools = LlmClient::tool_specs(&registry);
                 let mut messages = LlmClient::convert_messages(&ctx.llm_messages);
                 let channel = ctx.message.channel_id.clone();
+                let artifact_scope = self.artifact_scope(&ctx.message);
                 let trusted = ctx.message.trusted_sender_id().map(str::to_string);
                 let deps = RoundDeps {
                     registry: &registry,
                     tool_ctx: &tool_ctx,
                     message_channel: &channel,
+                    artifact_scope: &artifact_scope,
                     trusted_sender: trusted.as_deref(),
                     tools: &tools,
                 };

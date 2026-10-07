@@ -15,7 +15,7 @@
 //! invariants — admission control before any stage, at most one
 //! [`StreamingStage`](crate::pipeline::StreamingStage) — are stated per run, and
 //! a `Pipeline` that looped would have to restate every one of them.
-//! See `docs/adr/0009-agent-loop.md`.
+//! See `docs/adr/0010-agent-loop.md`.
 //!
 //! ```text
 //! setup   ──▶ once   : persona, memory fetch, context building

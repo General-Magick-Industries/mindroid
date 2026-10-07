@@ -69,7 +69,7 @@ pub use config::{
 pub use core::agent_loop::{
     AgentLoop, Continue, ControlResponse, DEFAULT_LOOP_ITERATIONS, LoopOutcome, Refused, StopReason,
 };
-pub use core::content::{ContentPart, ContentSource};
+pub use core::content::{ArtifactReference, ContentPart, ContentSource};
 pub use core::context::Context;
 pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
 pub use core::events::PipelineEvent;

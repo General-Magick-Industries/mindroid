@@ -54,7 +54,7 @@ impl PipelineStage for ArtifactOffload {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        let scope = ctx.message.channel_id.clone();
+        let scope = self.manager.store().scope_for(&ctx.message);
         let current_user = ctx
             .get_run::<crate::pipeline::extensions::CurrentUserMessage>()
             .map(|current| current.0);
@@ -94,6 +94,61 @@ mod tests {
     use crate::core::content::{ContentPart, ContentSource};
     use crate::models::{LlmMessage, Message};
     use std::sync::Arc;
+
+    struct ConversationScoped(LocalArtifactStore);
+
+    #[async_trait]
+    impl ArtifactStore for ConversationScoped {
+        async fn save(
+            &self,
+            scope: &str,
+            data: &[u8],
+            mime_type: &str,
+        ) -> Result<crate::artifacts::StoredArtifact> {
+            self.0.save(scope, data, mime_type).await
+        }
+        async fn load(&self, scope: &str, id: &str) -> Result<crate::artifacts::Artifact> {
+            self.0.load(scope, id).await
+        }
+        async fn delete(&self, scope: &str, id: &str) -> Result<()> {
+            self.0.delete(scope, id).await
+        }
+        fn scope_for(&self, message: &Message) -> String {
+            message.conversation_id().to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn offload_saves_under_the_scope_the_store_chooses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConversationScoped(LocalArtifactStore::new(tmp.path())));
+        let mut msg = Message::new("look", "user", "user-a1-delivery");
+        msg.metadata
+            .insert("magickspace_id".into(), "space1".into());
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        ctx.llm_messages.push(LlmMessage::with_parts(
+            Role::User,
+            vec![ContentPart::image(
+                ContentSource::Inline { data: vec![4, 5] },
+                "image/png",
+            )],
+        ));
+
+        ArtifactOffload::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        let ContentPart::File {
+            source: ContentSource::Uri { uri },
+            ..
+        } = &ctx.llm_messages[0].content[0]
+        else {
+            panic!("expected a reference part");
+        };
+        assert_eq!(store.load("space1", uri).await.unwrap().data, vec![4, 5]);
+        assert!(store.load("user-a1-delivery", uri).await.is_err());
+    }
 
     #[tokio::test]
     async fn replaces_inline_image_with_bare_id_reference() {

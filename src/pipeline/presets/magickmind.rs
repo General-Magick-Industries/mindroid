@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::core::content::{ArtifactReference, ContentPart};
 use crate::core::context::Context;
 use crate::core::prompt_text::{
     MAX_BLOCK_BYTES, escape_markup, neutralize_block, neutralize_line, sanitize_block,
@@ -89,6 +90,19 @@ struct ChatHistoryItem {
     content: String,
     #[serde(default)]
     message_type: String,
+    #[serde(default, deserialize_with = "lenient_artifact_parts")]
+    artifact_data: Vec<ContentPart>,
+}
+
+/// One malformed attachment must not fail the whole context response.
+fn lenient_artifact_parts<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ContentPart>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(ArtifactReference::parts_from_value(&value))
 }
 
 impl ChatHistoryItem {
@@ -674,11 +688,13 @@ fn convert_context_response(
         // line — no more than the sender could say aloud in chat, and visible
         // to anyone reading it, unlike the invisible controls `sanitize_block`
         // folds.
-        messages.push(LlmMessage::user(format!(
+        let mut message = LlmMessage::user(format!(
             "[{}]: {}",
             escape_markup(&sanitize_line(item.speaker())),
             neutralize_block(&item.content)
-        )));
+        ));
+        message.content.extend(item.artifact_data.iter().cloned());
+        messages.push(message);
     }
 
     // Knowledge and documents → system context
@@ -962,6 +978,61 @@ mod tests {
             rendered,
             vec!["[u1]: oldest", "middle", "[u1]: newest"],
             "history must read oldest to newest, with the agent's own turn as assistant"
+        );
+    }
+
+    #[test]
+    fn one_malformed_attachment_does_not_fail_the_context_response() {
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"chat_history":[
+                {"sent_by_user_id":"u1","content":"look",
+                 "artifact_data":[{"id":"p1","metadata":null},{"id":7},"junk",{"id":"../x"}]}
+            ]}"#,
+        )
+        .expect("a bad attachment must not fail the whole response");
+
+        let messages = convert_context_response(resp, Some("a1"), true).messages;
+
+        assert_eq!(
+            messages[0].content.len(),
+            2,
+            "text plus the one valid reference"
+        );
+    }
+
+    #[test]
+    fn replayed_artifact_data_becomes_reference_parts_on_other_senders_turns() {
+        use crate::core::content::ContentSource;
+
+        let resp: PrepareContextResponse = serde_json::from_str(
+            r#"{"chat_history":[
+                {"sent_by_user_id":"a1","content":"nice photo",
+                 "artifact_data":[{"id":"own"}]},
+                {"sent_by_user_id":"u1","content":"look",
+                 "artifact_data":[{"id":"p1","mime_type":"image/jpeg","file_name":"desk.jpg"},{"id":" "}]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let messages = convert_context_response(resp, Some("a1"), true).messages;
+
+        let user = &messages[0];
+        assert_eq!(user.text(), "[u1]: look");
+        assert_eq!(
+            user.content.len(),
+            2,
+            "blank ids are dropped: {:?}",
+            user.content
+        );
+        assert!(matches!(
+            &user.content[1],
+            ContentPart::File { source: ContentSource::Uri { uri }, mime_type, filename, .. }
+                if uri == "p1" && mime_type == "image/jpeg" && filename.as_deref() == Some("desk.jpg")
+        ));
+        assert_eq!(
+            messages[1].content.len(),
+            1,
+            "the agent's own turn stays text-only"
         );
     }
 
