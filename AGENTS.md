@@ -55,7 +55,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
 | `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
-| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"`; with `llm-hosted`: `CorpusTool`, `CorpusCatalog` |
+| `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `MagickmindArtifactStore`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"`; with `llm-hosted`: `CorpusTool`, `CorpusCatalog` |
 | `full` | everything above | All types |
 
 Backend-specific code lives behind `magickmind`, not `persona` — enabling the
@@ -267,7 +267,7 @@ src/
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
 ├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio source/sink, VAD (ADR-0003)
-├── artifacts/      # ArtifactStore trait + local, manager (ADR-0004)
+├── artifacts/      # ArtifactStore trait + local, magickmind, manager (ADR-0004, ADR-0009)
 ├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls
 ├── observer/       # Observer trait + log impl

@@ -24,7 +24,8 @@ pub const GET_ARTIFACT_TOOL: &str = "get_artifact";
 /// **Scope:** the `scope` held here is used ONLY for the validation message
 /// returned by `execute`. The bytes the model actually sees are re-injected by
 /// [`XmlToolExecutorStage`](crate::pipeline::stages::XmlToolExecutorStage) using the
-/// live per-message scope (`ctx.message.channel_id`), which is authoritative. In
+/// live per-message scope (`ArtifactStore::scope_for`, the delivery channel by
+/// default), which is authoritative. In
 /// a multi-channel process this tool's pinned scope can therefore disagree with
 /// the executor's, making `execute`'s confirmation string wrong while the
 /// attached bytes stay correct. Prefer one tool instance per channel, or use

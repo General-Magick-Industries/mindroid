@@ -593,6 +593,14 @@ fn parse_push(text: &str, subscribed_channel: &str, trust_fanout_sender: bool) -
             msg.metadata.insert(key.into(), value.clone());
         }
     }
+    let artifact_key = crate::core::content::ARTIFACT_DATA_METADATA_KEY;
+    if let Some(value) = outer
+        .get(artifact_key)
+        .or_else(|| inner.get(artifact_key))
+        .filter(|v| v.is_array())
+    {
+        msg.metadata.insert(artifact_key.into(), value.clone());
+    }
     // Conversation-scope facts the backend stamps on the payload; absent on
     // older backends and non-magickmind publishers, so each copies only when
     // present. sent_by_user_name is display data (the verified identity is
@@ -1568,6 +1576,27 @@ mod tests {
         assert_eq!(msg.metadata["tools"][0]["name"], "peek");
         assert_eq!(msg.metadata["context"]["page"], "/spaces/1");
         assert_eq!(msg.message_type, MessageType::Text);
+    }
+
+    #[test]
+    fn artifact_data_rides_the_metadata_and_only_as_an_array() {
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({
+                "content": "look",
+                "sender_id": "u1",
+                "artifact_data": [{ "id": "a1", "mime_type": "image/jpeg" }],
+            }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("delivered");
+        assert_eq!(msg.metadata["artifact_data"][0]["id"], "a1");
+
+        let frame = push(
+            "user:a1#a1",
+            serde_json::json!({ "content": "look", "sender_id": "u1", "artifact_data": "a1" }),
+        );
+        let msg = parse_push(&frame, "user:a1#a1", false).expect("delivered");
+        assert!(!msg.metadata.contains_key("artifact_data"));
     }
 
     /// The declared type is what makes a message control traffic. A sender that
