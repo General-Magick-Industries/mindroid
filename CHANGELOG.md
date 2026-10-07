@@ -143,6 +143,12 @@ parsing the event stream sees it as a string field. Both loop events carry
 
 ### Added
 
+- **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
+  persisted the way a fetch would replay it: a framed remote call as inert JSON,
+  anything else escaped as `push_agent_reply` does. Callers that cache a
+  prepared context should switch to it, or the cached path replays the agent's
+  own calls HTML-escaped.
+
 - **Live affect on the MagickMind persona prompt.** `EpisodeIngestStage` reads
   the `runtime_state` envelope Bifrost returns from episode ingest (PAD affect,
   baseline, per-axis half-lives, `state_version`, TTL), keeps the latest version
@@ -303,8 +309,21 @@ parsing the event stream sees it as a string field. Both loop events carry
   `offer(tool)` adds one, in place of a namesake. Only host code writes run
   scope, so a sender still cannot displace a registered tool.
 
+### Changed
+
+- `MagickmindContextConfig::default()` no longer requests pelican:
+  `include_pelican` is `false`. The backend retired the fetcher and ignored the
+  field; set it to `true` to send the old request.
+
 ### Fixed
 
+- MagickMind tool loops. `MagickmindPersistence` saves a framed remote call as
+  `message_type: TOOL_CALL`; it went out untyped, so devices received it as
+  chat. The type comes from a marker the tool executor binds to the exact framed
+  text, never from the body, so a reply shaped like a call stays chat. History
+  replay reads `message_type`: the agent's own `TOOL_CALL` replays as JSON with
+  `\u003c`-style escapes and folded invisible controls instead of HTML
+  entities, and a live `TOOL_RESULT` no longer reaches the prompt twice.
 - `Pipeline::run_streaming` stops after a streaming stage that halts, as
   `Pipeline::run` stops after any stage that does. The post-streaming stages
   used to run regardless, so a streaming executor dropping a forged

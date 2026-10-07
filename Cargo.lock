@@ -1670,6 +1670,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mindroid-example-magickmind-e2e"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "mindroid",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "mindroid-example-magickmind-ollama"
 version = "0.0.1"
 dependencies = [

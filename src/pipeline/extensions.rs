@@ -38,6 +38,30 @@ pub(crate) struct PersistedUserTurn(pub String);
 /// one genuine claim exempt a later, unrelated message.
 pub(crate) struct CorrelatedRemoteResult(pub(crate) String);
 
+/// Set by a tool executor that leaves a framed remote call as `ctx.response`,
+/// carrying that exact text. Readers must compare it to the response they act
+/// on: run scope outlives a single `Pipeline::run`, so a later stage that
+/// replaces the response must not inherit the call's type.
+pub(crate) struct FramedRemoteCall(String);
+
+impl FramedRemoteCall {
+    /// Mark the current `ctx.response`. Set the response first.
+    pub(crate) fn mark(ctx: &mut crate::Context) {
+        if let Some(framed) = ctx.response.clone() {
+            ctx.set(Self(framed));
+        }
+    }
+
+    /// A new turn on a reused context starts unmarked.
+    pub(crate) fn clear(ctx: &mut crate::Context) {
+        ctx.take::<Self>();
+    }
+
+    pub(crate) fn covers(ctx: &crate::Context, text: &str) -> bool {
+        ctx.get_run::<Self>().is_some_and(|marked| marked.0 == text)
+    }
+}
+
 /// A single binary attachment (image, audio, video, or arbitrary file) to send
 /// to the LLM, stored in [`PipelineContext`] extensions as part of [`FileInputs`].
 ///

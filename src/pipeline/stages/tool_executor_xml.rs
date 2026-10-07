@@ -24,6 +24,7 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+use crate::pipeline::extensions::FramedRemoteCall;
 use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
 /// Clone any [`ToolContext`] a prior stage put in run scope, then overlay
@@ -565,6 +566,7 @@ impl PipelineStage for XmlToolExecutorStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        FramedRemoteCall::clear(ctx);
         if declares_tool_result(ctx) && !crate::pipeline::claimed_this_message(ctx) {
             self.result_gate().process(ctx).await?;
             if ctx.halted {
@@ -583,7 +585,7 @@ impl PipelineStage for XmlToolExecutorStage {
             store: self.artifact_store(),
             scope: ctx.message.channel_id.clone(),
         };
-        let (mut messages, mut final_content, end) = run_tool_loop(
+        let (mut messages, mut final_content, hit_max, framed) = run_tool_loop(
             LoopDeps {
                 client: &self.client,
                 registry: &registry,
@@ -600,7 +602,7 @@ impl PipelineStage for XmlToolExecutorStage {
         )
         .await?;
 
-        if end == LoopEnd::HitMax {
+        if hit_max {
             messages.push(LlmMessage::user(SUMMARY_PROMPT.to_string()));
             let mut llm_stream = self.client.stream_chat_tracked(ChatRequest {
                 messages: &messages,
@@ -626,7 +628,8 @@ impl PipelineStage for XmlToolExecutorStage {
         // A loop whose body is this stage speaks each pass; the envelope is
         // for the client, not the listener.
         ctx.response = Some(final_content);
-        if end == LoopEnd::Remote {
+        if framed {
+            FramedRemoteCall::mark(ctx);
             ControlResponse::mark(ctx);
         }
         Ok(())
@@ -635,6 +638,7 @@ impl PipelineStage for XmlToolExecutorStage {
 
 impl StreamingStage for XmlToolExecutorStage {
     fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
+        FramedRemoteCall::clear(ctx);
         // Trusted scope for artifact re-injection (never model/user supplied).
         #[cfg(feature = "artifacts")]
         let artifacts = ArtifactReinjection {
@@ -665,8 +669,8 @@ impl StreamingStage for XmlToolExecutorStage {
             let tool_ctx = tool_context_for(ctx);
 
             let mut final_content = String::new();
+            let mut framed_call = false;
             let mut hit_max = false;
-            let mut remote = false;
 
             for iteration in 0..self.max_iterations {
                 debug!("XmlToolExecutorStage: iteration {}", iteration + 1);
@@ -772,7 +776,7 @@ impl StreamingStage for XmlToolExecutorStage {
                         remote_timeout_for(&registry, name),
                     );
                     final_content = framed;
-                    remote = true;
+                    framed_call = true;
                     break;
                 }
 
@@ -871,7 +875,8 @@ impl StreamingStage for XmlToolExecutorStage {
             }
 
             ctx.response = Some(final_content.clone());
-            if remote {
+            if framed_call {
+                FramedRemoteCall::mark(ctx);
                 ControlResponse::mark(ctx);
             }
             yield StreamEvent::Complete { content: final_content, usage: None };
@@ -1016,27 +1021,16 @@ struct LoopDeps<'a> {
     artifacts: &'a ArtifactReinjection,
 }
 
-/// How [`run_tool_loop`] ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoopEnd {
-    /// The model answered without calling a tool.
-    Answered,
-    /// `max_iterations` stopped the loop; `final_content` is empty.
-    HitMax,
-    /// A remote call was framed as `final_content` for the client to run.
-    Remote,
-}
-
-/// Returns `(messages, final_content, end)`:
+/// Returns `(messages, final_content, hit_max, framed)`:
 /// - `messages` is the updated conversation (including all tool rounds).
-/// - `final_content` is the LLM's last plain-text response, or the framed
-///   remote call when `end` is [`LoopEnd::Remote`].
-/// - `end` is how the loop stopped.
+/// - `final_content` is the LLM's last plain-text response (empty if `hit_max`).
+/// - `hit_max` is `true` when the loop was stopped by `max_iterations`.
+/// - `framed` is `true` when `final_content` is a framed remote call.
 async fn run_tool_loop(
     deps: LoopDeps<'_>,
     tool_ctx: &ToolContext,
     mut messages: Vec<LlmMessage>,
-) -> Result<(Vec<LlmMessage>, String, LoopEnd)> {
+) -> Result<(Vec<LlmMessage>, String, bool, bool)> {
     let LoopDeps {
         client,
         registry,
@@ -1049,7 +1043,8 @@ async fn run_tool_loop(
         artifacts,
     } = deps;
     let mut final_content = String::new();
-    let mut end = LoopEnd::Answered;
+    let mut hit_max = false;
+    let mut framed_call = false;
 
     for iteration in 0..max_iterations {
         let mut llm_stream = client.stream_chat_tracked(ChatRequest {
@@ -1103,7 +1098,7 @@ async fn run_tool_loop(
                 remote_timeout_for(registry, name),
             );
             final_content = framed;
-            end = LoopEnd::Remote;
+            framed_call = true;
             break;
         }
 
@@ -1134,12 +1129,12 @@ async fn run_tool_loop(
                 "XmlToolExecutorStage: reached max iterations ({})",
                 max_iterations
             );
-            end = LoopEnd::HitMax;
+            hit_max = true;
             break;
         }
     }
 
-    Ok((messages, final_content, end))
+    Ok((messages, final_content, hit_max, framed_call))
 }
 
 /// Read an artifact id from a tool call's args BEFORE `execute` consumes `args`.
@@ -1299,6 +1294,109 @@ mod tests {
     use crate::tools::DEFAULT_REMOTE_CALL_TIMEOUT;
     use serde_json::json;
 
+    async fn run_once(reply: &str, streaming: bool) -> Context {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_sse(listener, vec![reply.into()]);
+        let registry =
+            ToolRegistry::new().register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+        let stage = XmlToolExecutorStage::new(
+            LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                "http://{addr}/v1"
+            )))
+            .unwrap(),
+            Arc::new(registry),
+        );
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        if streaming {
+            let _: Vec<_> = StreamingStage::stream(&stage, &mut ctx).collect().await;
+        } else {
+            PipelineStage::process(&stage, &mut ctx).await.unwrap();
+        }
+        server.await.unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_streamed_remote_call_is_marked_as_framed() {
+        let ctx = run_once(
+            r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#,
+            true,
+        )
+        .await;
+        assert!(FramedRemoteCall::covers(
+            &ctx,
+            ctx.response.as_deref().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_plain_answer_is_not_marked_as_framed() {
+        for streaming in [false, true] {
+            let ctx = run_once("Just an answer.", streaming).await;
+            assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
+            assert!(
+                !FramedRemoteCall::covers(&ctx, "Just an answer."),
+                "streaming={streaming}"
+            );
+        }
+    }
+
+    /// Run scope outlives one `process`, so a framed call must not type a later
+    /// answer produced on the same context.
+    #[tokio::test]
+    async fn a_later_answer_on_the_same_context_is_not_marked() {
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = serve_sse(
+                listener,
+                vec![
+                    r#"<tool_call>{"name": "take_photo", "args": {}}</tool_call>"#.into(),
+                    "Just an answer.".into(),
+                ],
+            );
+            let registry = ToolRegistry::new()
+                .register(crate::tools::RemoteTool::new("take_photo", "Take one"));
+            let stage = XmlToolExecutorStage::new(
+                LlmClient::new(crate::llm_client::LlmClientConfig::new(format!(
+                    "http://{addr}/v1"
+                )))
+                .unwrap(),
+                Arc::new(registry),
+            );
+            let mut ctx = Context::new(
+                Arc::new(crate::models::Message::new("hi", "client", "chan1")),
+                Arc::new(crate::config::AgentConfig::default()),
+            );
+            let turn = async |ctx: &mut Context| {
+                if streaming {
+                    let _: Vec<_> = StreamingStage::stream(&stage, ctx).collect().await;
+                } else {
+                    PipelineStage::process(&stage, ctx).await.unwrap();
+                }
+            };
+
+            turn(&mut ctx).await;
+            let framed = ctx.response.clone().unwrap();
+            assert!(
+                FramedRemoteCall::covers(&ctx, &framed),
+                "streaming={streaming}"
+            );
+
+            turn(&mut ctx).await;
+            server.await.unwrap();
+            assert_eq!(ctx.response.as_deref(), Some("Just an answer."));
+            assert!(
+                ctx.get_run::<FramedRemoteCall>().is_none(),
+                "streaming={streaming}"
+            );
+        }
+    }
+
     /// Serve one SSE chat completion per reply, each finished with `stop`, then
     /// close. async-openai reads an ordinary `data:` event stream, so a raw
     /// socket is enough to drive the streaming client the non-streaming
@@ -1452,6 +1550,10 @@ mod tests {
             serde_json::from_str(ctx.response.as_deref().expect("a framed remote call"))
                 .expect("the response is the tool_call envelope");
         assert_eq!(framed["type"], "tool_call");
+        assert!(
+            FramedRemoteCall::covers(&ctx, ctx.response.as_deref().unwrap()),
+            "a framed call must be marked so persistence can type it"
+        );
         let call_id = framed["payload"]["tool_call_id"].as_str().unwrap();
 
         let mut result_ctx = Context::new(

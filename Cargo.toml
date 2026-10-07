@@ -32,6 +32,7 @@ members = [
     "examples/corpus_probe",
     "examples/gemini_live",
     "examples/openai_realtime",
+    "examples/magickmind_e2e",
 ]
 resolver = "3"
 

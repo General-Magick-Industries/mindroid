@@ -82,6 +82,7 @@ use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall};
 use crate::pipeline::PipelineStage;
+use crate::pipeline::extensions::FramedRemoteCall;
 use crate::tools::{DynamicRegistry, ToolRegistry};
 
 /// The loop's transcript, in run scope.
@@ -398,6 +399,7 @@ impl PipelineStage for ToolRound {
             // The envelope is for the client, not the listener: a loop that
             // speaks its passes must not read it aloud.
             ctx.response = Some(framed);
+            FramedRemoteCall::mark(ctx);
             ControlResponse::mark(ctx);
             return Ok(());
         }
@@ -632,6 +634,10 @@ mod tests {
         assert!(
             ctx.get_run::<ControlResponse>().is_some(),
             "the envelope is marked so a speaking loop does not read it aloud"
+        );
+        assert!(
+            FramedRemoteCall::covers(&ctx, ctx.response.as_deref().unwrap()),
+            "persistence saves the envelope as TOOL_CALL"
         );
     }
 
