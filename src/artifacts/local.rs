@@ -206,6 +206,24 @@ impl LocalArtifactStore {
     /// Capped with `take` rather than a `metadata()` pre-size: the length is
     /// attacker-controlled, and a sparse file costs them nothing while an
     /// up-front reservation of it aborts the process under `panic = "abort"`.
+    async fn read(&self, scope: &str, id: &str, limit: u64) -> Result<Artifact> {
+        let (bytes_path, sidecar_path) = self.resolve_paths(scope, id, false).await?;
+
+        let data = Self::read_no_follow(&bytes_path, limit)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("read artifact '{id}' failed: {e}")))?;
+        let json = Self::read_no_follow(&sidecar_path, MAX_SIDECAR_BYTES)
+            .await
+            .map_err(|e| MindroidError::artifact(format!("read sidecar for '{id}' failed: {e}")))?;
+        let sidecar: Sidecar = serde_json::from_slice(&json)
+            .map_err(|e| MindroidError::artifact(format!("parse sidecar failed: {e}")))?;
+
+        Ok(Artifact {
+            data,
+            mime_type: sidecar.mime_type,
+        })
+    }
+
     async fn read_no_follow(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 
@@ -282,21 +300,12 @@ impl ArtifactStore for LocalArtifactStore {
     }
 
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact> {
-        let (bytes_path, sidecar_path) = self.resolve_paths(scope, id, false).await?;
+        self.read(scope, id, MAX_ARTIFACT_BYTES).await
+    }
 
-        let data = Self::read_no_follow(&bytes_path, MAX_ARTIFACT_BYTES)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("read artifact '{id}' failed: {e}")))?;
-        let json = Self::read_no_follow(&sidecar_path, MAX_SIDECAR_BYTES)
-            .await
-            .map_err(|e| MindroidError::artifact(format!("read sidecar for '{id}' failed: {e}")))?;
-        let sidecar: Sidecar = serde_json::from_slice(&json)
-            .map_err(|e| MindroidError::artifact(format!("parse sidecar failed: {e}")))?;
-
-        Ok(Artifact {
-            data,
-            mime_type: sidecar.mime_type,
-        })
+    async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
+        let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        self.read(scope, id, limit.min(MAX_ARTIFACT_BYTES)).await
     }
 
     async fn delete(&self, scope: &str, id: &str) -> Result<()> {
@@ -343,6 +352,23 @@ mod tests {
         assert!(store.load("chan1", &id).await.is_err());
         // Delete is idempotent.
         store.delete("chan1", &id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_bounded_load_refuses_an_artifact_over_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalArtifactStore::new(tmp.path());
+        let id = store
+            .save("a", &[1, 2, 3, 4], "image/png")
+            .await
+            .unwrap()
+            .id;
+
+        assert!(store.load_bounded("a", &id, 3).await.is_err());
+        assert_eq!(
+            store.load_bounded("a", &id, 4).await.unwrap().data,
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[tokio::test]

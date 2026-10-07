@@ -1234,7 +1234,7 @@ async fn finalize_round_message(
                         );
                         parts.push(ContentPart::text(format!(
                             "(artifact {id} is {}, which cannot be shown inline)",
-                            art.mime_type
+                            crate::core::content::visible_mime_type(&art.mime_type)
                         )));
                     }
                 },

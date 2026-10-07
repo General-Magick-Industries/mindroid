@@ -5,21 +5,22 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::artifacts::{ArtifactManager, ArtifactStore, inline_image_type};
+use crate::artifacts::{ArtifactManager, ArtifactStore, INLINED_ARTIFACT_KEY, inline_image_type};
 use crate::core::content::{
-    ARTIFACT_DATA_METADATA_KEY, ArtifactReference, ContentPart, ContentSource,
-    MAX_ARTIFACT_REFERENCES, is_artifact_id,
+    ARTIFACT_DATA_METADATA_KEY, ArtifactReference, ContentPart, ContentSource, is_artifact_id,
 };
 use crate::core::context::Context;
+use crate::llm_client::{render_llm_metadata, sanitize_llm_visible};
 use crate::models::Role;
 use crate::pipeline::extensions::CurrentUserMessage;
 use crate::pipeline::stages::tool_executor_xml::MAX_REINJECTED_ARTIFACTS;
 use crate::{PipelineStage, Result};
 
-/// Default cap on bytes inlined per turn: base64 grows it by a third, and a 1 MiB
-/// request cap must also fit the prompt and history.
+/// Default cap on the bytes this stage inlines per turn: base64 grows it by a
+/// third, and a 1 MiB request cap must also fit the prompt, history and any
+/// `get_artifact` re-attachment.
 pub const DEFAULT_MAX_INLINE_BYTES: usize = 512 * 1024;
 
 /// Loads the images in the inbound message's `artifact_data` and attaches them
@@ -28,8 +29,12 @@ pub const DEFAULT_MAX_INLINE_BYTES: usize = 512 * 1024;
 /// references in that many earlier messages, newest first. The current turn has
 /// first claim on [`with_max_images`](Self::with_max_images) and
 /// [`with_max_bytes`](Self::with_max_bytes); anything else stays a reference for
-/// `get_artifact`. Run it after the user turn is built; it replaces the references
-/// [`AttachMedia`](super::AttachMedia) added for the same ids.
+/// `get_artifact`.
+///
+/// Run it after the user turn is built; it replaces the references
+/// [`AttachMedia`](super::AttachMedia) added for the same ids. An
+/// [`ArtifactOffload`](super::ArtifactOffload) placed after it restores the
+/// original references rather than storing the images again.
 pub struct InlineArtifacts {
     store: Arc<dyn ArtifactStore>,
     max_bytes: usize,
@@ -39,11 +44,13 @@ pub struct InlineArtifacts {
 
 struct Budget {
     bytes: usize,
-    images: usize,
-    inlined: HashSet<String>,
+    loads: usize,
+    attempted: HashSet<String>,
+    inlined: usize,
 }
 
 impl InlineArtifacts {
+    /// Inline from `store`, with the default budgets and no history window.
     pub fn new(store: Arc<dyn ArtifactStore>) -> Self {
         Self {
             store,
@@ -58,13 +65,14 @@ impl InlineArtifacts {
         Self::new(manager.store().clone())
     }
 
-    /// Cap the total bytes inlined in one turn.
+    /// Cap the bytes inlined in one turn. Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
     }
 
-    /// Cap the images inlined in one turn.
+    /// Cap the artifacts loaded in one turn, and so the images inlined; a load
+    /// that cannot be inlined still counts. Defaults to 8.
     pub fn with_max_images(mut self, max_images: usize) -> Self {
         self.max_images = max_images;
         self
@@ -77,46 +85,75 @@ impl InlineArtifacts {
         self
     }
 
-    async fn try_inline(
+    async fn resolve(
         &self,
         scope: &str,
-        id: &str,
-        mime_type: &str,
+        part: ContentPart,
         budget: &mut Budget,
-    ) -> Option<ContentPart> {
-        let maybe_image = mime_type.is_empty()
-            || mime_type == "application/octet-stream"
-            || mime_type.starts_with("image/");
-        if budget.images == 0 || !maybe_image || budget.inlined.contains(id) {
-            return None;
+    ) -> Vec<ContentPart> {
+        let ContentPart::File {
+            source: ContentSource::Uri { uri },
+            mime_type,
+            filename,
+            metadata,
+        } = &part
+        else {
+            return vec![part];
+        };
+        let maybe_image =
+            mime_type == "application/octet-stream" || mime_type.starts_with("image/");
+        if !maybe_image
+            || !is_artifact_id(uri)
+            || budget.loads == 0
+            || budget.bytes == 0
+            || !budget.attempted.insert(uri.clone())
+        {
+            return vec![part];
         }
-        match self.store.load(scope, id).await {
-            Ok(art) => match inline_image_type(&art.data) {
-                Some(sniffed) if art.data.len() <= budget.bytes => {
-                    budget.bytes -= art.data.len();
-                    budget.images -= 1;
-                    budget.inlined.insert(id.to_string());
-                    Some(ContentPart::image(
-                        ContentSource::Inline { data: art.data },
-                        sniffed,
-                    ))
-                }
-                _ => {
-                    debug!(
-                        "InlineArtifacts: '{id}' ({}, {} bytes, {} left) cannot be inlined; keeping the reference",
-                        art.mime_type,
-                        art.data.len(),
-                        budget.bytes
-                    );
-                    None
-                }
-            },
+        budget.loads -= 1;
+        let artifact = match self.store.load_bounded(scope, uri, budget.bytes).await {
+            Ok(artifact) => artifact,
             Err(e) => {
-                warn!("InlineArtifacts: loading '{id}' failed: {e}");
-                None
+                debug!("InlineArtifacts: keeping '{uri}' as a reference: {e}");
+                return vec![part];
             }
+        };
+        let Some(image_type) = inline_image_type(&artifact.data) else {
+            debug!(
+                "InlineArtifacts: '{uri}' ({}) is not an image the model accepts; keeping the reference",
+                artifact.mime_type
+            );
+            return vec![part];
+        };
+        budget.bytes -= artifact.data.len();
+        budget.inlined += 1;
+
+        let name = filename
+            .as_deref()
+            .map(sanitize_llm_visible)
+            .filter(|f| !f.is_empty())
+            .map(|f| format!(" \"{f}\""))
+            .unwrap_or_default();
+        let label = format!(
+            "[{image_type} artifact {}{name}{}]",
+            sanitize_llm_visible(uri),
+            render_llm_metadata(metadata)
+        );
+        let mut image = ContentPart::image(
+            ContentSource::Inline {
+                data: artifact.data,
+            },
+            image_type,
+        );
+        if let Some(image_metadata) = image.metadata_mut() {
+            image_metadata.insert(INLINED_ARTIFACT_KEY.into(), uri.clone().into());
         }
+        vec![ContentPart::text(label), image]
     }
+}
+
+fn references_one_of(part: &ContentPart, ids: &HashSet<String>) -> bool {
+    matches!(part, ContentPart::File { source: ContentSource::Uri { uri }, .. } if ids.contains(uri))
 }
 
 #[async_trait]
@@ -126,16 +163,21 @@ impl PipelineStage for InlineArtifacts {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        let references: Vec<ArtifactReference> = ctx
+        let mut ids = HashSet::new();
+        let references: Vec<ContentPart> = ctx
             .message
             .metadata
             .get(ARTIFACT_DATA_METADATA_KEY)
-            .and_then(|v| v.as_array())
+            .map(ArtifactReference::parts_from_value)
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
-            .filter_map(|v| serde_json::from_value::<ArtifactReference>(v.clone()).ok())
-            .filter(|r| is_artifact_id(&r.id))
-            .take(MAX_ARTIFACT_REFERENCES)
+            .filter(|part| match part {
+                ContentPart::File {
+                    source: ContentSource::Uri { uri },
+                    ..
+                } => ids.insert(uri.clone()),
+                _ => false,
+            })
             .collect();
         if references.is_empty() && self.history_messages == 0 {
             return Ok(());
@@ -157,60 +199,46 @@ impl PipelineStage for InlineArtifacts {
         let scope = self.store.scope_for(&ctx.message);
         let mut budget = Budget {
             bytes: self.max_bytes,
-            images: self.max_images,
-            inlined: HashSet::new(),
+            loads: self.max_images,
+            attempted: HashSet::new(),
+            inlined: 0,
         };
 
         if !references.is_empty() {
-            let ids: Vec<String> = references.iter().map(|r| r.id.clone()).collect();
             let mut parts = Vec::with_capacity(references.len());
             for reference in references {
-                match self
-                    .try_inline(&scope, &reference.id, &reference.mime_type, &mut budget)
-                    .await
-                {
-                    Some(image) => parts.push(image),
-                    None => parts.extend(reference.into_part()),
-                }
+                parts.extend(self.resolve(&scope, reference, &mut budget).await);
             }
-            let turn = &mut ctx.llm_messages[index];
-            turn.content.retain(|p| {
-                !matches!(p, ContentPart::File { source: ContentSource::Uri { uri }, .. } if ids.contains(uri))
-            });
-            turn.content.extend(parts);
+            for message in ctx.llm_messages[index..]
+                .iter_mut()
+                .filter(|m| m.role == Role::User)
+            {
+                message.content.retain(|p| !references_one_of(p, &ids));
+            }
+            ctx.llm_messages[index].content.extend(parts);
         }
 
-        let earlier: Vec<(usize, usize, String, String)> = ctx.llm_messages[..index]
+        let earlier: Vec<usize> = ctx.llm_messages[..index]
             .iter()
             .enumerate()
             .rev()
             .filter(|(_, m)| m.role != Role::System)
             .take(self.history_messages)
             .filter(|(_, m)| m.role == Role::User)
-            .flat_map(|(i, m)| {
-                m.content
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(j, part)| match part {
-                        ContentPart::File {
-                            source: ContentSource::Uri { uri },
-                            mime_type,
-                            ..
-                        } if is_artifact_id(uri) => Some((i, j, uri.clone(), mime_type.clone())),
-                        _ => None,
-                    })
-            })
+            .map(|(i, _)| i)
             .collect();
-        for (i, j, id, mime_type) in earlier {
-            if let Some(image) = self.try_inline(&scope, &id, &mime_type, &mut budget).await {
-                ctx.llm_messages[i].content[j] = image;
+        for i in earlier {
+            let content = std::mem::take(&mut ctx.llm_messages[i].content);
+            let mut resolved = Vec::with_capacity(content.len());
+            for part in content {
+                resolved.extend(self.resolve(&scope, part, &mut budget).await);
             }
+            ctx.llm_messages[i].content = resolved;
         }
 
         debug!(
             "InlineArtifacts: inlined {} images, {} bytes left",
-            budget.inlined.len(),
-            budget.bytes
+            budget.inlined, budget.bytes
         );
         Ok(())
     }
@@ -219,33 +247,53 @@ impl PipelineStage for InlineArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifacts::LocalArtifactStore;
+    use crate::artifacts::{Artifact, LocalArtifactStore, StoredArtifact};
     use crate::config::AgentConfig;
     use crate::models::{LlmMessage, Message};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn jpeg(tag: &[u8]) -> Vec<u8> {
         [&[0xFF, 0xD8, 0xFF][..], tag].concat()
     }
 
-    async fn setup(
-        files: &[(Vec<u8>, &str)],
-    ) -> (tempfile::TempDir, Arc<LocalArtifactStore>, Vec<String>) {
+    struct Counting {
+        inner: LocalArtifactStore,
+        loads: AtomicUsize,
+        saves: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ArtifactStore for Counting {
+        async fn save(&self, scope: &str, data: &[u8], mime_type: &str) -> Result<StoredArtifact> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            self.inner.save(scope, data, mime_type).await
+        }
+        async fn load(&self, scope: &str, id: &str) -> Result<Artifact> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load(scope, id).await
+        }
+        async fn delete(&self, scope: &str, id: &str) -> Result<()> {
+            self.inner.delete(scope, id).await
+        }
+    }
+
+    async fn setup(files: &[(Vec<u8>, &str)]) -> (tempfile::TempDir, Arc<Counting>, Vec<String>) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalArtifactStore::new(tmp.path()));
+        let inner = LocalArtifactStore::new(tmp.path());
         let mut ids = Vec::new();
         for (data, mime) in files {
-            ids.push(store.save("space1", data, mime).await.unwrap().id);
+            ids.push(inner.save("space1", data, mime).await.unwrap().id);
         }
+        let store = Arc::new(Counting {
+            inner,
+            loads: AtomicUsize::new(0),
+            saves: AtomicUsize::new(0),
+        });
         (tmp, store, ids)
     }
 
     fn ctx_with(artifact_data: serde_json::Value) -> Context {
-        let mut msg = Message::new("look", "u1", "space1");
-        msg.metadata
-            .insert(ARTIFACT_DATA_METADATA_KEY.into(), artifact_data);
-        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
-        ctx.llm_messages = vec![LlmMessage::system("sys"), LlmMessage::user("look")];
-        ctx
+        history_ctx(vec![], artifact_data)
     }
 
     fn history_ctx(history: Vec<LlmMessage>, artifact_data: serde_json::Value) -> Context {
@@ -258,6 +306,10 @@ mod tests {
             .chain([LlmMessage::system("context"), LlmMessage::user("look")])
             .collect();
         ctx
+    }
+
+    fn current(ctx: &Context) -> usize {
+        ctx.llm_messages.len() - 1
     }
 
     fn with_ref(role: Role, text: &str, id: &str) -> LlmMessage {
@@ -299,14 +351,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_attached_image_reaches_the_model_inline() {
+    async fn an_attached_image_reaches_the_model_inline_with_its_label() {
         let (_tmp, store, ids) = setup(&[(jpeg(&[1, 2, 3]), "image/jpeg")]).await;
-        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0], "mime_type": "image/jpeg"}]));
+        let mut ctx = ctx_with(serde_json::json!([{
+            "id": ids[0], "mime_type": "image/jpeg", "file_name": "desk.jpg",
+            "metadata": {"caption": "my desk"}
+        }]));
 
         InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
 
-        assert_eq!(inline_images(&ctx, 1), vec![jpeg(&[1, 2, 3])]);
-        assert!(references(&ctx, 1).is_empty());
+        let turn = current(&ctx);
+        assert_eq!(inline_images(&ctx, turn), vec![jpeg(&[1, 2, 3])]);
+        assert!(references(&ctx, turn).is_empty());
+        let label = ctx.llm_messages[turn].text();
+        assert!(label.contains(&ids[0]), "{label}");
+        assert!(
+            label.contains("desk.jpg") && label.contains("my desk"),
+            "{label}"
+        );
+        assert!(!label.contains("get_artifact"), "{label}");
     }
 
     #[tokio::test]
@@ -314,16 +377,32 @@ mod tests {
         let (_tmp, store, ids) = setup(&[(jpeg(&[7]), "image/png")]).await;
         let mut ctx = ctx_with(serde_json::json!([{"id": ids[0], "mime_type": "image/png"}]));
         super::super::AttachMedia.process(&mut ctx).await.unwrap();
-        assert_eq!(references(&ctx, 1), vec![ids[0].clone()]);
+        assert_eq!(references(&ctx, current(&ctx)), vec![ids[0].clone()]);
 
         InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
 
-        assert_eq!(inline_images(&ctx, 1), vec![jpeg(&[7])]);
-        assert!(references(&ctx, 1).is_empty());
+        assert_eq!(inline_images(&ctx, current(&ctx)), vec![jpeg(&[7])]);
+        assert!(references(&ctx, current(&ctx)).is_empty());
     }
 
     #[tokio::test]
-    async fn what_cannot_be_inlined_stays_a_reference() {
+    async fn attach_media_references_on_a_later_turn_are_removed_too() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[8]), "image/png")]).await;
+        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}]));
+        let turn = current(&ctx);
+        ctx.llm_messages
+            .push(LlmMessage::user("a later injected note"));
+        ctx.set(CurrentUserMessage(turn));
+        super::super::AttachMedia.process(&mut ctx).await.unwrap();
+
+        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+
+        assert_eq!(inline_images(&ctx, turn), vec![jpeg(&[8])]);
+        assert!(references(&ctx, turn + 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_cannot_be_inlined_stays_a_reference_and_non_images_are_not_loaded() {
         let (_tmp, store, ids) =
             setup(&[(vec![1], "application/pdf"), (jpeg(&[2; 10]), "image/png")]).await;
         let mut ctx = ctx_with(serde_json::json!([
@@ -332,33 +411,56 @@ mod tests {
             {"id": "missing", "mime_type": "image/png"},
         ]));
 
-        InlineArtifacts::new(store)
+        InlineArtifacts::new(store.clone())
             .with_max_bytes(4)
             .process(&mut ctx)
             .await
             .unwrap();
 
-        assert!(inline_images(&ctx, 1).is_empty());
+        assert!(inline_images(&ctx, current(&ctx)).is_empty());
         assert_eq!(
-            references(&ctx, 1),
+            references(&ctx, current(&ctx)),
             vec![ids[0].clone(), ids[1].clone(), "missing".to_string()]
+        );
+        assert_eq!(
+            store.loads.load(Ordering::SeqCst),
+            2,
+            "the PDF is never loaded"
         );
     }
 
     #[tokio::test]
-    async fn the_byte_budget_is_shared_across_the_turn() {
+    async fn an_oversized_image_does_not_stop_a_later_one_that_fits() {
         let (_tmp, store, ids) =
-            setup(&[(jpeg(&[1; 3]), "image/png"), (jpeg(&[2; 3]), "image/png")]).await;
+            setup(&[(jpeg(&[1; 20]), "image/png"), (jpeg(&[2]), "image/png")]).await;
         let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}, {"id": ids[1]}]));
 
         InlineArtifacts::new(store)
-            .with_max_bytes(11)
+            .with_max_bytes(10)
             .process(&mut ctx)
             .await
             .unwrap();
 
-        assert_eq!(inline_images(&ctx, 1), vec![jpeg(&[1; 3])]);
-        assert_eq!(references(&ctx, 1), vec![ids[1].clone()]);
+        assert_eq!(inline_images(&ctx, current(&ctx)), vec![jpeg(&[2])]);
+        assert_eq!(references(&ctx, current(&ctx)), vec![ids[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn every_load_counts_against_the_cap_even_when_nothing_inlines() {
+        let heic = b"\0\0\0\x18ftypheic".to_vec();
+        let files: Vec<(Vec<u8>, &str)> = (0..10).map(|_| (heic.clone(), "image/heic")).collect();
+        let (_tmp, store, ids) = setup(&files).await;
+        let data: Vec<_> = ids.iter().map(|id| serde_json::json!({"id": id})).collect();
+        let mut ctx = ctx_with(serde_json::Value::Array(data));
+
+        InlineArtifacts::new(store.clone())
+            .with_max_images(3)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(store.loads.load(Ordering::SeqCst), 3);
+        assert_eq!(references(&ctx, current(&ctx)), ids);
     }
 
     #[tokio::test]
@@ -374,8 +476,11 @@ mod tests {
             .process(&mut ctx)
             .await
             .unwrap();
-        assert_eq!(inline_images(&ctx, 1).len(), MAX_REINJECTED_ARTIFACTS);
-        assert_eq!(references(&ctx, 1).len(), 2);
+        assert_eq!(
+            inline_images(&ctx, current(&ctx)).len(),
+            MAX_REINJECTED_ARTIFACTS
+        );
+        assert_eq!(references(&ctx, current(&ctx)).len(), 2);
 
         let mut ctx = ctx_with(serde_json::Value::Array(data));
         InlineArtifacts::new(store)
@@ -383,21 +488,48 @@ mod tests {
             .process(&mut ctx)
             .await
             .unwrap();
-        assert_eq!(inline_images(&ctx, 1).len(), 3);
+        assert_eq!(inline_images(&ctx, current(&ctx)).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_reference_is_loaded_and_shown_once() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[3]), "image/png")]).await;
+        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}, {"id": ids[0]}, {"id": ids[0]}]));
+
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(inline_images(&ctx, current(&ctx)), vec![jpeg(&[3])]);
+        assert!(references(&ctx, current(&ctx)).is_empty());
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn it_attaches_to_the_current_user_turn_not_the_last() {
         let (_tmp, store, ids) = setup(&[(jpeg(&[9]), "image/png")]).await;
         let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}]));
+        let turn = current(&ctx);
         ctx.llm_messages
             .push(LlmMessage::user("a later injected note"));
-        ctx.set(CurrentUserMessage(1));
+        ctx.set(CurrentUserMessage(turn));
 
         InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
 
-        assert_eq!(inline_images(&ctx, 1), vec![jpeg(&[9])]);
-        assert!(inline_images(&ctx, 2).is_empty());
+        assert_eq!(inline_images(&ctx, turn), vec![jpeg(&[9])]);
+        assert!(inline_images(&ctx, turn + 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_current_marker_on_a_non_user_turn_falls_back_to_the_last_user_turn() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[6]), "image/png")]).await;
+        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}]));
+        ctx.set(CurrentUserMessage(0));
+
+        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+
+        assert_eq!(inline_images(&ctx, current(&ctx)), vec![jpeg(&[6])]);
     }
 
     #[tokio::test]
@@ -421,9 +553,13 @@ mod tests {
             serde_json::json!([]),
         );
 
-        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
 
         assert_eq!(references(&ctx, 1), vec![ids[0].clone()]);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -447,7 +583,24 @@ mod tests {
 
         assert_eq!(references(&ctx, 1), vec![ids[0].clone()]);
         assert_eq!(inline_images(&ctx, 3), vec![jpeg(&[2])]);
-        assert_eq!(ctx.llm_messages[3].text(), "recent");
+        assert!(ctx.llm_messages[3].text().starts_with("recent"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_artifact_in_history_stays_a_reference() {
+        let (_tmp, store, _) = setup(&[]).await;
+        let mut ctx = history_ctx(
+            vec![with_ref(Role::User, "gone", "missing")],
+            serde_json::json!([]),
+        );
+
+        InlineArtifacts::new(store)
+            .with_history_messages(1)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(references(&ctx, 1), vec!["missing".to_string()]);
     }
 
     #[tokio::test]
@@ -466,7 +619,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(inline_images(&ctx, 3), vec![jpeg(&[2])]);
+        assert_eq!(inline_images(&ctx, current(&ctx)), vec![jpeg(&[2])]);
         assert_eq!(references(&ctx, 1), vec![ids[0].clone()]);
     }
 
@@ -481,7 +634,7 @@ mod tests {
             serde_json::json!([]),
         );
 
-        InlineArtifacts::new(store)
+        InlineArtifacts::new(store.clone())
             .with_history_messages(2)
             .process(&mut ctx)
             .await
@@ -489,6 +642,7 @@ mod tests {
 
         assert_eq!(inline_images(&ctx, 2), vec![jpeg(&[4])]);
         assert_eq!(references(&ctx, 1), vec![ids[0].clone()]);
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -508,29 +662,6 @@ mod tests {
         assert_eq!(references(&ctx, 1), vec![ids[0].clone()]);
     }
 
-    #[test]
-    fn only_formats_vision_endpoints_accept_count_as_images() {
-        let png = [
-            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
-        ];
-        assert_eq!(inline_image_type(&png), Some("image/png"));
-        assert_eq!(inline_image_type(&jpeg(&[])), Some("image/jpeg"));
-        assert_eq!(inline_image_type(b"GIF89a..."), Some("image/gif"));
-        assert_eq!(
-            inline_image_type(b"RIFF\0\0\0\0WEBPVP8 "),
-            Some("image/webp")
-        );
-        assert_eq!(
-            inline_image_type(b"\x89PNG\r\n\x1a\nnot really a png"),
-            None
-        );
-        assert_eq!(inline_image_type(b"\0\0\0\x18ftypheic"), None);
-        assert_eq!(
-            inline_image_type(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
-            None
-        );
-    }
-
     #[tokio::test]
     async fn a_declared_image_the_endpoint_would_reject_stays_a_reference() {
         let (_tmp, store, ids) = setup(&[
@@ -542,7 +673,26 @@ mod tests {
 
         InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
 
-        assert!(inline_images(&ctx, 1).is_empty());
-        assert_eq!(references(&ctx, 1), ids);
+        assert!(inline_images(&ctx, current(&ctx)).is_empty());
+        assert_eq!(references(&ctx, current(&ctx)), ids);
+    }
+
+    #[tokio::test]
+    async fn a_later_offload_restores_the_senders_reference_instead_of_storing_again() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0], "mime_type": "image/jpeg"}]));
+
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        crate::pipeline::stages::ArtifactOffload::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(store.saves.load(Ordering::SeqCst), 0);
+        assert_eq!(references(&ctx, current(&ctx)), vec![ids[0].clone()]);
+        assert!(inline_images(&ctx, current(&ctx)).is_empty());
     }
 }

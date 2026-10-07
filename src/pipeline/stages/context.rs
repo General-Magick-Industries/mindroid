@@ -274,9 +274,8 @@ fn resolve_files(ctx: &Context) -> Vec<ResolvedFile> {
 ///
 /// # Note
 ///
-/// Inline bytes are base64-encoded by the LLM client only when the `transport-ws`
-/// feature is enabled. The client currently only converts `image/*` to the wire
-/// format; other types are attached here but dropped during conversion.
+/// The LLM client sends inline `image/*` parts as base64 data URLs; other inline
+/// types are attached here but dropped during conversion.
 ///
 /// # Examples
 ///

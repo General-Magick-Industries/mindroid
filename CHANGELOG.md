@@ -15,9 +15,14 @@ listed under **Breaking Changes** with a migration note.
   turn, so the model sees a photo the turn it arrives instead of calling
   `get_artifact`. `with_history_messages(n)` also inlines references in the `n`
   messages before it (default 0). The current turn has first claim on
-  `with_max_images` (default 8) and `with_max_bytes` (default
-  `DEFAULT_MAX_INLINE_BYTES`, 512 KiB). Only PNG, JPEG, GIF and WebP, checked by
-  signature, are inlined; anything else stays a reference.
+  `with_max_images` (default 8 loads, inlined or not) and `with_max_bytes`
+  (default `DEFAULT_MAX_INLINE_BYTES`, 512 KiB). Only PNG, JPEG, GIF and WebP,
+  checked by signature, are inlined, each with a label carrying its id, name and
+  metadata; anything else stays a reference. A later `ArtifactOffload` restores
+  the original reference instead of storing the image again. See ADR-0010.
+- `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
+  The default loads and then checks; `LocalArtifactStore` and
+  `MagickmindArtifactStore` stop reading at the limit.
 
 - `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
   artifact service. Uploads go into a magickspace through presign, PUT and finalize;
@@ -286,11 +291,14 @@ truncated.
 
 ### Fixed
 
-- `get_artifact` on a HEIC, SVG or corrupt image failed the whole turn. Both
-  executors inlined anything declared `image/*`, and the provider rejects the
-  request outright for a format it cannot read. They now inline only PNG, JPEG,
-  GIF and WebP, checked by signature, and tell the model the rest cannot be
-  shown inline.
+- `get_artifact` on a HEIC, SVG or other unrecognised image failed the whole
+  turn. Both executors inlined anything declared `image/*`, and the provider
+  rejects the request outright for a format it cannot read. They now inline only
+  PNG, JPEG, GIF and WebP, checked by signature, and tell the model the rest
+  cannot be shown inline. The type named in that text is validated first.
+
+- `MagickmindArtifactStore` request errors no longer include the URL, which for
+  a download is a presigned link.
 
 - `get_artifact` calls with the id under another key. Small models copy the tool
   prompt's `{"param": …}` example and send `{"param": "<id>"}`, which loaded

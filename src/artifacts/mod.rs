@@ -23,12 +23,16 @@ pub use manager::ArtifactManager;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{MindroidError, Result};
 use crate::models::Message;
 
+/// Metadata key an inlined image carries its artifact id under, so offload can
+/// restore the reference instead of storing the bytes again.
+pub(crate) const INLINED_ARTIFACT_KEY: &str = "_artifact_id";
+
 /// The image type vision endpoints accept, read from the bytes' signature
-/// rather than the declared type: one HEIC, SVG or corrupt file sent inline fails
-/// the whole request.
+/// rather than the declared type: one HEIC, SVG or other unrecognised file sent
+/// inline fails the whole request.
 pub(crate) fn inline_image_type(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\x89PNG\r\n\x1a\n") && data.get(12..16) == Some(&b"IHDR"[..]) {
         Some("image/png")
@@ -102,6 +106,18 @@ pub trait ArtifactStore: Send + Sync + 'static {
     /// Load raw bytes + metadata back by `(scope, id)`.
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact>;
 
+    /// Like [`load`](Self::load), but fails for an artifact over `max_bytes`. The
+    /// default loads it whole and then checks; a store that can stop early should.
+    async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
+        let artifact = self.load(scope, id).await?;
+        if artifact.data.len() > max_bytes {
+            return Err(MindroidError::artifact(format!(
+                "artifact '{id}' exceeds {max_bytes} bytes"
+            )));
+        }
+        Ok(artifact)
+    }
+
     /// Delete an artifact. Idempotent — deleting a missing id is `Ok`.
     async fn delete(&self, scope: &str, id: &str) -> Result<()>;
 
@@ -152,6 +168,10 @@ impl<T: ArtifactStore> ArtifactStore for Arc<T> {
         (**self).load(scope, id).await
     }
 
+    async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
+        (**self).load_bounded(scope, id, max_bytes).await
+    }
+
     async fn delete(&self, scope: &str, id: &str) -> Result<()> {
         (**self).delete(scope, id).await
     }
@@ -166,6 +186,33 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_formats_vision_endpoints_accept_count_as_images() {
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        assert_eq!(inline_image_type(&png), Some("image/png"));
+        assert_eq!(
+            inline_image_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(inline_image_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            inline_image_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(
+            inline_image_type(b"\x89PNG\r\n\x1a\nnot really a png"),
+            None
+        );
+        assert_eq!(inline_image_type(b"\0\0\0\x18ftypheic"), None);
+        assert_eq!(
+            inline_image_type(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+        assert_eq!(inline_image_type(b""), None);
+    }
 
     #[tokio::test]
     async fn no_store_save_errors_rather_than_fabricating_an_id() {

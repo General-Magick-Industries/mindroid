@@ -79,8 +79,12 @@ pub(crate) fn requested_id(args: &Value) -> Option<&str> {
     if let Some(id) = args.get("id") {
         return id.as_str();
     }
-    match args.as_object()?.values().collect::<Vec<_>>()[..] {
-        [only] => only.as_str(),
+    if let Some(id) = args.as_str() {
+        return Some(id);
+    }
+    let mut values = args.as_object()?.values();
+    match (values.next(), values.next()) {
+        (Some(only), None) => only.as_str(),
         _ => None,
     }
 }
@@ -138,6 +142,7 @@ mod tests {
         assert_eq!(requested_id(&json!({"id": 7, "param": "a1"})), None);
         assert_eq!(requested_id(&json!({"a": "1", "b": "2"})), None);
         assert_eq!(requested_id(&json!({})), None);
+        assert_eq!(requested_id(&json!("a1")), Some("a1"));
     }
 
     #[tokio::test]

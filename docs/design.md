@@ -170,7 +170,7 @@ is opt-*out*, because for artifacts exposure is the norm and hiding is the excep
 
 #### The offload / rehydrate flow
 
-Three pieces cooperate, all built from one shared `Arc<dyn ArtifactStore>` (mirroring
+Four pieces cooperate, all built from one shared `Arc<dyn ArtifactStore>` (mirroring
 how `Identity` is shared) so the offload stage and the load tool operate on the
 same store:
 
@@ -188,6 +188,13 @@ same store:
    them as a multimodal `Role::Tool` message the model can see. A round
    re-attaches at most 8 artifacts, deduplicated — every one is held in memory
    and base64-expanded into the request — and the message names any left out.
+   Only PNG, JPEG, GIF and WebP are re-attached, by byte signature; anything else
+   is described as text.
+4. **`InlineArtifacts`** (pipeline stage, opt-in) — for media a sender attached by
+   reference (`artifact_data`), loads the images onto the current user turn, and
+   with `with_history_messages(n)` onto the `n` messages before it, within a
+   per-turn image and byte budget. A later `ArtifactOffload` restores the original
+   references rather than storing the images again. See ADR-0010.
 
 Because a reference is just a `ContentPart::File` carrying an opaque id, swapping
 the storage backend (local → remote → S3 → encrypted) changes nothing downstream —
