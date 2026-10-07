@@ -10,6 +10,12 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- `InlineArtifacts` (feature `artifacts`): loads the images an inbound message
+  attaches by reference (`artifact_data`) and puts them inline on the current user
+  turn, so the model sees a photo the turn it arrives instead of calling
+  `get_artifact`. Capped at 8 images and `DEFAULT_MAX_INLINE_BYTES` (512 KiB) per
+  turn; anything else stays a reference.
+
 - `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
   artifact service. Uploads go into a magickspace through presign, PUT and finalize;
   loads fall back to the caller's own route for artifacts no message has attached yet.
