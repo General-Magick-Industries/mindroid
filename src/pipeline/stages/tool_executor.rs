@@ -1436,7 +1436,7 @@ mod tests {
         let store: Arc<dyn crate::artifacts::ArtifactStore> =
             Arc::new(LocalArtifactStore::new(tmp.path()));
         let id = store
-            .save("chan1", b"   ftypheic", "image/heic")
+            .save("chan1", b"\0\0\0\x18ftypheic", "image/heic")
             .await
             .unwrap()
             .id;
