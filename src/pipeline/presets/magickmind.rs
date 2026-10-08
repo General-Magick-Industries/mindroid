@@ -285,6 +285,49 @@ impl MagickmindClient {
         config: &MagickmindContextConfig,
         exclude_sender: Option<&str>,
     ) -> Result<PreparedContext> {
+        self.fetch_context(
+            magickspace_id,
+            participant_id,
+            query,
+            config,
+            exclude_sender,
+            false,
+        )
+        .await
+    }
+
+    /// Like [`prepare_context`](Self::prepare_context), but keeps the newest
+    /// message even when it is the turn being answered. For a caller that
+    /// fetches mid-turn to cache history for the *next* turn, where that
+    /// message is history rather than the live turn the caller appends itself.
+    pub async fn prepare_context_keeping_inbound(
+        &self,
+        magickspace_id: &str,
+        participant_id: &str,
+        query: &str,
+        config: &MagickmindContextConfig,
+        exclude_sender: Option<&str>,
+    ) -> Result<PreparedContext> {
+        self.fetch_context(
+            magickspace_id,
+            participant_id,
+            query,
+            config,
+            exclude_sender,
+            true,
+        )
+        .await
+    }
+
+    async fn fetch_context(
+        &self,
+        magickspace_id: &str,
+        participant_id: &str,
+        query: &str,
+        config: &MagickmindContextConfig,
+        exclude_sender: Option<&str>,
+        keep_inbound: bool,
+    ) -> Result<PreparedContext> {
         // Service-user → tenant-scoped route; end-user JWT → membership-scoped
         // /v1/end-user/... route (participant = token subject).
         let url = match self.credential_kind {
@@ -360,7 +403,9 @@ impl MagickmindClient {
                 status_code: None,
             })?;
 
-        drop_inbound_turn(&mut parsed.chat_history, participant_id, query);
+        if !keep_inbound {
+            drop_inbound_turn(&mut parsed.chat_history, participant_id, query);
+        }
 
         Ok(convert_context_response(
             parsed,
@@ -1479,6 +1524,65 @@ mod tests {
             serde_json::from_str(&body).unwrap()
         });
         (base, server)
+    }
+
+    async fn prepared_from(reply: serde_json::Value, keep_inbound: bool) -> PreparedContext {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request_body(&mut sock).await;
+            let reply = reply.to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        let client = MagickmindClient::try_new(base, identity, true).unwrap();
+        let config = MagickmindContextConfig::default();
+        let prepared = match keep_inbound {
+            true => {
+                client
+                    .prepare_context_keeping_inbound("space-1", "u1", "look", &config, Some("a1"))
+                    .await
+            }
+            false => {
+                client
+                    .prepare_context("space-1", "u1", "look", &config, Some("a1"))
+                    .await
+            }
+        }
+        .unwrap();
+        server.await.unwrap();
+        prepared
+    }
+
+    /// A refresh taken mid-turn caches history for the next turn, so the
+    /// message being answered belongs in it, attachments included.
+    #[tokio::test]
+    async fn the_inbound_turn_is_kept_only_when_asked() {
+        let reply = serde_json::json!({"chat_history": [
+            {"sent_by_user_id": "u1", "content": "look",
+             "artifact_data": [{"id": "p1", "mime_type": "image/jpeg"}]},
+            {"sent_by_user_id": "a1", "content": "earlier reply"},
+        ]});
+
+        let live = prepared_from(reply.clone(), false).await;
+        assert!(live.messages.iter().all(|m| !m.text().contains("look")));
+
+        let kept = prepared_from(reply, true).await;
+        let inbound = kept
+            .messages
+            .iter()
+            .find(|m| m.text().contains("look"))
+            .expect("the inbound turn is kept");
+        assert!(inbound.content.iter().any(|p| matches!(
+            p,
+            ContentPart::File { source: crate::core::content::ContentSource::Uri { uri }, .. } if uri == "p1"
+        )));
     }
 
     const ENVELOPE: &str = r#"{"type":"tool_call","payload":{"name":"drive"}}"#;
