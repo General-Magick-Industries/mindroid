@@ -48,7 +48,9 @@ pub(crate) const FRAME_MS: u32 = 32;
 /// Re-cuts microphone chunks into [`FRAME_MS`] frames. The frontend counts
 /// frames, so frames of any other length would scale its barge-in and silence
 /// timings by the device's chunk size.
+#[derive(Debug)]
 pub(crate) struct Framer {
+    sample_bytes: usize,
     frame_bytes: usize,
     sample_rate: u32,
     channels: u16,
@@ -57,18 +59,22 @@ pub(crate) struct Framer {
 
 impl Framer {
     pub(crate) fn new(sample_rate: u32, channels: u16) -> Self {
+        let sample_bytes = usize::from(channels.max(1)) * 2;
         let samples = sample_rate as usize * FRAME_MS as usize / 1_000;
-        let frame_bytes = samples * usize::from(channels.max(1)) * 2;
         Self {
-            frame_bytes,
+            sample_bytes,
+            frame_bytes: samples * sample_bytes,
             sample_rate,
             channels,
-            pending: Vec::with_capacity(frame_bytes * 2),
+            pending: Vec::new(),
         }
     }
 
+    /// A chunk's trailing partial sample is dropped so it cannot misalign
+    /// every frame after it.
     pub(crate) fn push(&mut self, chunk: &AudioChunk) -> Vec<AudioChunk> {
-        self.pending.extend_from_slice(&chunk.data);
+        let usable = chunk.data.len() - chunk.data.len() % self.sample_bytes;
+        self.pending.extend_from_slice(&chunk.data[..usable]);
         let whole = self.pending.len() - self.pending.len() % self.frame_bytes;
         let frames = self.pending[..whole]
             .chunks_exact(self.frame_bytes)
@@ -111,12 +117,13 @@ impl SileroDetector {
         } else {
             (16_000, 512)
         };
-        let resampler = Resampler::new(sample_rate, rate).map_err(|e| MindroidError::Transport {
-            message: format!(
-                "SileroDetector: capture rate {sample_rate} Hz is neither 8 kHz nor a multiple of 16 kHz"
-            ),
-            source: Some(Box::new(e)),
-        })?;
+        let resampler =
+            Resampler::new(sample_rate, rate).map_err(|e| MindroidError::Transport {
+                message: format!(
+                    "SileroDetector: capture rate {sample_rate} Hz is unsupported: {e}"
+                ),
+                source: Some(Box::new(e)),
+            })?;
         Ok(Self {
             vad: VadInference::new(rate, frame)?,
             resampler,
@@ -203,6 +210,12 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(frames.iter().all(|f| f.data.len() == 1_536 * 2));
         assert_eq!(framer.pending.len(), 100 * 2);
+
+        let mut odd = Framer::new(16_000, 1);
+        let mut chunk = mic(511);
+        chunk.data.push(7);
+        assert!(odd.push(&chunk).is_empty());
+        assert_eq!(odd.pending.len(), 511 * 2);
 
         let mut stereo = Framer::new(16_000, 2);
         let frames = stereo.push(&AudioChunk {

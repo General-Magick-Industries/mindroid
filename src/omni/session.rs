@@ -456,14 +456,13 @@ impl OmniSession {
         //    `transport-audio`; only that feature populates them.
         let mut vad_out_rx: Option<mpsc::Receiver<(AudioChunk, f32)>> = None;
         let mut vad_in_tx: Option<mpsc::Sender<AudioChunk>> = None;
+        let (sample_rate, channels) = self
+            .audio_source
+            .as_ref()
+            .map_or((16_000, 1), |s| (s.sample_rate(), s.channels()));
 
         #[cfg(feature = "transport-audio")]
         if use_local_vad {
-            let sample_rate = self
-                .audio_source
-                .as_ref()
-                .map(|s| s.sample_rate())
-                .unwrap_or(16_000);
             match SileroDetector::new(sample_rate) {
                 Ok(detector) => {
                     let (tx, rx) = spawn_worker(Box::new(detector));
@@ -479,11 +478,6 @@ impl OmniSession {
         //    actual construction is feature-gated.
         #[cfg(feature = "transport-audio")]
         let mut audio_frontend: Option<AudioFrontend> = if vad_in_tx.is_some() {
-            let sample_rate = self
-                .audio_source
-                .as_ref()
-                .map(|s| s.sample_rate())
-                .unwrap_or(16_000);
             let vad_config = match &self.config.turn_detection {
                 TurnDetection::Local(cfg) => cfg.clone(),
                 _ => VadConfig::default(),
@@ -498,12 +492,9 @@ impl OmniSession {
         } else {
             None
         };
-        let mut framer = Framer::new(
-            self.audio_source
-                .as_ref()
-                .map_or(16_000, |s| s.sample_rate()),
-            self.audio_source.as_ref().map_or(1, |s| s.channels()),
-        );
+        let mut framer = vad_in_tx
+            .as_ref()
+            .map(|_| Framer::new(sample_rate, channels));
 
         let (mut mic_sq, mut mic_n, mut mic_last) = (0f64, 0usize, std::time::Instant::now());
 
@@ -631,9 +622,11 @@ impl OmniSession {
                         // When local VAD is active, also send a copy to the inference
                         // worker.  `try_send` — skip the frame if the inbox is full
                         // rather than blocking the audio loop.
-                        if let Some(ref tx) = vad_in_tx {
+                        if let (Some(tx), Some(framer)) = (&vad_in_tx, framer.as_mut()) {
                             for frame in framer.push(&chunk) {
-                                let _ = tx.try_send(frame);
+                                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(frame) {
+                                    tracing::warn!("local VAD behind the microphone, frame dropped");
+                                }
                             }
                         }
                     } else {
@@ -796,7 +789,7 @@ impl OmniSession {
         let mut audio_frontend: Option<AudioFrontend> =
             if has_local_turn_detection || has_local_barge_in {
                 Some(
-                    AudioFrontend::builder(vad_config, 32)
+                    AudioFrontend::builder(vad_config, u64::from(FRAME_MS))
                         .sample_rate_hz(sample_rate)
                         .barge_in_mode(self.config.barge_in.clone())
                         .turn_detection(self.config.turn_detection.clone())

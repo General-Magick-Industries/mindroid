@@ -176,7 +176,7 @@ vad.process(probability, Duration::from_millis(30));
 
 #### 8. `voice::encode_wav` moved to `omni::audio::wav`
 
-The crate had three PCM16 WAV encoders; `omni::audio::wav` is now the only
+The crate had two PCM16 WAV encoders; `omni::audio::wav` is now the only
 one, and it no longer needs `transport-audio` or `hound`. Output is
 byte-identical.
 
@@ -211,9 +211,9 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 - `omni::audio::Resampler`: integer-factor downsampling of PCM16 behind a
   windowed-sinc anti-alias filter, streaming across chunks. The OpenAI provider
   and `SileroDetector` both use it. A ratio that is not an integer, such as
-  24 → 16 kHz or 44.1 → 24 kHz, is refused with `ResampleError`.
+  24 → 16 kHz or 44.1 → 24 kHz, is refused with `ResampleError`, as is a
+  factor above `MAX_FACTOR` (12, i.e. 192 → 16 kHz).
 - `SileroDetector` accepts an 8 kHz microphone, running Silero's 8 kHz model.
-
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
   WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`

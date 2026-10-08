@@ -12,6 +12,10 @@ const TAPS_PER_FACTOR: usize = 32;
 /// Pass-band edge as a fraction of the output's Nyquist frequency.
 const CUTOFF: f64 = 0.9;
 
+/// Largest supported factor (192 → 16 kHz). The filter grows with the factor,
+/// and rates can come from a remote client's chunks.
+pub const MAX_FACTOR: u32 = 12;
+
 /// Why a [`Resampler`] cannot convert between two rates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ResampleError {
@@ -19,6 +23,8 @@ pub enum ResampleError {
     ZeroRate,
     #[error("{from} Hz is not an integer multiple of {to} Hz")]
     NotIntegerMultiple { from: u32, to: u32 },
+    #[error("{from} Hz is more than {MAX_FACTOR} times {to} Hz")]
+    FactorTooLarge { from: u32, to: u32 },
 }
 
 /// Lowers mono PCM16 from one rate to another that divides it exactly.
@@ -46,13 +52,17 @@ impl Resampler {
     /// [`ResampleError::ZeroRate`] when either rate is zero, and
     /// [`ResampleError::NotIntegerMultiple`] when `from` is not an integer
     /// multiple of `to` — which includes every `from < to`, since only
-    /// downsampling is supported.
+    /// downsampling is supported — and [`ResampleError::FactorTooLarge`] above
+    /// [`MAX_FACTOR`].
     pub fn new(from: u32, to: u32) -> Result<Self, ResampleError> {
         if from == 0 || to == 0 {
             return Err(ResampleError::ZeroRate);
         }
         if !from.is_multiple_of(to) {
             return Err(ResampleError::NotIntegerMultiple { from, to });
+        }
+        if from / to > MAX_FACTOR {
+            return Err(ResampleError::FactorTooLarge { from, to });
         }
         let factor = (from / to) as usize;
         let taps = low_pass(factor);
@@ -263,5 +273,18 @@ mod tests {
         assert!(Resampler::new(16_000, 48_000).is_err());
         assert_eq!(Resampler::new(0, 16_000), Err(ResampleError::ZeroRate));
         assert_eq!(Resampler::new(16_000, 0), Err(ResampleError::ZeroRate));
+    }
+
+    #[test]
+    fn factors_above_the_cap_are_refused() {
+        assert!(Resampler::new(192_000, 16_000).is_ok());
+        assert_eq!(
+            Resampler::new(208_000, 16_000),
+            Err(ResampleError::FactorTooLarge {
+                from: 208_000,
+                to: 16_000
+            })
+        );
+        assert!(Resampler::new(24_000 * 178_956, 24_000).is_err());
     }
 }
