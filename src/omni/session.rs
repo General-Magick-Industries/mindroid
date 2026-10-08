@@ -2,7 +2,7 @@ use crate::core::config::AgentConfig;
 use crate::core::error::MindroidError;
 use crate::core::models::{Message, SenderType};
 use crate::memory::Memory;
-use crate::omni::audio::{AudioSink, AudioSource, wav};
+use crate::omni::audio::{AudioSink, AudioSource, speech::Framer, wav};
 use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
     AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionState,
@@ -22,7 +22,10 @@ use tokio_util::sync::CancellationToken;
 // Local-VAD imports — only compiled when the Silero ONNX feature is present.
 #[cfg(feature = "transport-audio")]
 use {
-    crate::omni::audio::{SileroDetector, speech::spawn_worker},
+    crate::omni::audio::{
+        SileroDetector,
+        speech::{FRAME_MS, spawn_worker},
+    },
     crate::voice::frontend::{AudioFrontend, FrontendEvent},
     crate::voice::types::VadConfig,
     std::time::Instant,
@@ -486,7 +489,7 @@ impl OmniSession {
                 _ => VadConfig::default(),
             };
             Some(
-                AudioFrontend::builder(vad_config, 32)
+                AudioFrontend::builder(vad_config, u64::from(FRAME_MS))
                     .sample_rate_hz(sample_rate)
                     .barge_in_mode(self.config.barge_in.clone())
                     .turn_detection(self.config.turn_detection.clone())
@@ -495,6 +498,12 @@ impl OmniSession {
         } else {
             None
         };
+        let mut framer = Framer::new(
+            self.audio_source
+                .as_ref()
+                .map_or(16_000, |s| s.sample_rate()),
+            self.audio_source.as_ref().map_or(1, |s| s.channels()),
+        );
 
         let (mut mic_sq, mut mic_n, mut mic_last) = (0f64, 0usize, std::time::Instant::now());
 
@@ -623,7 +632,9 @@ impl OmniSession {
                         // worker.  `try_send` — skip the frame if the inbox is full
                         // rather than blocking the audio loop.
                         if let Some(ref tx) = vad_in_tx {
-                            let _ = tx.try_send(chunk);
+                            for frame in framer.push(&chunk) {
+                                let _ = tx.try_send(frame);
+                            }
                         }
                     } else {
                         // Audio stream ended.

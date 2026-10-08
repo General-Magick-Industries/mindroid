@@ -42,6 +42,48 @@ pub(crate) fn spawn_worker(
     (chunk_tx, score_rx)
 }
 
+/// Length of one scored frame. At 16 kHz it is exactly one Silero window.
+pub(crate) const FRAME_MS: u32 = 32;
+
+/// Re-cuts microphone chunks into [`FRAME_MS`] frames. The frontend counts
+/// frames, so frames of any other length would scale its barge-in and silence
+/// timings by the device's chunk size.
+pub(crate) struct Framer {
+    frame_bytes: usize,
+    sample_rate: u32,
+    channels: u16,
+    pending: Vec<u8>,
+}
+
+impl Framer {
+    pub(crate) fn new(sample_rate: u32, channels: u16) -> Self {
+        let samples = sample_rate as usize * FRAME_MS as usize / 1_000;
+        let frame_bytes = samples * usize::from(channels.max(1)) * 2;
+        Self {
+            frame_bytes,
+            sample_rate,
+            channels,
+            pending: Vec::with_capacity(frame_bytes * 2),
+        }
+    }
+
+    pub(crate) fn push(&mut self, chunk: &AudioChunk) -> Vec<AudioChunk> {
+        self.pending.extend_from_slice(&chunk.data);
+        let whole = self.pending.len() - self.pending.len() % self.frame_bytes;
+        let frames = self.pending[..whole]
+            .chunks_exact(self.frame_bytes)
+            .map(|data| AudioChunk {
+                data: data.to_vec(),
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                bits_per_sample: 16,
+            })
+            .collect();
+        self.pending.drain(..whole);
+        frames
+    }
+}
+
 /// Silero VAD. The model takes 8 or 16 kHz audio in fixed frames, so the first
 /// channel of the microphone's PCM16 is resampled to the model's rate and framed
 /// here; a chunk too short to complete a frame reports the previous probability.
@@ -142,6 +184,34 @@ mod tests {
             scored.push((chunk.data[0], p));
         }
         assert_eq!(scored, [(1, 2.0), (2, 4.0), (3, 6.0)]);
+    }
+
+    /// `CpalAudioSource` sends 512-sample chunks, 10.7 ms at 48 kHz; the frontend
+    /// must still see 32 ms frames, with the remainder carried to the next push.
+    #[test]
+    fn framer_cuts_small_mic_chunks_into_frame_ms_frames() {
+        let mut framer = Framer::new(48_000, 1);
+        let mic = |samples: usize| AudioChunk {
+            data: vec![1u8; samples * 2],
+            sample_rate: 48_000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        assert!(framer.push(&mic(512)).is_empty());
+        assert!(framer.push(&mic(512)).is_empty());
+        let frames = framer.push(&mic(512 + 1_536 + 100));
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| f.data.len() == 1_536 * 2));
+        assert_eq!(framer.pending.len(), 100 * 2);
+
+        let mut stereo = Framer::new(16_000, 2);
+        let frames = stereo.push(&AudioChunk {
+            data: vec![0u8; 512 * 2 * 2],
+            sample_rate: 16_000,
+            channels: 2,
+            bits_per_sample: 16,
+        });
+        assert_eq!(frames.len(), 1);
     }
 
     /// A 48 kHz stereo microphone, the common Windows default, must be accepted and

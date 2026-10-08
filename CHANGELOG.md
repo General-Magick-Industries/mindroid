@@ -362,7 +362,11 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   worker as `VoiceGate`. It built Silero at the microphone's own rate, which the
   model refuses for anything but 8 or 16 kHz, so on a 48 kHz microphone local
   barge-in and turn detection were silently off. They now work there; a rate
-  Silero still cannot take is logged as a warning instead of ignored.
+  Silero still cannot take is logged as a warning instead of ignored. The
+  microphone is re-cut into 32 ms frames before scoring, because the frontend
+  counts frames as 32 ms: `CpalAudioSource`'s 10.7 ms chunks at 48 kHz made
+  barge-in fire after about 110 ms of speech instead of 320 ms, and ended
+  turns after a third of the configured silence.
 - The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
   `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
   configured `transcriber` produced nothing while the provider's own input
