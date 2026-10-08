@@ -145,6 +145,11 @@ Implement `Tool` trait → register in `ToolRegistry` → whichever executor sta
 async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
 ```
 
+A tool whose result includes images (a camera, a screenshot) also overrides
+`execute_with_images`. Only `OmniSession` sends those images, through
+`OmniProvider::send_tool_result_with_images`: Gemini Live puts them in the
+function response's `parts`, and providers without image support drop them.
+
 `ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
 extension map for backend data (credentials, agent id) set by a stage. Never take
 identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0005
