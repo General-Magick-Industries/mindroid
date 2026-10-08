@@ -104,7 +104,8 @@ pub struct SileroDetector {
 
 #[cfg(feature = "transport-audio")]
 impl SileroDetector {
-    /// `sample_rate` is the microphone's rate: 8 kHz or a multiple of 16 kHz.
+    /// `sample_rate` is the microphone's rate: 8 kHz, or a multiple of 16 kHz up
+    /// to 192 kHz.
     /// Every chunk scored afterwards must arrive at that rate.
     ///
     /// # Errors
@@ -119,9 +120,7 @@ impl SileroDetector {
         };
         let resampler =
             Resampler::new(sample_rate, rate).map_err(|e| MindroidError::Transport {
-                message: format!(
-                    "SileroDetector: capture rate {sample_rate} Hz is unsupported: {e}"
-                ),
+                message: format!("SileroDetector: capture rate {sample_rate} Hz is unsupported"),
                 source: Some(Box::new(e)),
             })?;
         Ok(Self {

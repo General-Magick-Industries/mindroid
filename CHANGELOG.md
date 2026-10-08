@@ -212,7 +212,7 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   windowed-sinc anti-alias filter, streaming across chunks. The OpenAI provider
   and `SileroDetector` both use it. A ratio that is not an integer, such as
   24 → 16 kHz or 44.1 → 24 kHz, is refused with `ResampleError`, as is a
-  factor above `MAX_FACTOR` (12, i.e. 192 → 16 kHz).
+  factor above `MAX_FACTOR` (12; 192 → 16 kHz is the largest accepted).
 - `SileroDetector` accepts an 8 kHz microphone, running Silero's 8 kHz model.
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
