@@ -21,6 +21,10 @@ listed under **Breaking Changes** with a migration note.
   metadata; anything else stays a reference. A later `ArtifactOffload` turns an
   inlined image back into a reference to the sender's artifact instead of storing
   it again. See ADR-0010.
+- `MagickmindClient::prepare_context_keeping_inbound`: `prepare_context` without
+  dropping the newest message as the turn being answered. A caller that fetches
+  mid-turn to cache history for the next turn needs that message kept, with its
+  attachments; `prepare_context` drops it because the caller appends it itself.
 - `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
   The default loads and then checks; `LocalArtifactStore` and
   `MagickmindArtifactStore` stop reading at the limit.
