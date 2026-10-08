@@ -292,10 +292,11 @@ pub(crate) fn sanitize_llm_visible(s: &str) -> String {
     let flattened: String = s
         .chars()
         .map(|c| match c {
-            c if c.is_control() || is_layout_control(c) => ' ',
+            c if is_layout_control(c) => ' ',
             '[' | ']' | '{' | '}' | '"' => '\'',
             c => c,
         })
+        .take(MAX_LLM_VISIBLE_FIELD)
         .collect();
     cap_escaped(escape_markup(flattened.trim()), MAX_LLM_VISIBLE_FIELD)
 }

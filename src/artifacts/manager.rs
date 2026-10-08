@@ -95,8 +95,8 @@ impl ArtifactManager {
     /// load tool (the actual byte re-injection is done by the executor). Returns
     /// an error string as a normal `Ok` so the model can recover.
     ///
-    /// Confirms the artifact exists without downloading it: a zero-byte bound
-    /// fails on any content, and that failure means it is there.
+    /// Checks existence with a zero-byte bound, whose too-large failure means the
+    /// artifact is there; a store overriding `load_bounded` never downloads it.
     pub async fn load_described(&self, scope: &str, id: &str) -> String {
         if id.is_empty() {
             return "Error: no artifact id provided".to_string();

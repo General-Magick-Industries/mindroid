@@ -71,7 +71,9 @@ impl InlineArtifacts {
         Self::new(manager.store().clone())
     }
 
-    /// Cap the bytes inlined in one turn. Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
+    /// Cap the image bytes a turn's requests carry: what this stage inlines, plus
+    /// what both tool executors re-attach for `get_artifact` (anything they load
+    /// counts, image or not). Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
@@ -253,9 +255,13 @@ impl PipelineStage for InlineArtifacts {
         if budget.inlined > 0 {
             match ctx.llm_messages.iter_mut().find(|m| m.role == Role::System) {
                 Some(system) => system.append_text(&format!("\n\n{CAN_SEE_IMAGES}")),
-                None => ctx
-                    .llm_messages
-                    .insert(0, crate::LlmMessage::system(CAN_SEE_IMAGES)),
+                None => {
+                    ctx.llm_messages
+                        .insert(0, crate::LlmMessage::system(CAN_SEE_IMAGES));
+                    if current.is_some() {
+                        ctx.set(CurrentUserMessage(index + 1));
+                    }
+                }
             }
         }
         Ok(())
@@ -393,6 +399,38 @@ mod tests {
             "{label}"
         );
         assert!(!label.contains("get_artifact"), "{label}");
+    }
+
+    #[tokio::test]
+    async fn the_inserted_system_note_keeps_the_current_turn_pointed_at() {
+        use crate::pipeline::extensions::PersistedUserTurn;
+
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut msg = Message::new("mine", "u1", "space1");
+        msg.metadata.insert(
+            ARTIFACT_DATA_METADATA_KEY.into(),
+            serde_json::json!([{"id": ids[0]}]),
+        );
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        ctx.llm_messages = vec![LlmMessage::user("someone else's"), LlmMessage::user("mine")];
+        ctx.set(CurrentUserMessage(1));
+
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        crate::pipeline::stages::ArtifactOffload::new(store)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.get_run::<CurrentUserMessage>().map(|c| c.0), Some(2));
+        let persisted = &ctx.get_run::<PersistedUserTurn>().unwrap().0;
+        assert!(
+            persisted.contains("mine") && persisted.contains(&ids[0]),
+            "{persisted}"
+        );
+        assert!(!persisted.contains("someone else"), "{persisted}");
     }
 
     #[tokio::test]

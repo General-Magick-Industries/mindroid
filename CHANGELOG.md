@@ -305,15 +305,19 @@ truncated.
   the model why anything was not attached. A repeat request for something that
   could not be shown is answered without loading it again. Without
   `InlineArtifacts` there is no byte bound, as before.
+
 - A scoped `get_artifact` downloaded the whole artifact just to confirm it
   existed; `ArtifactManager::load_described` now checks with a zero-byte bound.
+
 - `InlineArtifacts` tells the model it can see images on turns where it inlined
   one, as a sentence in the system prompt (or a system message of its own when
   there is none). With a persona prompt, gpt-4o-mini otherwise answered "I can't
   see the photo" about an image in the same request.
+
 - Artifact labels are hardened against participant-authored text: file names
   and metadata escape `< > &` and fold layout controls, each field is capped
   after escaping, and a reference renders at most 8 metadata keys and 1 KiB.
+
 - `MagickmindArtifactStore` refuses redirects, which kept the bearer on a
   same-host https to http hop, and reports a bounded excerpt of an error body.
 

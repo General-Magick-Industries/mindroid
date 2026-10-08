@@ -263,6 +263,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_allowance_is_what_inline_artifacts_was_configured_with() {
+        use crate::config::AgentConfig;
+        use crate::pipeline::{PipelineStage, stages::InlineArtifacts};
+
+        let (_tmp, store, ids) = counting(&[(jpeg(10), "image/jpeg")]).await;
+        let shared: Arc<dyn ArtifactStore> = store.clone();
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("look", "u1", "chan1")),
+            Arc::new(AgentConfig::default()),
+        );
+        assert_eq!(AttachedImages::for_turn(&ctx).lock().bytes_left, usize::MAX);
+
+        InlineArtifacts::new(shared.clone())
+            .with_max_bytes(64)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        let attached = AttachedImages::for_turn(&ctx);
+        let parts = reattached_parts(ids, &shared, "chan1", &attached).await;
+
+        assert_eq!(images(&parts), 1);
+        assert_eq!(*store.loads.lock().unwrap(), vec![64]);
+    }
+
+    #[tokio::test]
     async fn without_an_allowance_any_image_is_attached() {
         let (_tmp, store, ids) =
             counting(&[(jpeg(DEFAULT_MAX_INLINE_BYTES * 2), "image/jpeg")]).await;

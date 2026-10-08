@@ -1371,7 +1371,6 @@ mod tests {
     /// `get_artifact` returns only a confirmation string, so the executor owes
     /// the model the bytes. They ride a follow-up user turn, since the OpenAI
     /// `tool` role carries text alone.
-
     #[cfg(feature = "artifacts")]
     #[tokio::test]
     async fn artifacts_are_re_attached_as_a_follow_up_user_turn() {
