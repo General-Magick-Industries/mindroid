@@ -157,6 +157,37 @@ Both non-streaming calls (`chat`, `chat_with_tools`) are now bounded by a
 `stream_chat` keeps its unbounded body read and long generations are not
 truncated.
 
+#### 7. `VadStateMachine` takes the chunk duration per call
+
+It counted silence in frames of a duration fixed at construction, which
+`VoiceGate` froze from the first chunk it saw. Silence is now counted in time,
+so chunks of any length can be mixed. Speech ends once the silent chunks add up
+to `silence_duration`; before, the frame count was rounded down, so 500 ms in
+30 ms chunks ended after 480 ms and now ends after 510 ms.
+
+```rust
+// before
+let mut vad = VadStateMachine::new(config, 30);
+vad.process(probability);
+// after
+let mut vad = VadStateMachine::new(config);
+vad.process(probability, Duration::from_millis(30));
+```
+
+#### 8. `voice::encode_wav` moved to `omni::audio::wav`
+
+The crate had two PCM16 WAV encoders; `omni::audio::wav` is now the only
+one, and it no longer needs `transport-audio` or `hound`. Output is
+byte-identical.
+
+```rust
+// before
+mindroid::voice::encode_wav(&samples, 16_000)
+// after
+mindroid::omni::audio::wav::encode_mono_f32(&samples, 16_000)
+mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
+```
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
@@ -177,6 +208,12 @@ truncated.
   `EpisodeIngestStage::apply_runtime_state` after `Context::reset_output`.
   `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
   and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
+- `omni::audio::Resampler`: integer-factor downsampling of PCM16 behind a
+  windowed-sinc anti-alias filter, streaming across chunks. The OpenAI provider
+  and `SileroDetector` both use it. A ratio that is not an integer, such as
+  24 → 16 kHz or 44.1 → 24 kHz, is refused with `ResampleError`, as is a
+  factor above `MAX_FACTOR` (12; 192 → 16 kHz is the largest accepted).
+- `SileroDetector` accepts an 8 kHz microphone, running Silero's 8 kHz model.
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
   WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
@@ -317,6 +354,19 @@ truncated.
   `\u003c`-style escapes and folded invisible controls instead of HTML
   entities, and a live `TOOL_RESULT` no longer reaches the prompt twice.
 
+- Downsampled audio no longer aliases. The OpenAI provider averaged sample
+  pairs, which leaves content above 12 kHz only partly attenuated, and
+  `SileroDetector` dropped samples with no filter at all, folding everything
+  above 8 kHz back into the band Silero listens to. Both now filter first.
+- `OmniSession`'s local VAD runs on the same `SileroDetector` and blocking
+  worker as `VoiceGate`. It built Silero at the microphone's own rate, which the
+  model refuses for anything but 8 or 16 kHz, so on a 48 kHz microphone local
+  barge-in and turn detection were silently off. They now work there; a rate
+  Silero still cannot take is logged as a warning instead of ignored. The
+  microphone is re-cut into 32 ms frames before scoring, because the frontend
+  counts frames as 32 ms: `CpalAudioSource`'s 10.7 ms chunks at 48 kHz made
+  barge-in fire after about 110 ms of speech instead of 320 ms, and ended
+  turns after a third of the configured silence.
 - The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
   `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
   configured `transcriber` produced nothing while the provider's own input

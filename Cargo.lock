@@ -1512,7 +1512,6 @@ dependencies = [
  "dashmap",
  "dirs",
  "futures",
- "hound",
  "libc",
  "mockall",
  "regex",

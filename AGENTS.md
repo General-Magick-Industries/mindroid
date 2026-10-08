@@ -48,7 +48,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
 | `omni-gemini` | `tokio-tungstenite`, `base64` | `GeminiLiveProvider`, `GeminiLiveConfig`, `gemini::tool_declarations` |
 | `omni-openai` | `tokio-tungstenite`, `base64` | `OpenAiRealtimeProvider`, `OpenAiRealtimeConfig`, `openai_realtime::tool_declarations` |
-| `transport-audio` | `cpal`, `hound`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage` |
+| `transport-audio` | `cpal`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage` |
 | `speech` | `reqwest` | `OpenAiStt`, `DeepgramTts`, etc. |
 | `apikey` | `reqwest` | `ApiKeyAuth` |
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |
@@ -266,7 +266,7 @@ src/
 │   ├── combinators.rs  # Branch/Router/Retry/Approval (+ Parallel/Fusion)
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
-├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio source/sink, VAD (ADR-0003)
+├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio (source/sink, resample, WAV, speech detector), VAD (ADR-0003)
 ├── artifacts/      # ArtifactStore trait + local, magickmind, manager (ADR-0004, ADR-0009, ADR-0010)
 ├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls

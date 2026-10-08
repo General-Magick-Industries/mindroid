@@ -23,7 +23,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::error::MindroidError;
 use crate::memory::Memory;
-use crate::omni::audio::{AudioSink, AudioSource};
+#[cfg(feature = "transport-audio")]
+pub use crate::omni::audio::SileroDetector;
+pub use crate::omni::audio::SpeechDetector;
+use crate::omni::audio::{AudioSink, AudioSource, speech::spawn_worker};
 use crate::omni::provider::OmniProvider;
 use crate::omni::session::{OmniSession, ToolContextInit};
 use crate::omni::types::{AudioChunk, BargeInMode, OmniConfig, TurnDetection};
@@ -32,79 +35,10 @@ use crate::tools::{Tool, ToolContext};
 use crate::voice::types::VadConfig;
 use crate::voice::vad::{VadDecision, VadStateMachine};
 
-/// Speech probability for one microphone chunk, in `[0, 1]`.
-///
-/// Called on a blocking worker thread, one chunk at a time and in order, so an
-/// implementation may do synchronous CPU work such as ONNX inference. It must
-/// still keep up with the microphone: chunks that arrive while the worker is busy
-/// are dropped, not queued past the channel's bound.
-pub trait SpeechDetector: Send {
-    fn speech_probability(&mut self, chunk: &AudioChunk) -> f32;
-}
-
-/// Silero VAD. The model only takes 16 kHz audio in 512-sample frames, so the
-/// microphone's PCM16 is decimated to 16 kHz (first channel only) and framed here;
-/// a chunk too short to complete a frame reports the previous probability.
-#[cfg(feature = "transport-audio")]
-pub struct SileroDetector {
-    vad: crate::omni::vad::VadInference,
-    pending: Vec<i16>,
-    last: f32,
-}
-
-#[cfg(feature = "transport-audio")]
-impl SileroDetector {
-    const RATE: u32 = 16_000;
-    const FRAME: usize = 512;
-
-    /// `sample_rate` is the microphone's rate and must be a multiple of 16 kHz.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MindroidError::Transport`] for an unsupported rate or when the
-    /// ONNX model cannot be loaded.
-    pub fn new(sample_rate: u32) -> Result<Self, MindroidError> {
-        if sample_rate == 0 || !sample_rate.is_multiple_of(Self::RATE) {
-            return Err(MindroidError::Transport {
-                message: format!(
-                    "SileroDetector: capture rate {sample_rate} Hz is not a multiple of 16 kHz"
-                ),
-                source: None,
-            });
-        }
-        Ok(Self {
-            vad: crate::omni::vad::VadInference::new(Self::RATE, Self::FRAME)?,
-            pending: Vec::with_capacity(Self::FRAME * 2),
-            last: 0.0,
-        })
-    }
-}
-
-#[cfg(feature = "transport-audio")]
-impl SpeechDetector for SileroDetector {
-    fn speech_probability(&mut self, chunk: &AudioChunk) -> f32 {
-        let step =
-            (chunk.sample_rate / Self::RATE).max(1) as usize * chunk.channels.max(1) as usize;
-        self.pending.extend(
-            chunk
-                .data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .step_by(step)
-                .map(|b| i16::from_le_bytes(*b)),
-        );
-        let mut best: Option<f32> = None;
-        while self.pending.len() >= Self::FRAME {
-            let frame: Vec<i16> = self.pending.drain(..Self::FRAME).collect();
-            let p = self.vad.predict(&frame);
-            best = Some(best.map_or(p, |b| b.max(p)));
-        }
-        if let Some(p) = best {
-            self.last = p;
-        }
-        self.last
-    }
+/// How much audio a PCM16 chunk holds.
+fn duration(chunk: &AudioChunk) -> Duration {
+    let frames = chunk.data.len() as u64 / (2 * u64::from(chunk.channels.max(1)));
+    Duration::from_micros(frames * 1_000_000 / u64::from(chunk.sample_rate.max(1)))
 }
 
 type ProviderFactory = Box<dyn Fn() -> Box<dyn OmniProvider> + Send + Sync>;
@@ -190,32 +124,17 @@ impl VoiceGate {
         let bytes_per_ms = (rate as usize * 2 * channels as usize / 1000).max(1);
         let preroll_cap = bytes_per_ms * self.preroll.as_millis() as usize;
 
-        // Silero is ONNX inference: synchronous, CPU-bound, and `VadInference` is
-        // documented as blocking-only. Scoring inline on this select loop starved
-        // every other arm, and a future that never yields also stops a paused test
-        // clock from auto-advancing — which is what hung the gate tests. The worker
-        // owns the detector and hands back the chunk it scored, so the loop below
-        // still sees every chunk exactly once and in order.
-        let Some(mut detector) = self.detector.take() else {
+        let Some(detector) = self.detector.take() else {
             return Err(MindroidError::config(
                 "VoiceGate requires a speech detector",
             ));
         };
-        let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(8);
-        let (score_tx, mut score_rx) = mpsc::channel::<(AudioChunk, f32)>(8);
-        tokio::task::spawn_blocking(move || {
-            while let Some(chunk) = chunk_rx.blocking_recv() {
-                let probability = detector.speech_probability(&chunk);
-                if score_tx.blocking_send((chunk, probability)).is_err() {
-                    break;
-                }
-            }
-        });
+        let (chunk_tx, mut score_rx) = spawn_worker(detector);
         // Dropped when the microphone ends, which closes the worker, which closes
         // `score_rx` once the last in-flight chunk is scored.
         let mut feed = Some(chunk_tx);
 
-        let mut vad: Option<VadStateMachine> = None;
+        let mut vad = VadStateMachine::new(self.vad.clone());
         let mut preroll: VecDeque<AudioChunk> = VecDeque::new();
         let mut preroll_bytes = 0usize;
         let mut live: Option<Live> = None;
@@ -245,9 +164,7 @@ impl VoiceGate {
                         None => {}
                     }
                     live = None;
-                    if let Some(v) = vad.as_mut() {
-                        v.reset();
-                    }
+                    vad.reset();
                     tracing::info!("voice gate: waiting for speech");
                 }
 
@@ -260,9 +177,7 @@ impl VoiceGate {
                     }
                 }, if live.is_some() => {
                     Self::close(&mut live, "idle").await;
-                    if let Some(v) = vad.as_mut() {
-                        v.reset();
-                    }
+                    vad.reset();
                 }
 
                 chunk = mic.next(), if feed.is_some() => {
@@ -287,9 +202,7 @@ impl VoiceGate {
                         Self::close(&mut live, "microphone closed").await;
                         return Ok(());
                     };
-                    let chunk_ms = (chunk.data.len() / bytes_per_ms).max(1) as u64;
-                    let sm = vad.get_or_insert_with(|| VadStateMachine::new(self.vad.clone(), chunk_ms));
-                    let decision = sm.process(probability);
+                    let decision = vad.process(probability, duration(&chunk));
                     tracing::trace!(?decision, first = chunk.data.first(), live = live.is_some(), "voice gate chunk");
                     if matches!(decision, VadDecision::SpeechStarted | VadDecision::SpeechContinues) {
                         last_speech = Instant::now();
@@ -753,23 +666,6 @@ mod tests {
         let opened: Opened = Arc::default();
         run_gate(gate(vec![chunk(0); 5], Duration::from_secs(5), &opened)).await;
         assert!(opened.lock().unwrap().is_empty());
-    }
-
-    /// A 48 kHz stereo microphone, the common Windows default, must be accepted and
-    /// framed down to what Silero takes; silence must score low.
-    #[cfg(feature = "transport-audio")]
-    #[test]
-    fn silero_detector_takes_a_48k_stereo_mic() {
-        let mut d = SileroDetector::new(48_000).unwrap();
-        let silence = AudioChunk {
-            data: vec![0u8; 48_000 * 2 * 2 / 10], // 100 ms stereo
-            sample_rate: 48_000,
-            channels: 2,
-            bits_per_sample: 16,
-        };
-        let p = d.speech_probability(&silence);
-        assert!(p < 0.3, "silence scored {p}");
-        assert!(SileroDetector::new(44_100).is_err());
     }
 
     /// The gate owns detection on this microphone. A session that also ran local
