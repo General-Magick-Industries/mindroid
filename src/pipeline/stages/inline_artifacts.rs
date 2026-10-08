@@ -72,8 +72,9 @@ impl InlineArtifacts {
     }
 
     /// Cap the image bytes a turn's requests carry: what this stage inlines, plus
-    /// what both tool executors re-attach for `get_artifact` (anything they load
-    /// counts, image or not). Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
+    /// what both tool executors re-attach for `get_artifact` after any image
+    /// already inline in the conversation (anything they load counts, image or
+    /// not). Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
@@ -258,8 +259,8 @@ impl PipelineStage for InlineArtifacts {
                 None => {
                     ctx.llm_messages
                         .insert(0, crate::LlmMessage::system(CAN_SEE_IMAGES));
-                    if current.is_some() {
-                        ctx.set(CurrentUserMessage(index + 1));
+                    if let Some(current) = current {
+                        ctx.set(CurrentUserMessage(current + 1));
                     }
                 }
             }

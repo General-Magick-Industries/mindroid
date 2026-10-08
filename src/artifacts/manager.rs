@@ -96,7 +96,7 @@ impl ArtifactManager {
     /// an error string as a normal `Ok` so the model can recover.
     ///
     /// Checks existence with a zero-byte bound, whose too-large failure means the
-    /// artifact is there; a store overriding `load_bounded` never downloads it.
+    /// artifact is there; a store whose `load_bounded` stops reading early never downloads it.
     pub async fn load_described(&self, scope: &str, id: &str) -> String {
         if id.is_empty() {
             return "Error: no artifact id provided".to_string();

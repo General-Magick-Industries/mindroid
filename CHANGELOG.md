@@ -27,7 +27,8 @@ listed under **Breaking Changes** with a migration note.
   attachments; `prepare_context` drops it because the caller appends it itself.
 - `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
   The default loads and then checks; `LocalArtifactStore` and
-  `MagickmindArtifactStore` stop reading at the limit.
+  `MagickmindArtifactStore` stop reading at the limit. An override should fail
+  with `artifacts::exceeds`, so callers can tell too large from missing.
 
 - `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
   artifact service. Uploads go into a magickspace through presign, PUT and finalize;
