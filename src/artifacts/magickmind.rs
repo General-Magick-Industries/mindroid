@@ -44,6 +44,7 @@ impl MagickmindArtifactStore {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| api_err(format!("artifact HTTP client: {e}"), None))?;
         Ok(Self {
@@ -149,7 +150,7 @@ async fn checked(resp: Response, step: &str) -> Result<Response> {
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
     Err(api_err(
         format!("artifact {step} failed: {status} {body}"),
         Some(status),
