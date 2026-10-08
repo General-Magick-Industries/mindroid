@@ -172,14 +172,16 @@ async fn artifact_turn(
 
     for id in load_ids {
         match store.load(scope, &id).await {
-            Ok(art) if art.mime_type.starts_with("image/") => parts.push(ContentPart::image(
-                ContentSource::Inline { data: art.data },
-                art.mime_type,
-            )),
-            Ok(art) => parts.push(ContentPart::text(format!(
-                "(artifact {id} is {}, which cannot be shown inline)",
-                art.mime_type
-            ))),
+            Ok(art) => match crate::artifacts::inline_image_type(&art.data) {
+                Some(mime_type) => parts.push(ContentPart::image(
+                    ContentSource::Inline { data: art.data },
+                    mime_type,
+                )),
+                None => parts.push(ContentPart::text(format!(
+                    "(artifact {id} is {}, which cannot be shown inline)",
+                    crate::core::content::visible_mime_type(&art.mime_type)
+                ))),
+            },
             Err(e) => {
                 tracing::warn!("ToolExecutorStage: get_artifact '{id}' failed: {e}");
                 parts.push(ContentPart::text(format!(
@@ -1385,7 +1387,7 @@ mod tests {
         let store: Arc<dyn crate::artifacts::ArtifactStore> =
             Arc::new(LocalArtifactStore::new(tmp.path()));
         let id = store
-            .save("chan1", &[9, 9, 9], "image/png")
+            .save("chan1", &[0xFF, 0xD8, 0xFF, 9], "image/jpeg")
             .await
             .unwrap()
             .id;
@@ -1424,6 +1426,28 @@ mod tests {
             rendered.to_string().contains("could not re-attach"),
             "the model must be told the bytes are missing: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_image_the_endpoint_would_reject_is_described_not_attached() {
+        use crate::artifacts::LocalArtifactStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::artifacts::ArtifactStore> =
+            Arc::new(LocalArtifactStore::new(tmp.path()));
+        let id = store
+            .save("chan1", b"\0\0\0\x18ftypheic", "image/heic")
+            .await
+            .unwrap()
+            .id;
+
+        let msg = artifact_turn(vec![id], &store, "chan1")
+            .await
+            .expect("still produces a turn");
+
+        let rendered = serde_json::to_value(&msg).unwrap().to_string();
+        assert!(!rendered.contains("image_url"), "{rendered}");
+        assert!(rendered.contains("cannot be shown inline"), "{rendered}");
     }
 
     #[test]

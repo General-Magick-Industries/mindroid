@@ -72,6 +72,23 @@ impl GetArtifactTool {
     }
 }
 
+/// The id a `get_artifact` call asks for. Small models copy the reference
+/// line's positional `get_artifact("<id>")` into the prompt's generic
+/// `{"param": …}` example, so a lone string argument counts as the id.
+pub(crate) fn requested_id(args: &Value) -> Option<&str> {
+    if let Some(id) = args.get("id") {
+        return id.as_str();
+    }
+    if let Some(id) = args.as_str() {
+        return Some(id);
+    }
+    let mut values = args.as_object()?.values();
+    match (values.next(), values.next()) {
+        (Some(only), None) => only.as_str(),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl Tool for GetArtifactTool {
     fn name(&self) -> &str {
@@ -96,7 +113,7 @@ impl Tool for GetArtifactTool {
     }
 
     async fn execute(&self, args: Value, _ctx: &crate::tools::ToolContext) -> Result<String> {
-        let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let id = requested_id(&args).unwrap_or("");
         // The actual bytes are attached by XmlToolExecutorStage (which holds ctx and
         // the authoritative scope). Here we only produce the confirmation string.
         match &self.scope {
@@ -117,6 +134,16 @@ impl Tool for GetArtifactTool {
 mod tests {
     use super::*;
     use crate::artifacts::LocalArtifactStore;
+
+    #[test]
+    fn a_lone_string_argument_is_the_id() {
+        assert_eq!(requested_id(&json!({"id": "a1"})), Some("a1"));
+        assert_eq!(requested_id(&json!({"param": "a1"})), Some("a1"));
+        assert_eq!(requested_id(&json!({"id": 7, "param": "a1"})), None);
+        assert_eq!(requested_id(&json!({"a": "1", "b": "2"})), None);
+        assert_eq!(requested_id(&json!({})), None);
+        assert_eq!(requested_id(&json!("a1")), Some("a1"));
+    }
 
     #[tokio::test]
     async fn validates_and_confirms() {

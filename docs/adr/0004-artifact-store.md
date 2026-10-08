@@ -1,6 +1,6 @@
 # ADR-0004: ArtifactStore as a pure out-of-band media store
 
-- Status: Accepted (2026-08-06); scope choice and the no-hosted-client point superseded by [ADR-0009](0009-artifact-scope-per-store.md)
+- Status: Accepted (2026-08-06); scope choice and the no-hosted-client point superseded by [ADR-0009](0009-artifact-scope-per-store.md); on-demand-only re-attachment superseded by [ADR-0010](0010-inline-referenced-artifacts.md)
 - Deciders: Mindroid maintainers
 - Applies to: out-of-band media storage (`src/artifacts/`, `ArtifactOffload`, `GetArtifactTool`)
 

@@ -5,6 +5,8 @@ mod context;
 pub mod gate;
 #[cfg(feature = "llm-client")]
 mod ingest;
+#[cfg(feature = "artifacts")]
+mod inline_artifacts;
 #[cfg(feature = "llm-client")]
 mod llm_processor;
 mod post_processor;
@@ -12,7 +14,6 @@ pub mod stt;
 #[cfg(feature = "llm-client")]
 mod tool_executor;
 mod tool_executor_xml;
-#[cfg(feature = "transport-audio")]
 #[cfg(feature = "llm-client")]
 pub mod tts;
 
@@ -25,6 +26,8 @@ pub use context::SimpleContextBuilder;
 pub use gate::{AndGate, CoordinationGate, Gate, OrGate, RelevanceGate};
 #[cfg(feature = "llm-client")]
 pub use ingest::IngestStage;
+#[cfg(feature = "artifacts")]
+pub use inline_artifacts::{DEFAULT_MAX_INLINE_BYTES, InlineArtifacts};
 #[cfg(feature = "llm-client")]
 pub use llm_processor::{GenericLlmProcessor, collect_stream};
 pub use post_processor::PostProcessor;

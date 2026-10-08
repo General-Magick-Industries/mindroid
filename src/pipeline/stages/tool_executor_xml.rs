@@ -1170,7 +1170,7 @@ async fn run_tool_loop(
 #[cfg(feature = "artifacts")]
 pub(crate) fn get_artifact_id(name: &str, args: &serde_json::Value) -> Option<String> {
     if name == crate::tools::GET_ARTIFACT_TOOL {
-        args.get("id").and_then(|v| v.as_str()).map(str::to_string)
+        crate::tools::get_artifact::requested_id(args).map(str::to_string)
     } else {
         None
     }
@@ -1221,21 +1221,23 @@ async fn finalize_round_message(
                 // Only images round-trip as an `image_url` data URL; offload also
                 // covers audio/video/file, and a non-image sent that way is a hard
                 // provider 400 rather than graceful degradation.
-                Ok(art) if art.mime_type.starts_with("image/") => parts.push(ContentPart::image(
-                    ContentSource::Inline { data: art.data },
-                    art.mime_type,
-                )),
-                Ok(art) => {
-                    warn!(
-                        "XmlToolExecutorStage: artifact '{id}' is {}, not an image; \
-                         referencing it instead of inlining",
-                        art.mime_type
-                    );
-                    parts.push(ContentPart::text(format!(
-                        "(artifact {id} is {}, which cannot be shown inline)",
-                        art.mime_type
-                    )));
-                }
+                Ok(art) => match crate::artifacts::inline_image_type(&art.data) {
+                    Some(mime_type) => parts.push(ContentPart::image(
+                        ContentSource::Inline { data: art.data },
+                        mime_type,
+                    )),
+                    None => {
+                        warn!(
+                            "XmlToolExecutorStage: artifact '{id}' is {}, not an inlinable image; \
+                             referencing it instead of inlining",
+                            art.mime_type
+                        );
+                        parts.push(ContentPart::text(format!(
+                            "(artifact {id} is {}, which cannot be shown inline)",
+                            crate::core::content::visible_mime_type(&art.mime_type)
+                        )));
+                    }
+                },
                 Err(e) => {
                     warn!("XmlToolExecutorStage: get_artifact '{id}' failed: {e}");
                     parts.push(ContentPart::text(format!(
@@ -2228,7 +2230,7 @@ Some text.
             let store: Arc<dyn crate::artifacts::ArtifactStore> =
                 Arc::new(LocalArtifactStore::new(tmp.path()));
             let id = store
-                .save("chan1", &[9, 9, 9], "image/png")
+                .save("chan1", &[0xFF, 0xD8, 0xFF, 9], "image/jpeg")
                 .await
                 .unwrap()
                 .id;

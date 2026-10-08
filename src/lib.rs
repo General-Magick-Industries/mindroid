@@ -112,6 +112,8 @@ pub use pipeline::stages::ArtifactOffload;
 pub use pipeline::stages::AttachMedia;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::stages::AudioOutputStage;
+#[cfg(feature = "artifacts")]
+pub use pipeline::stages::InlineArtifacts;
 #[cfg(feature = "transport-audio")]
 pub use pipeline::stages::StreamingTtsTransformer;
 #[cfg(feature = "llm-client")]

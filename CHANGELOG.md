@@ -10,6 +10,21 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- `InlineArtifacts` (feature `artifacts`): loads the images an inbound message
+  attaches by reference (`artifact_data`) and puts them inline on the current user
+  turn, so the model sees a photo the turn it arrives instead of calling
+  `get_artifact`. `with_history_messages(n)` also inlines references in the `n`
+  messages before it (default 0). The current turn has first claim on
+  `with_max_images` (default 8 loads, inlined or not) and `with_max_bytes`
+  (default `DEFAULT_MAX_INLINE_BYTES`, 512 KiB). Only PNG, JPEG, GIF and WebP,
+  checked by signature, are inlined, each with a label carrying its id, name and
+  metadata; anything else stays a reference. A later `ArtifactOffload` turns an
+  inlined image back into a reference to the sender's artifact instead of storing
+  it again. See ADR-0010.
+- `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
+  The default loads and then checks; `LocalArtifactStore` and
+  `MagickmindArtifactStore` stop reading at the limit.
+
 - `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
   artifact service. Uploads go into a magickspace through presign, PUT and finalize;
   loads fall back to the caller's own route for artifacts no message has attached yet.
@@ -276,6 +291,23 @@ truncated.
   field; set it to `true` to send the old request.
 
 ### Fixed
+
+- Builds without `transport-audio` failed with three unresolved `tts` imports. A
+  `cfg` attribute left behind when a re-export was removed gated `pipeline::stages::tts`
+  on `transport-audio`, while its re-exports still compiled without it.
+
+- `get_artifact` on a HEIC, SVG or other unrecognised image failed the whole
+  turn. Both executors inlined anything declared `image/*`, and the provider
+  rejects the request outright for a format it cannot read. They now inline only
+  PNG, JPEG, GIF and WebP, checked by signature, and tell the model the rest
+  cannot be shown inline. The type named in that text is validated first.
+
+- `MagickmindArtifactStore` request and download errors no longer include the
+  URL, which for a download is a presigned link.
+
+- `get_artifact` calls with the id under another key. Small models copy the tool
+  prompt's `{"param": …}` example and send `{"param": "<id>"}`, which loaded
+  nothing. A lone string argument now counts as the id.
 
 - MagickMind tool loops. `MagickmindPersistence` saves a framed remote call as
   `message_type: TOOL_CALL`; it went out untyped, so devices received it as
