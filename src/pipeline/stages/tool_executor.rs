@@ -145,7 +145,7 @@ async fn artifact_turn(
     mut load_ids: Vec<String>,
     store: &Arc<dyn crate::artifacts::ArtifactStore>,
     scope: &str,
-    attached: &super::tool_executor_xml::AttachedImages,
+    attached: &super::reattach::AttachedImages,
 ) -> Option<ChatCompletionRequestMessage> {
     use crate::core::content::ContentPart;
     use crate::models::Role;
@@ -157,7 +157,7 @@ async fn artifact_turn(
     }
 
     let mut parts = vec![ContentPart::text(
-        "Artifacts you loaded this round, attached below:".to_string(),
+        "The artifacts you asked for this round:".to_string(),
     )];
     if !dropped.is_empty() {
         tracing::warn!(
@@ -167,11 +167,14 @@ async fn artifact_turn(
         parts.push(ContentPart::text(format!(
             "(only {} artifacts were re-attached this round; not attached: {})",
             super::tool_executor_xml::MAX_REINJECTED_ARTIFACTS,
-            dropped.join(", ")
+            dropped
+                .iter()
+                .map(|id| crate::llm_client::sanitize_llm_visible(id))
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
-    parts
-        .extend(super::tool_executor_xml::reattached_parts(load_ids, store, scope, attached).await);
+    parts.extend(super::reattach::reattached_parts(load_ids, store, scope, attached).await);
 
     let msg = crate::LlmMessage::with_parts(Role::User, parts);
     LlmClient::convert_messages(&[msg]).into_iter().next()
@@ -314,7 +317,7 @@ struct RoundDeps<'a> {
     /// Where re-injected artifacts load from; see `ArtifactStore::scope_for`.
     artifact_scope: &'a str,
     #[cfg(feature = "artifacts")]
-    attached: &'a super::tool_executor_xml::AttachedImages,
+    attached: &'a super::reattach::AttachedImages,
     trusted_sender: Option<&'a str>,
     tools: &'a [async_openai::types::chat::ChatCompletionTools],
 }
@@ -510,7 +513,7 @@ impl ToolExecutorStage {
         let mut messages = LlmClient::convert_messages(&ctx.llm_messages);
         let artifact_scope = self.artifact_scope(&ctx.message);
         #[cfg(feature = "artifacts")]
-        let attached = super::tool_executor_xml::AttachedImages::in_messages(&ctx.llm_messages);
+        let attached = super::reattach::AttachedImages::for_turn(ctx);
         let deps = RoundDeps {
             registry: &registry,
             tool_ctx: &tool_ctx,
@@ -625,7 +628,7 @@ impl StreamingStage for ToolExecutorStage {
                 let artifact_scope = self.artifact_scope(&ctx.message);
                 #[cfg(feature = "artifacts")]
                 let attached =
-                    super::tool_executor_xml::AttachedImages::in_messages(&ctx.llm_messages);
+                    super::reattach::AttachedImages::for_turn(ctx);
                 let trusted = ctx.message.trusted_sender_id().map(str::to_string);
                 let deps = RoundDeps {
                     registry: &registry,
@@ -1368,10 +1371,6 @@ mod tests {
     /// `get_artifact` returns only a confirmation string, so the executor owes
     /// the model the bytes. They ride a follow-up user turn, since the OpenAI
     /// `tool` role carries text alone.
-    #[cfg(feature = "artifacts")]
-    fn none_attached() -> super::super::tool_executor_xml::AttachedImages {
-        super::super::tool_executor_xml::AttachedImages::in_messages(&[])
-    }
 
     #[cfg(feature = "artifacts")]
     #[tokio::test]
@@ -1387,9 +1386,14 @@ mod tests {
             .unwrap()
             .id;
 
-        let msg = artifact_turn(vec![id.clone()], &store, "chan1", &none_attached())
-            .await
-            .expect("a follow-up turn carrying the bytes");
+        let msg = artifact_turn(
+            vec![id.clone()],
+            &store,
+            "chan1",
+            &super::super::reattach::AttachedImages::for_turn(&fresh_ctx()),
+        )
+        .await
+        .expect("a follow-up turn carrying the bytes");
 
         let rendered = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -1412,15 +1416,81 @@ mod tests {
         let store: Arc<dyn crate::artifacts::ArtifactStore> =
             Arc::new(LocalArtifactStore::new(tmp.path()));
 
-        let msg = artifact_turn(vec!["no-such-id".into()], &store, "chan1", &none_attached())
-            .await
-            .expect("still produces a turn");
+        let msg = artifact_turn(
+            vec!["no-such-id".into()],
+            &store,
+            "chan1",
+            &super::super::reattach::AttachedImages::for_turn(&fresh_ctx()),
+        )
+        .await
+        .expect("still produces a turn");
 
         let rendered = serde_json::to_value(&msg).unwrap();
         assert!(
             rendered.to_string().contains("could not re-attach"),
             "the model must be told the bytes are missing: {rendered}"
         );
+    }
+
+    /// The motivating bug end to end: the model asks again for a photo the
+    /// turn already carries, and the next request must not send it twice.
+    #[cfg(feature = "artifacts")]
+    #[tokio::test]
+    async fn a_photo_already_inlined_is_not_sent_again_when_the_model_asks_for_it() {
+        use crate::artifacts::{ArtifactManager, ArtifactStore, LocalArtifactStore};
+        use crate::core::content::ARTIFACT_DATA_METADATA_KEY;
+        use crate::pipeline::stages::InlineArtifacts;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ArtifactStore> = Arc::new(LocalArtifactStore::new(tmp.path()));
+        let id = store
+            .save("chan1", &[0xFF, 0xD8, 0xFF, 9], "image/jpeg")
+            .await
+            .unwrap()
+            .id;
+        let mut message = crate::models::Message::new("look", "client", "chan1");
+        message
+            .metadata
+            .insert(ARTIFACT_DATA_METADATA_KEY.into(), json!([{"id": id}]));
+        let mut ctx = Context::new(
+            Arc::new(message),
+            Arc::new(crate::config::AgentConfig::default()),
+        );
+        ctx.llm_messages = vec![
+            crate::LlmMessage::system("persona"),
+            crate::LlmMessage::user("look"),
+        ];
+        let manager = ArtifactManager::new(store);
+        InlineArtifacts::from_manager(&manager)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(
+            listener,
+            vec![
+                completion(json!({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "get_artifact",
+                                     "arguments": json!({"id": id}).to_string()}}]
+                })),
+                completion(json!({"role": "assistant", "content": "a desk"})),
+            ],
+        );
+        let registry =
+            ToolRegistry::new().register(crate::tools::GetArtifactTool::unscoped(manager));
+        ToolExecutorStage::new(stub_client(addr), Arc::new(registry))
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        let bodies = server.await.unwrap();
+
+        assert_eq!(bodies[1].matches("data:image/jpeg;base64").count(), 1);
+        assert!(bodies[1].contains("already attached"), "{}", bodies[1]);
+        assert_eq!(ctx.response.as_deref(), Some("a desk"));
     }
 
     #[tokio::test]
@@ -1436,9 +1506,14 @@ mod tests {
             .unwrap()
             .id;
 
-        let msg = artifact_turn(vec![id], &store, "chan1", &none_attached())
-            .await
-            .expect("still produces a turn");
+        let msg = artifact_turn(
+            vec![id],
+            &store,
+            "chan1",
+            &super::super::reattach::AttachedImages::for_turn(&fresh_ctx()),
+        )
+        .await
+        .expect("still produces a turn");
 
         let rendered = serde_json::to_value(&msg).unwrap().to_string();
         assert!(!rendered.contains("image_url"), "{rendered}");

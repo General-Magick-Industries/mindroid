@@ -186,8 +186,7 @@ impl MagickmindArtifactStore {
             "fetch",
         )
         .await?;
-        let too_large =
-            || MindroidError::artifact(format!("artifact '{id}' exceeds {limit} bytes"));
+        let too_large = || super::exceeds(id, limit);
         if resp.content_length().is_some_and(|n| n > limit as u64) {
             return Err(too_large());
         }

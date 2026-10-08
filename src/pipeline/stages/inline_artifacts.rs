@@ -18,10 +18,16 @@ use crate::pipeline::extensions::CurrentUserMessage;
 use crate::pipeline::stages::tool_executor_xml::MAX_REINJECTED_ARTIFACTS;
 use crate::{PipelineStage, Result};
 
-/// Default cap on the bytes this stage inlines per turn: base64 grows it by a
-/// third, and a 1 MiB request cap must also fit the prompt, history and any
-/// `get_artifact` re-attachment.
+/// Default cap on the image bytes a turn's requests carry: base64 grows it by a
+/// third, and a 1 MiB request cap must also fit the prompt and history. The
+/// executors' `get_artifact` re-attachment spends what this stage leaves.
 pub const DEFAULT_MAX_INLINE_BYTES: usize = 512 * 1024;
+
+/// The image bytes this turn's requests may carry, set by [`InlineArtifacts`]
+/// from [`with_max_bytes`](InlineArtifacts::with_max_bytes). Without it, the
+/// executors re-attach with no byte bound.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageAllowance(pub(crate) usize);
 
 /// Loads the images in the inbound message's `artifact_data` and attaches them
 /// inline to the current user turn; with
@@ -166,6 +172,7 @@ impl PipelineStage for InlineArtifacts {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        ctx.set(ImageAllowance(self.max_bytes));
         let mut ids = HashSet::new();
         let references: Vec<ContentPart> = ctx
             .message
@@ -246,9 +253,9 @@ impl PipelineStage for InlineArtifacts {
         if budget.inlined > 0 {
             match ctx.llm_messages.iter_mut().find(|m| m.role == Role::System) {
                 Some(system) => system.append_text(&format!("\n\n{CAN_SEE_IMAGES}")),
-                None => ctx.llm_messages[index]
-                    .content
-                    .push(ContentPart::text(CAN_SEE_IMAGES)),
+                None => ctx
+                    .llm_messages
+                    .insert(0, crate::LlmMessage::system(CAN_SEE_IMAGES)),
             }
         }
         Ok(())
@@ -386,6 +393,25 @@ mod tests {
             "{label}"
         );
         assert!(!label.contains("get_artifact"), "{label}");
+    }
+
+    #[tokio::test]
+    async fn without_a_system_prompt_the_note_gets_its_own_not_the_users_turn() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut msg = Message::new("look", "u1", "space1");
+        msg.metadata.insert(
+            ARTIFACT_DATA_METADATA_KEY.into(),
+            serde_json::json!([{"id": ids[0]}]),
+        );
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        ctx.llm_messages = vec![LlmMessage::user("look")];
+
+        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.llm_messages[0].role, Role::System);
+        assert_eq!(ctx.llm_messages[0].text(), CAN_SEE_IMAGES);
+        assert!(!ctx.llm_messages[1].text().contains(CAN_SEE_IMAGES));
+        assert_eq!(inline_images(&ctx, 1), vec![jpeg(&[1])]);
     }
 
     #[tokio::test]

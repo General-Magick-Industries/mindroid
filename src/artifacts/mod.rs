@@ -47,6 +47,16 @@ pub(crate) fn inline_image_type(data: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The error [`ArtifactStore::load_bounded`] returns for an artifact over its bound.
+pub(crate) fn exceeds(id: &str, max_bytes: impl std::fmt::Display) -> MindroidError {
+    MindroidError::artifact(format!("artifact '{id}' exceeds {max_bytes} bytes"))
+}
+
+pub(crate) fn is_exceeds(error: &MindroidError) -> bool {
+    matches!(error, MindroidError::Artifact { message, .. }
+        if message.starts_with("artifact '") && message.contains("' exceeds ") && message.ends_with(" bytes"))
+}
+
 /// Bytes + metadata returned by [`ArtifactStore::load`].
 #[derive(Debug, Clone)]
 pub struct Artifact {
@@ -112,9 +122,7 @@ pub trait ArtifactStore: Send + Sync + 'static {
     async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
         let artifact = self.load(scope, id).await?;
         if artifact.data.len() > max_bytes {
-            return Err(MindroidError::artifact(format!(
-                "artifact '{id}' exceeds {max_bytes} bytes"
-            )));
+            return Err(exceeds(id, max_bytes));
         }
         Ok(artifact)
     }
