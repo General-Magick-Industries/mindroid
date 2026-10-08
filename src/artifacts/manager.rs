@@ -94,12 +94,16 @@ impl ArtifactManager {
     /// Validate an artifact id and return a human-readable confirmation for the
     /// load tool (the actual byte re-injection is done by the executor). Returns
     /// an error string as a normal `Ok` so the model can recover.
+    ///
+    /// Checks existence with a zero-byte bound, whose too-large failure means the
+    /// artifact is there; a store whose `load_bounded` stops reading early never downloads it.
     pub async fn load_described(&self, scope: &str, id: &str) -> String {
         if id.is_empty() {
             return "Error: no artifact id provided".to_string();
         }
-        match self.store.load(scope, id).await {
+        match self.store.load_bounded(scope, id, 0).await {
             Ok(_) => format!("Loaded artifact {id}"),
+            Err(e) if super::is_exceeds(&e) => format!("Loaded artifact {id}"),
             Err(e) => format!("Error: could not load artifact {id}: {e}"),
         }
     }

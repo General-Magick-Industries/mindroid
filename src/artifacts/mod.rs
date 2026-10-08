@@ -47,6 +47,18 @@ pub(crate) fn inline_image_type(data: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The error [`ArtifactStore::load_bounded`] returns for an artifact over its bound.
+/// A store that overrides `load_bounded` should return it, so callers can tell
+/// "too large" from "missing".
+pub fn exceeds(id: &str, max_bytes: impl std::fmt::Display) -> MindroidError {
+    MindroidError::artifact(format!("artifact '{id}' exceeds {max_bytes} bytes"))
+}
+
+pub(crate) fn is_exceeds(error: &MindroidError) -> bool {
+    matches!(error, MindroidError::Artifact { message, .. }
+        if message.starts_with("artifact '") && message.contains("' exceeds ") && message.ends_with(" bytes"))
+}
+
 /// Bytes + metadata returned by [`ArtifactStore::load`].
 #[derive(Debug, Clone)]
 pub struct Artifact {
@@ -106,15 +118,14 @@ pub trait ArtifactStore: Send + Sync + 'static {
     /// Load raw bytes + metadata back by `(scope, id)`.
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact>;
 
-    /// Like [`load`](Self::load), but fails for an artifact over `max_bytes`. The
-    /// default loads it whole and then checks: a store that can stop reading early
-    /// should override it, and a store wrapping another should forward it.
+    /// Like [`load`](Self::load), but fails with [`exceeds`] for an artifact over
+    /// `max_bytes`. The default loads it whole and then checks: a store that can
+    /// stop reading early should override it, and a store wrapping another should
+    /// forward it.
     async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
         let artifact = self.load(scope, id).await?;
         if artifact.data.len() > max_bytes {
-            return Err(MindroidError::artifact(format!(
-                "artifact '{id}' exceeds {max_bytes} bytes"
-            )));
+            return Err(exceeds(id, max_bytes));
         }
         Ok(artifact)
     }
