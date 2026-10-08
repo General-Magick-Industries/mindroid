@@ -243,9 +243,22 @@ impl PipelineStage for InlineArtifacts {
             "InlineArtifacts: inlined {} images, {} bytes left",
             budget.inlined, budget.bytes
         );
+        if budget.inlined > 0 {
+            match ctx.llm_messages.iter_mut().find(|m| m.role == Role::System) {
+                Some(system) => system.append_text(&format!("\n\n{CAN_SEE_IMAGES}")),
+                None => ctx.llm_messages[index]
+                    .content
+                    .push(ContentPart::text(CAN_SEE_IMAGES)),
+            }
+        }
         Ok(())
     }
 }
+
+/// Persona prompts lead some vision models (gpt-4o-mini among them) to answer
+/// "I can't see images" about a photo in the same request.
+const CAN_SEE_IMAGES: &str = "You can see images. When a message has an image attached, it is \
+    shown to you in that message: look at it and answer from it directly.";
 
 #[cfg(test)]
 mod tests {
@@ -373,6 +386,26 @@ mod tests {
             "{label}"
         );
         assert!(!label.contains("get_artifact"), "{label}");
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_it_can_see_only_when_an_image_was_inlined() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}]));
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.llm_messages[0].text().ends_with(CAN_SEE_IMAGES));
+        assert!(!ctx.llm_messages[1].text().contains(CAN_SEE_IMAGES));
+
+        let mut ctx = ctx_with(serde_json::json!([{"id": "missing"}]));
+        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+        assert!(
+            ctx.llm_messages
+                .iter()
+                .all(|m| !m.text().contains(CAN_SEE_IMAGES))
+        );
     }
 
     #[tokio::test]
