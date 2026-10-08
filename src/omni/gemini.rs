@@ -22,7 +22,7 @@ use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
     AudioChunk, HistoryTurn, OmniConfig, OmniEvent, Role, TranscriptSource, TurnDetection, Usage,
 };
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolImage};
 
 /// Google AI Studio `BidiGenerateContent` WebSocket endpoint.
 pub const DEFAULT_ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -415,6 +415,18 @@ impl OmniProvider for GeminiLiveProvider {
     }
 
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError> {
+        self.send_tool_result_with_images(call_id, result, Vec::new())
+            .await
+    }
+
+    /// The images ride the function response's `parts`: the model ignores a
+    /// `realtimeInput` frame sent beside the response.
+    async fn send_tool_result_with_images(
+        &self,
+        call_id: &str,
+        result: Value,
+        images: Vec<ToolImage>,
+    ) -> Result<(), MindroidError> {
         let name = self
             .pending_calls
             .remove(call_id)
@@ -427,10 +439,21 @@ impl OmniProvider for GeminiLiveProvider {
             other => json!({ "result": other }),
         };
 
+        let mut function_response = json!({ "id": call_id, "name": name, "response": response });
+        if !images.is_empty() {
+            function_response["parts"] = images
+                .iter()
+                .map(|image| {
+                    json!({ "inlineData": {
+                        "mimeType": image.mime_type,
+                        "data": STANDARD.encode(&image.data),
+                    } })
+                })
+                .collect();
+        }
+
         self.send_json(json!({
-            "toolResponse": {
-                "functionResponses": [{ "id": call_id, "name": name, "response": response }]
-            }
+            "toolResponse": { "functionResponses": [function_response] }
         }))
         .await
     }
@@ -1061,6 +1084,55 @@ mod tests {
         assert_eq!(
             frame["toolResponse"]["functionResponses"][0]["response"]["result"],
             "sunny"
+        );
+        assert!(
+            frame["toolResponse"]["functionResponses"][0]
+                .get("parts")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_images_ride_the_function_response_parts() {
+        let (mut provider, mut seen) = connected(|frame| {
+            if frame.get("realtimeInput").is_some() {
+                vec![json!({ "toolCall": { "functionCalls": [{ "id": "c1", "name": "take_photo" }] } })]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let _setup = seen.recv().await;
+
+        let mut events = provider.events();
+        provider.end_audio_stream().await.unwrap();
+        let _echo = seen.recv().await;
+        let _call = events.next().await;
+
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+        provider
+            .send_tool_result_with_images(
+                "c1",
+                Value::String("photo taken".into()),
+                vec![ToolImage {
+                    mime_type: "image/jpeg".into(),
+                    data: jpeg.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let frame = seen.recv().await.expect("toolResponse frame");
+        let response = &frame["toolResponse"]["functionResponses"][0];
+        assert_eq!(response["name"], "take_photo");
+        assert_eq!(response["response"]["result"], "photo taken");
+        let inline = &response["parts"][0]["inlineData"];
+        assert_eq!(inline["mimeType"], "image/jpeg");
+        assert_eq!(inline["data"], STANDARD.encode(&jpeg));
+        assert_eq!(
+            frame.as_object().unwrap().len(),
+            1,
+            "no frame beside the toolResponse"
         );
     }
 

@@ -9,7 +9,7 @@ use crate::omni::types::{
     TranscriptSource, TurnDetection, Usage,
 };
 use crate::pipeline::stages::stt::SttProvider;
-use crate::tools::{Tool, ToolContext};
+use crate::tools::{Tool, ToolContext, ToolOutput};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -702,12 +702,13 @@ impl OmniSession {
                         Some(OmniEvent::ToolCall { id, name, args }) => {
                             tracing::info!(%channel, %sender, %id, %name, "tool call");
                             self.state = SessionState::ToolCall;
-                            let result = self.execute_tool(&name, args).await;
-                            let result_value = match result {
-                                Ok(r) => Value::String(r),
-                                Err(e) => serde_json::json!({"error": e.to_string()}),
+                            let (result_value, images) = match self.execute_tool(&name, args).await {
+                                Ok(out) => (Value::String(out.text), out.images),
+                                Err(e) => (serde_json::json!({"error": e.to_string()}), Vec::new()),
                             };
-                            self.provider.send_tool_result(&id, result_value).await?;
+                            self.provider
+                                .send_tool_result_with_images(&id, result_value, images)
+                                .await?;
                             // Return to Listening after tool call is dispatched.
                             self.state = SessionState::Listening;
                         }
@@ -782,13 +783,13 @@ impl OmniSession {
     }
 
     /// Find a tool by name and invoke it with the given arguments.
-    async fn execute_tool(&self, name: &str, args: Value) -> Result<String, MindroidError> {
+    async fn execute_tool(&self, name: &str, args: Value) -> Result<ToolOutput, MindroidError> {
         let tool = self
             .tools
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| MindroidError::pipeline(format!("tool not found: {name}")))?;
-        tool.execute(args, &self.tool_context()).await
+        tool.execute_with_images(args, &self.tool_context()).await
     }
 
     /// Test-only entry point that injects a pre-populated VAD results channel,
@@ -929,12 +930,13 @@ impl OmniSession {
                         }
                         Some(OmniEvent::ToolCall { id, name, args }) => {
                             self.state = SessionState::ToolCall;
-                            let result = self.execute_tool(&name, args).await;
-                            let result_value = match result {
-                                Ok(r) => Value::String(r),
-                                Err(e) => serde_json::json!({"error": e.to_string()}),
+                            let (result_value, images) = match self.execute_tool(&name, args).await {
+                                Ok(out) => (Value::String(out.text), out.images),
+                                Err(e) => (serde_json::json!({"error": e.to_string()}), Vec::new()),
                             };
-                            self.provider.send_tool_result(&id, result_value).await?;
+                            self.provider
+                                .send_tool_result_with_images(&id, result_value, images)
+                                .await?;
                             self.state = SessionState::Listening;
                         }
                         Some(OmniEvent::UserSpeechEnded) => {}
@@ -1242,6 +1244,7 @@ mod tests {
 
     use super::*;
     use crate::omni::types::{AudioChunk, OmniEvent};
+    use crate::tools::ToolImage;
     use async_stream::stream;
     use async_trait::async_trait;
     use futures::Stream;
@@ -1266,9 +1269,12 @@ mod tests {
     // Tracks send_audio calls and send_tool_result calls; events are driven via
     // an mpsc channel the test owns.
 
+    type RecordedImages = (String, Vec<ToolImage>);
+
     struct RecordingProvider {
         pub recorded_chunks: Arc<Mutex<Vec<AudioChunk>>>,
         pub recorded_tool_results: Arc<Mutex<Vec<(String, Value)>>>,
+        pub recorded_tool_images: Arc<Mutex<Vec<RecordedImages>>>,
         pub disconnected: Arc<Mutex<bool>>,
         event_rx: Option<mpsc::Receiver<OmniEvent>>,
     }
@@ -1279,6 +1285,7 @@ mod tests {
             let p = RecordingProvider {
                 recorded_chunks: Arc::new(Mutex::new(Vec::new())),
                 recorded_tool_results: Arc::new(Mutex::new(Vec::new())),
+                recorded_tool_images: Arc::new(Mutex::new(Vec::new())),
                 disconnected: Arc::new(Mutex::new(false)),
                 event_rx: Some(rx),
             };
@@ -1311,6 +1318,19 @@ mod tests {
                 .unwrap()
                 .push((call_id.to_string(), result));
             Ok(())
+        }
+
+        async fn send_tool_result_with_images(
+            &self,
+            call_id: &str,
+            result: Value,
+            images: Vec<ToolImage>,
+        ) -> Result<(), MindroidError> {
+            self.recorded_tool_images
+                .lock()
+                .unwrap()
+                .push((call_id.to_string(), images));
+            self.send_tool_result(call_id, result).await
         }
 
         async fn end_audio_stream(&self) -> Result<(), MindroidError> {
@@ -1494,6 +1514,45 @@ mod tests {
         }
     }
 
+    struct PhotoTool;
+
+    #[async_trait]
+    impl Tool for PhotoTool {
+        fn name(&self) -> &str {
+            "take_photo"
+        }
+
+        fn description(&self) -> &str {
+            "Takes a photo"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
+            Ok("photo taken".into())
+        }
+
+        async fn execute_with_images(
+            &self,
+            args: Value,
+            ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<ToolOutput> {
+            Ok(ToolOutput {
+                images: vec![ToolImage {
+                    mime_type: "image/jpeg".into(),
+                    data: vec![0xFF, 0xD8, 0xFF],
+                }],
+                ..self.execute(args, ctx).await?.into()
+            })
+        }
+    }
+
     // ── Builder tests ─────────────────────────────────────────────────────────
 
     /// Building without a provider must return an error.
@@ -1638,6 +1697,42 @@ mod tests {
             results[0].1,
             Value::String(r#"{"msg":"hello"}"#.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_tools_images_reach_the_provider_with_its_result() {
+        let (provider, tx) = RecordingProvider::new();
+        let results = Arc::clone(&provider.recorded_tool_results);
+        let images = Arc::clone(&provider.recorded_tool_images);
+
+        let mut session = OmniSession::builder()
+            .provider(provider)
+            .tool(EchoTool)
+            .tool(PhotoTool)
+            .build()
+            .unwrap();
+
+        for (id, name) in [("c1", "take_photo"), ("c2", "echo")] {
+            tx.send(OmniEvent::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                args: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        session.run().await.expect("run() should succeed");
+
+        assert_eq!(
+            results.lock().unwrap()[0],
+            ("c1".to_string(), Value::String("photo taken".into()))
+        );
+        let images = images.lock().unwrap();
+        assert_eq!(images[0].0, "c1");
+        assert_eq!(images[0].1[0].data, vec![0xFF, 0xD8, 0xFF]);
+        assert_eq!(images[1], ("c2".to_string(), Vec::new()));
     }
 
     /// AudioChunk followed by Interrupted → sink.stop() is called, state → Listening.

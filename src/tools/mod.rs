@@ -51,6 +51,29 @@ use crate::error::Result;
 ///
 /// Cloning shares the ext map (it's `Arc`-backed), so a value `set` on one clone
 /// is visible through the others — this is how a stage hands data to the executor.
+/// What [`Tool::execute_with_images`] returns.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<ToolImage>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// An image a tool returns for the model to see, as raw bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolImage {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Default, Clone)]
 pub struct ToolContext {
     /// Channel the message arrived on (`"stdio"` for the stdio transport; a
@@ -127,6 +150,13 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with parsed arguments and per-invocation context.
     /// Returns output as a plain string.
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>;
+
+    /// [`execute`](Self::execute), plus images the model should see with the
+    /// result. Only omni sessions send the images, and only to a provider that
+    /// accepts them. The default returns `execute`'s text and no images.
+    async fn execute_with_images(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        Ok(self.execute(args, ctx).await?.into())
+    }
 
     /// Whether this tool is executed by the client rather than the runtime.
     ///

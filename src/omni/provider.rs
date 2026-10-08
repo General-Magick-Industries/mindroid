@@ -1,5 +1,6 @@
 use crate::core::error::MindroidError;
 use crate::omni::types::{AudioChunk, OmniConfig, OmniEvent};
+use crate::tools::ToolImage;
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::Value;
@@ -12,6 +13,23 @@ pub trait OmniProvider: Send + Sync + 'static {
     async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError>;
     async fn send_text(&self, text: &str) -> Result<(), MindroidError>;
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError>;
+    /// [`send_tool_result`](Self::send_tool_result) with images the model should
+    /// see alongside the result. The default drops the images.
+    async fn send_tool_result_with_images(
+        &self,
+        call_id: &str,
+        result: Value,
+        images: Vec<ToolImage>,
+    ) -> Result<(), MindroidError> {
+        if !images.is_empty() {
+            tracing::debug!(
+                call_id,
+                images = images.len(),
+                "provider takes no tool-result images; dropping them"
+            );
+        }
+        self.send_tool_result(call_id, result).await
+    }
     async fn end_audio_stream(&self) -> Result<(), MindroidError>;
     /// Returns an OWNED stream (no lifetime tie to &self).
     /// Provider internally uses mpsc — call events() once before the select! loop.
@@ -209,5 +227,22 @@ mod tests {
         assert_eq!(results[0].1, json!({ "temp": 21 }));
         assert_eq!(results[1].0, "call-99");
         assert_eq!(results[1].1, json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_image_support_still_gets_the_result() {
+        let (provider, _tx) = MockOmniProvider::new();
+        let image = crate::tools::ToolImage {
+            mime_type: "image/jpeg".into(),
+            data: vec![0xFF, 0xD8, 0xFF],
+        };
+
+        provider
+            .send_tool_result_with_images("call-1", json!("photo taken"), vec![image])
+            .await
+            .unwrap();
+
+        let results = provider.recorded_tool_results.lock().unwrap();
+        assert_eq!(*results, vec![("call-1".to_string(), json!("photo taken"))]);
     }
 }
