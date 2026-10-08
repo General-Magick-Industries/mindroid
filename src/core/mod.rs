@@ -7,6 +7,7 @@ pub mod error;
 pub mod events;
 pub mod extension_map;
 pub(crate) mod factory;
+pub mod health;
 pub mod message;
 pub mod models;
 /// Shared HTTP/URL helpers. Gated on the features that pull in `reqwest`.
@@ -19,6 +20,7 @@ pub mod models;
     feature = "speech"
 ))]
 pub(crate) mod net;
+pub(crate) mod prompt_text;
 pub mod routine;
 pub mod runtime;
 pub mod strategy;

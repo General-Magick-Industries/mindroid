@@ -74,7 +74,7 @@ impl Tool for DelegationTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String> {
+    async fn execute(&self, args: Value, _ctx: &super::ToolContext) -> Result<String> {
         let message_text = args
             .get("message")
             .and_then(|v| v.as_str())
@@ -153,7 +153,10 @@ mod tests {
 
         let tool = make_tool(pipeline);
         let args = json!({ "message": "hello" });
-        let _ = tool.execute(args).await.expect("execute failed");
+        let _ = tool
+            .execute(args, &crate::tools::ToolContext::default())
+            .await
+            .expect("execute failed");
 
         assert!(
             called.load(Ordering::SeqCst),
@@ -170,7 +173,10 @@ mod tests {
 
         let tool = make_tool(pipeline);
         let args = json!({ "message": "do something" });
-        let result = tool.execute(args).await.expect("execute failed");
+        let result = tool
+            .execute(args, &crate::tools::ToolContext::default())
+            .await
+            .expect("execute failed");
 
         assert_eq!(result, expected);
     }
@@ -184,7 +190,10 @@ mod tests {
 
         let tool = make_tool(pipeline);
         let args = json!({ "message": "hello" });
-        let result = tool.execute(args).await.expect("execute failed");
+        let result = tool
+            .execute(args, &crate::tools::ToolContext::default())
+            .await
+            .expect("execute failed");
 
         assert_eq!(result, "no response");
     }
@@ -201,7 +210,10 @@ mod tests {
 
         let tool = make_tool(pipeline).with_session(session);
         let args = json!({ "message": "hello" });
-        let _ = tool.execute(args).await.expect("execute failed");
+        let _ = tool
+            .execute(args, &crate::tools::ToolContext::default())
+            .await
+            .expect("execute failed");
 
         assert!(called.load(Ordering::SeqCst));
     }

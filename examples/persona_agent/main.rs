@@ -16,15 +16,13 @@
 //!   6. MagickmindPersistence — save response to MagickMind
 //!
 //! Run with:
-//!   cargo run --example persona_agent --features full -- --config examples/persona_agent/dazael.toml
+//!   cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/dazael.toml
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{
-    MagickmindClient, MagickmindContext, MagickmindPersistence,
-};
+use mindroid::pipeline::presets::magickmind::{MagickmindContext, MagickmindPersistence};
 use mindroid::{
     ContextPreparer, ConversationHistory, GenericLlmProcessor, MindroidConfig, Pipeline,
     PipelineContext, PipelineStage, PostProcessor, PrepareOutcome, Result, Runtime,
@@ -134,19 +132,13 @@ async fn main() -> anyhow::Result<()> {
     // Auto-build identity, transport, memory, observer from config
     let builder = Runtime::from_config(config)?;
 
-    // MagickmindClient for context preparation and persistence
-    let identity = builder.auth_arc().unwrap();
+    // MagickmindClient for context preparation and persistence, wired from config.
+    let magickmind = Arc::new(
+        builder
+            .magickmind_client()
+            .expect("auth + base_url required"),
+    );
     let config = builder.config_ref().unwrap();
-    let magickmind_url = config
-        .auth
-        .base_url
-        .as_deref()
-        .unwrap_or("https://magickmind.example.com");
-    let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
-    if let Some(api_key) = &config.auth.api_key {
-        magickmind_client = magickmind_client.with_api_key(api_key);
-    }
-    let magickmind = Arc::new(magickmind_client);
 
     // Mention gate: only respond when @mentioned
     let mention_gate = MentionGate::new(&config.agent.name, &config.agent.agent_id);
@@ -220,7 +212,10 @@ async fn main() -> anyhow::Result<()> {
         .add_stage(SharedStage(Arc::clone(&persona_stage)))
         .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
         .add_stage(PostProcessor);
-    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage()? {
+    if let Some(mut reply_ingest) = builder.build_episode_reply_ingest_stage()? {
+        if let Some(inbound) = &inbound_ingest {
+            reply_ingest = reply_ingest.with_runtime_state_of(inbound);
+        }
         respond = respond.add_stage(reply_ingest);
     }
     let respond_pipeline =
@@ -310,6 +305,11 @@ async fn main() -> anyhow::Result<()> {
                 // stage splices between the system prompt and the user message.
                 pctx.reset_output();
                 pctx.set_ext(ConversationHistory(history));
+                // reset_output cleared the run-scoped affect; rehydrate it
+                // from the ingest stage so the persona stage can express it.
+                if let Some(ingest) = &inbound_ingest {
+                    ingest.apply_runtime_state(&mut pctx).await;
+                }
 
                 match ctx.run_with_context(&respond, &mut pctx).await {
                     Ok(None) => {
