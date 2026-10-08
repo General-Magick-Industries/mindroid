@@ -145,8 +145,9 @@ async fn artifact_turn(
     mut load_ids: Vec<String>,
     store: &Arc<dyn crate::artifacts::ArtifactStore>,
     scope: &str,
+    attached: &super::tool_executor_xml::AttachedImages,
 ) -> Option<ChatCompletionRequestMessage> {
-    use crate::core::content::{ContentPart, ContentSource};
+    use crate::core::content::ContentPart;
     use crate::models::Role;
 
     let requested = load_ids.len();
@@ -169,27 +170,8 @@ async fn artifact_turn(
             dropped.join(", ")
         )));
     }
-
-    for id in load_ids {
-        match store.load(scope, &id).await {
-            Ok(art) => match crate::artifacts::inline_image_type(&art.data) {
-                Some(mime_type) => parts.push(ContentPart::image(
-                    ContentSource::Inline { data: art.data },
-                    mime_type,
-                )),
-                None => parts.push(ContentPart::text(format!(
-                    "(artifact {id} is {}, which cannot be shown inline)",
-                    crate::core::content::visible_mime_type(&art.mime_type)
-                ))),
-            },
-            Err(e) => {
-                tracing::warn!("ToolExecutorStage: get_artifact '{id}' failed: {e}");
-                parts.push(ContentPart::text(format!(
-                    "(could not re-attach artifact {id})"
-                )));
-            }
-        }
-    }
+    parts
+        .extend(super::tool_executor_xml::reattached_parts(load_ids, store, scope, attached).await);
 
     let msg = crate::LlmMessage::with_parts(Role::User, parts);
     LlmClient::convert_messages(&[msg]).into_iter().next()
@@ -331,6 +313,8 @@ struct RoundDeps<'a> {
     message_channel: &'a str,
     /// Where re-injected artifacts load from; see `ArtifactStore::scope_for`.
     artifact_scope: &'a str,
+    #[cfg(feature = "artifacts")]
+    attached: &'a super::tool_executor_xml::AttachedImages,
     trusted_sender: Option<&'a str>,
     tools: &'a [async_openai::types::chat::ChatCompletionTools],
 }
@@ -365,11 +349,9 @@ impl ToolExecutorStage {
     ) -> Result<Round> {
         let RoundDeps {
             registry,
-            tool_ctx,
             message_channel,
-            artifact_scope,
             trusted_sender,
-            tools: _,
+            ..
         } = *deps;
 
         tracing::info!(
@@ -413,9 +395,7 @@ impl ToolExecutorStage {
             // `execute_local` reports the same parse error, and the round stays
             // complete, which the provider requires.
             let Ok(args) = args else {
-                return self
-                    .local_round(registry, tool_ctx, artifact_scope, outcome, messages)
-                    .await;
+                return self.local_round(deps, outcome, messages).await;
             };
             events.push(StreamEvent::ToolCall {
                 name: call.name.clone(),
@@ -442,19 +422,19 @@ impl ToolExecutorStage {
             });
         }
 
-        self.local_round(registry, tool_ctx, artifact_scope, outcome, messages)
-            .await
+        self.local_round(deps, outcome, messages).await
     }
 
     /// Run every call locally and append one tool result per declared id.
     async fn local_round(
         &self,
-        registry: &ToolRegistry,
-        tool_ctx: &ToolContext,
-        artifact_scope: &str,
+        deps: &RoundDeps<'_>,
         outcome: crate::llm_client::ToolsChatOutcome,
         messages: &mut Vec<ChatCompletionRequestMessage>,
     ) -> Result<Round> {
+        let RoundDeps {
+            registry, tool_ctx, ..
+        } = *deps;
         let mut events = Vec::new();
         #[cfg(feature = "artifacts")]
         let mut load_ids: Vec<String> = Vec::new();
@@ -502,7 +482,8 @@ impl ToolExecutorStage {
         if !ends_turn
             && !load_ids.is_empty()
             && let Some(store) = self.artifact_store()
-            && let Some(msg) = artifact_turn(load_ids, &store, artifact_scope).await
+            && let Some(msg) =
+                artifact_turn(load_ids, &store, deps.artifact_scope, deps.attached).await
         {
             messages.push(msg);
         }
@@ -528,11 +509,15 @@ impl ToolExecutorStage {
         let tools = LlmClient::tool_specs(&registry);
         let mut messages = LlmClient::convert_messages(&ctx.llm_messages);
         let artifact_scope = self.artifact_scope(&ctx.message);
+        #[cfg(feature = "artifacts")]
+        let attached = super::tool_executor_xml::AttachedImages::in_messages(&ctx.llm_messages);
         let deps = RoundDeps {
             registry: &registry,
             tool_ctx: &tool_ctx,
             message_channel: &ctx.message.channel_id,
             artifact_scope: &artifact_scope,
+            #[cfg(feature = "artifacts")]
+            attached: &attached,
             trusted_sender: ctx.message.trusted_sender_id(),
             tools: &tools,
         };
@@ -638,12 +623,17 @@ impl StreamingStage for ToolExecutorStage {
                 let mut messages = LlmClient::convert_messages(&ctx.llm_messages);
                 let channel = ctx.message.channel_id.clone();
                 let artifact_scope = self.artifact_scope(&ctx.message);
+                #[cfg(feature = "artifacts")]
+                let attached =
+                    super::tool_executor_xml::AttachedImages::in_messages(&ctx.llm_messages);
                 let trusted = ctx.message.trusted_sender_id().map(str::to_string);
                 let deps = RoundDeps {
                     registry: &registry,
                     tool_ctx: &tool_ctx,
                     message_channel: &channel,
                     artifact_scope: &artifact_scope,
+                    #[cfg(feature = "artifacts")]
+                    attached: &attached,
                     trusted_sender: trusted.as_deref(),
                     tools: &tools,
                 };
@@ -1379,6 +1369,11 @@ mod tests {
     /// the model the bytes. They ride a follow-up user turn, since the OpenAI
     /// `tool` role carries text alone.
     #[cfg(feature = "artifacts")]
+    fn none_attached() -> super::super::tool_executor_xml::AttachedImages {
+        super::super::tool_executor_xml::AttachedImages::in_messages(&[])
+    }
+
+    #[cfg(feature = "artifacts")]
     #[tokio::test]
     async fn artifacts_are_re_attached_as_a_follow_up_user_turn() {
         use crate::artifacts::LocalArtifactStore;
@@ -1392,7 +1387,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let msg = artifact_turn(vec![id.clone()], &store, "chan1")
+        let msg = artifact_turn(vec![id.clone()], &store, "chan1", &none_attached())
             .await
             .expect("a follow-up turn carrying the bytes");
 
@@ -1417,7 +1412,7 @@ mod tests {
         let store: Arc<dyn crate::artifacts::ArtifactStore> =
             Arc::new(LocalArtifactStore::new(tmp.path()));
 
-        let msg = artifact_turn(vec!["no-such-id".into()], &store, "chan1")
+        let msg = artifact_turn(vec!["no-such-id".into()], &store, "chan1", &none_attached())
             .await
             .expect("still produces a turn");
 
@@ -1441,7 +1436,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let msg = artifact_turn(vec![id], &store, "chan1")
+        let msg = artifact_turn(vec![id], &store, "chan1", &none_attached())
             .await
             .expect("still produces a turn");
 

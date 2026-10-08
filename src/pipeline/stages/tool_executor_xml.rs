@@ -448,9 +448,8 @@ impl ToolCallParser for XmlToolCallParser {
 pub(crate) const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 /// Cap on artifacts re-attached in one round. The model chooses the count, and
-/// each is held in memory and base64-expanded into the request. Bounds a round,
-/// not a turn: `messages` accumulates across iterations, so the worst case is
-/// still this times [`DEFAULT_MAX_ITERATIONS`].
+/// each is held in memory and base64-expanded into the request. The bytes they
+/// add across the whole turn are bounded separately, by [`AttachedImages`].
 #[cfg(feature = "artifacts")]
 pub(crate) const MAX_REINJECTED_ARTIFACTS: usize = 8;
 
@@ -590,6 +589,7 @@ impl PipelineStage for XmlToolExecutorStage {
                 |s| s.scope_for(&ctx.message),
             ),
             store: self.artifact_store(),
+            attached: AttachedImages::in_messages(&ctx.llm_messages),
         };
         let (mut messages, mut final_content, hit_max, framed) = run_tool_loop(
             LoopDeps {
@@ -650,6 +650,7 @@ impl StreamingStage for XmlToolExecutorStage {
                 |s| s.scope_for(&ctx.message),
             ),
             store: self.artifact_store(),
+            attached: AttachedImages::in_messages(&ctx.llm_messages),
         };
 
         Box::pin(async_stream::stream! {
@@ -1019,6 +1020,7 @@ struct ArtifactReinjection {
     store: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
     /// Never model- or user-supplied — taken from the inbound message.
     scope: String,
+    attached: AttachedImages,
 }
 
 /// The stage-owned inputs to [`run_tool_loop`], which travel together.
@@ -1186,6 +1188,129 @@ pub(crate) fn plan_reinjection(load_ids: &mut Vec<String>) -> Vec<String> {
     load_ids.split_off(load_ids.len().min(MAX_REINJECTED_ARTIFACTS))
 }
 
+/// The images a turn's requests already carry inline, and the bytes of the
+/// [`DEFAULT_MAX_INLINE_BYTES`](super::DEFAULT_MAX_INLINE_BYTES) allowance they
+/// leave. Every round resends the whole conversation, and an endpoint such as
+/// Bifrost refuses a body over 1 MiB, so re-attachment spends only what is left
+/// and never sends an image the model can already see.
+#[cfg(feature = "artifacts")]
+pub(crate) struct AttachedImages(std::sync::Mutex<Attached>);
+
+#[cfg(feature = "artifacts")]
+struct Attached {
+    bytes_left: usize,
+    ids: std::collections::HashSet<String>,
+}
+
+#[cfg(feature = "artifacts")]
+impl AttachedImages {
+    pub(crate) fn in_messages(messages: &[LlmMessage]) -> Self {
+        use crate::core::content::{ContentPart, ContentSource};
+
+        let (used, ids) = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|part| match part {
+                ContentPart::Image {
+                    source: ContentSource::Inline { data },
+                    metadata,
+                    ..
+                } => Some((
+                    data.len(),
+                    metadata.get(crate::artifacts::INLINED_ARTIFACT_KEY),
+                )),
+                _ => None,
+            })
+            .fold(
+                (0, std::collections::HashSet::new()),
+                |(used, mut ids), (len, id)| {
+                    ids.extend(id.and_then(|id| id.as_str()).map(str::to_string));
+                    (used + len, ids)
+                },
+            );
+        Self(std::sync::Mutex::new(Attached {
+            bytes_left: super::DEFAULT_MAX_INLINE_BYTES.saturating_sub(used),
+            ids,
+        }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Attached> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(feature = "artifacts")]
+pub(crate) async fn reattached_parts(
+    ids: Vec<String>,
+    store: &Arc<dyn crate::artifacts::ArtifactStore>,
+    scope: &str,
+    attached: &AttachedImages,
+) -> Vec<crate::core::content::ContentPart> {
+    let mut parts = Vec::with_capacity(ids.len());
+    for id in ids {
+        parts.push(reattached_part(id, store, scope, attached).await);
+    }
+    parts
+}
+
+#[cfg(feature = "artifacts")]
+async fn reattached_part(
+    id: String,
+    store: &Arc<dyn crate::artifacts::ArtifactStore>,
+    scope: &str,
+    attached: &AttachedImages,
+) -> crate::core::content::ContentPart {
+    use crate::core::content::{ContentPart, ContentSource};
+
+    let bytes_left = {
+        let attached = attached.lock();
+        if attached.ids.contains(&id) {
+            return ContentPart::text(format!("(artifact {id} is already attached above)"));
+        }
+        attached.bytes_left
+    };
+    if bytes_left == 0 {
+        return ContentPart::text(format!(
+            "(artifact {id} was not attached: this turn already carries all the images it can)"
+        ));
+    }
+    let art = match store.load_bounded(scope, &id, bytes_left).await {
+        Ok(art) => art,
+        Err(e) => {
+            warn!("Re-attaching artifact '{id}' failed: {e}");
+            return ContentPart::text(format!(
+                "(could not re-attach artifact {id}: it is missing, or larger than the {} KiB \
+                 this turn can still attach)",
+                bytes_left / 1024
+            ));
+        }
+    };
+    // Only images round-trip as an `image_url` data URL; a non-image sent that
+    // way is a hard provider 400 rather than graceful degradation.
+    let Some(mime_type) = crate::artifacts::inline_image_type(&art.data) else {
+        warn!(
+            "Artifact '{id}' is {}, not an inlinable image; referencing it instead of inlining",
+            art.mime_type
+        );
+        return ContentPart::text(format!(
+            "(artifact {id} is {}, which cannot be shown inline)",
+            crate::core::content::visible_mime_type(&art.mime_type)
+        ));
+    };
+    {
+        let mut attached = attached.lock();
+        attached.bytes_left = attached.bytes_left.saturating_sub(art.data.len());
+        attached.ids.insert(id.clone());
+    }
+    let mut image = ContentPart::image(ContentSource::Inline { data: art.data }, mime_type);
+    if let Some(metadata) = image.metadata_mut() {
+        metadata.insert(crate::artifacts::INLINED_ARTIFACT_KEY.into(), id.into());
+    }
+    image
+}
+
 /// Build the single tool-result message for a round (Defect 3: one multimodal
 /// `Role::Tool` message carrying the text results AND any re-injected artifact
 /// images). When artifacts are disabled, this is just a text `Role::Tool` message.
@@ -1195,7 +1320,7 @@ async fn finalize_round_message(
     mut load_ids: Vec<String>,
     artifacts: &ArtifactReinjection,
 ) -> LlmMessage {
-    use crate::core::content::{ContentPart, ContentSource};
+    use crate::core::content::ContentPart;
     use crate::models::Role;
 
     let requested = load_ids.len();
@@ -1216,36 +1341,8 @@ async fn finalize_round_message(
         )));
     }
     if let Some(store) = &artifacts.store {
-        for id in load_ids {
-            match store.load(&artifacts.scope, &id).await {
-                // Only images round-trip as an `image_url` data URL; offload also
-                // covers audio/video/file, and a non-image sent that way is a hard
-                // provider 400 rather than graceful degradation.
-                Ok(art) => match crate::artifacts::inline_image_type(&art.data) {
-                    Some(mime_type) => parts.push(ContentPart::image(
-                        ContentSource::Inline { data: art.data },
-                        mime_type,
-                    )),
-                    None => {
-                        warn!(
-                            "XmlToolExecutorStage: artifact '{id}' is {}, not an inlinable image; \
-                             referencing it instead of inlining",
-                            art.mime_type
-                        );
-                        parts.push(ContentPart::text(format!(
-                            "(artifact {id} is {}, which cannot be shown inline)",
-                            crate::core::content::visible_mime_type(&art.mime_type)
-                        )));
-                    }
-                },
-                Err(e) => {
-                    warn!("XmlToolExecutorStage: get_artifact '{id}' failed: {e}");
-                    parts.push(ContentPart::text(format!(
-                        "(could not re-attach artifact {id})"
-                    )));
-                }
-            }
-        }
+        parts
+            .extend(reattached_parts(load_ids, store, &artifacts.scope, &artifacts.attached).await);
     }
     LlmMessage::with_parts(Role::Tool, parts)
 }
@@ -2179,7 +2276,7 @@ Some text.
     #[cfg(feature = "artifacts")]
     mod artifacts_reinjection {
         use super::*;
-        use crate::artifacts::LocalArtifactStore;
+        use crate::artifacts::{ArtifactStore, LocalArtifactStore};
         use crate::core::content::ContentPart;
         use crate::models::Role;
         use std::sync::Arc;
@@ -2245,6 +2342,7 @@ Some text.
                 &ArtifactReinjection {
                     store: Some(store),
                     scope: "chan1".into(),
+                    attached: AttachedImages::in_messages(&[]),
                 },
             )
             .await;
@@ -2254,6 +2352,141 @@ Some text.
             assert_eq!(msg.content.len(), 2);
             assert!(matches!(msg.content[0], ContentPart::Text { .. }));
             assert!(matches!(msg.content[1], ContentPart::Image { .. }));
+        }
+
+        struct CountingStore {
+            inner: LocalArtifactStore,
+            loads: std::sync::Mutex<Vec<usize>>,
+        }
+
+        #[async_trait]
+        impl crate::artifacts::ArtifactStore for CountingStore {
+            async fn save(
+                &self,
+                scope: &str,
+                data: &[u8],
+                mime_type: &str,
+            ) -> Result<crate::artifacts::StoredArtifact> {
+                self.inner.save(scope, data, mime_type).await
+            }
+            async fn load(&self, scope: &str, id: &str) -> Result<crate::artifacts::Artifact> {
+                self.load_bounded(scope, id, usize::MAX).await
+            }
+            async fn load_bounded(
+                &self,
+                scope: &str,
+                id: &str,
+                max_bytes: usize,
+            ) -> Result<crate::artifacts::Artifact> {
+                self.loads.lock().unwrap().push(max_bytes);
+                self.inner.load_bounded(scope, id, max_bytes).await
+            }
+            async fn delete(&self, scope: &str, id: &str) -> Result<()> {
+                self.inner.delete(scope, id).await
+            }
+        }
+
+        fn jpeg(len: usize) -> Vec<u8> {
+            let mut data = vec![0xFF, 0xD8, 0xFF];
+            data.resize(len, 7);
+            data
+        }
+
+        async fn counting(
+            files: &[Vec<u8>],
+        ) -> (tempfile::TempDir, Arc<CountingStore>, Vec<String>) {
+            let tmp = tempfile::tempdir().unwrap();
+            let inner = LocalArtifactStore::new(tmp.path());
+            let mut ids = Vec::new();
+            for data in files {
+                ids.push(inner.save("chan1", data, "image/jpeg").await.unwrap().id);
+            }
+            let store = Arc::new(CountingStore {
+                inner,
+                loads: std::sync::Mutex::new(Vec::new()),
+            });
+            (tmp, store, ids)
+        }
+
+        fn images(parts: &[ContentPart]) -> usize {
+            parts
+                .iter()
+                .filter(|p| matches!(p, ContentPart::Image { .. }))
+                .count()
+        }
+
+        fn inlined(id: &str, len: usize) -> LlmMessage {
+            let mut image = ContentPart::image(
+                crate::core::content::ContentSource::Inline { data: jpeg(len) },
+                "image/jpeg",
+            );
+            image.metadata_mut().unwrap().insert(
+                crate::artifacts::INLINED_ARTIFACT_KEY.into(),
+                id.to_string().into(),
+            );
+            LlmMessage::with_parts(Role::User, vec![ContentPart::text("look"), image])
+        }
+
+        #[tokio::test]
+        async fn an_image_already_in_the_conversation_is_not_sent_again() {
+            let (_tmp, store, ids) = counting(&[jpeg(10)]).await;
+            let shared: Arc<dyn crate::artifacts::ArtifactStore> = store.clone();
+            let attached = AttachedImages::in_messages(&[inlined(&ids[0], 10)]);
+
+            let parts = reattached_parts(ids.clone(), &shared, "chan1", &attached).await;
+
+            assert_eq!(images(&parts), 0);
+            assert!(parts[0].as_text().unwrap().contains("already attached"));
+            assert!(store.loads.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_load_is_bounded_by_what_the_conversation_leaves() {
+            let big = crate::pipeline::stages::DEFAULT_MAX_INLINE_BYTES;
+            let (_tmp, store, ids) = counting(&[jpeg(big / 2)]).await;
+            let shared: Arc<dyn crate::artifacts::ArtifactStore> = store.clone();
+            let attached = AttachedImages::in_messages(&[inlined("other", big - 100)]);
+
+            let parts = reattached_parts(ids, &shared, "chan1", &attached).await;
+
+            assert_eq!(images(&parts), 0);
+            assert!(parts[0].as_text().unwrap().contains("larger than"));
+            assert_eq!(*store.loads.lock().unwrap(), vec![100]);
+        }
+
+        #[tokio::test]
+        async fn rounds_share_one_allowance_and_skip_what_they_attached() {
+            let big = crate::pipeline::stages::DEFAULT_MAX_INLINE_BYTES;
+            let (_tmp, store, ids) = counting(&[jpeg(big - 10), jpeg(20)]).await;
+            let shared: Arc<dyn crate::artifacts::ArtifactStore> = store.clone();
+            let attached = AttachedImages::in_messages(&[]);
+
+            let first = reattached_parts(vec![ids[0].clone()], &shared, "chan1", &attached).await;
+            let second = reattached_parts(ids.clone(), &shared, "chan1", &attached).await;
+
+            assert_eq!(images(&first), 1);
+            assert_eq!(images(&second), 0);
+            assert!(second[0].as_text().unwrap().contains("already attached"));
+            assert!(second[1].as_text().unwrap().contains("larger than"));
+            assert_eq!(*store.loads.lock().unwrap(), vec![big, 10]);
+        }
+
+        #[tokio::test]
+        async fn nothing_is_loaded_once_the_allowance_is_spent() {
+            let big = crate::pipeline::stages::DEFAULT_MAX_INLINE_BYTES;
+            let (_tmp, store, ids) = counting(&[jpeg(10)]).await;
+            let shared: Arc<dyn crate::artifacts::ArtifactStore> = store.clone();
+            let attached = AttachedImages::in_messages(&[inlined("other", big)]);
+
+            let parts = reattached_parts(ids, &shared, "chan1", &attached).await;
+
+            assert!(
+                parts[0]
+                    .as_text()
+                    .unwrap()
+                    .contains("all the images it can")
+            );
+            assert!(store.loads.lock().unwrap().is_empty());
         }
 
         #[tokio::test]
@@ -2267,6 +2500,7 @@ Some text.
                 &ArtifactReinjection {
                     store: Some(store),
                     scope: "chan1".into(),
+                    attached: AttachedImages::in_messages(&[]),
                 },
             )
             .await;
