@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::core::content::{ArtifactReference, ContentPart};
 use crate::core::context::Context;
@@ -13,7 +13,7 @@ use crate::core::prompt_text::{
 };
 use crate::llm_client::{AuthStyle, LlmClient, LlmClientConfig};
 use crate::pipeline::context::ContextProvider;
-use crate::pipeline::extensions::FramedRemoteCall;
+use crate::pipeline::extensions::{FramedRemoteCall, LocalToolCalls};
 use crate::pipeline::stages::{GenericLlmProcessor, PostProcessor};
 use crate::tools::remote::{normalize_tool_result, strip_call_attribute};
 use crate::{Auth, LlmMessage, MessageType, MindroidError, Pipeline, PipelineStage, Result};
@@ -21,6 +21,7 @@ use crate::{Auth, LlmMessage, MessageType, MindroidError, Pipeline, PipelineStag
 // ── Magickmind API types ──────────────────────────────────────────────────────
 
 const TOOL_CALL_TYPE: &str = "TOOL_CALL";
+const TOOL_RESULT_TYPE: &str = "TOOL_RESULT";
 
 #[derive(Serialize)]
 struct MagickmindSaveRequest<'a> {
@@ -186,13 +187,26 @@ impl PreparedContext {
     }
 
     /// Append the reply the turn run on `ctx` just persisted, replayed exactly
-    /// as a fetch would return it: a framed remote call the way a stored
-    /// `TOOL_CALL` replays, any other reply as
-    /// [`push_agent_reply`](Self::push_agent_reply) does.
+    /// as a fetch would return it: the turn's own tool calls and results first,
+    /// then a framed remote call the way a stored `TOOL_CALL` replays, any
+    /// other reply as [`push_agent_reply`](Self::push_agent_reply) does.
     pub fn push_agent_turn(&mut self, ctx: &Context, content: &str) {
+        if let Some(calls) = ctx.get_ext::<LocalToolCalls>() {
+            let agent_id = &ctx.agent_config.agent_id;
+            for call in &calls.0 {
+                self.insert_agent_turn(replay_agent_turn(
+                    &call.call_message(agent_id),
+                    Some(MessageType::ToolCall),
+                ));
+                self.insert_agent_turn(replay_agent_turn(
+                    &call.result_message(),
+                    Some(MessageType::ToolResult),
+                ));
+            }
+        }
         self.insert_agent_turn(replay_agent_turn(
             content,
-            FramedRemoteCall::covers(ctx, content),
+            FramedRemoteCall::covers(ctx, content).then_some(MessageType::ToolCall),
         ));
     }
 
@@ -639,25 +653,70 @@ fn is_live_turn(stored: &ChatHistoryItem, live: &str) -> bool {
                 .is_some_and(|framed| strip_call_attribute(&framed) == strip_call_attribute(live)))
 }
 
+/// A participant's typed tool traffic, as history labels it.
+enum ParticipantTool {
+    /// A result answering one of the agent's own calls, with that call's tool.
+    AnswersOwnCall(String),
+    /// A call of the participant's own, with its tool.
+    Calls(String),
+}
+
+fn participant_tool_traffic(
+    item: &ChatHistoryItem,
+    own_calls: &HashMap<String, String>,
+) -> Option<ParticipantTool> {
+    if declares(&item.message_type, MessageType::ToolResult) {
+        let (id, _) = frame_id_and_name(&item.content, "tool_result")?;
+        return own_calls
+            .get(&id)
+            .map(|name| ParticipantTool::AnswersOwnCall(name.clone()));
+    }
+    if declares(&item.message_type, MessageType::ToolCall) {
+        let (_, name) = frame_id_and_name(&item.content, "tool_call")?;
+        return Some(ParticipantTool::Calls(name));
+    }
+    None
+}
+
+/// The `tool_call_id` and tool name of a `frame` envelope, the name made safe
+/// to show in a label.
+fn frame_id_and_name(content: &str, frame: &str) -> Option<(String, String)> {
+    let envelope: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
+    if envelope.get("type")?.as_str()? != frame {
+        return None;
+    }
+    let payload = envelope.get("payload")?;
+    let id = payload.get("tool_call_id")?.as_str()?.to_string();
+    let name = escape_markup(&sanitize_line(payload.get("name")?.as_str()?));
+    (!id.is_empty() && !name.is_empty()).then_some((id, name))
+}
+
 fn declares(message_type: &str, kind: MessageType) -> bool {
     MessageType::from_wire(message_type) == Some(kind)
 }
 
-fn replay_agent_turn(content: &str, framed_call: bool) -> String {
-    framed_call
-        .then(|| replay_own_call(content))
-        .flatten()
+/// `framed` is the type the message was saved as: its body replays as a frame
+/// only when it is an envelope of that same type.
+fn replay_agent_turn(content: &str, framed: Option<MessageType>) -> String {
+    let frame = match framed {
+        Some(MessageType::ToolCall) => Some("tool_call"),
+        Some(MessageType::ToolResult) => Some("tool_result"),
+        _ => None,
+    };
+    frame
+        .and_then(|frame| replay_own_call(content, frame))
         .unwrap_or_else(|| neutralize_block(content))
 }
 
-/// The agent's own framed call, re-serialized from its parsed envelope. JSON
+/// The agent's own framed call or result, re-serialized from its parsed
+/// envelope. JSON
 /// escapes keep `<`, `>` and `&` inert without the HTML entities
 /// `neutralize_block` would leave in the model's own past call; strings are
 /// folded first, as `neutralize_block` would, so invisible controls a
 /// participant steered into the call do not replay either.
-fn replay_own_call(content: &str) -> Option<String> {
+fn replay_own_call(content: &str, frame: &str) -> Option<String> {
     let mut envelope: serde_json::Value = serde_json::from_str(content).ok()?;
-    if envelope.get("type")?.as_str()? != "tool_call" {
+    if envelope.get("type")?.as_str()? != frame {
         return None;
     }
     fold_strings(&mut envelope);
@@ -707,6 +766,21 @@ fn convert_context_response(
     // passing that order through puts the oldest turn last and inverts the
     // conversation: asked what a user said most recently, the model answers with
     // the oldest thing it can see.
+    // The agent's own calls, by `tool_call_id`, with their tool's name: what a
+    // participant's result answers, so it replays as that call's answer.
+    let own_calls: HashMap<String, String> = self_id
+        .map(|id| {
+            resp.chat_history
+                .iter()
+                .filter(|item| {
+                    item.sent_by_user_id == id
+                        && declares(&item.message_type, MessageType::ToolCall)
+                })
+                .filter_map(|item| frame_id_and_name(&item.content, "tool_call"))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for item in resp.chat_history.iter().rev() {
         if let Some(id) = self_id
             && item.sent_by_user_id == id
@@ -717,9 +791,12 @@ fn convert_context_response(
             // `MagickmindPersistence` saves the response verbatim, so it would
             // return here as the model's own apparent tool execution. A typed
             // call replays as inert JSON, anything else escaped.
+            let framed = [MessageType::ToolCall, MessageType::ToolResult]
+                .into_iter()
+                .find(|kind| declares(&item.message_type, kind.clone()));
             messages.push(LlmMessage::assistant(replay_agent_turn(
                 &item.content,
-                declares(&item.message_type, MessageType::ToolCall),
+                framed,
             )));
             continue;
         }
@@ -733,11 +810,16 @@ fn convert_context_response(
         // line — no more than the sender could say aloud in chat, and visible
         // to anyone reading it, unlike the invisible controls `sanitize_block`
         // folds.
-        let mut message = LlmMessage::user(format!(
-            "[{}]: {}",
-            escape_markup(&sanitize_line(item.speaker())),
-            neutralize_block(&item.content)
-        ));
+        let speaker = escape_markup(&sanitize_line(item.speaker()));
+        let label = match participant_tool_traffic(item, &own_calls) {
+            Some(ParticipantTool::AnswersOwnCall(name)) => {
+                format!("{speaker}, answering your {name} call")
+            }
+            Some(ParticipantTool::Calls(name)) => format!("{speaker} called {name}"),
+            None => speaker,
+        };
+        let mut message =
+            LlmMessage::user(format!("[{label}]: {}", neutralize_block(&item.content)));
         message.content.extend(item.artifact_data.iter().cloned());
         messages.push(message);
     }
@@ -757,7 +839,10 @@ fn convert_context_response(
             "Attribution: each conversation message is prefixed with its sender's \
              display name in square brackets, like `[Alice]: hello`. The bracketed \
              name is who wrote that message — use it to know who is speaking and \
-             to answer questions about names or who said what."
+             to answer questions about names or who said what. A tool call or result \
+             in your own turns is yours: you called that tool. `[Alice, answering \
+             your take_photo call]` is the result of your call, which Alice's \
+             client ran; `[Alice called take_photo]` is a call Alice made."
                 .to_string(),
         );
     }
@@ -851,6 +936,39 @@ impl PipelineStage for MagickmindPersistence {
         if magickspace_id.is_empty() {
             debug!("MagickmindPersistence: no magickspace_id in message, skipping save");
             return Ok(());
+        }
+
+        // The turn's own tool calls go first, each threaded to the message it
+        // answers, so the history reads in the order things happened. One that
+        // fails to save is logged: the reply still goes out.
+        let agent_id = &ctx.agent_config.agent_id;
+        if let Some(calls) = ctx.get_ext::<LocalToolCalls>() {
+            for call in &calls.0 {
+                let saved = async {
+                    let call_id = self
+                        .magickmind
+                        .save_typed_message(
+                            magickspace_id,
+                            agent_id,
+                            &call.call_message(agent_id),
+                            Some(&ctx.message.id),
+                            Some(TOOL_CALL_TYPE),
+                        )
+                        .await?;
+                    self.magickmind
+                        .save_typed_message(
+                            magickspace_id,
+                            agent_id,
+                            &call.result_message(),
+                            call_id.as_deref(),
+                            Some(TOOL_RESULT_TYPE),
+                        )
+                        .await
+                };
+                if let Err(e) = saved.await {
+                    warn!(tool = %call.name, "MagickmindPersistence: the turn's tool call was not saved: {e}");
+                }
+            }
         }
 
         let content = ctx.response.as_deref().unwrap_or("").to_string();
@@ -1587,6 +1705,94 @@ mod tests {
 
     const ENVELOPE: &str = r#"{"type":"tool_call","payload":{"name":"drive"}}"#;
 
+    /// Accepts `n` posts, answering each with the next id (`m1`, `m2`, ...),
+    /// and hands back their bodies in order.
+    async fn capture_posts(n: usize) -> (String, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for i in 1..=n {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let body = read_request_body(&mut sock).await;
+                let reply = format!(r#"{{"id":"m{i}"}}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                bodies.push(serde_json::from_str(&body).unwrap());
+            }
+            bodies
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn the_turns_tool_calls_are_saved_threaded_ahead_of_its_reply() {
+        let (base, server) = capture_posts(3).await;
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        let client = Arc::new(MagickmindClient::try_new(base, identity, true).unwrap());
+        let mut message = crate::models::Message::new("what did I say?", "u1", "chan1");
+        message
+            .metadata
+            .insert("magickspace_id".into(), serde_json::json!("space-1"));
+        let inbound = message.id.clone();
+        let agent = crate::config::AgentConfig {
+            agent_id: "a1".into(),
+            ..Default::default()
+        };
+        let mut ctx = Context::new(Arc::new(message), Arc::new(agent));
+        ctx.set_ext(LocalToolCalls(vec![
+            crate::pipeline::extensions::LocalToolCall {
+                id: "local-1".into(),
+                name: "search_episodic_memory".into(),
+                arguments: serde_json::json!({"query": "cats"}),
+                result: "You said you like cats.".into(),
+            },
+        ]));
+        ctx.response = Some("You said you like cats.".into());
+
+        MagickmindPersistence::new(client)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        let [call, result, reply] =
+            <[serde_json::Value; 3]>::try_from(server.await.unwrap()).unwrap();
+
+        assert_eq!(call["message_type"], "TOOL_CALL");
+        assert_eq!(call["reply_to_message_id"], inbound.as_str());
+        let framed: serde_json::Value =
+            serde_json::from_str(call["content"].as_str().unwrap()).unwrap();
+        assert_eq!(framed["payload"]["name"], "search_episodic_memory");
+        assert_eq!(framed["payload"]["args"]["query"], "cats");
+        assert_eq!(framed["payload"]["executor_id"], "a1");
+        assert_eq!(result["message_type"], "TOOL_RESULT");
+        assert_eq!(result["reply_to_message_id"], "m1");
+        let framed: serde_json::Value =
+            serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(framed["payload"]["tool_call_id"], "local-1");
+        assert_eq!(framed["payload"]["content"], "You said you like cats.");
+        assert_eq!(reply["content"], "You said you like cats.");
+        assert_eq!(reply["reply_to_message_id"], inbound.as_str());
+        assert!(reply["message_type"].is_null());
+    }
+
+    #[test]
+    fn a_long_result_is_cut_on_a_character_boundary() {
+        let call = crate::pipeline::extensions::LocalToolCall {
+            id: "c".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({}),
+            result: "é".repeat(crate::pipeline::extensions::MAX_RECORDED_RESULT_BYTES),
+        };
+        let framed: serde_json::Value = serde_json::from_str(&call.result_message()).unwrap();
+        let content = framed["payload"]["content"].as_str().unwrap();
+        assert!(content.ends_with(" [truncated]"));
+        assert!(content.len() <= crate::pipeline::extensions::MAX_RECORDED_RESULT_BYTES + 12);
+    }
+
     async fn persist(prepare: impl FnOnce(&mut Context)) -> serde_json::Value {
         let (base, server) = capture_one_post().await;
         let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
@@ -1720,6 +1926,116 @@ mod tests {
             "the fallback is the escaped body"
         );
         assert!(rendered.len() <= MAX_BLOCK_BYTES);
+    }
+
+    /// The history `items` (oldest first) replays as, for agent `a1`.
+    fn replayed(items: Vec<ChatHistoryItem>) -> Vec<String> {
+        let resp = PrepareContextResponse {
+            chat_history: items.into_iter().rev().collect(),
+            fetcher: String::new(),
+            corpus: Vec::new(),
+            corpora: Vec::new(),
+        };
+        convert_context_response(resp, Some("a1"), false)
+            .messages
+            .iter()
+            .map(LlmMessage::text)
+            .collect()
+    }
+
+    fn typed(from: &str, name: &str, content: &str, message_type: &str) -> ChatHistoryItem {
+        ChatHistoryItem {
+            sent_by_user_id: from.into(),
+            sent_by_user_name: name.into(),
+            content: content.into(),
+            message_type: message_type.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_result_answering_the_agents_call_replays_as_that_calls_answer() {
+        let call =
+            r#"{"type":"tool_call","payload":{"tool_call_id":"c1","name":"take_photo","args":{}}}"#;
+        let result = r#"{"type":"tool_result","payload":{"tool_call_id":"c1","name":"take_photo","content":"photo captured"}}"#;
+        let elsewhere = r#"{"type":"tool_result","payload":{"tool_call_id":"c9","name":"drive","content":"done"}}"#;
+
+        let texts = replayed(vec![
+            typed("u1", "Lynn", "take a photo", "TEXT"),
+            typed("a1", "Waxwell", call, "TOOL_CALL"),
+            typed("u1", "Lynn", result, "TOOL_RESULT"),
+            typed("u1", "Lynn", elsewhere, "TOOL_RESULT"),
+        ]);
+
+        assert!(
+            texts[2].starts_with("[Lynn, answering your take_photo call]: "),
+            "{}",
+            texts[2]
+        );
+        assert!(texts[3].starts_with("[Lynn]: "), "{}", texts[3]);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("is the result of your call")),
+            "the attribution note explains the label"
+        );
+    }
+
+    #[test]
+    fn a_participants_own_call_replays_as_theirs() {
+        let call =
+            r#"{"type":"tool_call","payload":{"tool_call_id":"b1","name":"drive<b>","args":{}}}"#;
+
+        let texts = replayed(vec![typed("b1", "Bob", call, "TOOL_CALL")]);
+
+        let call_line = texts.iter().find(|t| t.contains("called")).unwrap();
+        assert!(
+            call_line.starts_with("[Bob called drive&lt;b&gt;]: "),
+            "{call_line}"
+        );
+    }
+
+    #[test]
+    fn the_agents_own_result_replays_as_inert_json() {
+        let envelope = r#"{"type":"tool_result","payload":{"tool_call_id":"c1","name":"lookup","content":"R&D <b>"}}"#;
+
+        let rendered = own_call(envelope, "TOOL_RESULT");
+
+        assert!(!rendered.contains("&amp;"), "{rendered}");
+        assert!(!rendered.contains('<'), "{rendered}");
+        let replayed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(replayed["payload"]["content"], "R&D <b>");
+    }
+
+    #[test]
+    fn a_cached_turn_replays_its_tool_calls_like_a_fetch() {
+        let mut ctx = Context::new(
+            Arc::new(crate::models::Message::new("hi", "u1", "chan1")),
+            Arc::new(crate::config::AgentConfig {
+                agent_id: "a1".into(),
+                ..Default::default()
+            }),
+        );
+        let call = crate::pipeline::extensions::LocalToolCall {
+            id: "local-1".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({"q": "R&D"}),
+            result: "Found it.".into(),
+        };
+        ctx.set_ext(LocalToolCalls(vec![call.clone()]));
+
+        let mut cached = PreparedContext::new(Vec::new(), Vec::new());
+        cached.push_agent_turn(&ctx, "Here it is.");
+
+        let texts: Vec<String> = cached.messages.iter().map(LlmMessage::text).collect();
+        assert_eq!(
+            texts,
+            [
+                own_call(&call.call_message("a1"), "TOOL_CALL"),
+                own_call(&call.result_message(), "TOOL_RESULT"),
+                neutralize_block("Here it is."),
+            ]
+        );
     }
 
     #[test]

@@ -145,6 +145,11 @@ Implement `Tool` trait → register in `ToolRegistry` → whichever executor sta
 async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
 ```
 
+A tool whose result includes images (a camera, a screenshot) also overrides
+`execute_with_images`. Only `OmniSession` sends those images, through
+`OmniProvider::send_tool_result_with_images`: Gemini Live puts them in the
+function response's `parts`, and providers without image support drop them.
+
 `ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
 extension map for backend data (credentials, agent id) set by a stage. Never take
 identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0005
@@ -190,6 +195,12 @@ executor's `pending()` set to also resume the turn with a synthesized
 never responded rather than leaving the conversation silent. Deadlines are
 process-local — a restart forgets outstanding calls. See
 `docs/design/remote-tool-reliability.md`.
+
+The JSON stage records the turn's local calls and their results in
+`LocalToolCalls` (a context extension; `with_recorded_calls(false)` turns it
+off); `MagickmindPersistence` saves each as
+a `TOOL_CALL` and a threaded `TOOL_RESULT` ahead of the reply, naming the agent
+as the call's executor. A host that saves its own replies should do the same.
 
 `XmlToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling

@@ -10,6 +10,31 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- Tool results that carry images. `Tool::execute_with_images` returns a
+  `ToolOutput` (text plus `ToolImage`s); its default is `execute`'s text and no
+  images. `OmniSession` sends a tool's images to the new
+  `OmniProvider::send_tool_result_with_images`, after checking each one: its
+  bytes' type replaces the declared one, and an image a model would not take,
+  one over 2 MiB, or one past the fourth is dropped, with a note in the result's
+  text. `GeminiLiveProvider` sends them as `inlineData` in the function
+  response's `parts`; the default, for every other provider, says in the result
+  that they could not be shown. `ToolOutput` and `ToolImage` are
+  `#[non_exhaustive]`: build them with `ToolOutput::new(..).with_images(..)` and
+  `ToolImage::new`.
+- `VoiceGateBuilder::dynamic_tools(registry, declare)` (with `DeclareTools`):
+  each session the gate opens offers the registry's tools as they stand,
+  declared with the provider's renderer, so tools that change during a stream
+  reach the next session. Remote tools are left out, since a session runs every
+  call itself; `build` refuses `dynamic_tools` together with `tools`.
+- `artifacts::inline_image_type` is public, and lives in `core::content` so omni
+  builds without `artifacts` can use it.
+- The turn's own tool calls are saved. `ToolExecutorStage` records each call it
+  runs itself, with its result, in `LocalToolCalls` (on by default;
+  `with_recorded_calls(false)` turns it off; a tool that ends the turn is left
+  out). `MagickmindPersistence` saves each as a `TOOL_CALL`, naming the agent as
+  its `executor_id`, and a threaded `TOOL_RESULT` (cut to 4 KiB) ahead of the
+  reply, and a cached turn replays them as a fetch would.
+
 - `InlineArtifacts` (feature `artifacts`): loads the images an inbound message
   attaches by reference (`artifact_data`) and puts them inline on the current user
   turn, so the model sees a photo the turn it arrives instead of calling
@@ -290,6 +315,13 @@ truncated.
 
 ### Changed
 
+- History says who called a tool. A participant's `TOOL_RESULT` answering one of
+  the agent's own calls replays as `[Lynn, answering your take_photo call]: ...`,
+  a participant's own `TOOL_CALL` as `[Bob called drive]: ...`, and the agent's
+  own `TOOL_RESULT` as inert JSON like its calls. The attribution note explains
+  the labels.
+- A Gemini Live close frame with an error code arrives as `OmniEvent::Error`
+  instead of ending the event stream as if the session had closed normally.
 - `MagickmindContextConfig::default()` no longer requests pelican:
   `include_pelican` is `false`. The backend retired the fetcher and ignored the
   field; set it to `true` to send the old request.

@@ -15,6 +15,8 @@ use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use crate::core::error::MindroidError;
@@ -22,7 +24,7 @@ use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
     AudioChunk, HistoryTurn, OmniConfig, OmniEvent, Role, TranscriptSource, TurnDetection, Usage,
 };
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolImage};
 
 /// Google AI Studio `BidiGenerateContent` WebSocket endpoint.
 pub const DEFAULT_ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -361,6 +363,12 @@ impl OmniProvider for GeminiLiveProvider {
                         break;
                     }
                 };
+                if let WsMessage::Close(close) = &frame {
+                    if let Some(error) = close_error(close.as_ref()) {
+                        let _ = event_tx.send(OmniEvent::Error(Arc::new(error))).await;
+                    }
+                    break;
+                }
                 let Some(value) = frame_to_json(frame) else {
                     continue;
                 };
@@ -415,6 +423,18 @@ impl OmniProvider for GeminiLiveProvider {
     }
 
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError> {
+        self.send_tool_result_with_images(call_id, result, Vec::new())
+            .await
+    }
+
+    /// The images ride the function response's `parts`: the model ignores a
+    /// `realtimeInput` frame sent beside the response.
+    async fn send_tool_result_with_images(
+        &self,
+        call_id: &str,
+        result: Value,
+        images: Vec<ToolImage>,
+    ) -> Result<(), MindroidError> {
         let name = self
             .pending_calls
             .remove(call_id)
@@ -427,10 +447,21 @@ impl OmniProvider for GeminiLiveProvider {
             other => json!({ "result": other }),
         };
 
+        let mut function_response = json!({ "id": call_id, "name": name, "response": response });
+        if !images.is_empty() {
+            function_response["parts"] = images
+                .iter()
+                .map(|image| {
+                    json!({ "inlineData": {
+                        "mimeType": image.mime_type,
+                        "data": STANDARD.encode(&image.data),
+                    } })
+                })
+                .collect();
+        }
+
         self.send_json(json!({
-            "toolResponse": {
-                "functionResponses": [{ "id": call_id, "name": name, "response": response }]
-            }
+            "toolResponse": { "functionResponses": [function_response] }
         }))
         .await
     }
@@ -494,6 +525,19 @@ impl TranscriptAcc {
             TranscriptSource::Output => &mut self.output,
         }
     }
+}
+
+/// The error a close frame reports: anything but a normal closure, which is
+/// how Gemini rejects a frame it cannot take (an image it refuses, say).
+fn close_error(close: Option<&CloseFrame<'_>>) -> Option<MindroidError> {
+    let close = close?;
+    (close.code != CloseCode::Normal).then(|| {
+        transport(format!(
+            "Gemini Live closed the session: {} {}",
+            u16::from(close.code),
+            close.reason
+        ))
+    })
 }
 
 fn frame_to_json(frame: WsMessage) -> Option<Value> {
@@ -1062,6 +1106,73 @@ mod tests {
             frame["toolResponse"]["functionResponses"][0]["response"]["result"],
             "sunny"
         );
+        assert!(
+            frame["toolResponse"]["functionResponses"][0]
+                .get("parts")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_images_ride_the_function_response_parts() {
+        let (mut provider, mut seen) = connected(|frame| {
+            if frame.get("realtimeInput").is_some() {
+                vec![json!({ "toolCall": { "functionCalls": [{ "id": "c1", "name": "take_photo" }] } })]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let _setup = seen.recv().await;
+
+        let mut events = provider.events();
+        provider.end_audio_stream().await.unwrap();
+        let _echo = seen.recv().await;
+        let _call = events.next().await;
+
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+        provider
+            .send_tool_result_with_images(
+                "c1",
+                Value::String("photo taken".into()),
+                vec![ToolImage {
+                    mime_type: "image/jpeg".into(),
+                    data: jpeg.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let frame = seen.recv().await.expect("toolResponse frame");
+        let response = &frame["toolResponse"]["functionResponses"][0];
+        assert_eq!(response["name"], "take_photo");
+        assert_eq!(response["response"]["result"], "photo taken");
+        let inline = &response["parts"][0]["inlineData"];
+        assert_eq!(inline["mimeType"], "image/jpeg");
+        assert_eq!(inline["data"], STANDARD.encode(&jpeg));
+        assert_eq!(
+            frame.as_object().unwrap().len(),
+            1,
+            "no frame beside the toolResponse"
+        );
+    }
+
+    #[test]
+    fn a_close_frame_with_an_error_code_is_an_error() {
+        let refused = CloseFrame {
+            code: CloseCode::Invalid,
+            reason: "Request contains an invalid argument.".into(),
+        };
+        let normal = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        };
+
+        let error = close_error(Some(&refused)).expect("an error").to_string();
+        assert!(error.contains("1007"), "{error}");
+        assert!(error.contains("invalid argument"), "{error}");
+        assert!(close_error(Some(&normal)).is_none());
+        assert!(close_error(None).is_none());
     }
 
     #[test]

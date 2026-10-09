@@ -45,6 +45,52 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
+/// What [`Tool::execute_with_images`] returns. Build it with [`ToolOutput::new`].
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<ToolImage>,
+}
+
+impl ToolOutput {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
+        self
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+/// An image a tool returns for the model to see, as raw bytes. Build it with
+/// [`ToolImage::new`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ToolImage {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+impl ToolImage {
+    pub fn new(mime_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data,
+        }
+    }
+}
+
 /// Per-invocation context passed to a tool: the message's channel/sender plus a
 /// typed extension map. Backend-specific data (credentials, agent id) rides in
 /// the map, set by a stage, so tools stay transport-agnostic.
@@ -127,6 +173,13 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with parsed arguments and per-invocation context.
     /// Returns output as a plain string.
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>;
+
+    /// [`execute`](Self::execute), plus images the model should see with the
+    /// result. Only omni sessions send the images, and only to a provider that
+    /// accepts them. The default returns `execute`'s text and no images.
+    async fn execute_with_images(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        Ok(self.execute(args, ctx).await?.into())
+    }
 
     /// Whether this tool is executed by the client rather than the runtime.
     ///

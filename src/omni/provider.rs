@@ -1,5 +1,6 @@
 use crate::core::error::MindroidError;
 use crate::omni::types::{AudioChunk, OmniConfig, OmniEvent};
+use crate::tools::ToolImage;
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::Value;
@@ -12,11 +13,40 @@ pub trait OmniProvider: Send + Sync + 'static {
     async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError>;
     async fn send_text(&self, text: &str) -> Result<(), MindroidError>;
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError>;
+    /// [`send_tool_result`](Self::send_tool_result) with images the model should
+    /// see alongside the result. The default cannot show them: it drops them and
+    /// tells the model, so it does not describe a photo it never saw.
+    async fn send_tool_result_with_images(
+        &self,
+        call_id: &str,
+        result: Value,
+        images: Vec<ToolImage>,
+    ) -> Result<(), MindroidError> {
+        let result = match images.len() {
+            0 => result,
+            n => images_not_shown(result, n),
+        };
+        self.send_tool_result(call_id, result).await
+    }
     async fn end_audio_stream(&self) -> Result<(), MindroidError>;
     /// Returns an OWNED stream (no lifetime tie to &self).
     /// Provider internally uses mpsc — call events() once before the select! loop.
     fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>>;
     async fn disconnect(&mut self) -> Result<(), MindroidError>;
+}
+
+/// `result` noting that `n` images could not be shown with it.
+fn images_not_shown(result: Value, n: usize) -> Value {
+    match result {
+        Value::String(text) => {
+            Value::String(format!("{text}\n({n} image(s) could not be shown to you)"))
+        }
+        Value::Object(mut fields) => {
+            fields.insert("images_not_shown".into(), n.into());
+            Value::Object(fields)
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -209,5 +239,46 @@ mod tests {
         assert_eq!(results[0].1, json!({ "temp": 21 }));
         assert_eq!(results[1].0, "call-99");
         assert_eq!(results[1].1, json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_image_support_says_the_images_were_not_shown() {
+        let (provider, _tx) = MockOmniProvider::new();
+        let image = crate::tools::ToolImage {
+            mime_type: "image/jpeg".into(),
+            data: vec![0xFF, 0xD8, 0xFF],
+        };
+
+        provider
+            .send_tool_result_with_images("call-1", json!("photo taken"), vec![image])
+            .await
+            .unwrap();
+
+        provider
+            .send_tool_result_with_images(
+                "call-2",
+                json!({"status": "ok"}),
+                vec![crate::tools::ToolImage::new(
+                    "image/jpeg",
+                    vec![0xFF, 0xD8, 0xFF],
+                )],
+            )
+            .await
+            .unwrap();
+
+        let results = provider.recorded_tool_results.lock().unwrap();
+        assert_eq!(
+            *results,
+            vec![
+                (
+                    "call-1".to_string(),
+                    json!("photo taken\n(1 image(s) could not be shown to you)")
+                ),
+                (
+                    "call-2".to_string(),
+                    json!({"status": "ok", "images_not_shown": 1})
+                ),
+            ]
+        );
     }
 }
