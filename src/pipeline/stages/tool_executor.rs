@@ -35,7 +35,7 @@ use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall, ToolsChatOutcome, ToolsStreamEvent};
 use crate::models::StreamEvent;
-use crate::pipeline::extensions::FramedRemoteCall;
+use crate::pipeline::extensions::{FramedRemoteCall, LocalToolCall, LocalToolCalls};
 use crate::pipeline::{PipelineStage, StreamingStage};
 use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
 
@@ -54,6 +54,7 @@ pub struct ToolExecutorStage {
     max_iterations: usize,
     parallel_tool_calls: bool,
     streaming: bool,
+    record_local_calls: bool,
     pending: PendingRemoteCalls,
 }
 
@@ -70,6 +71,7 @@ impl ToolExecutorStage {
             registry,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             parallel_tool_calls: false,
+            record_local_calls: true,
             streaming: false,
             pending: PendingRemoteCalls::default(),
         }
@@ -90,6 +92,13 @@ impl ToolExecutorStage {
     /// out of order.
     pub fn with_parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel_tool_calls = parallel;
+        self
+    }
+
+    /// Record the calls the stage runs itself, with their results, in the
+    /// turn's [`LocalToolCalls`] for whoever saves the turn. On by default.
+    pub fn with_recorded_calls(mut self, record: bool) -> Self {
+        self.record_local_calls = record;
         self
     }
 
@@ -556,6 +565,13 @@ impl ToolExecutorStage {
         Ok((LoopOutcome::Answer(summary), all_events))
     }
 
+    fn record(&self, ctx: &mut Context, events: &[StreamEvent]) {
+        if self.record_local_calls {
+            let registry = registry_for_turn(ctx, &self.registry);
+            record_local_calls(ctx, events, &registry);
+        }
+    }
+
     /// Out of iterations: ask for an answer from what the loop gathered.
     async fn summarize(&self, mut messages: Vec<ChatCompletionRequestMessage>) -> Result<String> {
         tracing::warn!(
@@ -595,10 +611,43 @@ impl PipelineStage for ToolExecutorStage {
         if self.gate_dropped(ctx).await? {
             return Ok(());
         }
-        let (outcome, _events) = self.run_loop(ctx).await?;
+        let (outcome, events) = self.run_loop(ctx).await?;
+        self.record(ctx, &events);
         respond_with(ctx, outcome);
         Ok(())
     }
+}
+
+/// Add the calls `events` show ran here (a call followed by its result) to the
+/// turn's [`LocalToolCalls`].
+fn record_local_calls(ctx: &mut Context, events: &[StreamEvent], registry: &ToolRegistry) {
+    let ran: Vec<LocalToolCall> = events
+        .windows(2)
+        .filter_map(|pair| match pair {
+            [
+                StreamEvent::ToolCall { name, arguments },
+                StreamEvent::ToolResult {
+                    name: answered,
+                    result,
+                },
+            ] if name == answered && !registry.get(name).is_some_and(|t| t.ends_turn()) => {
+                Some(LocalToolCall {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.clone(),
+                    arguments: serde_json::from_str(arguments)
+                        .unwrap_or_else(|_| serde_json::Value::String(arguments.clone())),
+                    result: result.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    if ran.is_empty() {
+        return;
+    }
+    let mut calls = ctx.take_ext::<LocalToolCalls>().unwrap_or_default();
+    calls.0.extend(ran);
+    ctx.set_ext(calls);
 }
 
 fn respond_with(ctx: &mut Context, outcome: LoopOutcome) -> String {
@@ -689,6 +738,7 @@ impl StreamingStage for ToolExecutorStage {
                             return;
                         }
                     };
+                    self.record(ctx, &round.events);
                     for event in round.events {
                         yield event;
                     }
@@ -736,6 +786,7 @@ impl StreamingStage for ToolExecutorStage {
                     yield StreamEvent::Error { message: error.to_string() };
                 }
                 Ok((outcome, events)) => {
+                    self.record(ctx, &events);
                     for event in events {
                         yield event;
                     }
@@ -922,6 +973,110 @@ mod tests {
             Arc::new(crate::models::Message::new("hi", "client", "chan1")),
             Arc::new(crate::config::AgentConfig::default()),
         )
+    }
+
+    struct Recall;
+    #[async_trait]
+    impl Tool for Recall {
+        fn name(&self) -> &str {
+            "recall"
+        }
+        fn description(&self) -> &str {
+            "Look something up"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {"q": {"type": "string"}}})
+        }
+        async fn execute(&self, args: serde_json::Value, _: &ToolContext) -> Result<String> {
+            Ok(format!("Found: {}", args["q"].as_str().unwrap_or_default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_turns_local_calls_are_recorded_with_their_results() {
+        use futures::StreamExt;
+
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let lookup = completion(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "call-1", "type": "function",
+                    "function": {"name": "recall", "arguments": "{\"q\":\"cats\"}"}}]
+            }));
+            let answer = completion(json!({"role": "assistant", "content": "Cats are great."}));
+            let server = serve_completions(listener, vec![lookup, answer]);
+            let stage = ToolExecutorStage::new(
+                stub_client(addr),
+                Arc::new(ToolRegistry::new().register(Recall)),
+            );
+            let mut ctx = fresh_ctx();
+
+            if streaming {
+                let _: Vec<StreamEvent> = stage.stream(&mut ctx).collect().await;
+            } else {
+                stage.process(&mut ctx).await.unwrap();
+            }
+            server.await.unwrap();
+
+            let calls = &ctx.get_ext::<LocalToolCalls>().expect("recorded").0;
+            assert_eq!(calls.len(), 1, "streaming={streaming}");
+            assert_eq!(calls[0].name, "recall");
+            assert_eq!(calls[0].arguments, json!({"q": "cats"}));
+            assert_eq!(calls[0].result, "Found: cats");
+            assert_eq!(ctx.response.as_deref(), Some("Cats are great."));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stage_told_not_to_records_nothing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recall = completion(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "call-1", "type": "function",
+                "function": {"name": "recall", "arguments": "{}"}}]
+        }));
+        let answer = completion(json!({"role": "assistant", "content": "Done."}));
+        let server = serve_completions(listener, vec![recall, answer]);
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Recall)),
+        )
+        .with_recorded_calls(false);
+        let mut ctx = fresh_ctx();
+
+        stage.process(&mut ctx).await.unwrap();
+        server.await.unwrap();
+
+        assert!(ctx.get_ext::<LocalToolCalls>().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_delivers_the_reply_is_not_recorded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_completions(listener, vec![deliver_round(r#"{"msg": "hi"}"#, "")]);
+        let stage = ToolExecutorStage::new(
+            stub_client(addr),
+            Arc::new(ToolRegistry::new().register(Deliver)),
+        );
+        let mut ctx = fresh_ctx();
+
+        stage.process(&mut ctx).await.unwrap();
+        server.await.unwrap();
+
+        let names: Vec<&str> = ctx
+            .get_ext::<LocalToolCalls>()
+            .map(|c| c.0.iter().map(|call| call.name.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            names,
+            ["nope"],
+            "the unknown tool ran here and failed; deliver ends the turn"
+        );
     }
 
     #[tokio::test]
@@ -1630,6 +1785,8 @@ mod tests {
         );
         assert_eq!(messages[messages.len() - 1]["tool_call_id"], "c1");
         assert_eq!(messages[messages.len() - 1]["content"], "north gate");
+        let recorded = &ctx.get_ext::<LocalToolCalls>().expect("recorded").0;
+        assert_eq!(recorded[0].result, "north gate");
     }
 
     #[tokio::test]

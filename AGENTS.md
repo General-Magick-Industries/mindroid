@@ -196,6 +196,12 @@ never responded rather than leaving the conversation silent. Deadlines are
 process-local — a restart forgets outstanding calls. See
 `docs/design/remote-tool-reliability.md`.
 
+The JSON stage records the turn's local calls and their results in
+`LocalToolCalls` (a context extension; `with_recorded_calls(false)` turns it
+off); `MagickmindPersistence` saves each as
+a `TOOL_CALL` and a threaded `TOOL_RESULT` ahead of the reply, naming the agent
+as the call's executor. A host that saves its own replies should do the same.
+
 `XmlToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling
 mangle the XML format, and an unparseable call falls through as the final answer

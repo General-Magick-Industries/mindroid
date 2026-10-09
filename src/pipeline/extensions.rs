@@ -62,6 +62,66 @@ impl FramedRemoteCall {
     }
 }
 
+/// Longest tool result kept in a turn's history; the rest is cut off.
+pub const MAX_RECORDED_RESULT_BYTES: usize = 4 * 1024;
+
+/// A tool call the turn's [`ToolExecutorStage`] ran itself, with its result.
+/// A call that leaves the process (a remote tool) is not one, nor is a call to
+/// a tool that delivers the reply itself ([`Tool::ends_turn`]).
+///
+/// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
+/// [`Tool::ends_turn`]: crate::tools::Tool::ends_turn
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub result: String,
+}
+
+impl LocalToolCall {
+    /// The call as the agent's `TOOL_CALL` message: a framed call that names
+    /// `agent_id` as its executor, so a reader waiting on a device's result
+    /// knows not to.
+    pub fn call_message(&self, agent_id: &str) -> String {
+        serde_json::json!({
+            "type": "tool_call",
+            "payload": {
+                "tool_call_id": self.id,
+                "name": self.name,
+                "args": self.arguments,
+                "executor_id": agent_id,
+            }
+        })
+        .to_string()
+    }
+
+    /// The result as its `TOOL_RESULT` message, cut to
+    /// [`MAX_RECORDED_RESULT_BYTES`].
+    pub fn result_message(&self) -> String {
+        let mut end = self.result.len().min(MAX_RECORDED_RESULT_BYTES);
+        while !self.result.is_char_boundary(end) {
+            end -= 1;
+        }
+        let content = if end < self.result.len() {
+            format!("{} [truncated]", &self.result[..end])
+        } else {
+            self.result.clone()
+        };
+        serde_json::json!({
+            "type": "tool_result",
+            "payload": { "tool_call_id": self.id, "name": self.name, "content": content }
+        })
+        .to_string()
+    }
+}
+
+/// The turn's [`LocalToolCall`]s, in the order they ran. Whoever saves the turn
+/// saves them ahead of its reply, as `MagickmindPersistence` does, so the
+/// conversation's history holds what the agent looked up.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalToolCalls(pub Vec<LocalToolCall>);
+
 /// A single binary attachment (image, audio, video, or arbitrary file) to send
 /// to the LLM, stored in [`PipelineContext`] extensions as part of [`FileInputs`].
 ///
