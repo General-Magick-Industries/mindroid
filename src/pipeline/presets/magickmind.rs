@@ -653,6 +653,44 @@ fn is_live_turn(stored: &ChatHistoryItem, live: &str) -> bool {
                 .is_some_and(|framed| strip_call_attribute(&framed) == strip_call_attribute(live)))
 }
 
+/// A participant's typed tool traffic, as history labels it.
+enum ParticipantTool {
+    /// A result answering one of the agent's own calls, with that call's tool.
+    AnswersOwnCall(String),
+    /// A call of the participant's own, with its tool.
+    Calls(String),
+}
+
+fn participant_tool_traffic(
+    item: &ChatHistoryItem,
+    own_calls: &HashMap<String, String>,
+) -> Option<ParticipantTool> {
+    if declares(&item.message_type, MessageType::ToolResult) {
+        let (id, _) = frame_id_and_name(&item.content, "tool_result")?;
+        return own_calls
+            .get(&id)
+            .map(|name| ParticipantTool::AnswersOwnCall(name.clone()));
+    }
+    if declares(&item.message_type, MessageType::ToolCall) {
+        let (_, name) = frame_id_and_name(&item.content, "tool_call")?;
+        return Some(ParticipantTool::Calls(name));
+    }
+    None
+}
+
+/// The `tool_call_id` and tool name of a `frame` envelope, the name made safe
+/// to show in a label.
+fn frame_id_and_name(content: &str, frame: &str) -> Option<(String, String)> {
+    let envelope: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
+    if envelope.get("type")?.as_str()? != frame {
+        return None;
+    }
+    let payload = envelope.get("payload")?;
+    let id = payload.get("tool_call_id")?.as_str()?.to_string();
+    let name = escape_markup(&sanitize_line(payload.get("name")?.as_str()?));
+    (!id.is_empty() && !name.is_empty()).then_some((id, name))
+}
+
 fn declares(message_type: &str, kind: MessageType) -> bool {
     MessageType::from_wire(message_type) == Some(kind)
 }
@@ -728,6 +766,21 @@ fn convert_context_response(
     // passing that order through puts the oldest turn last and inverts the
     // conversation: asked what a user said most recently, the model answers with
     // the oldest thing it can see.
+    // The agent's own calls, by `tool_call_id`, with their tool's name: what a
+    // participant's result answers, so it replays as that call's answer.
+    let own_calls: HashMap<String, String> = self_id
+        .map(|id| {
+            resp.chat_history
+                .iter()
+                .filter(|item| {
+                    item.sent_by_user_id == id
+                        && declares(&item.message_type, MessageType::ToolCall)
+                })
+                .filter_map(|item| frame_id_and_name(&item.content, "tool_call"))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for item in resp.chat_history.iter().rev() {
         if let Some(id) = self_id
             && item.sent_by_user_id == id
@@ -757,11 +810,16 @@ fn convert_context_response(
         // line — no more than the sender could say aloud in chat, and visible
         // to anyone reading it, unlike the invisible controls `sanitize_block`
         // folds.
-        let mut message = LlmMessage::user(format!(
-            "[{}]: {}",
-            escape_markup(&sanitize_line(item.speaker())),
-            neutralize_block(&item.content)
-        ));
+        let speaker = escape_markup(&sanitize_line(item.speaker()));
+        let label = match participant_tool_traffic(item, &own_calls) {
+            Some(ParticipantTool::AnswersOwnCall(name)) => {
+                format!("{speaker}, answering your {name} call")
+            }
+            Some(ParticipantTool::Calls(name)) => format!("{speaker} called {name}"),
+            None => speaker,
+        };
+        let mut message =
+            LlmMessage::user(format!("[{label}]: {}", neutralize_block(&item.content)));
         message.content.extend(item.artifact_data.iter().cloned());
         messages.push(message);
     }
@@ -781,7 +839,10 @@ fn convert_context_response(
             "Attribution: each conversation message is prefixed with its sender's \
              display name in square brackets, like `[Alice]: hello`. The bracketed \
              name is who wrote that message — use it to know who is speaking and \
-             to answer questions about names or who said what."
+             to answer questions about names or who said what. A tool call or result \
+             in your own turns is yours: you called that tool. `[Alice, answering \
+             your take_photo call]` is the result of your call, which Alice's \
+             client ran; `[Alice called take_photo]` is a call Alice made."
                 .to_string(),
         );
     }
@@ -1865,6 +1926,73 @@ mod tests {
             "the fallback is the escaped body"
         );
         assert!(rendered.len() <= MAX_BLOCK_BYTES);
+    }
+
+    /// The history `items` (oldest first) replays as, for agent `a1`.
+    fn replayed(items: Vec<ChatHistoryItem>) -> Vec<String> {
+        let resp = PrepareContextResponse {
+            chat_history: items.into_iter().rev().collect(),
+            fetcher: String::new(),
+            corpus: Vec::new(),
+            corpora: Vec::new(),
+        };
+        convert_context_response(resp, Some("a1"), false)
+            .messages
+            .iter()
+            .map(LlmMessage::text)
+            .collect()
+    }
+
+    fn typed(from: &str, name: &str, content: &str, message_type: &str) -> ChatHistoryItem {
+        ChatHistoryItem {
+            sent_by_user_id: from.into(),
+            sent_by_user_name: name.into(),
+            content: content.into(),
+            message_type: message_type.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_result_answering_the_agents_call_replays_as_that_calls_answer() {
+        let call =
+            r#"{"type":"tool_call","payload":{"tool_call_id":"c1","name":"take_photo","args":{}}}"#;
+        let result = r#"{"type":"tool_result","payload":{"tool_call_id":"c1","name":"take_photo","content":"photo captured"}}"#;
+        let elsewhere = r#"{"type":"tool_result","payload":{"tool_call_id":"c9","name":"drive","content":"done"}}"#;
+
+        let texts = replayed(vec![
+            typed("u1", "Lynn", "take a photo", "TEXT"),
+            typed("a1", "Waxwell", call, "TOOL_CALL"),
+            typed("u1", "Lynn", result, "TOOL_RESULT"),
+            typed("u1", "Lynn", elsewhere, "TOOL_RESULT"),
+        ]);
+
+        assert!(
+            texts[2].starts_with("[Lynn, answering your take_photo call]: "),
+            "{}",
+            texts[2]
+        );
+        assert!(texts[3].starts_with("[Lynn]: "), "{}", texts[3]);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("is the result of your call")),
+            "the attribution note explains the label"
+        );
+    }
+
+    #[test]
+    fn a_participants_own_call_replays_as_theirs() {
+        let call =
+            r#"{"type":"tool_call","payload":{"tool_call_id":"b1","name":"drive<b>","args":{}}}"#;
+
+        let texts = replayed(vec![typed("b1", "Bob", call, "TOOL_CALL")]);
+
+        let call_line = texts.iter().find(|t| t.contains("called")).unwrap();
+        assert!(
+            call_line.starts_with("[Bob called drive&lt;b&gt;]: "),
+            "{call_line}"
+        );
     }
 
     #[test]
