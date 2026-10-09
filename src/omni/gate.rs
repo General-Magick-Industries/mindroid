@@ -397,7 +397,19 @@ impl VoiceGate {
         let Some((registry, declare)) = &self.dynamic_tools else {
             return self.tools.clone();
         };
-        let tools = registry.load().tools().to_vec();
+        let (remote, tools): (Vec<_>, Vec<_>) = registry
+            .load()
+            .tools()
+            .iter()
+            .cloned()
+            .partition(|t| t.is_remote());
+        if !remote.is_empty() {
+            let names: Vec<&str> = remote.iter().map(|t| t.name()).collect();
+            tracing::warn!(
+                tools = ?names,
+                "voice gate: leaving out remote tools, which a session cannot run"
+            );
+        }
         config.tools_schema = Some(declare(&tools));
         tools
     }
@@ -508,8 +520,11 @@ impl VoiceGateBuilder {
     }
 
     /// Tools read from `registry` as each session opens and declared with
-    /// `declare`, so a store reaches the next session. Overrides
-    /// [`tools`](Self::tools) and the config's `tools_schema`.
+    /// `declare`, so a store reaches the next session. Replaces the config's
+    /// `tools_schema`; [`build`](Self::build) refuses it alongside
+    /// [`tools`](Self::tools). A session runs every call itself, so remote
+    /// tools are left out: a device's tools must be host-side tools that relay
+    /// the call.
     pub fn dynamic_tools(mut self, registry: DynamicRegistry, declare: DeclareTools) -> Self {
         self.dynamic_tools = Some((registry, declare));
         self
@@ -597,6 +612,11 @@ impl VoiceGateBuilder {
         // per-session in `open`; turn detection cannot be, because rewriting it to
         // `Server` would hand turn-taking to the provider and throw away the
         // caller's `VadConfig` without saying so.
+        if self.dynamic_tools.is_some() && !self.tools.is_empty() {
+            return Err(MindroidError::config(
+                "VoiceGate takes its tools from `tools` or from `dynamic_tools`, not both",
+            ));
+        }
         if matches!(self.config.turn_detection, TurnDetection::Local(_)) {
             return Err(MindroidError::config(
                 "VoiceGate owns local speech detection, so a session cannot also run \
@@ -863,6 +883,60 @@ mod tests {
         let mut config = OmniConfig::default();
         assert_eq!(g.session_tools(&mut config).len(), 1);
         assert_eq!(config.tools_schema, Some(serde_json::json!(["shell"])));
+    }
+
+    #[test]
+    fn remote_tools_are_neither_declared_nor_offered() {
+        use crate::tools::{RemoteTool, ShellTool, ToolRegistry};
+
+        fn names(tools: &[Arc<dyn Tool>]) -> serde_json::Value {
+            tools.iter().map(|t| t.name()).collect()
+        }
+        let registry = DynamicRegistry::new(ToolRegistry::new().plus_tools(vec![
+            Arc::new(ShellTool::default()),
+            Arc::new(RemoteTool::new("take_photo", "Take a photo")),
+        ]));
+        let opened: Opened = Arc::default();
+        let g = VoiceGate::builder()
+            .provider(factory(&opened))
+            .detector(Scripted)
+            .audio_source(Paced {
+                chunks: vec![],
+                gap: Duration::from_millis(10),
+            })
+            .dynamic_tools(registry, names)
+            .build()
+            .unwrap();
+
+        let mut config = OmniConfig::default();
+        let tools = g.session_tools(&mut config);
+
+        assert_eq!(names(&tools), serde_json::json!(["shell"]));
+        assert_eq!(config.tools_schema, Some(serde_json::json!(["shell"])));
+    }
+
+    #[test]
+    fn static_and_dynamic_tools_together_are_refused() {
+        use crate::tools::{ShellTool, ToolRegistry};
+
+        let opened: Opened = Arc::default();
+        let built = VoiceGate::builder()
+            .provider(factory(&opened))
+            .detector(Scripted)
+            .audio_source(Paced {
+                chunks: vec![],
+                gap: Duration::from_millis(10),
+            })
+            .tools(vec![Arc::new(ShellTool::default())])
+            .dynamic_tools(DynamicRegistry::new(ToolRegistry::new()), |_| {
+                serde_json::json!([])
+            })
+            .build();
+
+        let Err(err) = built else {
+            panic!("both tool sources must be refused");
+        };
+        assert!(err.to_string().contains("dynamic_tools"), "{err}");
     }
 
     #[test]

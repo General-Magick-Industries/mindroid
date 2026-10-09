@@ -30,22 +30,7 @@ use crate::models::Message;
 /// restore the reference instead of storing the bytes again.
 pub(crate) const INLINED_ARTIFACT_KEY: &str = "_artifact_id";
 
-/// The image type vision endpoints accept, read from the bytes' signature
-/// rather than the declared type: one HEIC, SVG or other unrecognised file sent
-/// inline fails the whole request.
-pub fn inline_image_type(data: &[u8]) -> Option<&'static str> {
-    if data.starts_with(b"\x89PNG\r\n\x1a\n") && data.get(12..16) == Some(&b"IHDR"[..]) {
-        Some("image/png")
-    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(&b"WEBP"[..]) {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
+pub use crate::core::content::inline_image_type;
 
 /// Bytes + metadata returned by [`ArtifactStore::load`].
 #[derive(Debug, Clone)]

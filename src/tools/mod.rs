@@ -45,35 +45,58 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
+/// What [`Tool::execute_with_images`] returns. Build it with [`ToolOutput::new`].
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<ToolImage>,
+}
+
+impl ToolOutput {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
+        self
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+/// An image a tool returns for the model to see, as raw bytes. Build it with
+/// [`ToolImage::new`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ToolImage {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+impl ToolImage {
+    pub fn new(mime_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data,
+        }
+    }
+}
+
 /// Per-invocation context passed to a tool: the message's channel/sender plus a
 /// typed extension map. Backend-specific data (credentials, agent id) rides in
 /// the map, set by a stage, so tools stay transport-agnostic.
 ///
 /// Cloning shares the ext map (it's `Arc`-backed), so a value `set` on one clone
 /// is visible through the others — this is how a stage hands data to the executor.
-/// What [`Tool::execute_with_images`] returns.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ToolOutput {
-    pub text: String,
-    pub images: Vec<ToolImage>,
-}
-
-impl From<String> for ToolOutput {
-    fn from(text: String) -> Self {
-        Self {
-            text,
-            images: Vec::new(),
-        }
-    }
-}
-
-/// An image a tool returns for the model to see, as raw bytes.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolImage {
-    pub mime_type: String,
-    pub data: Vec<u8>,
-}
-
 #[derive(Default, Clone)]
 pub struct ToolContext {
     /// Channel the message arrived on (`"stdio"` for the stdio transport; a

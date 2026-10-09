@@ -15,6 +15,8 @@ use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use crate::core::error::MindroidError;
@@ -361,6 +363,12 @@ impl OmniProvider for GeminiLiveProvider {
                         break;
                     }
                 };
+                if let WsMessage::Close(close) = &frame {
+                    if let Some(error) = close_error(close.as_ref()) {
+                        let _ = event_tx.send(OmniEvent::Error(Arc::new(error))).await;
+                    }
+                    break;
+                }
                 let Some(value) = frame_to_json(frame) else {
                     continue;
                 };
@@ -517,6 +525,19 @@ impl TranscriptAcc {
             TranscriptSource::Output => &mut self.output,
         }
     }
+}
+
+/// The error a close frame reports: anything but a normal closure, which is
+/// how Gemini rejects a frame it cannot take (an image it refuses, say).
+fn close_error(close: Option<&CloseFrame<'_>>) -> Option<MindroidError> {
+    let close = close?;
+    (close.code != CloseCode::Normal).then(|| {
+        transport(format!(
+            "Gemini Live closed the session: {} {}",
+            u16::from(close.code),
+            close.reason
+        ))
+    })
 }
 
 fn frame_to_json(frame: WsMessage) -> Option<Value> {
@@ -1134,6 +1155,24 @@ mod tests {
             1,
             "no frame beside the toolResponse"
         );
+    }
+
+    #[test]
+    fn a_close_frame_with_an_error_code_is_an_error() {
+        let refused = CloseFrame {
+            code: CloseCode::Invalid,
+            reason: "Request contains an invalid argument.".into(),
+        };
+        let normal = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        };
+
+        let error = close_error(Some(&refused)).expect("an error").to_string();
+        assert!(error.contains("1007"), "{error}");
+        assert!(error.contains("invalid argument"), "{error}");
+        assert!(close_error(Some(&normal)).is_none());
+        assert!(close_error(None).is_none());
     }
 
     #[test]

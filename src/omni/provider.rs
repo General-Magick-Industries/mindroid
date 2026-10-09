@@ -14,20 +14,18 @@ pub trait OmniProvider: Send + Sync + 'static {
     async fn send_text(&self, text: &str) -> Result<(), MindroidError>;
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError>;
     /// [`send_tool_result`](Self::send_tool_result) with images the model should
-    /// see alongside the result. The default drops the images.
+    /// see alongside the result. The default cannot show them: it drops them and
+    /// tells the model, so it does not describe a photo it never saw.
     async fn send_tool_result_with_images(
         &self,
         call_id: &str,
         result: Value,
         images: Vec<ToolImage>,
     ) -> Result<(), MindroidError> {
-        if !images.is_empty() {
-            tracing::debug!(
-                call_id,
-                images = images.len(),
-                "provider takes no tool-result images; dropping them"
-            );
-        }
+        let result = match images.len() {
+            0 => result,
+            n => images_not_shown(result, n),
+        };
         self.send_tool_result(call_id, result).await
     }
     async fn end_audio_stream(&self) -> Result<(), MindroidError>;
@@ -35,6 +33,20 @@ pub trait OmniProvider: Send + Sync + 'static {
     /// Provider internally uses mpsc — call events() once before the select! loop.
     fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>>;
     async fn disconnect(&mut self) -> Result<(), MindroidError>;
+}
+
+/// `result` noting that `n` images could not be shown with it.
+fn images_not_shown(result: Value, n: usize) -> Value {
+    match result {
+        Value::String(text) => {
+            Value::String(format!("{text}\n({n} image(s) could not be shown to you)"))
+        }
+        Value::Object(mut fields) => {
+            fields.insert("images_not_shown".into(), n.into());
+            Value::Object(fields)
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -230,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_provider_without_image_support_still_gets_the_result() {
+    async fn a_provider_without_image_support_says_the_images_were_not_shown() {
         let (provider, _tx) = MockOmniProvider::new();
         let image = crate::tools::ToolImage {
             mime_type: "image/jpeg".into(),
@@ -242,7 +254,31 @@ mod tests {
             .await
             .unwrap();
 
+        provider
+            .send_tool_result_with_images(
+                "call-2",
+                json!({"status": "ok"}),
+                vec![crate::tools::ToolImage::new(
+                    "image/jpeg",
+                    vec![0xFF, 0xD8, 0xFF],
+                )],
+            )
+            .await
+            .unwrap();
+
         let results = provider.recorded_tool_results.lock().unwrap();
-        assert_eq!(*results, vec![("call-1".to_string(), json!("photo taken"))]);
+        assert_eq!(
+            *results,
+            vec![
+                (
+                    "call-1".to_string(),
+                    json!("photo taken\n(1 image(s) could not be shown to you)")
+                ),
+                (
+                    "call-2".to_string(),
+                    json!({"status": "ok", "images_not_shown": 1})
+                ),
+            ]
+        );
     }
 }

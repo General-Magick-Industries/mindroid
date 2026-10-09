@@ -1,4 +1,5 @@
 use crate::core::config::AgentConfig;
+use crate::core::content::{inline_image_type, visible_mime_type};
 use crate::core::error::MindroidError;
 use crate::core::models::{Message, SenderType};
 use crate::memory::Memory;
@@ -9,7 +10,7 @@ use crate::omni::types::{
     TranscriptSource, TurnDetection, Usage,
 };
 use crate::pipeline::stages::stt::SttProvider;
-use crate::tools::{Tool, ToolContext, ToolOutput};
+use crate::tools::{Tool, ToolContext, ToolImage, ToolOutput};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -702,10 +703,7 @@ impl OmniSession {
                         Some(OmniEvent::ToolCall { id, name, args }) => {
                             tracing::info!(%channel, %sender, %id, %name, "tool call");
                             self.state = SessionState::ToolCall;
-                            let (result_value, images) = match self.execute_tool(&name, args).await {
-                                Ok(out) => (Value::String(out.text), out.images),
-                                Err(e) => (serde_json::json!({"error": e.to_string()}), Vec::new()),
-                            };
+                            let (result_value, images) = tool_result(self.execute_tool(&name, args).await);
                             self.provider
                                 .send_tool_result_with_images(&id, result_value, images)
                                 .await?;
@@ -930,10 +928,7 @@ impl OmniSession {
                         }
                         Some(OmniEvent::ToolCall { id, name, args }) => {
                             self.state = SessionState::ToolCall;
-                            let (result_value, images) = match self.execute_tool(&name, args).await {
-                                Ok(out) => (Value::String(out.text), out.images),
-                                Err(e) => (serde_json::json!({"error": e.to_string()}), Vec::new()),
-                            };
+                            let (result_value, images) = tool_result(self.execute_tool(&name, args).await);
                             self.provider
                                 .send_tool_result_with_images(&id, result_value, images)
                                 .await?;
@@ -1185,8 +1180,83 @@ impl Default for OmniSessionBuilder {
     }
 }
 
+/// Most images one tool result shows the model.
+const MAX_TOOL_IMAGES: usize = 4;
+/// Largest image one tool result shows the model.
+const MAX_TOOL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// A tool call's outcome as the provider gets it: the text (or the error) and
+/// the images the model may be shown.
+fn tool_result(outcome: Result<ToolOutput, MindroidError>) -> (Value, Vec<ToolImage>) {
+    match outcome {
+        Ok(out) => {
+            let mut text = out.text;
+            let images = shown_images(&mut text, out.images);
+            (Value::String(text), images)
+        }
+        Err(e) => (serde_json::json!({"error": e.to_string()}), Vec::new()),
+    }
+}
+
+/// The images a provider may send: each read as the type its bytes show, not
+/// the type the tool declared, within [`MAX_TOOL_IMAGE_BYTES`] and
+/// [`MAX_TOOL_IMAGES`]. One a provider would reject can close the whole
+/// session, so each one dropped is noted in `text` for the model instead.
+fn shown_images(text: &mut String, images: Vec<ToolImage>) -> Vec<ToolImage> {
+    let mut shown = Vec::new();
+    for image in images {
+        let refused = match inline_image_type(&image.data) {
+            None => Some(visible_mime_type(&image.mime_type).to_string()),
+            Some(_) if image.data.len() > MAX_TOOL_IMAGE_BYTES => {
+                Some(format!("over {} MiB", MAX_TOOL_IMAGE_BYTES / (1024 * 1024)))
+            }
+            Some(_) if shown.len() == MAX_TOOL_IMAGES => {
+                Some(format!("only {MAX_TOOL_IMAGES} images are shown"))
+            }
+            Some(mime_type) => {
+                shown.push(ToolImage::new(mime_type, image.data));
+                None
+            }
+        };
+        if let Some(why) = refused {
+            tracing::warn!(%why, "a tool's image is not shown to the model");
+            text.push_str(&format!("\n(an image could not be shown to you: {why})"));
+        }
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_images_a_model_takes_are_shown_and_the_rest_are_noted() {
+        use super::{MAX_TOOL_IMAGE_BYTES, MAX_TOOL_IMAGES, ToolImage, shown_images};
+
+        let jpeg = |n: usize| [vec![0xFF, 0xD8, 0xFF], vec![0; n]].concat();
+        let mut images = vec![
+            ToolImage::new("image/png", jpeg(1)),
+            ToolImage::new("image/svg+xml", b"<svg/>".to_vec()),
+            ToolImage::new("image/jpeg", jpeg(MAX_TOOL_IMAGE_BYTES)),
+        ];
+        images.extend((0..MAX_TOOL_IMAGES).map(|_| ToolImage::new("image/jpeg", jpeg(1))));
+        let mut text = "photo taken".to_string();
+
+        let shown = shown_images(&mut text, images);
+
+        assert_eq!(shown.len(), MAX_TOOL_IMAGES);
+        assert!(
+            shown.iter().all(|i| i.mime_type == "image/jpeg"),
+            "the bytes' type wins"
+        );
+        assert!(
+            text.contains("could not be shown to you: image/svg+xml"),
+            "{text}"
+        );
+        assert!(text.contains("over 2 MiB"), "{text}");
+        assert!(text.contains("only 4 images are shown"), "{text}");
+        assert!(text.starts_with("photo taken"));
+    }
+
     #[test]
     fn utterance_capture_slices_with_lead_and_writes_a_wav_header() {
         let mut cap = super::UtteranceCapture::new();
