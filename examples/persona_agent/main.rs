@@ -212,10 +212,7 @@ async fn main() -> anyhow::Result<()> {
         .add_stage(SharedStage(Arc::clone(&persona_stage)))
         .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
         .add_stage(PostProcessor);
-    if let Some(mut reply_ingest) = builder.build_episode_reply_ingest_stage()? {
-        if let Some(inbound) = &inbound_ingest {
-            reply_ingest = reply_ingest.with_runtime_state_of(inbound);
-        }
+    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage()? {
         respond = respond.add_stage(reply_ingest);
     }
     let respond_pipeline =

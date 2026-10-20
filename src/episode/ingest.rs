@@ -187,10 +187,9 @@ async fn read_capped(
 
 const MAX_RUNTIME_STATES: usize = 256;
 
-/// Whose affect a held state is. Persona can hold a row per agent and one per
-/// agent-and-user, and an envelope does not say which it came from, so each
-/// sender's state is kept apart. `sender_id: None` is the agent's own row,
-/// learned from ingesting the agent's reply, where the agent is the sender.
+/// Whose affect a held state is. Persona holds mood per agent and user, so
+/// each sender's state is kept apart and only ever expressed toward that
+/// sender: one conversation's mood never colours another user's replies.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct RuntimeStateKey {
     agent_id: String,
@@ -202,13 +201,6 @@ impl RuntimeStateKey {
         Self {
             agent_id: ctx.agent_config.agent_id.clone(),
             sender_id: Some(ctx.message.sender_id.clone()),
-        }
-    }
-
-    fn agent(ctx: &Context) -> Self {
-        Self {
-            agent_id: ctx.agent_config.agent_id.clone(),
-            sender_id: None,
         }
     }
 }
@@ -275,13 +267,9 @@ impl RuntimeStateCache {
     async fn current(
         &self,
         sender: &RuntimeStateKey,
-        agent: &RuntimeStateKey,
         at: DateTime<Utc>,
     ) -> Option<RuntimeAffectSnapshot> {
-        let states = self.states.read().await;
-        [sender, agent]
-            .into_iter()
-            .find_map(|key| states.get(key)?.decayed_at(at))
+        self.states.read().await.get(sender)?.decayed_at(at)
     }
 }
 
@@ -393,8 +381,7 @@ impl EpisodeIngestStage {
 
     /// Put the agent's latest valid, locally decayed affect toward this
     /// message's sender into the run-scoped pipeline context. With no state of
-    /// the sender's own, the agent's is used, which the reply stage learns once
-    /// it shares this stage's state ([`EpisodeReplyIngestStage::with_runtime_state_of`]).
+    /// the sender's own, none is applied: another user's mood is never borrowed.
     ///
     /// `Context::reset_output` clears run-scoped extensions. Call this again
     /// after such a reset when ingest and persona execution use separate
@@ -402,16 +389,9 @@ impl EpisodeIngestStage {
     pub async fn apply_runtime_state(&self, ctx: &mut Context) {
         let _ = ctx.take_ext::<RuntimeAffectSnapshot>();
         let sender = RuntimeStateKey::sender(ctx);
-        let agent = RuntimeStateKey::agent(ctx);
-        match self
-            .runtime_states
-            .current(&sender, &agent, Utc::now())
-            .await
-        {
+        match self.runtime_states.current(&sender, Utc::now()).await {
             Some(affect) => ctx.set_ext(affect),
-            None if self.runtime_states.is_held(&sender).await
-                || self.runtime_states.is_held(&agent).await =>
-            {
+            None if self.runtime_states.is_held(&sender).await => {
                 debug!("EpisodeIngestStage: held runtime affect state has expired; none applied")
             }
             None => debug!("EpisodeIngestStage: no runtime affect state to apply"),
@@ -490,24 +470,24 @@ fn trusted_display_name(message: &Message) -> Option<String> {
 /// storing the reply twice. Ingest is best-effort.
 pub struct EpisodeReplyIngestStage {
     client: EpisodeClient,
-    runtime_states: Option<Arc<RuntimeStateCache>>,
 }
 
 impl EpisodeReplyIngestStage {
     pub fn new(base_url: &str, identity: Arc<dyn Auth>, credential_kind: CredentialKind) -> Self {
         Self {
             client: EpisodeClient::new(base_url, identity, credential_kind),
-            runtime_states: None,
         }
     }
 
-    /// Keep the affect state returned by reply ingest in `inbound`'s state.
-    ///
-    /// The reply is ingested with the agent as its sender, so its state is the
-    /// agent's own rather than any user's, and `inbound` falls back to it for a
-    /// sender it holds no state for. Without this the reply's state is dropped.
-    pub fn with_runtime_state_of(mut self, inbound: &EpisodeIngestStage) -> Self {
-        self.runtime_states = Some(Arc::clone(&inbound.runtime_states));
+    /// Formerly kept the reply's affect state as a fallback for senders the
+    /// inbound stage held none for. The reply is ingested with the agent as its
+    /// sender, so that state is the agent's own row, which mixes every
+    /// conversation without a single counterpart; mood is now expressed only
+    /// toward the user it was felt with, and the reply's state is dropped.
+    #[deprecated(
+        note = "mood is per user; the reply's agent-wide state is no longer expressed, so this does nothing"
+    )]
+    pub fn with_runtime_state_of(self, _inbound: &EpisodeIngestStage) -> Self {
         self
     }
 
@@ -552,13 +532,7 @@ impl PipelineStage for EpisodeReplyIngestStage {
         };
 
         match self.client.ingest(&ctx.agent_config.agent_id, &msg).await {
-            Ok(runtime_state) => {
-                debug!("EpisodeReplyIngestStage: ingested reply {reply_id}");
-                if let (Some(states), Some(state)) = (&self.runtime_states, runtime_state) {
-                    let key = RuntimeStateKey::agent(ctx);
-                    log_accept(self.name(), states.accept(key, state, Utc::now()).await);
-                }
-            }
+            Ok(_) => debug!("EpisodeReplyIngestStage: ingested reply {reply_id}"),
             Err(e) => warn!("EpisodeReplyIngestStage: ingest failed (continuing): {e}"),
         }
         Ok(())
@@ -739,10 +713,7 @@ mod tests {
             AcceptOutcome::AcceptedExpired
         ));
         assert!(cache.is_held(&k).await, "stored despite being expired");
-        assert!(
-            cache.current(&k, &k, now).await.is_none(),
-            "nothing renders"
-        );
+        assert!(cache.current(&k, now).await.is_none(), "nothing renders");
     }
 
     #[tokio::test]
@@ -1168,7 +1139,7 @@ mod tests {
             AcceptOutcome::Stale
         ));
 
-        assert_eq!(cache.current(&k, &k, now).await.unwrap().state_version, 2);
+        assert_eq!(cache.current(&k, now).await.unwrap().state_version, 2);
     }
 
     /// Per-user persona rows carry independent version counters, so one
@@ -1177,7 +1148,6 @@ mod tests {
     async fn runtime_cache_keeps_senders_apart() {
         let cache = RuntimeStateCache::default();
         let now = Utc::now();
-        let agent = key("agent-1", None);
         let alice = key("agent-1", Some("alice"));
         let bob = key("agent-1", Some("bob"));
 
@@ -1191,33 +1161,32 @@ mod tests {
             AcceptOutcome::Accepted
         ));
 
-        let seen_by_alice = cache.current(&alice, &agent, now).await.unwrap();
-        let seen_by_bob = cache.current(&bob, &agent, now).await.unwrap();
+        let seen_by_alice = cache.current(&alice, now).await.unwrap();
+        let seen_by_bob = cache.current(&bob, now).await.unwrap();
         assert_eq!(seen_by_alice.state_version, 7);
         assert_eq!(seen_by_bob.state_version, 2);
         assert!(seen_by_bob.pleasure < 0.0);
     }
 
+    /// Mood is felt with one user; a sender with no state of their own gets
+    /// none, never another conversation's.
     #[tokio::test]
-    async fn a_sender_without_state_falls_back_to_the_agents() {
+    async fn a_sender_without_state_borrows_no_one_elses() {
         let cache = RuntimeStateCache::default();
         let now = Utc::now();
-        let agent = key("agent-1", None);
-        let alice = key("agent-1", Some("alice"));
-        let carol = key("agent-1", Some("carol"));
-
-        assert!(cache.current(&carol, &agent, now).await.is_none());
         cache
-            .accept(agent.clone(), runtime_state(5, now), now)
+            .accept(key("agent-1", Some("alice")), runtime_state(9, now), now)
             .await;
         cache
-            .accept(alice.clone(), runtime_state(9, now), now)
+            .accept(key("agent-1", None), runtime_state(5, now), now)
             .await;
 
-        let carols = cache.current(&carol, &agent, now).await.unwrap();
-        assert_eq!(carols.state_version, 5, "no state of carol's own");
-        let alices = cache.current(&alice, &agent, now).await.unwrap();
-        assert_eq!(alices.state_version, 9, "a sender's own state wins");
+        assert!(
+            cache
+                .current(&key("agent-1", Some("carol")), now)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1231,8 +1200,7 @@ mod tests {
             .await;
 
         let other = key("agent-2", Some("user-1"));
-        let other_agent = key("agent-2", None);
-        assert!(cache.current(&other, &other_agent, now).await.is_none());
+        assert!(cache.current(&other, now).await.is_none());
         assert!(matches!(
             cache
                 .accept(other.clone(), runtime_state(2, now), now)
@@ -1271,7 +1239,7 @@ mod tests {
             .await;
 
         let later = now + chrono::Duration::seconds(120);
-        let lapsed = cache.current(&k, &k, later).await;
+        let lapsed = cache.current(&k, later).await;
         assert!(lapsed.is_none(), "60 s ttl has lapsed");
         assert!(matches!(
             cache
@@ -1279,38 +1247,7 @@ mod tests {
                 .await,
             AcceptOutcome::Accepted
         ));
-        assert_eq!(cache.current(&k, &k, later).await.unwrap().state_version, 1);
-    }
-
-    /// The reply is ingested as the agent, so what it returns is the agent's
-    /// own state, and a sender the inbound stage holds nothing for reads it.
-    #[tokio::test]
-    async fn reply_ingest_feeds_the_agent_state_the_inbound_stage_falls_back_to() {
-        let (url, server) = serve_once(http_200(&envelope_body())).await;
-        let inbound = EpisodeIngestStage::new(
-            "https://unused.invalid",
-            Arc::new(StaticAuth::new("t")),
-            CredentialKind::EndUser,
-        );
-        let reply = EpisodeReplyIngestStage::new(
-            &url,
-            Arc::new(StaticAuth::new("t")),
-            CredentialKind::EndUser,
-        )
-        .with_allow_insecure(true)
-        .with_runtime_state_of(&inbound);
-
-        let (mut ctx, _) = failing_ctx("hello");
-        ctx.response = Some("a reply".into());
-        reply.process(&mut ctx).await.unwrap();
-        server.await.unwrap();
-
-        let states = &inbound.runtime_states;
-        assert!(states.is_held(&key("agent-1", None)).await);
-        assert!(!states.is_held(&key("agent-1", Some("user-1"))).await);
-        inbound.apply_runtime_state(&mut ctx).await;
-        let affect = ctx.get_ext::<RuntimeAffectSnapshot>().unwrap();
-        assert_eq!(affect.state_version, 3);
+        assert_eq!(cache.current(&k, later).await.unwrap().state_version, 1);
     }
 
     #[tokio::test]

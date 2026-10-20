@@ -161,6 +161,21 @@ Both non-streaming calls (`chat`, `chat_with_tools`) are now bounded by a
 `stream_chat` keeps its unbounded body read and long generations are not
 truncated.
 
+#### 7. Live affect is expressed only toward the user it was felt with
+
+A sender with no affect state of their own now gets none, instead of the
+agent's own state: the persona service holds mood per agent and user, and the
+agent's own row mixes every conversation without a single counterpart.
+`EpisodeReplyIngestStage::with_runtime_state_of` is deprecated and does
+nothing, so the reply's state is no longer kept.
+
+```rust
+// before
+let reply = EpisodeReplyIngestStage::new(url, auth, kind).with_runtime_state_of(&inbound);
+// after
+let reply = EpisodeReplyIngestStage::new(url, auth, kind);
+```
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
@@ -290,6 +305,12 @@ truncated.
 
 ### Changed
 
+- Prepared-prompt caches default to 5 minutes (`DEFAULT_TTL_SECS = 300`, and
+  `persona.cache_ttl_secs`), down from 10, matching the persona service's
+  freshness limit for an evolved personality. `MagickmindAgentPersonaStage`
+  also honours the agent-route response's `ttl_seconds` when it is shorter, so
+  a longer configured TTL can no longer hold a prompt past the server's limit.
+  The stale-prompt fallback on a failed re-fetch is unchanged.
 - `MagickmindContextConfig::default()` no longer requests pelican:
   `include_pelican` is `false`. The backend retired the fetcher and ignored the
   field; set it to `true` to send the old request.

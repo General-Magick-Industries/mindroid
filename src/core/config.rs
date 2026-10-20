@@ -431,7 +431,8 @@ pub struct PersonaConfig {
     /// Defaults to `~/.mindroid/personas`.
     pub data_dir: Option<String>,
     /// Cache TTL (seconds) for server-prepared system prompts (`type = "magickmind-prepared"`).
-    /// Defaults to 600 (10 minutes). `0` disables caching.
+    /// Defaults to 300 (5 minutes), the persona service's freshness limit. On the
+    /// agent route a shorter server `ttl_seconds` still wins. `0` disables caching.
     pub cache_ttl_secs: Option<u64>,
     /// Permit sending auth headers over plaintext `http://` (local development only).
     /// Production deployments must use `https://`.
