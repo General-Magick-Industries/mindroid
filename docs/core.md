@@ -938,7 +938,7 @@ pub struct PersonaConfig {
     pub persona_id: Option<String>,
     pub base_url: Option<String>,       // falls back to memory.base_url, then auth.base_url
     pub data_dir: Option<String>,       // for "local" personas
-    pub cache_ttl_secs: Option<u64>,    // prepared-prompt cache TTL (default 600; 0 disables)
+    pub cache_ttl_secs: Option<u64>,    // prepared-prompt cache TTL (default 300; 0 disables)
     pub allow_insecure: bool,           // permit auth headers over plaintext http:// (local dev only)
 }
 ```

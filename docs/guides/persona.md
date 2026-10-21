@@ -244,7 +244,7 @@ formatting logic in Rust.
 type = "magickmind-prepared"
 persona_id = "your-persona-id"              # default persona (see below)
 base_url = "https://magickmind.example.com" # falls back to memory/auth base_url
-cache_ttl_secs = 600                        # optional; prepared-prompt cache TTL (default 600 = 10 min, 0 disables)
+cache_ttl_secs = 300                        # optional; prepared-prompt cache TTL (default 300 = 5 min, 0 disables)
 # allow_insecure = true                     # permit auth headers over plaintext http:// (local dev only)
 ```
 
@@ -280,10 +280,12 @@ the resolve-and-cache mechanism is the SDK's.
 
 `MagickmindPersonaStage` caches each prepared `system_prompt` keyed by
 `(persona_id, user_id)` so voice/chat turns don't call the server on every message
-(the `prepare` response carries no TTL, so the cache lifetime is the SDK's
-choice). The default is 10 minutes; override per stage with
-`.with_ttl(Duration)` or via `cache_ttl_secs` in config. A TTL of `0` disables
-caching entirely (nothing is stored).
+(the persona-route `prepare` response carries no TTL, so the cache lifetime is the
+SDK's choice). `MagickmindAgentPersonaStage` caches per `(agent, user_id)`, and the
+agent-route response's `ttl_seconds` caps each prompt's freshness. The default is
+5 minutes, the persona service's freshness limit for an evolved personality;
+override per stage with `.with_ttl(Duration)` or via `cache_ttl_secs` in config. A
+TTL of `0` disables caching entirely (nothing is stored).
 
 - **Eviction:** Expired entries are swept on the write path once the cache
   exceeds 200 entries.
