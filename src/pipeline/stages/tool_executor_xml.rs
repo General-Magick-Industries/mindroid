@@ -107,22 +107,24 @@ fn acknowledgment(response_text: &str) -> String {
 /// Mirrors the `{type, payload}` wire shape used elsewhere; `tool_call_id`
 /// correlates the client's returning result. `ack` is any prose the model wrote
 /// alongside the call, for the client to surface while it executes.
+/// `executor_id` is who may answer it, the identity the result is bound to.
 pub(crate) fn frame_remote_call(
     name: &str,
     args: &serde_json::Value,
     ack: &str,
+    executor_id: Option<&str>,
 ) -> (String, String) {
     let id = uuid::Uuid::new_v4().to_string();
-    let framed = serde_json::json!({
-        "type": "tool_call",
-        "payload": {
-            "tool_call_id": &id,
-            "name": name,
-            "args": args,
-            "ack": ack,
-        }
-    })
-    .to_string();
+    let mut payload = serde_json::json!({
+        "tool_call_id": &id,
+        "name": name,
+        "args": args,
+        "ack": ack,
+    });
+    if let Some(executor_id) = executor_id {
+        payload["executor_id"] = executor_id.into();
+    }
+    let framed = serde_json::json!({ "type": "tool_call", "payload": payload }).to_string();
     (framed, id)
 }
 
@@ -774,13 +776,18 @@ impl StreamingStage for XmlToolExecutorStage {
                         name: name.clone(),
                         arguments: args.to_string(),
                     };
-                    let (framed, call_id) =
-                        frame_remote_call(name, args, &acknowledgment(&response_text));
+                    let executor_id = executor_id
+                        .as_deref()
+                        .or_else(|| ctx.message.trusted_sender_id());
+                    let (framed, call_id) = frame_remote_call(
+                        name,
+                        args,
+                        &acknowledgment(&response_text),
+                        executor_id,
+                    );
                     self.pending.record_for(
                         &ctx.message.channel_id,
-                        executor_id
-                            .as_deref()
-                            .or_else(|| ctx.message.trusted_sender_id()),
+                        executor_id,
                         &call_id,
                         name,
                         remote_timeout_for(&registry, name),
@@ -1104,10 +1111,12 @@ async fn run_tool_loop(
             remote_executor_for(registry, name, trusted_sender)
                 .map(|executor_id| (name, args, executor_id))
         }) {
-            let (framed, call_id) = frame_remote_call(name, args, &acknowledgment(&response_text));
+            let executor_id = executor_id.as_deref().or(trusted_sender);
+            let (framed, call_id) =
+                frame_remote_call(name, args, &acknowledgment(&response_text), executor_id);
             pending.record_for(
                 message_channel,
-                executor_id.as_deref().or(trusted_sender),
+                executor_id,
                 &call_id,
                 name,
                 remote_timeout_for(registry, name),
@@ -1701,7 +1710,7 @@ mod tests {
 
     #[test]
     fn frame_remote_call_includes_ack() {
-        let (framed, id) = frame_remote_call("attack", &json!({"target":"orc"}), "Charging!");
+        let (framed, id) = frame_remote_call("attack", &json!({"target":"orc"}), "Charging!", None);
         let v: serde_json::Value = serde_json::from_str(&framed).unwrap();
         assert_eq!(v["type"], "tool_call");
         assert_eq!(v["payload"]["name"], "attack");
@@ -1711,6 +1720,11 @@ mod tests {
             Some(id.as_str()),
             "the returned id must be the one on the wire, or correlation cannot match"
         );
+        assert!(v["payload"].get("executor_id").is_none());
+
+        let (framed, _) = frame_remote_call("attack", &json!({}), "", Some("robot-7"));
+        let v: serde_json::Value = serde_json::from_str(&framed).unwrap();
+        assert_eq!(v["payload"]["executor_id"], "robot-7");
     }
 
     #[tokio::test]

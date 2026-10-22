@@ -28,9 +28,12 @@ use crate::omni::provider::OmniProvider;
 use crate::omni::session::{OmniSession, ToolContextInit};
 use crate::omni::types::{AudioChunk, BargeInMode, OmniConfig, TurnDetection};
 use crate::pipeline::stages::stt::SttProvider;
-use crate::tools::{Tool, ToolContext};
+use crate::tools::{DynamicRegistry, Tool, ToolContext};
 use crate::voice::types::VadConfig;
 use crate::voice::vad::{VadDecision, VadStateMachine};
+
+/// Renders tools as a provider's declarations, such as `gemini::tool_declarations`.
+pub type DeclareTools = fn(&[Arc<dyn Tool>]) -> serde_json::Value;
 
 /// Speech probability for one microphone chunk, in `[0, 1]`.
 ///
@@ -158,6 +161,7 @@ pub struct VoiceGate {
     audio_source: Arc<dyn AudioSource>,
     audio_sink: Option<Arc<dyn AudioSink>>,
     tools: Vec<Arc<dyn Tool>>,
+    dynamic_tools: Option<(DynamicRegistry, DeclareTools)>,
     config: OmniConfig,
     memory: Option<Arc<dyn Memory>>,
     conversation: Option<(String, String, String)>,
@@ -360,7 +364,7 @@ impl VoiceGate {
                 sample_rate: rate,
                 channels,
             })
-            .tools(self.tools.clone())
+            .tools(self.session_tools(&mut config))
             .config(config)
             .cancel_token(cancel.clone());
         if let Some(s) = &self.audio_sink {
@@ -387,6 +391,27 @@ impl VoiceGate {
         let mut task = JoinSet::new();
         task.spawn(async move { session.run().await });
         Ok(Live { tx, cancel, task })
+    }
+
+    fn session_tools(&self, config: &mut OmniConfig) -> Vec<Arc<dyn Tool>> {
+        let Some((registry, declare)) = &self.dynamic_tools else {
+            return self.tools.clone();
+        };
+        let (remote, tools): (Vec<_>, Vec<_>) = registry
+            .load()
+            .tools()
+            .iter()
+            .cloned()
+            .partition(|t| t.is_remote());
+        if !remote.is_empty() {
+            let names: Vec<&str> = remote.iter().map(|t| t.name()).collect();
+            tracing::warn!(
+                tools = ?names,
+                "voice gate: leaving out remote tools, which a session cannot run"
+            );
+        }
+        config.tools_schema = Some(declare(&tools));
+        tools
     }
 
     async fn close(live: &mut Option<Live>, why: &str) {
@@ -428,6 +453,7 @@ pub struct VoiceGateBuilder {
     audio_source: Option<Arc<dyn AudioSource>>,
     audio_sink: Option<Arc<dyn AudioSink>>,
     tools: Vec<Arc<dyn Tool>>,
+    dynamic_tools: Option<(DynamicRegistry, DeclareTools)>,
     config: OmniConfig,
     memory: Option<Arc<dyn Memory>>,
     conversation: Option<(String, String, String)>,
@@ -448,6 +474,7 @@ impl Default for VoiceGateBuilder {
             audio_source: None,
             audio_sink: None,
             tools: Vec::new(),
+            dynamic_tools: None,
             config: OmniConfig::default(),
             memory: None,
             conversation: None,
@@ -489,6 +516,17 @@ impl VoiceGateBuilder {
 
     pub fn tools(mut self, t: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = t;
+        self
+    }
+
+    /// Tools read from `registry` as each session opens and declared with
+    /// `declare`, so a store reaches the next session. Replaces the config's
+    /// `tools_schema`; [`build`](Self::build) refuses it alongside
+    /// [`tools`](Self::tools). A session runs every call itself, so remote
+    /// tools are left out: a device's tools must be host-side tools that relay
+    /// the call.
+    pub fn dynamic_tools(mut self, registry: DynamicRegistry, declare: DeclareTools) -> Self {
+        self.dynamic_tools = Some((registry, declare));
         self
     }
 
@@ -574,6 +612,11 @@ impl VoiceGateBuilder {
         // per-session in `open`; turn detection cannot be, because rewriting it to
         // `Server` would hand turn-taking to the provider and throw away the
         // caller's `VadConfig` without saying so.
+        if self.dynamic_tools.is_some() && !self.tools.is_empty() {
+            return Err(MindroidError::config(
+                "VoiceGate takes its tools from `tools` or from `dynamic_tools`, not both",
+            ));
+        }
         if matches!(self.config.turn_detection, TurnDetection::Local(_)) {
             return Err(MindroidError::config(
                 "VoiceGate owns local speech detection, so a session cannot also run \
@@ -594,6 +637,7 @@ impl VoiceGateBuilder {
                 .ok_or_else(|| MindroidError::config("VoiceGate requires an audio source"))?,
             audio_sink: self.audio_sink,
             tools: self.tools,
+            dynamic_tools: self.dynamic_tools,
             config: self.config,
             memory: self.memory,
             conversation: self.conversation,
@@ -809,6 +853,90 @@ mod tests {
         let opened: Opened = Arc::default();
         let g = gate(vec![], Duration::from_secs(5), &opened);
         assert!(g.open(16_000, 1, vec![], 1).is_ok());
+    }
+
+    #[test]
+    fn each_session_declares_the_registry_as_it_stands() {
+        use crate::tools::{ShellTool, ToolRegistry};
+
+        fn names(tools: &[Arc<dyn Tool>]) -> serde_json::Value {
+            tools.iter().map(|t| t.name()).collect()
+        }
+        let registry = DynamicRegistry::new(ToolRegistry::new());
+        let opened: Opened = Arc::default();
+        let g = VoiceGate::builder()
+            .provider(factory(&opened))
+            .detector(Scripted)
+            .audio_source(Paced {
+                chunks: vec![],
+                gap: Duration::from_millis(10),
+            })
+            .dynamic_tools(registry.clone(), names)
+            .build()
+            .unwrap();
+
+        let mut config = OmniConfig::default();
+        assert!(g.session_tools(&mut config).is_empty());
+        assert_eq!(config.tools_schema, Some(serde_json::json!([])));
+
+        registry.store(ToolRegistry::new().plus_tools(vec![Arc::new(ShellTool::default())]));
+        let mut config = OmniConfig::default();
+        assert_eq!(g.session_tools(&mut config).len(), 1);
+        assert_eq!(config.tools_schema, Some(serde_json::json!(["shell"])));
+    }
+
+    #[test]
+    fn remote_tools_are_neither_declared_nor_offered() {
+        use crate::tools::{RemoteTool, ShellTool, ToolRegistry};
+
+        fn names(tools: &[Arc<dyn Tool>]) -> serde_json::Value {
+            tools.iter().map(|t| t.name()).collect()
+        }
+        let registry = DynamicRegistry::new(ToolRegistry::new().plus_tools(vec![
+            Arc::new(ShellTool::default()),
+            Arc::new(RemoteTool::new("take_photo", "Take a photo")),
+        ]));
+        let opened: Opened = Arc::default();
+        let g = VoiceGate::builder()
+            .provider(factory(&opened))
+            .detector(Scripted)
+            .audio_source(Paced {
+                chunks: vec![],
+                gap: Duration::from_millis(10),
+            })
+            .dynamic_tools(registry, names)
+            .build()
+            .unwrap();
+
+        let mut config = OmniConfig::default();
+        let tools = g.session_tools(&mut config);
+
+        assert_eq!(names(&tools), serde_json::json!(["shell"]));
+        assert_eq!(config.tools_schema, Some(serde_json::json!(["shell"])));
+    }
+
+    #[test]
+    fn static_and_dynamic_tools_together_are_refused() {
+        use crate::tools::{ShellTool, ToolRegistry};
+
+        let opened: Opened = Arc::default();
+        let built = VoiceGate::builder()
+            .provider(factory(&opened))
+            .detector(Scripted)
+            .audio_source(Paced {
+                chunks: vec![],
+                gap: Duration::from_millis(10),
+            })
+            .tools(vec![Arc::new(ShellTool::default())])
+            .dynamic_tools(DynamicRegistry::new(ToolRegistry::new()), |_| {
+                serde_json::json!([])
+            })
+            .build();
+
+        let Err(err) = built else {
+            panic!("both tool sources must be refused");
+        };
+        assert!(err.to_string().contains("dynamic_tools"), "{err}");
     }
 
     #[test]
