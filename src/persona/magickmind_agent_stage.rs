@@ -9,24 +9,9 @@ use crate::auth::Auth;
 use crate::core::context::Context;
 use crate::core::net::{PreparedPromptCache, PromptCacheKey};
 use crate::error::{MindroidError, Result};
+use crate::models::CredentialKind;
 use crate::models::LlmMessage;
 use crate::pipeline::PipelineStage;
-
-/// Which credential the caller holds, and therefore which prepare route the
-/// stage uses.
-///
-/// Bifrost split one preparation behind two routes so no handler has to ask
-/// which caller it is serving. A service user names the agent in the path; an
-/// agent reaches the same logic as itself, with no id to supply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PersonaCaller {
-    /// Service-user credential — `POST /v1/end-users/{agent_id}/persona/prepare`.
-    /// The path segment is an **agent id**, not a persona id.
-    ServiceUser,
-    /// The agent's own end-user JWT — `POST /v1/end-user/persona/prepare`. No id
-    /// is sent; the agent is the token subject.
-    EndUser,
-}
 
 /// A pipeline stage that delegates persona prompt construction to MagickMind's
 /// **agent-scoped** prepare endpoint and uses the returned prompt verbatim.
@@ -35,22 +20,25 @@ pub enum PersonaCaller {
 /// computes a finished `system_prompt`. The difference is the identifier: this
 /// stage is keyed by **agent id**, not persona id, and follows the credential:
 ///
-/// - [`PersonaCaller::ServiceUser`] — `POST /v1/end-users/{agent_id}/persona/prepare`.
+/// - [`CredentialKind::ServiceUser`] — `POST /v1/end-users/{agent_id}/persona/prepare`.
 ///   Passing a persona id here yields a 404 ("Agent not found").
-/// - [`PersonaCaller::EndUser`] — `POST /v1/end-user/persona/prepare`. The agent
+/// - [`CredentialKind::EndUser`] — `POST /v1/end-user/persona/prepare`. The agent
 ///   is the token subject, so `agent_id` is neither required nor sent.
 ///
 /// The service-user route also accepts an end-user token, but then pins the path
 /// id to the token subject (403 on mismatch). Hold an end-user JWT and use
-/// [`PersonaCaller::EndUser`] — it has no id to mismatch.
+/// [`CredentialKind::EndUser`] — it has no id to mismatch.
 ///
 /// ## Caching and degradation
 ///
 /// Identical policy to [`MagickmindPersonaStage`](super::MagickmindPersonaStage):
 /// prepared prompts are cached per `(agent_key, user_id)` for [`with_ttl`]
-/// (default 10 minutes), a failed re-fetch degrades to the last-good prompt, and
-/// a zero TTL disables caching. On the end-user route the agent id is fixed by
-/// the token, so the cache key uses a constant marker for it.
+/// (default 5 minutes), a failed re-fetch degrades to the last-good prompt, and
+/// a zero TTL disables caching. The server's `ttl_seconds` for a prompt caps
+/// how long it stays fresh, so an evolved personality reaches the prompt within
+/// the server's freshness limit even under a longer configured TTL. On the
+/// end-user route the agent id is fixed by the token, so the cache key uses a
+/// constant marker for it.
 ///
 /// [`with_ttl`]: MagickmindAgentPersonaStage::with_ttl
 pub struct MagickmindAgentPersonaStage {
@@ -59,7 +47,7 @@ pub struct MagickmindAgentPersonaStage {
     /// Default agent id for the service-user route. Ignored on the end-user
     /// route, where the agent is the token subject.
     agent_id: String,
-    caller: PersonaCaller,
+    credential_kind: CredentialKind,
     identity: Arc<dyn Auth>,
     /// Fallback conversation history injected at construction time. A
     /// per-request [`ConversationHistory`](super::ConversationHistory)
@@ -74,7 +62,7 @@ pub struct MagickmindAgentPersonaStage {
 const END_USER_AGENT_KEY: &str = "\0end-user";
 
 impl MagickmindAgentPersonaStage {
-    /// Create a new stage, defaulting to the [`PersonaCaller::ServiceUser`] route.
+    /// Create a new stage, defaulting to the [`CredentialKind::ServiceUser`] route.
     ///
     /// No network call is made at construction time.
     pub fn new(base_url: &str, agent_id: &str, identity: Arc<dyn Auth>) -> Self {
@@ -84,7 +72,7 @@ impl MagickmindAgentPersonaStage {
             )),
             base_url: base_url.trim_end_matches('/').to_string(),
             agent_id: agent_id.to_string(),
-            caller: PersonaCaller::ServiceUser,
+            credential_kind: CredentialKind::ServiceUser,
             identity,
             history: Arc::new(Vec::new()),
             cache: PreparedPromptCache::new(Duration::from_secs(Self::DEFAULT_TTL_SECS)),
@@ -92,16 +80,17 @@ impl MagickmindAgentPersonaStage {
         }
     }
 
-    /// Default prepared-prompt cache TTL in seconds (10 minutes).
-    pub const DEFAULT_TTL_SECS: u64 = 600;
+    /// Default prepared-prompt cache TTL in seconds (5 minutes), the persona
+    /// service's freshness limit for an evolved personality.
+    pub const DEFAULT_TTL_SECS: u64 = 300;
 
     /// Total HTTP request timeout in seconds. The prepare call gates message
     /// processing, so a hung server must not stall pipelines indefinitely.
     pub const HTTP_TIMEOUT_SECS: u64 = 10;
 
-    /// Select which route the stage uses. Defaults to [`PersonaCaller::ServiceUser`].
-    pub fn with_caller(mut self, caller: PersonaCaller) -> Self {
-        self.caller = caller;
+    /// Select which route the stage uses. Defaults to [`CredentialKind::ServiceUser`].
+    pub fn with_credential_kind(mut self, credential_kind: CredentialKind) -> Self {
+        self.credential_kind = credential_kind;
         self
     }
 
@@ -111,7 +100,8 @@ impl MagickmindAgentPersonaStage {
         self
     }
 
-    /// Override the prepared-prompt cache TTL (default 10 minutes).
+    /// Override the prepared-prompt cache TTL (default 5 minutes). A shorter
+    /// `ttl_seconds` from the server still wins for that prompt.
     ///
     /// A TTL of zero disables caching: every message re-fetches, nothing is
     /// stored, and there is no stale fallback.
@@ -132,11 +122,11 @@ impl MagickmindAgentPersonaStage {
     /// `None` only for non-user senders, so the `None` slot holds the agent's
     /// generic, non-personalized prompt and two real users never share it. That
     /// invariant depends on the server not personalizing a request that carries
-    /// no `user_id` — if it ever does, this slot must be split per caller.
+    /// no `user_id` — if it ever does, this slot must be split per credential_kind.
     fn agent_cache_key(&self) -> String {
-        match self.caller {
-            PersonaCaller::ServiceUser => self.agent_id.clone(),
-            PersonaCaller::EndUser => END_USER_AGENT_KEY.to_string(),
+        match self.credential_kind {
+            CredentialKind::ServiceUser => self.agent_id.clone(),
+            CredentialKind::EndUser => END_USER_AGENT_KEY.to_string(),
         }
     }
 
@@ -156,9 +146,11 @@ impl MagickmindAgentPersonaStage {
         }
 
         match self.prepare(user_id).await {
-            Ok(prompt) => {
-                self.cache.insert(key, prompt.clone());
-                Ok(prompt)
+            Ok(prepared) => {
+                let server_ttl = prepared.server_ttl();
+                self.cache
+                    .insert_with_server_ttl(key, prepared.system_prompt.clone(), server_ttl);
+                Ok(prepared.system_prompt)
             }
             Err(e) => {
                 if let Some(stale) = self.cache.get_any(&key) {
@@ -185,11 +177,11 @@ impl MagickmindAgentPersonaStage {
                 message: "base_url cannot be a base URL".to_string(),
                 status_code: None,
             })?;
-            match self.caller {
-                PersonaCaller::ServiceUser => {
+            match self.credential_kind {
+                CredentialKind::ServiceUser => {
                     segments.extend(&["v1", "end-users", &self.agent_id, "persona", "prepare"]);
                 }
-                PersonaCaller::EndUser => {
+                CredentialKind::EndUser => {
                     segments.extend(&["v1", "end-user", "persona", "prepare"]);
                 }
             }
@@ -198,7 +190,7 @@ impl MagickmindAgentPersonaStage {
     }
 
     /// Call the prepare endpoint and return the finished system prompt.
-    async fn prepare(&self, user_id: Option<&str>) -> Result<String> {
+    async fn prepare(&self, user_id: Option<&str>) -> Result<PreparePersonaResponse> {
         // Defense in depth: the builder already refuses a non-TLS base_url at
         // startup, but a directly-constructed stage has not been through it.
         crate::core::net::require_secure_url(
@@ -224,26 +216,27 @@ impl MagickmindAgentPersonaStage {
             })?;
 
         let status = resp.status();
+        crate::core::net::note_auth_status(self.identity.as_ref(), status);
         if !status.is_success() {
             let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
-            let hint = match (self.caller, status.as_u16()) {
-                (PersonaCaller::ServiceUser, 404) => {
+            let hint = match (self.credential_kind, status.as_u16()) {
+                (CredentialKind::ServiceUser, 404) => {
                     " (is this an agent id? this route is keyed by agent, not persona)"
                 }
-                (PersonaCaller::ServiceUser, 403) => {
+                (CredentialKind::ServiceUser, 403) => {
                     " (agent id does not match the token subject; holding an end-user JWT, \
                       configure auth.type = \"enduser\")"
                 }
-                (PersonaCaller::EndUser, 401) => {
+                (CredentialKind::EndUser, 401) => {
                     " (this route needs an end-user JWT; with a service-user credential the \
                       agent id is named in the path instead)"
                 }
-                (PersonaCaller::EndUser, 403) => " (end-user token revoked or not permitted)",
+                (CredentialKind::EndUser, 403) => " (end-user token revoked or not permitted)",
                 _ => "",
             };
-            let subject = match self.caller {
-                PersonaCaller::ServiceUser => format!("agent {}", self.agent_id),
-                PersonaCaller::EndUser => "the calling agent".to_string(),
+            let subject = match self.credential_kind {
+                CredentialKind::ServiceUser => format!("agent {}", self.agent_id),
+                CredentialKind::EndUser => "the calling agent".to_string(),
             };
             return Err(MindroidError::Api {
                 message: format!("Failed to prepare persona for {subject}{hint}: {text}"),
@@ -251,12 +244,10 @@ impl MagickmindAgentPersonaStage {
             });
         }
 
-        let prepared: PreparePersonaResponse =
-            resp.json().await.map_err(|e| MindroidError::Api {
-                message: format!("error decoding prepare-persona response: {e}"),
-                status_code: None,
-            })?;
-        Ok(prepared.system_prompt)
+        resp.json().await.map_err(|e| MindroidError::Api {
+            message: format!("error decoding prepare-persona response: {e}"),
+            status_code: None,
+        })
     }
 }
 
@@ -273,9 +264,9 @@ impl PipelineStage for MagickmindAgentPersonaStage {
         // carries the subject), so name the route instead of logging a blank
         // field. `user_id` is deliberately omitted — see resolve_prompt.
         debug!(
-            "MagickmindAgentPersonaStage: preparing agent={} caller={:?} personalized={}",
+            "MagickmindAgentPersonaStage: preparing agent={} credential_kind={:?} personalized={}",
             self.agent_cache_key(),
-            self.caller,
+            self.credential_kind,
             user_id.is_some()
         );
         let system_prompt = self.resolve_prompt(user_id.as_deref()).await?;
@@ -287,7 +278,11 @@ impl PipelineStage for MagickmindAgentPersonaStage {
             messages.len(),
         );
 
+        let current_user = messages.len() - 1;
         ctx.llm_messages = messages;
+        ctx.set(crate::pipeline::extensions::CurrentUserMessage(
+            current_user,
+        ));
 
         Ok(())
     }
@@ -301,34 +296,47 @@ struct PreparePersonaRequest<'a> {
 }
 
 /// Response body. The prepare endpoint returns richer metadata, but only the
-/// finished prompt is used here.
-#[derive(Deserialize)]
+/// finished prompt and how long it may be served are used here.
+#[derive(Debug, Deserialize)]
 struct PreparePersonaResponse {
     system_prompt: String,
+    /// Absent from older servers. Zero or negative is read as "no limit
+    /// given", not "do not cache": an unset field must not turn every message
+    /// into a prepare call.
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+}
+
+impl PreparePersonaResponse {
+    fn server_ttl(&self) -> Option<Duration> {
+        self.ttl_seconds
+            .filter(|secs| *secs > 0)
+            .map(|secs| Duration::from_secs(secs.unsigned_abs()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn stage(caller: PersonaCaller) -> MagickmindAgentPersonaStage {
+    fn stage(credential_kind: CredentialKind) -> MagickmindAgentPersonaStage {
         MagickmindAgentPersonaStage::new(
             "https://x",
             "agent-1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         )
-        .with_caller(caller)
+        .with_credential_kind(credential_kind)
     }
 
     #[test]
     fn service_user_route_carries_the_agent_id() {
-        let url = stage(PersonaCaller::ServiceUser).prepare_url().unwrap();
+        let url = stage(CredentialKind::ServiceUser).prepare_url().unwrap();
         assert_eq!(url.path(), "/v1/end-users/agent-1/persona/prepare");
     }
 
     #[test]
     fn end_user_route_omits_the_agent_id() {
-        let url = stage(PersonaCaller::EndUser).prepare_url().unwrap();
+        let url = stage(CredentialKind::EndUser).prepare_url().unwrap();
         assert_eq!(url.path(), "/v1/end-user/persona/prepare");
         assert!(!url.path().contains("agent-1"));
     }
@@ -340,7 +348,7 @@ mod tests {
             "agent-1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         );
-        assert_eq!(s.caller, PersonaCaller::ServiceUser);
+        assert_eq!(s.credential_kind, CredentialKind::ServiceUser);
     }
 
     #[test]
@@ -348,11 +356,11 @@ mod tests {
         // Service-user keys by agent id; end-user by the fixed marker, so the two
         // routes never share a cache entry even at the same base_url.
         assert_eq!(
-            stage(PersonaCaller::ServiceUser).agent_cache_key(),
+            stage(CredentialKind::ServiceUser).agent_cache_key(),
             "agent-1"
         );
         assert_eq!(
-            stage(PersonaCaller::EndUser).agent_cache_key(),
+            stage(CredentialKind::EndUser).agent_cache_key(),
             END_USER_AGENT_KEY
         );
     }
@@ -368,6 +376,31 @@ mod tests {
         let resp: PreparePersonaResponse =
             serde_json::from_str(r#"{"system_prompt":"You are Aria.","agent_id":"a"}"#).unwrap();
         assert_eq!(resp.system_prompt, "You are Aria.");
+    }
+
+    #[test]
+    fn the_servers_ttl_bounds_the_prompt_and_an_unset_one_does_not() {
+        let ttl = |body: &str| {
+            serde_json::from_str::<PreparePersonaResponse>(body)
+                .unwrap()
+                .server_ttl()
+        };
+        assert_eq!(
+            ttl(r#"{"system_prompt":"p","ttl_seconds":120}"#),
+            Some(Duration::from_secs(120))
+        );
+        // An older server, or an unset field, must not disable caching.
+        assert_eq!(ttl(r#"{"system_prompt":"p"}"#), None);
+        assert_eq!(ttl(r#"{"system_prompt":"p","ttl_seconds":0}"#), None);
+        assert_eq!(ttl(r#"{"system_prompt":"p","ttl_seconds":-5}"#), None);
+    }
+
+    #[test]
+    fn default_ttl_is_the_freshness_limit() {
+        assert_eq!(
+            stage(CredentialKind::ServiceUser).cache.ttl(),
+            Duration::from_secs(300)
+        );
     }
 
     #[tokio::test]

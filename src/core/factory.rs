@@ -20,6 +20,20 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// The [`CredentialKind`] implied by `auth.type`: `"enduser"` acts as an end
+/// user, everything else as a service user. Pass it to adapters (the Centrifugo
+/// transport via `with_credential_kind`, the magickmind clients via
+/// `with_credential_kind`) so route and connect behavior follow the credential.
+///
+/// [`CredentialKind`]: crate::models::CredentialKind
+pub fn credential_kind_from_config(config: &MindroidConfig) -> crate::models::CredentialKind {
+    if config.auth.auth_type.as_deref() == Some("enduser") {
+        crate::models::CredentialKind::EndUser
+    } else {
+        crate::models::CredentialKind::ServiceUser
+    }
+}
+
 pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
     let auth_type = config.auth.auth_type.as_deref().unwrap_or("static");
 
@@ -34,16 +48,55 @@ pub(crate) fn build_auth(config: &MindroidConfig) -> Result<Arc<dyn Auth>> {
         // routes magickmind calls to the end-user API surface, where the agent
         // is the token subject rather than a path parameter.
         //
-        // Gated on `persona`: that routing is the only thing distinguishing
-        // this from `static`, and it exists only in persona-gated code. Without
+        // Gated on `magickmind`: that routing is the only thing distinguishing
+        // this from `static`, and it exists only in backend-gated code. Without
         // the feature the variant would be silently meaningless, so reject it.
-        #[cfg(feature = "persona")]
+        #[cfg(feature = "magickmind")]
         "enduser" => {
+            // A pre-minted end-user JWT. The end-user vs service-user routing
+            // decision is made by the transport and magickmind clients from
+            // `auth.type`, not here.
             let token =
                 config.auth.token.as_deref().ok_or_else(|| {
                     MindroidError::config("auth.token is required for enduser auth")
                 })?;
-            Ok(Arc::new(crate::auth::static_id::StaticAuth::new(token)))
+
+            // Always EndUserAuth — `rotate_token` chooses how the credential is
+            // kept fresh, not what type holds it. A plain static holder would
+            // report `ServiceUser` (routing this token to the wrong surface) and
+            // would never latch a rejection, so a supervisor that stops
+            // redelivering yields an agent that 401s every call while reporting
+            // healthy.
+            let base_url = config.auth.base_url.as_deref().ok_or_else(|| {
+                MindroidError::config(
+                    "auth.base_url is required for enduser auth (it is the host the \
+                     credential belongs to, and where rotation posts)",
+                )
+            })?;
+
+            let mut auth = crate::auth::enduser::EndUserAuth::try_new(
+                base_url,
+                token,
+                config.auth.token_expires_at.as_deref(),
+                config.auth.allow_insecure,
+            )?;
+            if let Some(ttl) = config.auth.token_ttl_seconds {
+                auth = auth.with_ttl_seconds(ttl);
+            }
+            if let Some(path) = &config.auth.token_file {
+                auth = auth.with_token_file(path);
+            }
+
+            if config.auth.rotate_token {
+                // Self-refresh: a supervised token is barred from the refresh
+                // route, so that pairing is a guaranteed 403 — terminal. Fail at
+                // boot rather than an hour in.
+                auth.ensure_self_refreshable()?;
+            } else {
+                // Supervised: a control plane re-mints and redelivers.
+                auth = auth.supervised();
+            }
+            Ok(Arc::new(auth))
         }
 
         #[cfg(feature = "apikey")]
@@ -87,9 +140,12 @@ pub(crate) fn build_transport(
                 MindroidError::config("transport.url is required for centrifugo transport")
             })?;
             let agent_id = &config.agent.agent_id;
+            let kind = credential_kind_from_config(config);
             Ok(Box::new(
                 crate::transport::centrifugo::CentrifugoTransport::new(url, agent_id, auth.clone())
-                    .with_allow_insecure(config.transport.allow_insecure),
+                    .with_credential_kind(kind)
+                    .with_allow_insecure(config.transport.allow_insecure)
+                    .with_trust_fanout_sender(config.transport.trust_server_fanout_sender),
             ))
         }
 
@@ -136,6 +192,31 @@ pub(crate) fn build_memory(
 
         other => Err(MindroidError::config(format!(
             "unknown or disabled memory type: '{other}'"
+        ))),
+    }
+}
+
+/// Build the artifact store from config. Returns `Arc` (not `Box`) because the
+/// store is shared into BOTH the persistence stage AND the load tool/executor.
+#[cfg(feature = "artifacts")]
+pub fn build_artifact_store(
+    config: &MindroidConfig,
+) -> Result<Arc<dyn crate::artifacts::ArtifactStore>> {
+    let a_type = config.artifacts.artifacts_type.as_deref().unwrap_or("none");
+    match a_type {
+        "none" => Ok(Arc::new(crate::artifacts::NoArtifactStore)),
+        "local" => {
+            let path = config
+                .artifacts
+                .path
+                .as_deref()
+                .unwrap_or("./mindroid-artifacts");
+            Ok(Arc::new(crate::artifacts::LocalArtifactStore::new(
+                expand_tilde(path),
+            )))
+        }
+        other => Err(MindroidError::config(format!(
+            "unknown or disabled artifacts type: '{other}'"
         ))),
     }
 }

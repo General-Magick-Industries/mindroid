@@ -1,5 +1,5 @@
 # Chain-of-thought example configuration
-# Run with: cargo run --example chain_of_thought --features full -- --config examples/chain_of_thought.toml
+# Run with: cargo run -p mindroid-example-cot-trip-agent --bin cot_trip_agent -- --config examples/cot_trip_agent/config_alt.toml
 
 [agent]
 agent_id = "your-agent-id-here"

@@ -129,7 +129,7 @@ magickmind_pipeline(
    - Trims whitespace
 
 5. **MagickmindPersistence**
-   - Saves final response to MagickMind via `MagickmindClient.save_message()`
+   - Saves the final response to MagickMind, typed `TOOL_CALL` when the tool executor framed a remote call
    - Skips when the message carries no `channel_id` (magickspace id)
 
 **MagickmindClient API**:
@@ -144,9 +144,10 @@ pub async fn prepare_context(
     query: &str,
     config: &MagickmindContextConfig,
     exclude_sender: Option<&str>,
-) -> Result<Vec<LlmMessage>>
+) -> Result<PreparedContext>
 // POST /v1/magickspaces/{id}/context
 // Body: { participant_id, chat_history?, pelican?, corpus? }
+// PreparedContext { messages: Vec<LlmMessage>, corpora: Vec<CorpusCatalogEntry> }
 
 pub async fn save_message(
     &self,

@@ -204,7 +204,7 @@ let config = MindroidConfig::resolve_from_args()?;
 Or pass `--config ./mindroid.toml` at runtime:
 
 ```sh
-cargo run --example my_agent -- --config ./mindroid.toml
+cargo run -p mindroid-example-local-persona --bin local_persona -- --config ./mindroid.toml
 ```
 
 ## Integration: PersonaProvider Trait

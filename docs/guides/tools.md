@@ -24,14 +24,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> Value;  // JSON Schema
-    async fn execute(&self, args: Value) -> Result<String>;
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>;
 }
 ```
 
 ### Custom Tool Example
 
 ```rust
-use mindroid::tools::Tool;
+use mindroid::tools::{Tool, ToolContext};
 use serde_json::{json, Value};
 
 struct WeatherTool;
@@ -54,7 +54,7 @@ impl Tool for WeatherTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> mindroid::Result<String> {
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> mindroid::Result<String> {
         let city = args["city"].as_str().unwrap_or("unknown");
         Ok(format!("Weather in {city}: 22C, sunny"))
     }
@@ -83,7 +83,16 @@ The generated prompt includes each tool's name, description, and JSON Schema par
 
 ## Tool Execution Loop
 
-`ToolExecutorStage` implements an iterative loop that lets the LLM use multiple tools in sequence:
+> Two executor stages implement this loop. `XmlToolExecutorStage`, described below,
+> asks the model for `<tool_call>` markup and parses it back out of the response
+> text. `ToolExecutorStage` instead sends tools in the request's native
+> `tools` field and reads structured `tool_calls` back, which is what you want on
+> an endpoint that speaks OpenAI function calling — the XML failure modes in this
+> section do not apply to it. Everything else (registry, `ToolContext`, remote
+> tools, artifact re-injection) is identical. See "Choosing a tool executor" in
+> `AGENTS.md`.
+
+`XmlToolExecutorStage` implements an iterative loop that lets the LLM use multiple tools in sequence:
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -122,7 +131,7 @@ The parser extracts these, executes each tool, and feeds results back as user me
 ### Configuration
 
 ```rust
-ToolExecutorStage::new(registry, llm_config)
+XmlToolExecutorStage::new(client, registry)
     .with_max_iterations(10)       // default: 20
     .with_parser(MyCustomParser)   // default: XmlToolCallParser
 ```

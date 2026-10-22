@@ -1,0 +1,20 @@
+[package]
+name = "mindroid-example-openai-realtime"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "openai_realtime"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["omni-openai", "transport-audio", "persistence", "llm-client"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio-util = "0.7"

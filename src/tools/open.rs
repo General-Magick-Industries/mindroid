@@ -62,7 +62,7 @@ impl Tool for OpenTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String> {
+    async fn execute(&self, args: Value, _ctx: &super::ToolContext) -> Result<String> {
         let target = args
             .get("target")
             .and_then(|v| v.as_str())
