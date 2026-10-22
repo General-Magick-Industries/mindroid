@@ -65,12 +65,20 @@ impl FramedRemoteCall {
 /// Longest tool result kept in a turn's history; the rest is cut off.
 pub const MAX_RECORDED_RESULT_BYTES: usize = 4 * 1024;
 
+pub(crate) const RESULT_NOT_KEPT: &str = "(not kept in this conversation's history)";
+pub(crate) const CALL_FAILED: &str = "the call failed";
+
 /// A tool call the turn's [`ToolExecutorStage`] ran itself, with its result.
 /// A call that leaves the process (a remote tool) is not one, nor is a call to
 /// a tool that delivers the reply itself ([`Tool::ends_turn`]).
 ///
+/// `result` is the tool's output only when the tool opts in with
+/// [`Tool::keeps_result_in_history`]; otherwise it is a placeholder, and a
+/// failed call's is a generic note rather than the error.
+///
 /// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
 /// [`Tool::ends_turn`]: crate::tools::Tool::ends_turn
+/// [`Tool::keeps_result_in_history`]: crate::tools::Tool::keeps_result_in_history
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalToolCall {
     pub id: String,
@@ -117,8 +125,11 @@ impl LocalToolCall {
 }
 
 /// The turn's [`LocalToolCall`]s, in the order they ran. Whoever saves the turn
-/// saves them ahead of its reply, as `MagickmindPersistence` does, so the
-/// conversation's history holds what the agent looked up.
+/// saves them after its reply, as `MagickmindPersistence` does, so the
+/// conversation's history holds what the agent looked up without delaying the
+/// reply. [`ToolExecutorStage`] clears them when a turn starts.
+///
+/// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalToolCalls(pub Vec<LocalToolCall>);
 

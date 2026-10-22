@@ -209,6 +209,17 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool's result may be saved with its call in the
+    /// conversation's history, where every member can read it.
+    ///
+    /// Off by default: a result can carry what the agent knows from elsewhere
+    /// (another conversation's memories, a knowledge base), and the call is
+    /// then saved with a placeholder instead. Turn it on only for a tool whose
+    /// result is fine for everyone in the conversation to read.
+    fn keeps_result_in_history(&self) -> bool {
+        false
+    }
+
     /// Authenticated identity expected to execute this remote tool.
     ///
     /// Manifest-backed tools set this to their publisher. Static remote tools

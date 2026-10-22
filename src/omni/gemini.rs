@@ -527,11 +527,12 @@ impl TranscriptAcc {
     }
 }
 
-/// The error a close frame reports: anything but a normal closure, which is
+/// The error a close frame reports: anything but a normal closure or a server
+/// going away (a session that reached its time limit after `goAway`), which is
 /// how Gemini rejects a frame it cannot take (an image it refuses, say).
 fn close_error(close: Option<&CloseFrame<'_>>) -> Option<MindroidError> {
     let close = close?;
-    (close.code != CloseCode::Normal).then(|| {
+    (!matches!(close.code, CloseCode::Normal | CloseCode::Away)).then(|| {
         transport(format!(
             "Gemini Live closed the session: {} {}",
             u16::from(close.code),
@@ -1171,7 +1172,13 @@ mod tests {
         let error = close_error(Some(&refused)).expect("an error").to_string();
         assert!(error.contains("1007"), "{error}");
         assert!(error.contains("invalid argument"), "{error}");
+        let away = CloseFrame {
+            code: CloseCode::Away,
+            reason: "".into(),
+        };
+
         assert!(close_error(Some(&normal)).is_none());
+        assert!(close_error(Some(&away)).is_none());
         assert!(close_error(None).is_none());
     }
 

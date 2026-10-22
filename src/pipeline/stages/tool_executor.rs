@@ -35,9 +35,11 @@ use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall, ToolsChatOutcome, ToolsStreamEvent};
 use crate::models::StreamEvent;
-use crate::pipeline::extensions::{FramedRemoteCall, LocalToolCall, LocalToolCalls};
+use crate::pipeline::extensions::{
+    CALL_FAILED, FramedRemoteCall, LocalToolCall, LocalToolCalls, RESULT_NOT_KEPT,
+};
 use crate::pipeline::{PipelineStage, StreamingStage};
-use crate::tools::{DynamicRegistry, ToolContext, ToolRegistry};
+use crate::tools::{DynamicRegistry, Tool, ToolContext, ToolRegistry};
 
 /// How many of a response's tool calls run at once when parallel calls are on.
 /// Bounded (ADR-0001) so a model that emits dozens cannot fan all of them out.
@@ -330,6 +332,7 @@ struct Round {
     outcome: RoundOutcome,
     /// Events to surface (ToolCall/ToolResult), in order.
     events: Vec<StreamEvent>,
+    ran: Vec<LocalToolCall>,
 }
 
 /// The turn-invariant inputs to a round, which travel together.
@@ -398,6 +401,7 @@ impl ToolExecutorStage {
             return Ok(Round {
                 outcome: RoundOutcome::Final(outcome.content),
                 events: Vec::new(),
+                ran: Vec::new(),
             });
         }
 
@@ -435,12 +439,13 @@ impl ToolExecutorStage {
             } else {
                 outcome.content.trim()
             };
-            let (framed, call_id) = frame_remote_call(&call.name, &args, ack);
+            let executor_id = executor_id.as_deref().or(trusted_sender);
+            let (framed, call_id) = frame_remote_call(&call.name, &args, ack, executor_id);
             // The trusted delivery channel is what `RemoteResultGate` claims
             // under; `tool_ctx.channel_id` is the workspace id and never matches.
             self.pending.record_for(
                 message_channel,
-                executor_id.as_deref().or(trusted_sender),
+                executor_id,
                 &call_id,
                 &call.name,
                 super::tool_executor_xml::remote_timeout_for(registry, &call.name),
@@ -448,6 +453,7 @@ impl ToolExecutorStage {
             return Ok(Round {
                 outcome: RoundOutcome::Remote(framed),
                 events,
+                ran: Vec::new(),
             });
         }
 
@@ -465,6 +471,7 @@ impl ToolExecutorStage {
         messages: &mut Vec<ChatCompletionRequestMessage>,
     ) -> Result<Round> {
         let mut events = Vec::new();
+        let mut ran = Vec::new();
         #[cfg(feature = "artifacts")]
         let mut load_ids: Vec<String> = Vec::new();
         let mut ends_turn = false;
@@ -497,8 +504,11 @@ impl ToolExecutorStage {
             }
             // Only a call that ran ends the turn: a failed one loops back so
             // the model sees the error and can retry.
-            ends_turn |=
-                executed.is_ok() && registry.get(&call.name).is_some_and(|t| t.ends_turn());
+            let tool = registry.get(&call.name);
+            ends_turn |= executed.is_ok() && tool.as_ref().is_some_and(|t| t.ends_turn());
+            if !tool.as_ref().is_some_and(|t| t.ends_turn()) {
+                ran.push(recorded_call(call, &executed, tool.as_deref()));
+            }
             let result = executed.unwrap_or_else(|e| e);
             events.push(StreamEvent::ToolResult {
                 name: call.name.clone(),
@@ -526,12 +536,17 @@ impl ToolExecutorStage {
         Ok(Round {
             outcome: round_outcome,
             events,
+            ran,
         })
     }
 
     /// Full loop shared by the streaming and non-streaming paths. Returns the
-    /// final response text plus every ToolCall/ToolResult event in order.
-    async fn run_loop(&self, ctx: &Context) -> Result<(LoopOutcome, Vec<StreamEvent>)> {
+    /// final response text plus every ToolCall/ToolResult event in order, and
+    /// the calls that ran here.
+    async fn run_loop(
+        &self,
+        ctx: &Context,
+    ) -> Result<(LoopOutcome, Vec<StreamEvent>, Vec<LocalToolCall>)> {
         let registry = registry_for_turn(ctx, &self.registry);
         let tool_ctx = tool_context_for(ctx);
         let tools = LlmClient::tool_specs(&registry);
@@ -547,29 +562,33 @@ impl ToolExecutorStage {
         };
 
         let mut all_events = Vec::new();
+        let mut all_ran = Vec::new();
         for iteration in 0..self.max_iterations {
             let round = self.run_round(&deps, &mut messages, iteration).await?;
             all_events.extend(round.events);
+            all_ran.extend(round.ran);
             match round.outcome {
                 RoundOutcome::Final(text) => {
-                    return Ok((LoopOutcome::Answer(text), all_events));
+                    return Ok((LoopOutcome::Answer(text), all_events, all_ran));
                 }
                 RoundOutcome::Remote(text) => {
-                    return Ok((LoopOutcome::Remote(text), all_events));
+                    return Ok((LoopOutcome::Remote(text), all_events, all_ran));
                 }
                 RoundOutcome::Continue => {}
             }
         }
 
         let summary = self.summarize(messages).await?;
-        Ok((LoopOutcome::Answer(summary), all_events))
+        Ok((LoopOutcome::Answer(summary), all_events, all_ran))
     }
 
-    fn record(&self, ctx: &mut Context, events: &[StreamEvent]) {
-        if self.record_local_calls {
-            let registry = registry_for_turn(ctx, &self.registry);
-            record_local_calls(ctx, events, &registry);
+    fn record(&self, ctx: &mut Context, ran: Vec<LocalToolCall>) {
+        if !self.record_local_calls || ran.is_empty() {
+            return;
         }
+        let mut calls = ctx.take_ext::<LocalToolCalls>().unwrap_or_default();
+        calls.0.extend(ran);
+        ctx.set_ext(calls);
     }
 
     /// Out of iterations: ask for an answer from what the loop gathered.
@@ -607,47 +626,39 @@ impl PipelineStage for ToolExecutorStage {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
-        FramedRemoteCall::clear(ctx);
+        start_turn(ctx);
         if self.gate_dropped(ctx).await? {
             return Ok(());
         }
-        let (outcome, events) = self.run_loop(ctx).await?;
-        self.record(ctx, &events);
+        let (outcome, _events, ran) = self.run_loop(ctx).await?;
+        self.record(ctx, ran);
         respond_with(ctx, outcome);
         Ok(())
     }
 }
 
-/// Add the calls `events` show ran here (a call followed by its result) to the
-/// turn's [`LocalToolCalls`].
-fn record_local_calls(ctx: &mut Context, events: &[StreamEvent], registry: &ToolRegistry) {
-    let ran: Vec<LocalToolCall> = events
-        .windows(2)
-        .filter_map(|pair| match pair {
-            [
-                StreamEvent::ToolCall { name, arguments },
-                StreamEvent::ToolResult {
-                    name: answered,
-                    result,
-                },
-            ] if name == answered && !registry.get(name).is_some_and(|t| t.ends_turn()) => {
-                Some(LocalToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name: name.clone(),
-                    arguments: serde_json::from_str(arguments)
-                        .unwrap_or_else(|_| serde_json::Value::String(arguments.clone())),
-                    result: result.clone(),
-                })
-            }
-            _ => None,
-        })
-        .collect();
-    if ran.is_empty() {
-        return;
+fn start_turn(ctx: &mut Context) {
+    FramedRemoteCall::clear(ctx);
+    ctx.take_ext::<LocalToolCalls>();
+}
+
+fn recorded_call(
+    call: &NativeToolCall,
+    executed: &std::result::Result<String, String>,
+    tool: Option<&dyn Tool>,
+) -> LocalToolCall {
+    let result = match executed {
+        Ok(text) if tool.is_some_and(|t| t.keeps_result_in_history()) => text.clone(),
+        Ok(_) => RESULT_NOT_KEPT.to_string(),
+        Err(_) => CALL_FAILED.to_string(),
+    };
+    LocalToolCall {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: call.name.clone(),
+        arguments: serde_json::from_str(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone())),
+        result,
     }
-    let mut calls = ctx.take_ext::<LocalToolCalls>().unwrap_or_default();
-    calls.0.extend(ran);
-    ctx.set_ext(calls);
 }
 
 fn respond_with(ctx: &mut Context, outcome: LoopOutcome) -> String {
@@ -670,7 +681,7 @@ fn keep_spoken(ctx: &mut Context, spoken: &str) {
 
 impl StreamingStage for ToolExecutorStage {
     fn stream<'a>(&'a self, ctx: &'a mut Context) -> BoxStream<'a, StreamEvent> {
-        FramedRemoteCall::clear(ctx);
+        start_turn(ctx);
         Box::pin(async_stream::stream! {
             match self.gate_dropped(ctx).await {
                 Ok(true) => return,
@@ -738,7 +749,7 @@ impl StreamingStage for ToolExecutorStage {
                             return;
                         }
                     };
-                    self.record(ctx, &round.events);
+                    self.record(ctx, round.ran);
                     for event in round.events {
                         yield event;
                     }
@@ -785,8 +796,8 @@ impl StreamingStage for ToolExecutorStage {
                 Err(error) => {
                     yield StreamEvent::Error { message: error.to_string() };
                 }
-                Ok((outcome, events)) => {
-                    self.record(ctx, &events);
+                Ok((outcome, events, ran)) => {
+                    self.record(ctx, ran);
                     for event in events {
                         yield event;
                     }
@@ -1024,8 +1035,45 @@ mod tests {
             assert_eq!(calls.len(), 1, "streaming={streaming}");
             assert_eq!(calls[0].name, "recall");
             assert_eq!(calls[0].arguments, json!({"q": "cats"}));
-            assert_eq!(calls[0].result, "Found: cats");
+            assert_eq!(
+                calls[0].result, RESULT_NOT_KEPT,
+                "a tool that does not opt in keeps its result out of history"
+            );
             assert_eq!(ctx.response.as_deref(), Some("Cats are great."));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_on_a_reused_context_drops_the_last_turns_calls() {
+        use futures::StreamExt;
+
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = serve_completions(
+                listener,
+                vec![completion(json!({"role": "assistant", "content": "done"}))],
+            );
+            let stage = ToolExecutorStage::new(stub_client(addr), Arc::new(ToolRegistry::new()));
+            let mut ctx = fresh_ctx();
+            ctx.set_ext(LocalToolCalls(vec![LocalToolCall {
+                id: "earlier".into(),
+                name: "recall".into(),
+                arguments: json!({}),
+                result: RESULT_NOT_KEPT.into(),
+            }]));
+
+            if streaming {
+                let _: Vec<StreamEvent> = stage.stream(&mut ctx).collect().await;
+            } else {
+                stage.process(&mut ctx).await.unwrap();
+            }
+            server.await.unwrap();
+
+            assert!(
+                ctx.get_ext::<LocalToolCalls>().is_none(),
+                "streaming={streaming}"
+            );
         }
     }
 
@@ -1068,14 +1116,19 @@ mod tests {
         stage.process(&mut ctx).await.unwrap();
         server.await.unwrap();
 
-        let names: Vec<&str> = ctx
+        let recorded: Vec<(&str, &str)> = ctx
             .get_ext::<LocalToolCalls>()
-            .map(|c| c.0.iter().map(|call| call.name.as_str()).collect())
+            .map(|c| {
+                c.0.iter()
+                    .map(|call| (call.name.as_str(), call.result.as_str()))
+                    .collect()
+            })
             .unwrap_or_default();
         assert_eq!(
-            names,
-            ["nope"],
-            "the unknown tool ran here and failed; deliver ends the turn"
+            recorded,
+            [("nope", CALL_FAILED)],
+            "the unknown tool ran here and failed, recorded without its error; \
+             deliver ends the turn"
         );
     }
 
@@ -1677,6 +1730,9 @@ mod tests {
                 "the streamed arguments arrive whole"
             );
             Ok("north gate".into())
+        }
+        fn keeps_result_in_history(&self) -> bool {
+            true
         }
     }
 
