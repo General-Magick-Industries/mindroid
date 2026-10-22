@@ -208,7 +208,10 @@ impl LocalArtifactStore {
 
         let data = Self::read_no_follow(&bytes_path, limit)
             .await
-            .map_err(|e| MindroidError::artifact(format!("read artifact '{id}' failed: {e}")))?;
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidData => super::exceeds(id, limit),
+                _ => MindroidError::artifact(format!("read artifact '{id}' failed: {e}")),
+            })?;
         let json = Self::read_no_follow(&sidecar_path, MAX_SIDECAR_BYTES)
             .await
             .map_err(|e| MindroidError::artifact(format!("read sidecar for '{id}' failed: {e}")))?;

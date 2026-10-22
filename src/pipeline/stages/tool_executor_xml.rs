@@ -448,9 +448,8 @@ impl ToolCallParser for XmlToolCallParser {
 pub(crate) const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 /// Cap on artifacts re-attached in one round. The model chooses the count, and
-/// each is held in memory and base64-expanded into the request. Bounds a round,
-/// not a turn: `messages` accumulates across iterations, so the worst case is
-/// still this times [`DEFAULT_MAX_ITERATIONS`].
+/// each is held in memory and base64-expanded into the request. The bytes they
+/// add across the whole turn are bounded separately, by the turn's image allowance.
 #[cfg(feature = "artifacts")]
 pub(crate) const MAX_REINJECTED_ARTIFACTS: usize = 8;
 
@@ -590,6 +589,7 @@ impl PipelineStage for XmlToolExecutorStage {
                 |s| s.scope_for(&ctx.message),
             ),
             store: self.artifact_store(),
+            attached: super::reattach::AttachedImages::for_turn(ctx),
         };
         let (mut messages, mut final_content, hit_max, framed) = run_tool_loop(
             LoopDeps {
@@ -650,6 +650,7 @@ impl StreamingStage for XmlToolExecutorStage {
                 |s| s.scope_for(&ctx.message),
             ),
             store: self.artifact_store(),
+            attached: super::reattach::AttachedImages::for_turn(ctx),
         };
 
         Box::pin(async_stream::stream! {
@@ -1019,6 +1020,7 @@ struct ArtifactReinjection {
     store: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
     /// Never model- or user-supplied — taken from the inbound message.
     scope: String,
+    attached: super::reattach::AttachedImages,
 }
 
 /// The stage-owned inputs to [`run_tool_loop`], which travel together.
@@ -1195,7 +1197,7 @@ async fn finalize_round_message(
     mut load_ids: Vec<String>,
     artifacts: &ArtifactReinjection,
 ) -> LlmMessage {
-    use crate::core::content::{ContentPart, ContentSource};
+    use crate::core::content::ContentPart;
     use crate::models::Role;
 
     let requested = load_ids.len();
@@ -1212,40 +1214,23 @@ async fn finalize_round_message(
     if !dropped.is_empty() {
         parts.push(ContentPart::text(format!(
             "(only {MAX_REINJECTED_ARTIFACTS} artifacts were re-attached this round; not attached: {})",
-            dropped.join(", ")
+            dropped
+                .iter()
+                .map(|id| crate::llm_client::sanitize_llm_visible(id))
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     if let Some(store) = &artifacts.store {
-        for id in load_ids {
-            match store.load(&artifacts.scope, &id).await {
-                // Only images round-trip as an `image_url` data URL; offload also
-                // covers audio/video/file, and a non-image sent that way is a hard
-                // provider 400 rather than graceful degradation.
-                Ok(art) => match crate::artifacts::inline_image_type(&art.data) {
-                    Some(mime_type) => parts.push(ContentPart::image(
-                        ContentSource::Inline { data: art.data },
-                        mime_type,
-                    )),
-                    None => {
-                        warn!(
-                            "XmlToolExecutorStage: artifact '{id}' is {}, not an inlinable image; \
-                             referencing it instead of inlining",
-                            art.mime_type
-                        );
-                        parts.push(ContentPart::text(format!(
-                            "(artifact {id} is {}, which cannot be shown inline)",
-                            crate::core::content::visible_mime_type(&art.mime_type)
-                        )));
-                    }
-                },
-                Err(e) => {
-                    warn!("XmlToolExecutorStage: get_artifact '{id}' failed: {e}");
-                    parts.push(ContentPart::text(format!(
-                        "(could not re-attach artifact {id})"
-                    )));
-                }
-            }
-        }
+        parts.extend(
+            super::reattach::reattached_parts(
+                load_ids,
+                store,
+                &artifacts.scope,
+                &artifacts.attached,
+            )
+            .await,
+        );
     }
     LlmMessage::with_parts(Role::Tool, parts)
 }
@@ -2245,6 +2230,9 @@ Some text.
                 &ArtifactReinjection {
                     store: Some(store),
                     scope: "chan1".into(),
+                    attached: super::super::super::reattach::AttachedImages::for_turn(&gate_ctx(
+                        "x",
+                    )),
                 },
             )
             .await;
@@ -2267,6 +2255,9 @@ Some text.
                 &ArtifactReinjection {
                     store: Some(store),
                     scope: "chan1".into(),
+                    attached: super::super::super::reattach::AttachedImages::for_turn(&gate_ctx(
+                        "x",
+                    )),
                 },
             )
             .await;
