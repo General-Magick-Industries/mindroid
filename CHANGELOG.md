@@ -347,7 +347,7 @@ let reply = EpisodeReplyIngestStage::new(url, auth, kind);
   but only when Lynn is the call's `executor_id`; a result from anyone else, or
   to a call that names no executor, replays as a plain `[Bob]: ...` turn. A
   participant's own `TOOL_CALL` replays as `[Bob called drive]: ...`, with
-  brackets stripped from the tool name, and the agent's own `TOOL_RESULT` as a
+  brackets stripped from tool and display names, and the agent's own `TOOL_RESULT` as a
   user turn, `[result of your lookup call]: ...`. The agent's own recorded
   calls replay ahead of the reply they were saved after, and one whose result
   was never saved is not replayed. The attribution note explains the labels.

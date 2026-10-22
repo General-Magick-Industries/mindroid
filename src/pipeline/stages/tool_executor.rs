@@ -99,6 +99,9 @@ impl ToolExecutorStage {
 
     /// Record the calls the stage runs itself, with their results, in the
     /// turn's [`LocalToolCalls`] for whoever saves the turn. On by default.
+    /// Each run of the stage starts the list afresh, so a stage re-entered
+    /// within one turn (a Branch or Router loop) keeps only its last run's
+    /// calls.
     pub fn with_recorded_calls(mut self, record: bool) -> Self {
         self.record_local_calls = record;
         self
