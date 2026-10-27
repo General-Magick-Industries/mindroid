@@ -79,6 +79,11 @@ Contacts the Magick Mind REST API for server-side dyadic computation:
 let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
 ```
 
+Config does not build this client. For MagickMind personas, use the
+[server-prepared prompt](#magickmind-prepared-prompt-server-formats) so the
+agent's wording matches the server's; the client remains for code that needs the
+raw schema or effective personality.
+
 ### LocalPersonaProvider (file-based)
 
 Reads from local files. No network required. Ideal for development:
@@ -172,6 +177,12 @@ The cloud provider applies an equivalent algorithm server-side and returns the a
 
 `PersonaContextBuilder` implements `PipelineStage`. It replaces `SimpleContextBuilder` when a persona is configured.
 
+It is the **`type = "local"`** path: the prompt is formatted in-process from a
+local `persona.md`, on a 0–1 scale, without trait bands or descriptions.
+`RuntimeBuilder::build_persona_stage()` builds it for `"local"` personas only.
+MagickMind personas use the
+[server-prepared prompt](#magickmind-prepared-prompt-server-formats) instead.
+
 ### Construction
 
 ```rust
@@ -196,6 +207,8 @@ On each `process()` call:
 
 ### Generated system prompt
 
+For a local persona:
+
 ```
 You are Aria, a wellness coach.
 
@@ -212,39 +225,58 @@ Communication tones: empathetic, calm, encouraging
 
 ---
 
-## MagickMind-prepared Prompt (delegated formatting)
+## MagickMind-prepared Prompt (server formats)
 
-`PersonaContextBuilder` (above) fetches structured trait data and formats the
-system prompt **in-process** in Rust. An alternative is to let the **MagickMind
-server** own prompt construction: `MagickmindPersonaStage` calls the server's
-prepare endpoint and uses the returned string verbatim.
+Every MagickMind persona takes its prompt from the **MagickMind server**: the
+SDK calls a prepare endpoint and uses the returned string verbatim, so the SDK
+and the server always render the same wording. `PersonaContextBuilder` (above)
+formats in-process and serves only `"local"` personas.
 
 ```
-POST {base_url}/v1/persona/{persona_id}/prepare
+POST {base_url}/v1/end-users/{agent_id}/persona/prepare   # magickmind-prepared-agent, service user
+POST {base_url}/v1/end-user/persona/prepare               # magickmind-prepared-agent, auth.type = "enduser"
+POST {base_url}/v1/persona/{persona_id}/prepare           # magickmind-prepared (deprecated route)
 body:   { "user_id": "<optional>" }
 returns: { "system_prompt": "..." }
 ```
 
-The server computes the effective personality — including numeric trait
-*banding* (e.g. "very high", "moderate") — and returns a finished
-`system_prompt` string. Use this when the MagickMind server is the single
-source of truth for prompt rendering and you do not want to duplicate
-formatting logic in Rust.
+The server computes the effective personality and returns a finished
+`system_prompt` string, with trait *bands* (e.g. "very low", "moderate") and
+each trait's blueprint description. The agent-keyed routes
+(`magickmind-prepared-agent`) serve the **evolved, per-user** personality. The
+persona-keyed route (`magickmind-prepared`) is deprecated server-side and renders
+**authored values only**: no evolution, no per-user adjustment.
 
-| | `magickmind` (SDK formats) | `magickmind-prepared` (server formats) |
+| | `local` (SDK formats) | `magickmind-prepared-agent` / `magickmind-prepared` (server formats) |
 |---|---|---|
-| Trait banding / custom phrasing | no — raw `- warmth: 0.8` | yes — banded server-side |
-| Requests from the SDK | 2 (persona + effective personality) | 1 (prepare) |
-| Formatting location | Rust (`format_trait`) | Server (single source of truth) |
+| Persona source | local `persona.md` | MagickMind service |
+| Trait bands and descriptions | no — raw `- warmth: 0.8` | yes — rendered server-side |
+| Requests from the SDK | none | 1 per uncached prompt (prepare) |
+| Formatting location | Rust (`PersonaContextBuilder`) | Server (single source of truth) |
 
 ### Configuration
+
+Agent-keyed (evolved, per-user personality):
+
+```toml
+[agent]
+agent_id = "your-agent-id"                  # path key; not needed with auth.type = "enduser"
+
+[persona]
+type = "magickmind-prepared-agent"
+base_url = "https://magickmind.example.com" # falls back to memory/auth base_url
+cache_ttl_secs = 300                        # optional; prepared-prompt cache TTL (default 300 = 5 min, 0 disables)
+# allow_insecure = true                     # permit auth headers over plaintext http:// (local dev only)
+```
+
+Persona-keyed (authored values only):
 
 ```toml
 [persona]
 type = "magickmind-prepared"
 persona_id = "your-persona-id"              # default persona (see below)
 base_url = "https://magickmind.example.com" # falls back to memory/auth base_url
-cache_ttl_secs = 600                        # optional; prepared-prompt cache TTL (default 600 = 10 min, 0 disables)
+cache_ttl_secs = 300                        # optional; prepared-prompt cache TTL (default 300 = 5 min, 0 disables)
 # allow_insecure = true                     # permit auth headers over plaintext http:// (local dev only)
 ```
 
@@ -252,10 +284,41 @@ Auth headers ride on every prepare request, so plaintext `http://` base URLs
 are refused unless `allow_insecure = true` explicitly opts in for local
 development.
 
-`RuntimeBuilder::build_magickmind_persona_stage()` returns the configured stage
-(no startup network call — the server computes everything per-request). The
-`persona_agent` example auto-selects it when `type = "magickmind-prepared"`; see
+`RuntimeBuilder::build_magickmind_agent_persona_stage()` and
+`build_magickmind_persona_stage()` return the configured stage (no startup
+network call — the server computes everything per-request). The `persona_agent`
+example auto-selects whichever is configured; see
+`examples/persona_agent/magickmind-prepared-agent.toml` and
 `examples/persona_agent/magickmind-prepared.toml`.
+
+### Migrating from `type = "magickmind"`
+
+`type = "magickmind"` used to fetch the effective personality and format the
+prompt in the SDK (`- warmth: 50.0`, no bands, no descriptions). It is now a
+**deprecated alias** of the prepared types and logs a warning at build time:
+
+| Your config | Resolves to |
+|---|---|
+| `auth.type = "enduser"`, or `agent.agent_id` set | `magickmind-prepared-agent` |
+| neither | `magickmind-prepared` (`persona_id` required) |
+
+Set the explicit type to silence the warning. Four behaviours change:
+
+- **TLS.** The base URL must be `https://` unless `persona.allow_insecure = true`,
+  as for the prepared types. The old mapping did not check.
+- **Caching.** `persona.cache_ttl_secs` now applies, with the prepared stages'
+  default of 5 minutes.
+- **Authored values only without an agent.** The persona-keyed route serves
+  authored trait values only. Set `agent.agent_id` (or use end-user auth) to get
+  the evolved, per-user prompt.
+- **`persona_id` is ignored on the agent route.** The server uses the agent's
+  active persona. If your config sets a `persona_id` that is not that persona,
+  the personality changes; make it the agent's active persona in MagickMind, or
+  drop `agent.agent_id` to keep the persona-keyed route.
+
+`build_persona_stage()` returns `None` for `type = "magickmind"` and logs a
+warning; build the stage with `build_magickmind_agent_persona_stage()` or
+`build_magickmind_persona_stage()`.
 
 ### Per-message persona selection (`PersonaId`)
 
@@ -280,10 +343,12 @@ the resolve-and-cache mechanism is the SDK's.
 
 `MagickmindPersonaStage` caches each prepared `system_prompt` keyed by
 `(persona_id, user_id)` so voice/chat turns don't call the server on every message
-(the `prepare` response carries no TTL, so the cache lifetime is the SDK's
-choice). The default is 10 minutes; override per stage with
-`.with_ttl(Duration)` or via `cache_ttl_secs` in config. A TTL of `0` disables
-caching entirely (nothing is stored).
+(the persona-route `prepare` response carries no TTL, so the cache lifetime is the
+SDK's choice). `MagickmindAgentPersonaStage` caches per `(agent, user_id)`, and the
+agent-route response's `ttl_seconds` caps each prompt's freshness. The default is
+5 minutes, the persona service's freshness limit for an evolved personality;
+override per stage with `.with_ttl(Duration)` or via `cache_ttl_secs` in config. A
+TTL of `0` disables caching entirely (nothing is stored).
 
 - **Eviction:** Expired entries are swept on the write path once the cache
   exceeds 200 entries.
@@ -318,13 +383,13 @@ let pipeline = Pipeline::new()
     .add_stage(post_processor);
 ```
 
-For cloud-backed personas, substitute `MagickmindPersonaClient`:
+For MagickMind personas, use the server-prepared stage in place of
+`PersonaContextBuilder`:
 
 ```rust
-use mindroid::persona::MagickmindPersonaClient;
-
-let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
-let stage = PersonaContextBuilder::new(Arc::new(client), "aria").await?;
+let persona_stage = builder
+    .build_magickmind_agent_persona_stage()
+    .expect("[persona] type = \"magickmind-prepared-agent\"");
 ```
 
 See also: [local-persona.md](local-persona.md), [magickmind-integration.md](magickmind-integration.md).

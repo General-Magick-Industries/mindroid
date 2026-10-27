@@ -1,5 +1,5 @@
 # Budget planning agent configuration
-# Run with: cargo run --example cot_budget_agent --features full -- --config examples/cot_budget_agent.toml
+# Run with: cargo run -p mindroid-example-cot-budget-agent --bin cot_budget_agent -- --config examples/cot_budget_agent/config.toml
 
 [agent]
 agent_id = "example-agent-id"

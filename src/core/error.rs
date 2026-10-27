@@ -25,6 +25,12 @@ pub enum MindroidError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    #[error("Artifact error: {message}")]
+    Artifact {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     #[error("API error: {message} (HTTP {status_code:?})")]
     Api {
         message: String,
@@ -53,6 +59,14 @@ impl MindroidError {
     pub fn pipeline(message: impl Into<String>) -> Self {
         Self::Pipeline {
             stage: "coordinator".into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Convenience constructor for artifact-store errors without a source chain.
+    pub fn artifact(message: impl Into<String>) -> Self {
+        Self::Artifact {
             message: message.into(),
             source: None,
         }

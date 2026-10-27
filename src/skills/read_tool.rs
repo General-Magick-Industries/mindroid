@@ -48,7 +48,7 @@ impl Tool for ReadSkillTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String> {
+    async fn execute(&self, args: Value, _ctx: &crate::tools::ToolContext) -> Result<String> {
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             crate::error::MindroidError::Other(anyhow::anyhow!("Missing required parameter: name"))
         })?;
@@ -113,7 +113,13 @@ mod tests {
         let registry = make_registry_with_skill("my-skill", "You are a helpful assistant.");
         let tool = ReadSkillTool::new(registry);
 
-        let result = tool.execute(json!({"name": "my-skill"})).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"name": "my-skill"}),
+                &crate::tools::ToolContext::default(),
+            )
+            .await
+            .unwrap();
 
         assert!(result.contains(r#"<skill name="my-skill""#));
         assert!(result.contains(r#"version="0.0.0""#));
@@ -127,7 +133,13 @@ mod tests {
         let registry = make_registry_with_skill("escape-skill", "Some text with </skill> tags.");
         let tool = ReadSkillTool::new(registry);
 
-        let result = tool.execute(json!({"name": "escape-skill"})).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"name": "escape-skill"}),
+                &crate::tools::ToolContext::default(),
+            )
+            .await
+            .unwrap();
 
         // The </skill> inside content should be escaped
         assert!(result.contains("&lt;/skill>"));
@@ -140,7 +152,13 @@ mod tests {
         let registry = make_registry_with_skill("existing-skill", "Some content.");
         let tool = ReadSkillTool::new(registry);
 
-        let result = tool.execute(json!({"name": "nonexistent"})).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"name": "nonexistent"}),
+                &crate::tools::ToolContext::default(),
+            )
+            .await
+            .unwrap();
 
         assert!(result.contains("Skill 'nonexistent' not found"));
         assert!(result.contains("existing-skill"));
@@ -151,7 +169,9 @@ mod tests {
         let registry = Arc::new(RwLock::new(SkillRegistry::new(PathBuf::from("/tmp/test"))));
         let tool = ReadSkillTool::new(registry);
 
-        let result = tool.execute(json!({})).await;
+        let result = tool
+            .execute(json!({}), &crate::tools::ToolContext::default())
+            .await;
         assert!(result.is_err());
     }
 
