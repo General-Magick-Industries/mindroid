@@ -427,7 +427,11 @@ Calls:
 - `GET /v1/persona/{persona_id}` — fetch static persona schema
 - `GET /v1/runtime/effective-personality/{persona_id}?user_id={user_id}` — fetch blended personality
 
-Use for centrally-managed personas with instant updates across agents.
+Config no longer builds this client: `persona.type = "magickmind"` now uses the
+server-prepared prompt (`MagickmindAgentPersonaStage` / `MagickmindPersonaStage`),
+so the agent's wording matches the server's. Wire the client by hand only if you
+need the raw schema or effective personality. See
+[Persona guide](./guides/persona.md#migrating-from-type--magickmind).
 
 Both implementations blend authored traits with optional per-user dyadic overrides. Lock levels control how much dyadic learning can adapt each trait:
 
