@@ -207,6 +207,45 @@ let reply = EpisodeReplyIngestStage::new(url, auth, kind).with_runtime_state_of(
 let reply = EpisodeReplyIngestStage::new(url, auth, kind);
 ```
 
+#### 8. `persona.type = "magickmind"` uses the server-prepared prompt
+
+The SDK no longer formats a prompt for MagickMind personas. It rendered
+`- warmth: 50.0` with no bands or trait descriptions, and its wording had
+drifted from the server's. `"magickmind"` is now a deprecated alias that logs a
+warning at build time and resolves to `"magickmind-prepared-agent"` when
+`auth.type = "enduser"` or `agent.agent_id` is set, else to
+`"magickmind-prepared"`. Config no longer creates `MagickmindPersonaClient`;
+it and `PersonaContextBuilder` stay public, and `"local"` is unchanged.
+
+- The base URL must be `https://` unless `persona.allow_insecure = true`.
+- `persona.cache_ttl_secs` applies, with the prepared stages' 5-minute default.
+- Without an agent id, the persona-keyed route serves authored trait values
+  only, with no evolution or per-user adjustment. Set `agent.agent_id` for the
+  evolved prompt.
+- On the agent route `persona.persona_id` is ignored: the server uses the
+  agent's active persona. The warning says so when one is set.
+- `RuntimeBuilder::build_persona_stage()` returns `Ok(None)` for
+  `"magickmind"` and logs a warning; it serves `"local"` personas only.
+
+```rust
+// before
+let stage = builder.build_persona_stage().await?.expect("persona");
+// after
+let stage: Arc<dyn PipelineStage> = match builder.build_magickmind_agent_persona_stage() {
+    Some(s) => Arc::new(s),
+    None => Arc::new(builder.build_magickmind_persona_stage().expect("persona")),
+};
+```
+
+```toml
+# before
+[persona]
+type = "magickmind"
+# after: agent-keyed (agent.agent_id, or auth.type = "enduser")
+[persona]
+type = "magickmind-prepared-agent"
+```
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just

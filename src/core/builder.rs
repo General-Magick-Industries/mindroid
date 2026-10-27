@@ -19,8 +19,7 @@ use super::runtime::Runtime;
 
 #[cfg(feature = "persona")]
 use crate::persona::{
-    LocalPersonaProvider, MagickmindPersonaClient, MagickmindPersonaStage, PersonaContextBuilder,
-    PersonaProvider,
+    LocalPersonaProvider, MagickmindPersonaStage, PersonaContextBuilder, PersonaProvider,
 };
 
 #[cfg(feature = "identity")]
@@ -84,13 +83,15 @@ pub struct RuntimeBuilder {
     #[cfg(feature = "persona")]
     pub(crate) persona_provider: Option<Arc<dyn PersonaProvider>>,
     /// MagickMind-prepared persona: `(base_url, persona_id, cache_ttl_secs, allow_insecure)`.
-    /// Set when `persona.type = "magickmind-prepared"`. Built into a
+    /// Set when `persona.type = "magickmind-prepared"`, or the deprecated
+    /// `"magickmind"` without an agent id or end-user auth. Built into a
     /// `MagickmindPersonaStage` on demand.
     #[cfg(feature = "persona")]
     pub(crate) magickmind_persona: Option<(String, String, Option<u64>, bool)>,
     /// Agent-scoped prepared persona:
     /// `(base_url, agent_id, credential_kind, cache_ttl_secs, allow_insecure)`.
-    /// Set when `persona.type = "magickmind-prepared-agent"`. Built into a
+    /// Set when `persona.type = "magickmind-prepared-agent"`, or the deprecated
+    /// `"magickmind"` with an agent id or end-user auth. Built into a
     /// `MagickmindAgentPersonaStage` on demand. `agent_id` is empty on the
     /// end-user route, where the token subject supplies it.
     #[cfg(feature = "persona")]
@@ -210,16 +211,30 @@ impl RuntimeBuilder {
         self.persona_provider.clone()
     }
 
-    /// Build a `PersonaContextBuilder` pipeline stage from the configured
-    /// persona provider.
+    /// Build a `PersonaContextBuilder` pipeline stage for a `persona.type = "local"`
+    /// persona, which formats the prompt in-process.
     ///
     /// This is async because it fetches the persona schema (name, role,
     /// background story, tones) once at construction time.
     ///
-    /// Returns `None` if no persona provider is configured.
+    /// Returns `None` if no persona provider is configured. MagickMind personas,
+    /// including the deprecated `"magickmind"` type, use the server-prepared
+    /// prompt instead: build them with
+    /// [`build_magickmind_agent_persona_stage`](Self::build_magickmind_agent_persona_stage)
+    /// or [`build_magickmind_persona_stage`](Self::build_magickmind_persona_stage).
     #[cfg(feature = "persona")]
     pub async fn build_persona_stage(&self) -> Result<Option<PersonaContextBuilder>> {
         let config = self.config.as_ref();
+        if config.and_then(|c| c.persona.persona_type.as_deref()) == Some("magickmind") {
+            // This used to be the "magickmind" stage, so an app that calls only
+            // this builder would otherwise lose its persona without a word.
+            tracing::warn!(
+                "build_persona_stage() serves persona.type = \"local\" only and returns None \
+                 for \"magickmind\", which now uses the server-prepared prompt; build it with \
+                 build_magickmind_agent_persona_stage() or build_magickmind_persona_stage()"
+            );
+            return Ok(None);
+        }
         let persona_id = config.and_then(|c| c.persona.persona_id.as_deref());
 
         match (&self.persona_provider, persona_id) {
@@ -233,8 +248,9 @@ impl RuntimeBuilder {
 
     /// Build a `MagickmindPersonaStage` from the configured MagickMind-prepared persona.
     ///
-    /// Returns `None` unless `persona.type = "magickmind-prepared"` was configured (and
-    /// auth has been resolved). Unlike [`build_persona_stage`](Self::build_persona_stage),
+    /// Returns `None` unless `persona.type = "magickmind-prepared"` (or the deprecated
+    /// `"magickmind"` without an agent id or end-user auth) was configured and
+    /// auth has been resolved. Unlike [`build_persona_stage`](Self::build_persona_stage),
     /// this performs no network call — the server computes the prompt per-request.
     #[cfg(feature = "persona")]
     pub fn build_magickmind_persona_stage(&self) -> Option<MagickmindPersonaStage> {
@@ -251,8 +267,9 @@ impl RuntimeBuilder {
     /// Build a `MagickmindAgentPersonaStage` from the configured
     /// agent-scoped prepared persona.
     ///
-    /// Returns `None` unless `persona.type = "magickmind-prepared-agent"` was
-    /// configured (and auth resolved). The route follows `auth.type`: a
+    /// Returns `None` unless `persona.type = "magickmind-prepared-agent"` (or the
+    /// deprecated `"magickmind"` with an agent id or end-user auth) was
+    /// configured and auth resolved. The route follows `auth.type`: a
     /// service-user credential names `agent.agent_id` in the path, while
     /// `auth.type = "enduser"` uses the id-less end-user route. No network call
     /// is made here — the server computes the prompt per-request.
@@ -647,123 +664,51 @@ impl Runtime {
         #[cfg(feature = "persona")]
         {
             match config.persona.persona_type.as_deref() {
+                // Deprecated alias. It used to format the prompt in-process from
+                // the effective personality, which drifted from the server's
+                // wording; it now takes Bifrost's prepared prompt so there is
+                // one copy of that wording.
                 Some("magickmind") => {
-                    if config.persona.persona_id.is_some() {
-                        let base_url = config
-                            .persona
-                            .base_url
-                            .as_deref()
-                            .or(config.memory.base_url.as_deref())
-                            .or(config.auth.base_url.as_deref())
-                            .ok_or_else(|| {
-                                MindroidError::config(
-                                    "persona.base_url, memory.base_url, or auth.base_url is required for magickmind persona",
-                                )
-                            })?;
-                        let client = MagickmindPersonaClient::new(base_url, auth);
-                        builder.persona_provider =
-                            Some(Arc::new(client) as Arc<dyn PersonaProvider>);
+                    let agent_keyed = crate::core::factory::credential_kind_from_config(&config)
+                        == crate::models::CredentialKind::EndUser
+                        || !config.agent.agent_id.is_empty();
+                    if agent_keyed {
+                        builder.magickmind_agent_persona =
+                            Some(prepared_agent_persona(&config, "magickmind")?);
+                        // Old configs set persona_id beside agent_id; the agent
+                        // route takes the agent's active persona, so a different
+                        // persona_id would change the personality silently.
+                        let ignored = if config.persona.persona_id.is_some() {
+                            "; persona.persona_id is ignored on this route, which uses the \
+                             agent's active persona"
+                        } else {
+                            ""
+                        };
+                        tracing::warn!(
+                            "persona.type = \"magickmind\" is deprecated and now resolves to \
+                             \"magickmind-prepared-agent\" (the server-prepared prompt); set \
+                             persona.type = \"magickmind-prepared-agent\" explicitly{ignored}"
+                        );
                     } else {
-                        return Err(MindroidError::config(
-                            "persona.persona_id is required when persona.type = \"magickmind\"",
-                        ));
+                        builder.magickmind_persona = Some(prepared_persona(&config, "magickmind")?);
+                        tracing::warn!(
+                            "persona.type = \"magickmind\" is deprecated and now resolves to \
+                             \"magickmind-prepared\" (the server-prepared prompt), whose \
+                             persona-keyed route serves authored trait values only, with no \
+                             evolution or per-user adjustment; set agent.agent_id to get the \
+                             evolved per-user prompt, and set persona.type explicitly"
+                        );
                     }
                 }
                 Some("magickmind-prepared") => {
-                    let persona_id = config.persona.persona_id.clone().ok_or_else(|| {
-                        MindroidError::config(
-                            "persona.persona_id is required when persona.type = \"magickmind-prepared\"",
-                        )
-                    })?;
-                    let base_url = config
-                        .persona
-                        .base_url
-                        .as_deref()
-                        .or(config.memory.base_url.as_deref())
-                        .or(config.auth.base_url.as_deref())
-                        .ok_or_else(|| {
-                            MindroidError::config(
-                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind-prepared persona",
-                            )
-                        })?
-                        .to_string();
-                    // Auth headers ride on every prepare request — fail fast on
-                    // a non-TLS base_url unless explicitly opted in.
-                    crate::core::net::require_secure_url(
-                        &base_url,
-                        config.persona.allow_insecure,
-                        "persona.allow_insecure",
-                    )?;
-                    builder.magickmind_persona = Some((
-                        base_url,
-                        persona_id,
-                        config.persona.cache_ttl_secs,
-                        config.persona.allow_insecure,
-                    ));
+                    builder.magickmind_persona =
+                        Some(prepared_persona(&config, "magickmind-prepared")?);
                 }
                 Some("magickmind-prepared-agent") => {
-                    let base_url = config
-                        .persona
-                        .base_url
-                        .as_deref()
-                        .or(config.memory.base_url.as_deref())
-                        .or(config.auth.base_url.as_deref())
-                        .ok_or_else(|| {
-                            MindroidError::config(
-                                "persona.base_url, memory.base_url, or auth.base_url is required for magickmind-prepared-agent persona",
-                            )
-                        })?
-                        .to_string();
-                    // Auth headers ride on every prepare request — fail fast on
-                    // a non-TLS base_url unless explicitly opted in.
-                    crate::core::net::require_secure_url(
-                        &base_url,
-                        config.persona.allow_insecure,
-                        "persona.allow_insecure",
-                    )?;
-
-                    // The credential decides the route. An end-user JWT is the
-                    // agent itself (id-less route); a service-user credential
-                    // names the agent in the path and so requires agent_id.
-                    let credential_kind =
-                        crate::core::factory::credential_kind_from_config(&config);
-                    let is_enduser = credential_kind == crate::models::CredentialKind::EndUser;
-                    let agent_id = if is_enduser {
-                        String::new()
-                    } else {
-                        if config.agent.agent_id.is_empty() {
-                            return Err(MindroidError::config(
-                                "agent.agent_id is required when persona.type = \
-                                 \"magickmind-prepared-agent\" with a service-user credential; \
-                                 with auth.type = \"enduser\" the agent is taken from the token \
-                                 subject instead",
-                            ));
-                        }
-                        // The id becomes a URL path segment. Percent-encoding
-                        // handles separators, but `.` and `..` are path
-                        // navigation and would silently drop the preceding
-                        // segment — rewriting the route instead of 404ing.
-                        if !config
-                            .agent
-                            .agent_id
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-                        {
-                            return Err(MindroidError::config(format!(
-                                "agent.agent_id {:?} must contain only ASCII letters, digits, \
-                                 '-' or '_' — it is sent as a URL path segment",
-                                config.agent.agent_id
-                            )));
-                        }
-                        config.agent.agent_id.clone()
-                    };
-                    builder.magickmind_agent_persona = Some((
-                        base_url,
-                        agent_id,
-                        credential_kind,
-                        config.persona.cache_ttl_secs,
-                        config.persona.allow_insecure,
-                    ));
+                    builder.magickmind_agent_persona = Some(prepared_agent_persona(
+                        &config,
+                        "magickmind-prepared-agent",
+                    )?);
                 }
                 Some("local") => {
                     if let Some(persona_id) = config.persona.persona_id.as_deref() {
@@ -805,6 +750,111 @@ impl Runtime {
         builder.config = Some(config);
         Ok(builder)
     }
+}
+
+// -- server-prepared persona settings ------------------------------------------
+
+/// The prepare endpoint's base URL: `persona.base_url`, then `memory.base_url`,
+/// then `auth.base_url`. `persona_type` only names the setting in the error.
+#[cfg(feature = "persona")]
+fn prepared_persona_base_url(config: &MindroidConfig, persona_type: &str) -> Result<String> {
+    let base_url = config
+        .persona
+        .base_url
+        .as_deref()
+        .or(config.memory.base_url.as_deref())
+        .or(config.auth.base_url.as_deref())
+        .ok_or_else(|| {
+            MindroidError::config(format!(
+                "persona.base_url, memory.base_url, or auth.base_url is required for \
+                 {persona_type} persona"
+            ))
+        })?
+        .to_string();
+    // Auth headers ride on every prepare request — fail fast on a non-TLS
+    // base_url unless explicitly opted in.
+    crate::core::net::require_secure_url(
+        &base_url,
+        config.persona.allow_insecure,
+        "persona.allow_insecure",
+    )?;
+    Ok(base_url)
+}
+
+/// Settings for the persona-keyed prepare route, as stored in
+/// `RuntimeBuilder::magickmind_persona`.
+#[cfg(feature = "persona")]
+fn prepared_persona(
+    config: &MindroidConfig,
+    persona_type: &str,
+) -> Result<(String, String, Option<u64>, bool)> {
+    let persona_id = config.persona.persona_id.clone().ok_or_else(|| {
+        MindroidError::config(format!(
+            "persona.persona_id is required when persona.type = \"{persona_type}\""
+        ))
+    })?;
+    let base_url = prepared_persona_base_url(config, persona_type)?;
+    Ok((
+        base_url,
+        persona_id,
+        config.persona.cache_ttl_secs,
+        config.persona.allow_insecure,
+    ))
+}
+
+/// Settings for the agent-keyed prepare route, as stored in
+/// `RuntimeBuilder::magickmind_agent_persona`.
+#[cfg(feature = "persona")]
+fn prepared_agent_persona(
+    config: &MindroidConfig,
+    persona_type: &str,
+) -> Result<(
+    String,
+    String,
+    crate::models::CredentialKind,
+    Option<u64>,
+    bool,
+)> {
+    let base_url = prepared_persona_base_url(config, persona_type)?;
+
+    // The credential decides the route. An end-user JWT is the agent itself
+    // (id-less route); a service-user credential names the agent in the path
+    // and so requires agent_id.
+    let credential_kind = crate::core::factory::credential_kind_from_config(config);
+    let agent_id = if credential_kind == crate::models::CredentialKind::EndUser {
+        String::new()
+    } else {
+        if config.agent.agent_id.is_empty() {
+            return Err(MindroidError::config(format!(
+                "agent.agent_id is required when persona.type = \"{persona_type}\" with a \
+                 service-user credential; with auth.type = \"enduser\" the agent is taken \
+                 from the token subject instead"
+            )));
+        }
+        // The id becomes a URL path segment. Percent-encoding handles
+        // separators, but `.` and `..` are path navigation and would silently
+        // drop the preceding segment — rewriting the route instead of 404ing.
+        if !config
+            .agent
+            .agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return Err(MindroidError::config(format!(
+                "agent.agent_id {:?} must contain only ASCII letters, digits, '-' or '_' — \
+                 it is sent as a URL path segment",
+                config.agent.agent_id
+            )));
+        }
+        config.agent.agent_id.clone()
+    };
+    Ok((
+        base_url,
+        agent_id,
+        credential_kind,
+        config.persona.cache_ttl_secs,
+        config.persona.allow_insecure,
+    ))
 }
 
 // -- subsystem builders (delegated to factory module) -------------------------
@@ -918,5 +968,251 @@ mod tests {
             .config_ref()
             .expect("config must remain available to build()");
         assert_eq!(stored.auth.token.as_deref(), Some("cfg-token"));
+    }
+
+    #[cfg(feature = "persona")]
+    fn magickmind_persona_config() -> MindroidConfig {
+        let mut c = config_with_auth_token("t");
+        c.persona.persona_type = Some("magickmind".into());
+        c.persona.persona_id = Some("persona-1".into());
+        c.persona.base_url = Some("https://mm.example.com".into());
+        c
+    }
+
+    #[cfg(feature = "persona")]
+    fn config_error(config: MindroidConfig) -> String {
+        match Runtime::from_config(config) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("config must be rejected"),
+        }
+    }
+
+    /// The deprecated type must take the server's prompt, not format one
+    /// locally: an agent id selects the evolved per-user (agent-keyed) route.
+    #[cfg(feature = "persona")]
+    #[tokio::test]
+    async fn magickmind_with_an_agent_id_uses_the_agent_keyed_prepared_prompt() {
+        let mut config = magickmind_persona_config();
+        config.agent.agent_id = "agent-1".into();
+        config.persona.cache_ttl_secs = Some(60);
+        let builder = Runtime::from_config(config).unwrap();
+
+        let (_, agent_id, kind, ttl, _) = builder.magickmind_agent_persona.clone().unwrap();
+        assert_eq!(agent_id, "agent-1");
+        assert_eq!(kind, crate::models::CredentialKind::ServiceUser);
+        assert_eq!(
+            ttl,
+            Some(60),
+            "cache_ttl_secs now applies to \"magickmind\""
+        );
+        assert!(builder.build_magickmind_agent_persona_stage().is_some());
+        assert!(builder.build_magickmind_persona_stage().is_none());
+        assert!(builder.persona_provider().is_none());
+        assert!(builder.build_persona_stage().await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "magickmind")]
+    #[tokio::test]
+    async fn magickmind_with_enduser_auth_uses_the_id_less_agent_route() {
+        let mut config = magickmind_persona_config();
+        config.auth.auth_type = Some("enduser".into());
+        config.auth.base_url = Some("https://mm.example.com".into());
+        let builder = Runtime::from_config(config).unwrap();
+
+        let (_, agent_id, kind, _, _) = builder.magickmind_agent_persona.clone().unwrap();
+        assert_eq!(agent_id, "", "the token subject names the agent");
+        assert_eq!(kind, crate::models::CredentialKind::EndUser);
+        assert!(builder.build_magickmind_agent_persona_stage().is_some());
+        assert!(builder.build_magickmind_persona_stage().is_none());
+        assert!(builder.build_persona_stage().await.unwrap().is_none());
+    }
+
+    /// With nothing naming an agent, the only route left is persona-keyed,
+    /// which still needs the persona id the old mapping required.
+    #[cfg(feature = "persona")]
+    #[tokio::test]
+    async fn magickmind_without_an_agent_uses_the_persona_keyed_prepared_prompt() {
+        let builder = Runtime::from_config(magickmind_persona_config()).unwrap();
+
+        let (_, persona_id, _, _) = builder.magickmind_persona.clone().unwrap();
+        assert_eq!(persona_id, "persona-1");
+        assert!(builder.build_magickmind_persona_stage().is_some());
+        assert!(builder.build_magickmind_agent_persona_stage().is_none());
+        assert!(builder.build_persona_stage().await.unwrap().is_none());
+
+        let mut config = magickmind_persona_config();
+        config.persona.persona_id = None;
+        assert_eq!(
+            config_error(config),
+            "Config error: persona.persona_id is required when persona.type = \"magickmind\""
+        );
+    }
+
+    /// The old mapping sent auth headers over any scheme; the prepared routes
+    /// refuse plaintext unless opted in, and "magickmind" now does too.
+    #[cfg(feature = "persona")]
+    #[test]
+    fn magickmind_refuses_a_plaintext_base_url_unless_allowed() {
+        let mut config = magickmind_persona_config();
+        config.persona.base_url = Some("http://mm.example.com".into());
+        let msg = config_error(config.clone());
+        assert!(msg.contains("persona.allow_insecure"), "{msg}");
+
+        config.persona.allow_insecure = true;
+        let builder = Runtime::from_config(config).unwrap();
+        assert!(builder.build_magickmind_persona_stage().is_some());
+    }
+
+    #[cfg(feature = "persona")]
+    #[test]
+    fn magickmind_rejects_an_agent_id_that_is_not_a_path_segment_like_the_agent_type() {
+        let mut config = magickmind_persona_config();
+        config.agent.agent_id = "../x".into();
+        let via_alias = config_error(config.clone());
+
+        config.persona.persona_type = Some("magickmind-prepared-agent".into());
+        let via_explicit = config_error(config);
+
+        assert!(via_alias.contains("URL path segment"), "{via_alias}");
+        assert_eq!(via_alias, via_explicit);
+    }
+
+    /// Collects formatted log output so a test can assert on a warning.
+    #[cfg(feature = "persona")]
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "persona")]
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "persona")]
+    impl CapturedLogs {
+        /// Routes this thread's events here until the guard drops.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let logs = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// The warning is the only signal that an old config changed route, so it
+    /// must name what it resolved to, and what is now ignored or lost.
+    #[cfg(feature = "persona")]
+    #[tokio::test]
+    async fn magickmind_warns_with_the_type_it_resolved_to() {
+        let agent_keyed = CapturedLogs::default();
+        {
+            let _guard = agent_keyed.capture();
+            let mut config = magickmind_persona_config();
+            config.agent.agent_id = "agent-1".into();
+            let builder = Runtime::from_config(config).unwrap();
+            builder.build_persona_stage().await.unwrap();
+        }
+        let text = agent_keyed.text();
+        assert!(
+            text.contains("now resolves to \"magickmind-prepared-agent\""),
+            "{text}"
+        );
+        assert!(text.contains("persona.persona_id is ignored"), "{text}");
+        assert!(
+            text.contains("build_magickmind_agent_persona_stage()"),
+            "build_persona_stage must point at the prepared builders: {text}"
+        );
+
+        let persona_keyed = CapturedLogs::default();
+        {
+            let _guard = persona_keyed.capture();
+            Runtime::from_config(magickmind_persona_config()).unwrap();
+        }
+        let text = persona_keyed.text();
+        assert!(
+            text.contains("now resolves to \"magickmind-prepared\""),
+            "{text}"
+        );
+        assert!(text.contains("authored trait values only"), "{text}");
+        assert!(text.contains("set agent.agent_id"), "{text}");
+
+        let explicit = CapturedLogs::default();
+        {
+            let _guard = explicit.capture();
+            let mut config = magickmind_persona_config();
+            config.agent.agent_id = "agent-1".into();
+            config.persona.persona_type = Some("magickmind-prepared-agent".into());
+            Runtime::from_config(config).unwrap();
+        }
+        assert!(
+            !explicit.text().contains("deprecated"),
+            "{}",
+            explicit.text()
+        );
+    }
+
+    /// The explicit types now share their settings helpers with the alias; the
+    /// errors their users see must not change wording.
+    #[cfg(feature = "persona")]
+    #[test]
+    fn the_explicit_prepared_types_keep_their_error_messages() {
+        let mut config = config_with_auth_token("t");
+        config.persona.persona_type = Some("magickmind-prepared".into());
+        assert_eq!(
+            config_error(config.clone()),
+            "Config error: persona.persona_id is required when persona.type = \
+             \"magickmind-prepared\""
+        );
+
+        config.persona.persona_id = Some("persona-1".into());
+        assert_eq!(
+            config_error(config.clone()),
+            "Config error: persona.base_url, memory.base_url, or auth.base_url is required \
+             for magickmind-prepared persona"
+        );
+
+        config.persona.persona_type = Some("magickmind-prepared-agent".into());
+        config.persona.base_url = Some("https://mm.example.com".into());
+        assert_eq!(
+            config_error(config),
+            "Config error: agent.agent_id is required when persona.type = \
+             \"magickmind-prepared-agent\" with a service-user credential; with auth.type = \
+             \"enduser\" the agent is taken from the token subject instead"
+        );
+    }
+
+    /// "local" is not a Bifrost path and keeps formatting in-process.
+    #[cfg(feature = "persona")]
+    #[tokio::test]
+    async fn local_persona_still_uses_the_in_process_context_builder() {
+        let mut config = config_with_auth_token("t");
+        config.persona.persona_type = Some("local".into());
+        config.persona.persona_id = Some("guide".into());
+        config.persona.data_dir = Some(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/local_persona/personas"
+            )
+            .into(),
+        );
+        let builder = Runtime::from_config(config).unwrap();
+
+        assert!(builder.persona_provider().is_some());
+        assert!(builder.build_magickmind_persona_stage().is_none());
+        assert!(builder.build_magickmind_agent_persona_stage().is_none());
+        assert!(builder.build_persona_stage().await.unwrap().is_some());
     }
 }

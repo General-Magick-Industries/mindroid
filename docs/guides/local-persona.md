@@ -12,7 +12,7 @@ Use local persona files for offline agents, privacy-sensitive deployments, and e
 - Privacy regulations prevent sending persona data to external services
 - You want to store dyadic (per-user) learned trait adaptations locally
 
-**Use remote persona (`magickmind`) when:**
+**Use a remote persona (`magickmind-prepared-agent`, the server-prepared prompt) when:**
 
 - Your team manages personas in a central platform
 - You want instant updates without redeploying
@@ -293,14 +293,15 @@ Communication tones: friendly, professional, patient
 
 ## Comparison: Local vs. Remote
 
-| Feature | Local | Remote (magickmind) |
+| Feature | Local | Remote (`magickmind-prepared-agent`) |
 |---|---|---|
 | File storage | YAML/TOML files | REST API |
 | Persona updates | Redeploy agent | Live via API (no redeploy) |
 | Dyadic learning | JSON files in `dyadic/` | Server-managed database |
 | Version control | Git friendly | Central platform versioning |
-| Network calls | None (offline) | Yes (trait fetches) |
+| Network calls | None (offline) | Yes (one prepare call per uncached prompt) |
 | Privacy | Fully local | Data sent to API server |
+| Prompt formatting | In the SDK (`PersonaContextBuilder`) | On the server, with trait bands and descriptions |
 | Use case | Development, air-gapped | Teams, managed platforms |
 
 ## Advanced: Custom Trait Learning
