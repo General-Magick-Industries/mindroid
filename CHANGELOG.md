@@ -307,17 +307,21 @@ parsing the event stream sees it as a string field. Both loop events carry
   `finish` never stores what was refused. A refused turn also returns no
   response, from a loop or a plain `Pipeline`, so a gate's echo of the refused
   message is never sent back as the reply. A plain `ctx.halted` still runs
-  `finish` in full. `BranchStage` lifting a halt clears the mark with it; a
-  stage of your own that clears `ctx.halted` after a refusal should
-  `ctx.take::<Refused>()` too, or a later halt in the turn is taken for the
-  refusal (no `finish`, no reply). Lifting the halt hands that stage
+  `finish` in full. `Refused::lift(ctx)` lifts a refusal's halt and its mark
+  together, as `BranchStage` does; a stage of your own that recovers from a
+  refusal should use it rather than clear `ctx.halted` alone, or a later halt
+  in the turn is taken for the refusal (no `finish`, no reply). Lifting the halt hands that stage
   `ctx.response`: a gate's echo it leaves there is returned as the reply.
 - `run_streaming` speaks a body with no streaming stage one pass at a time:
   each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
   supplies is spoken as the last one. A response marked with
   `ControlResponse::mark` — a framed remote call — is never spoken. `ToolRound`
   and both tool executors mark theirs; a stage of your own calls
-  `ControlResponse::mark(ctx)` after setting `ctx.response`.
+  `ControlResponse::mark(ctx)` after setting `ctx.response`. `finish` and the
+  final `Complete` get every spoken pass joined, so persistence keeps what the
+  caller heard (an empty settling round no longer leaves nothing to save); a
+  turn that ends on a framed call hands them the call. `run` is unchanged and
+  hands `finish` the last pass.
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
   WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
@@ -427,6 +431,10 @@ parsing the event stream sees it as a string field. Both loop events carry
 
 ### Changed
 
+- `MemoryPersistence` and `MagickmindPersistence` skip a `ToolManifest` turn.
+  An accepted manifest is a plain halt, so a loop's `finish` runs over it, and
+  `MemoryPersistence` saved the manifest as a user turn. `MemoryPersistence`
+  also drops a whitespace-only reply now, as `MagickmindPersistence` does.
 - Prepared-prompt caches default to 5 minutes (`DEFAULT_TTL_SECS = 300`, and
   `persona.cache_ttl_secs`), down from 10, matching the persona service's
   freshness limit for an evolved personality. `MagickmindAgentPersonaStage`

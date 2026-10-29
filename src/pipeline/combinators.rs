@@ -58,8 +58,7 @@ impl PipelineStage for BranchStage {
         self.gate.process(ctx).await?;
 
         if ctx.halted {
-            ctx.halted = false;
-            ctx.take::<Refused>();
+            Refused::lift(ctx);
             if let Some(ref fail_pipeline) = self.fail {
                 fail_pipeline.run(ctx).await?;
             }

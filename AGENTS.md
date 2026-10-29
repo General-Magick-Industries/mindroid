@@ -106,8 +106,8 @@ after a halt or the cap, and not at all after a cancellation, a body error, or a
 refusal (`Refused::halt` — admission control, a dropped `tool_result`, `LlmRound`'s
 unclaimed one, a rejected manifest), so a loop's persistence never stores what was
 refused, and a refused turn returns no reply. A stage that lifts a refusal's halt
-takes the `Refused` mark with it, as `BranchStage` does, or a later halt in the turn
-reads as the refusal; it also owns `ctx.response` from then on, so a gate's echo left
+does it with `Refused::lift`, as `BranchStage` does, which takes the mark too, or a
+later halt in the turn reads as the refusal; it also owns `ctx.response` from then on, so a gate's echo left
 there goes out as the reply. A pass's `Error` ends the turn — stricter than
 `Pipeline::run_streaming`, which forwards it and carries on.
 
@@ -118,7 +118,9 @@ the results, never replied. `finish` sees the `StopReason` in run scope, and
 **`run_streaming` speaks a body with no streaming stage one pass at a time**: each
 pass's prose becomes one `Chunk`, never a response marked with `ControlResponse::mark`
 (a framed remote call), so TTS works over split rounds; at the cap, the answer `finish`
-supplies is spoken last. A body that has a streaming stage is left to it.
+supplies is spoken last. A body that has a streaming stage is left to it. `finish`, and
+the final `Complete`, get every spoken pass joined, which is what the caller heard and
+what `ToolExecutorStage`'s streamed rounds keep; `run` hands `finish` the last pass.
 `LoopCompleted` carries the `StopReason`, the only place a streaming caller sees it, and
 both loop events carry the loop's name.
 

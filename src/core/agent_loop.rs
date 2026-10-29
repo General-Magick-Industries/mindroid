@@ -120,7 +120,7 @@ impl ControlResponse {
 /// so a loop nested as a stage refuses its parent's turn too. The mark names
 /// the message it refused, so a [`Context`] reused for the next message is not
 /// refused by it. A stage that lifts `ctx.halted` to recover from a refusal
-/// takes the mark with it, as `BranchStage` does.
+/// does it with [`Refused::lift`], as `BranchStage` does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused(String);
 
@@ -131,11 +131,28 @@ impl Refused {
         ctx.set(Refused(ctx.message.id.clone()));
     }
 
+    /// Lift a halt to recover from a refusal, taking the mark with it so a
+    /// later halt in the turn is not read as the refusal.
+    pub fn lift(ctx: &mut Context) {
+        ctx.halted = false;
+        ctx.take::<Refused>();
+    }
+
     /// Whether the current message was refused.
     pub fn covers(ctx: &Context) -> bool {
         ctx.get_run::<Refused>()
             .is_some_and(|mark| mark.0 == ctx.message.id)
     }
+}
+
+fn append_spoken(spoken: &mut String, text: &str) {
+    if !spoken.is_empty()
+        && !spoken.ends_with(char::is_whitespace)
+        && !text.starts_with(char::is_whitespace)
+    {
+        spoken.push(' ');
+    }
+    spoken.push_str(text);
 }
 
 fn halt_reason(ctx: &Context) -> StopReason {
@@ -366,6 +383,11 @@ impl AgentLoop {
     /// `finish`; the final `Complete` carries it after. The one exception is the
     /// cap: `finish` text that the last pass did not already say — a
     /// `CapSummary` answer — is spoken as a last `Chunk`, since no pass will.
+    /// What `finish` receives as the reply is every pass that was spoken,
+    /// joined, as `ToolExecutorStage`'s streamed rounds keep it, so persistence
+    /// stores what the caller heard; a turn that ends on a framed remote call
+    /// hands it the call. [`run`](Self::run) speaks nothing and hands it the
+    /// last pass's text.
     ///
     /// **An `Error` from a pass ends the turn**, which is stricter than
     /// [`Pipeline::run_streaming`]: there a streaming stage's `Error` is
@@ -390,6 +412,8 @@ impl AgentLoop {
 
             let mut iterations = 0;
             let mut spent: Option<TokenUsage> = None;
+            let mut spoken = String::new();
+            let mut carried_control = false;
             let reason = if ctx.halted {
                 halt_reason(ctx)
             } else {
@@ -443,8 +467,10 @@ impl AgentLoop {
                             && !ctx.cancel.is_cancelled()
                             && !text.trim().is_empty()
                         {
+                            append_spoken(&mut spoken, &text);
                             yield StreamEvent::Chunk { content: text.clone() };
                         }
+                        carried_control = control;
                         carried = Some(text);
                     }
 
@@ -460,6 +486,12 @@ impl AgentLoop {
                 }
             };
 
+            // The caller heard every spoken pass, so the reply `finish` persists
+            // is all of it, as `ToolExecutorStage`'s streamed rounds keep it —
+            // unless the turn ended on a framed call, which is the reply.
+            if !carried_control && !spoken.is_empty() {
+                carried = Some(spoken);
+            }
             let last_pass = carried.clone();
             let content = match self.run_finish(ctx, carried, reason).await {
                 Ok(text) => text.unwrap_or_default(),
@@ -1403,7 +1435,7 @@ mod tests {
         assert_eq!(completes, 1, "the turn ends once, not once per pass");
         assert!(matches!(
             events.last(),
-            Some(StreamEvent::Complete { content, .. }) if content == "pass 3"
+            Some(StreamEvent::Complete { content, .. }) if content == "pass 1 pass 2 pass 3"
         ));
     }
 
@@ -1948,5 +1980,114 @@ mod tests {
             }
         }
         assert_eq!(names, ["planner", "planner"]);
+    }
+
+    /// Records the reply `finish` was handed.
+    struct SeesReply(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[async_trait]
+    impl PipelineStage for SeesReply {
+        fn name(&self) -> &str {
+            "sees-reply"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            *self.0.lock().unwrap() = ctx.response.clone();
+            Ok(())
+        }
+    }
+
+    /// Says "let me check" and asks for another pass, then runs `last`.
+    struct ChecksThen<S>(Arc<AtomicUsize>, S);
+
+    #[async_trait]
+    impl<S: PipelineStage> PipelineStage for ChecksThen<S> {
+        fn name(&self) -> &str {
+            "checks-then"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                ctx.response = Some("let me check".into());
+                ctx.set(Continue);
+                Ok(())
+            } else {
+                self.1.process(ctx).await
+            }
+        }
+    }
+
+    async fn streamed_reply(body: Pipeline) -> (Vec<StreamEvent>, Option<String>) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx = ctx();
+        let events: Vec<_> = AgentLoop::new(body)
+            .with_finish(Pipeline::new().add_stage(SeesReply(seen.clone())))
+            .run_streaming(&mut ctx)
+            .collect()
+            .await;
+        let reply = seen.lock().unwrap().clone();
+        (events, reply)
+    }
+
+    /// The caller heard every pass, so `finish` persists every pass.
+    #[tokio::test]
+    async fn a_streamed_turn_hands_finish_everything_it_spoke() {
+        let (body, _) = rounds(3);
+        let (events, reply) = streamed_reply(body).await;
+
+        assert_eq!(reply.as_deref(), Some("round 1 round 2 round 3"));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Complete { content, .. }) if content == "round 1 round 2 round 3"
+        ));
+    }
+
+    /// An empty settling round is the answer, but the caller already heard
+    /// "let me check"; without the spoken carry nothing would be persisted.
+    #[tokio::test]
+    async fn an_empty_settling_round_keeps_what_was_spoken() {
+        let body = Pipeline::new().add_stage(ChecksThen(Arc::new(AtomicUsize::new(0)), Says("")));
+        let (events, reply) = streamed_reply(body).await;
+
+        assert_eq!(chunks(&events), ["let me check"]);
+        assert_eq!(reply.as_deref(), Some("let me check"));
+    }
+
+    #[tokio::test]
+    async fn a_framed_call_after_spoken_prose_stays_the_reply() {
+        let body =
+            Pipeline::new().add_stage(ChecksThen(Arc::new(AtomicUsize::new(0)), FramesACall));
+        let (_, reply) = streamed_reply(body).await;
+
+        assert_eq!(reply.as_deref(), Some(r#"{"type":"tool_call"}"#));
+    }
+
+    /// `run` speaks nothing, so it keeps handing `finish` the last pass.
+    #[tokio::test]
+    async fn run_hands_finish_the_last_pass() {
+        let (body, _) = rounds(3);
+        let outcome = AgentLoop::new(body).run(&mut ctx()).await.unwrap();
+
+        assert_eq!(outcome.response.as_deref(), Some("round 3"));
+    }
+
+    #[tokio::test]
+    async fn lifting_a_refusal_takes_the_mark_with_the_halt() {
+        let mut ctx = ctx();
+        Refused::halt(&mut ctx);
+        Refused::lift(&mut ctx);
+
+        assert!(!ctx.halted);
+        assert!(!Refused::covers(&ctx));
+
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(PlainHalt))
+            .run(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.reason,
+            StopReason::Halted,
+            "a later halt is a plain halt"
+        );
     }
 }

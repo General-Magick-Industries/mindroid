@@ -165,7 +165,9 @@ on purpose.
   as control traffic with `ControlResponse::mark`, which is public so an
   embedder's own stage can do the same. The mark names the response it covers,
   so prose a later stage writes over it is still spoken. A body with a streaming
-  stage is left to that stage.
+  stage is left to that stage. What `finish` receives is every spoken pass
+  joined, so persistence keeps what the caller heard, as `ToolExecutorStage`'s
+  streamed rounds do; a turn ending on a framed call hands it the call.
 - `ToolRound` and `XmlToolExecutorStage` run tools through the same path as
   `ToolExecutorStage`, so a failed call reads the same to the model whichever
   executor ran it, and each call gets the same log line.

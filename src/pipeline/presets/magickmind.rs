@@ -1041,6 +1041,10 @@ impl PipelineStage for MagickmindPersistence {
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
         let message = Arc::clone(&ctx.message);
+        if message.message_type == MessageType::ToolManifest {
+            debug!("MagickmindPersistence: a tool manifest is not a turn, skipping save");
+            return Ok(());
+        }
         let magickspace_id = message.conversation_id();
         if magickspace_id.is_empty() {
             debug!("MagickmindPersistence: no magickspace_id in message, skipping save");
@@ -1753,6 +1757,29 @@ mod tests {
 
             stage.process(&mut ctx).await.unwrap();
         }
+    }
+
+    /// A manifest is control traffic: even with a reply left on the context,
+    /// nothing is posted to the space. The client points nowhere.
+    #[tokio::test]
+    async fn persistence_sends_nothing_for_a_tool_manifest() {
+        use crate::config::AgentConfig;
+        use crate::core::context::Context;
+        use crate::models::Message;
+
+        let identity: Arc<dyn Auth> = Arc::new(StaticAuth::new("token"));
+        let stage = MagickmindPersistence::new(Arc::new(MagickmindClient::new(
+            "http://127.0.0.1:1",
+            identity,
+        )));
+
+        let mut message = Message::new(r#"{"tools":[]}"#, "robot", "space-1");
+        message.message_type = MessageType::ToolManifest;
+        let mut ctx = Context::new(Arc::new(message), Arc::new(AgentConfig::default()));
+        ctx.halted = true;
+        ctx.response = Some(r#"{"tools":[]}"#.into());
+
+        stage.process(&mut ctx).await.unwrap();
     }
 
     #[tokio::test]

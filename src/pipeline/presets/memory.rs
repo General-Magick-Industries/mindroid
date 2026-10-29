@@ -35,7 +35,9 @@ use tracing::debug;
 
 use crate::core::context::Context;
 use crate::memory::Memory;
-use crate::{ContextProvider, LlmMessage, Message, MindroidError, PipelineStage, Result};
+use crate::{
+    ContextProvider, LlmMessage, Message, MessageType, MindroidError, PipelineStage, Result,
+};
 
 // ── MemoryClient ────────────────────────────────────────────────────────────
 
@@ -218,6 +220,10 @@ impl PipelineStage for MemoryPersistence {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        // A manifest swaps the agent's tools; it is not a turn of conversation.
+        if ctx.message.message_type == MessageType::ToolManifest {
+            return Ok(());
+        }
         let channel_id = &ctx.message.channel_id;
 
         let user_content = ctx
@@ -235,8 +241,8 @@ impl PipelineStage for MemoryPersistence {
                 source: None,
             })?;
 
-        // Save assistant response (skip if empty or absent)
-        if let Some(response) = ctx.response.as_deref().filter(|r| !r.is_empty()) {
+        // Save assistant response (skip if blank or absent)
+        if let Some(response) = ctx.response.as_deref().filter(|r| !r.trim().is_empty()) {
             self.client
                 .save_message(
                     channel_id,
@@ -371,6 +377,37 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");
         assert_eq!(history[0].sender_id, "user-1");
+    }
+
+    #[tokio::test]
+    async fn persistence_skips_a_blank_response() {
+        let mem = Arc::new(SqliteMemory::new(":memory:").unwrap());
+        let persistence = MemoryPersistence::new(Arc::new(MemoryClient::new(mem.clone())));
+
+        let mut pctx = Context::new(
+            test_message("chan1", "user-1", "hello").into(),
+            crate::config::AgentConfig::default().into(),
+        );
+        pctx.response = Some(" \n".into());
+        persistence.process(&mut pctx).await.unwrap();
+
+        let history = mem.get_history("chan1", 10).await.unwrap();
+        assert_eq!(history.len(), 1, "only the user turn: {history:?}");
+    }
+
+    /// A manifest swaps tools; saving it would replay it as a user turn.
+    #[tokio::test]
+    async fn persistence_skips_a_tool_manifest() {
+        let mem = Arc::new(SqliteMemory::new(":memory:").unwrap());
+        let persistence = MemoryPersistence::new(Arc::new(MemoryClient::new(mem.clone())));
+
+        let mut message = test_message("chan1", "robot", r#"{"tools":[]}"#);
+        message.message_type = MessageType::ToolManifest;
+        let mut pctx = Context::new(message.into(), crate::config::AgentConfig::default().into());
+        pctx.halted = true;
+        persistence.process(&mut pctx).await.unwrap();
+
+        assert!(mem.get_history("chan1", 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
