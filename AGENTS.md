@@ -12,7 +12,7 @@ These are load-bearing. If a change touches one, read the linked ADR in `docs/ad
 - **Concurrency = structured.** Prefer `JoinSet` / `select!` / `CancellationToken` over detached `tokio::spawn`. Fan-out collects results; it never shares `&mut Context` across tasks. → `docs/adr/0001-concurrency.md`
 - **Observability = middleware, never a mutable observer registry.** Cross-cutting concerns wrap traits (tower-style) or ride the `PipelineEvent` / callback stream. → `docs/adr/0002-observability.md`
 - **OmniSession is a separate execution model**, not an extended `Pipeline`. → `docs/adr/0003-omnisession.md`
-- **`AgentLoop` is likewise a separate execution model**, composed *of* pipelines. Iteration belongs to the loop, not to a stage that owns a private one. → `docs/adr/0010-agent-loop.md`
+- **`AgentLoop` is likewise a separate execution model**, composed *of* pipelines. Iteration belongs to the loop, not to a stage that owns a private one. → `docs/adr/0011-agent-loop.md`
 - **Control traffic with no consumer never becomes prompt text.** `Pipeline` refuses it at the entrance, before any stage runs — the one sanctioned deviation from "control flow composes from stages". → `docs/adr/0008-pipeline-admission.md`
 - **Accept traits, return structs.** Every subsystem is a swappable trait; keep them small and object-safe.
 
@@ -55,7 +55,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |
 | `persona` | `reqwest` | `PersonaContextBuilder`, `MagickmindPersonaStage`, `PersonaId`, `ConversationHistory`, `LocalPersonaProvider` |
 | `identity` | (none) | `IdentityResolver`, `IdentityResolutionStage` |
-| `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `GetArtifactTool` |
+| `artifacts` | `base64` (+ `llm-client`) | `ArtifactStore`, `LocalArtifactStore`, `ArtifactOffload`, `InlineArtifacts`, `GetArtifactTool` |
 | `magickmind` | (includes `artifacts`, `persona`) | `EndUserAuth`, `MagickmindArtifactStore`, `EpisodicMemoryTool`, `RecallTimeWindowTool`, `AgentCredentials`, `auth.type = "enduser"`; with `llm-hosted`: `CorpusTool`, `CorpusCatalog` |
 | `full` | everything above | All types |
 
@@ -87,7 +87,7 @@ rates differ per provider — Gemini is 16 kHz in / 24 kHz out (`CpalAudio::new_
 OpenAI is 24 kHz both ways (`CpalAudio::new`). Both are footguns worth designing away;
 no ADR covers it yet.
 
-### AgentLoop — the iterative model (ADR-0010)
+### AgentLoop — the iterative model (ADR-0011)
 
 A `Pipeline` runs once per message. `AgentLoop` runs three of them — `setup` once,
 `body` per iteration, `finish` once — over one `Context`, so run scope is the loop's
@@ -215,6 +215,11 @@ Implement `Tool` trait → register in `ToolRegistry` → whichever executor sta
 async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
 ```
 
+A tool whose result includes images (a camera, a screenshot) also overrides
+`execute_with_images`. Only `OmniSession` sends those images, through
+`OmniProvider::send_tool_result_with_images`: Gemini Live puts them in the
+function response's `parts`, and providers without image support drop them.
+
 `ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
 extension map for backend data (credentials, agent id) set by a stage. Never take
 identity from `args` — that's model-generated. Use `_ctx` if unused. → ADR-0005
@@ -260,6 +265,14 @@ executor's `pending()` set to also resume the turn with a synthesized
 never responded rather than leaving the conversation silent. Deadlines are
 process-local — a restart forgets outstanding calls. See
 `docs/design/remote-tool-reliability.md`.
+
+The JSON stage records the turn's local calls in `LocalToolCalls` (a context
+extension; `with_recorded_calls(false)` turns it off). A result is kept only
+for a tool that opts in with `Tool::keeps_result_in_history`, because history is
+readable by every member of the space; others keep a placeholder.
+`MagickmindPersistence` saves each as a `TOOL_CALL` and a threaded
+`TOOL_RESULT` after the reply, naming the agent as the call's executor. A host
+that saves its own replies should do the same.
 
 `XmlToolExecutorStage` remains the default in every preset. Prefer the JSON stage on
 an endpoint that supports it: models post-trained for native function calling
@@ -337,7 +350,7 @@ src/
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
 ├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio source/sink, VAD (ADR-0003)
-├── artifacts/      # ArtifactStore trait + local, magickmind, manager (ADR-0004, ADR-0009)
+├── artifacts/      # ArtifactStore trait + local, magickmind, manager (ADR-0004, ADR-0009, ADR-0010)
 ├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls
 ├── observer/       # Observer trait + log impl

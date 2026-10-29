@@ -406,32 +406,45 @@ pub struct ObserverConfig {
 
 /// Configuration for the persona subsystem.
 ///
-/// When `type = "magickmind"`, the runtime will fetch the effective personality
-/// from the magickmind runtime service per-request and format the prompt in-process.
-/// When `type = "magickmind-prepared"`, the runtime delegates prompt construction to the
-/// MagickMind server's `POST /v1/persona/{id}/prepare` endpoint and uses the returned
-/// `system_prompt` verbatim (the server owns trait banding / formatting). Keyed by persona id.
-/// When `type = "magickmind-prepared-agent"`, same server-prepared prompt but keyed by
-/// **agent id**: the route follows `auth.type` — a service-user credential names the agent in
-/// the path (`agent.agent_id` required), while `auth.type = "enduser"` uses the id-less
-/// end-user route where the agent is the token subject.
-/// When `type = "local"`, the persona is loaded from a local `persona.md` file.
-/// When `type = "markdown"`, the system prompt is loaded from a local file.
+/// When `type = "magickmind-prepared-agent"`, the runtime takes the MagickMind server's
+/// prepared prompt keyed by **agent id** and uses the returned `system_prompt` verbatim
+/// (the server owns trait banding, descriptions and wording). This route serves the
+/// evolved, per-user personality. It follows `auth.type`: a service-user credential names
+/// the agent in the path (`POST /v1/end-users/{agent_id}/persona/prepare`, `agent.agent_id`
+/// required), while `auth.type = "enduser"` uses the id-less end-user route
+/// (`POST /v1/end-user/persona/prepare`) where the agent is the token subject.
+/// When `type = "magickmind-prepared"`, same server-prepared prompt but keyed by persona id
+/// (`POST /v1/persona/{id}/prepare`). That route is deprecated server-side and renders
+/// authored trait values only: no evolution, no per-user adjustment.
+/// When `type = "local"`, the persona is loaded from a local `persona.md` file and the
+/// prompt is formatted in-process by `PersonaContextBuilder`.
+///
+/// `type = "magickmind"` is a deprecated alias of the prepared types (it no longer formats
+/// the prompt locally): it resolves to `"magickmind-prepared-agent"` when `auth.type =
+/// "enduser"` or `agent.agent_id` is set, and to `"magickmind-prepared"` otherwise, with a
+/// warning at build time. Like them, it requires an `https` base URL unless
+/// `allow_insecure = true`, and honours `cache_ttl_secs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersonaConfig {
-    /// Persona provider type. Supported: `"magickmind"`, `"magickmind-prepared"`, `"local"`.
+    /// Persona provider type. Supported: `"magickmind-prepared-agent"`,
+    /// `"magickmind-prepared"`, `"local"`. `"magickmind"` is a deprecated alias:
+    /// `"magickmind-prepared-agent"` with end-user auth or an `agent.agent_id`,
+    /// else `"magickmind-prepared"`.
     #[serde(rename = "type")]
     pub persona_type: Option<String>,
-    /// The persona ID to fetch.
+    /// The persona ID to fetch. Unused on the agent-keyed route, which resolves
+    /// the agent's active persona server-side.
     pub persona_id: Option<String>,
     /// Base URL for the magickmind API. Falls back to `memory.base_url` if absent.
     pub base_url: Option<String>,
     /// Directory containing local persona files (for `type = "local"`).
     /// Defaults to `~/.mindroid/personas`.
     pub data_dir: Option<String>,
-    /// Cache TTL (seconds) for server-prepared system prompts (`type = "magickmind-prepared"`).
-    /// Defaults to 600 (10 minutes). `0` disables caching.
+    /// Cache TTL (seconds) for server-prepared system prompts (both prepared types and
+    /// the `"magickmind"` alias).
+    /// Defaults to 300 (5 minutes), the persona service's freshness limit. On the
+    /// agent route a shorter server `ttl_seconds` still wins. `0` disables caching.
     pub cache_ttl_secs: Option<u64>,
     /// Permit sending auth headers over plaintext `http://` (local development only).
     /// Production deployments must use `https://`.

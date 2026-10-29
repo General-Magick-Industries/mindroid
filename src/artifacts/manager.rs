@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use crate::artifacts::ArtifactStore;
-use crate::core::content::{ContentPart, ContentSource};
+use crate::artifacts::{ArtifactStore, INLINED_ARTIFACT_KEY};
+use crate::core::content::{ContentPart, ContentSource, is_artifact_id};
 use crate::error::Result;
 
 /// Wraps an [`ArtifactStore`] and provides the offload + load-tool orchestration
@@ -63,11 +63,16 @@ impl ArtifactManager {
     }
 
     /// Offload every inline media part in `content` to the store under `scope`,
-    /// replacing each with a bare-id `File` reference. Text / already-referenced
-    /// parts are untouched. Returns the number of parts offloaded.
+    /// replacing each with a bare-id `File` reference. An image `InlineArtifacts`
+    /// loaded becomes a reference to its artifact again, without a save. Text /
+    /// already-referenced parts are untouched. Returns the number of parts offloaded.
     pub async fn offload(&self, scope: &str, content: &mut [ContentPart]) -> Result<usize> {
         let mut count = 0;
         for part in content.iter_mut() {
+            if let Some(reference) = inlined_reference(part) {
+                *part = reference;
+                continue;
+            }
             let Some((data, mime)) = inline_media(part) else {
                 continue;
             };
@@ -98,6 +103,32 @@ impl ArtifactManager {
             Err(e) => format!("Error: could not load artifact {id}: {e}"),
         }
     }
+}
+
+/// The reference an inlined image was loaded from, so it is not stored twice.
+fn inlined_reference(part: &ContentPart) -> Option<ContentPart> {
+    let ContentPart::Image {
+        source: ContentSource::Inline { .. },
+        mime_type,
+        metadata,
+    } = part
+    else {
+        return None;
+    };
+    let id = metadata
+        .get(INLINED_ARTIFACT_KEY)?
+        .as_str()
+        .filter(|id| is_artifact_id(id))?;
+    let mut metadata = metadata.clone();
+    metadata.remove(INLINED_ARTIFACT_KEY);
+    Some(ContentPart::File {
+        source: ContentSource::Uri {
+            uri: id.to_string(),
+        },
+        mime_type: mime_type.clone(),
+        filename: None,
+        metadata,
+    })
 }
 
 /// Extract `(bytes, mime)` from an inline media part. Returns `None` for text

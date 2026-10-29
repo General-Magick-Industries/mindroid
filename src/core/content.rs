@@ -51,11 +51,7 @@ impl ArtifactReference {
         if !is_artifact_id(&self.id) {
             return None;
         }
-        let mime_type = if is_mime_type(&self.mime_type) {
-            self.mime_type
-        } else {
-            "application/octet-stream".to_string()
-        };
+        let mime_type = visible_mime_type(&self.mime_type).to_string();
         Some(ContentPart::File {
             source: ContentSource::Uri { uri: self.id },
             mime_type,
@@ -86,6 +82,33 @@ pub fn is_artifact_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The image type vision endpoints accept, read from the bytes' signature
+/// rather than the declared type: one HEIC, SVG or other unrecognised file sent
+/// inline fails the whole request.
+pub fn inline_image_type(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") && data.get(12..16) == Some(&b"IHDR"[..]) {
+        Some("image/png")
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(&b"WEBP"[..]) {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// `mime` when it is a well-formed MIME type, else `application/octet-stream`:
+/// a stored type is uploader-declared and lands in model-visible text.
+pub(crate) fn visible_mime_type(mime: &str) -> &str {
+    if is_mime_type(mime) {
+        mime
+    } else {
+        "application/octet-stream"
+    }
 }
 
 fn is_mime_type(mime: &str) -> bool {

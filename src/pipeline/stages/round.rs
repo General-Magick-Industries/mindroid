@@ -344,13 +344,14 @@ impl ToolRound {
 
         let args = parse_args(&call.arguments).ok()?;
         let ack = ctx.response.as_deref().unwrap_or("").trim();
-        let (framed, call_id) = frame_remote_call(&call.name, &args, ack);
+        let executor_id = executor_id.as_deref().or(trusted_sender);
+        let (framed, call_id) = frame_remote_call(&call.name, &args, ack, executor_id);
 
         // Correlation is against the trusted delivery channel, not
         // `tool_ctx.channel_id` — that is the workspace id and never matches.
         self.pending.record_for(
             &ctx.message.channel_id,
-            executor_id.as_deref().or(trusted_sender),
+            executor_id,
             &call_id,
             &call.name,
             remote_timeout_for(registry, &call.name),
@@ -639,6 +640,23 @@ mod tests {
             FramedRemoteCall::covers(&ctx, ctx.response.as_deref().unwrap()),
             "persistence saves the envelope as TOOL_CALL"
         );
+    }
+
+    #[tokio::test]
+    async fn a_framed_remote_call_names_its_executor() {
+        let registry = ToolRegistry::new().register(
+            crate::tools::RemoteTool::new("take_photo", "Capture a photo").executor_id("robot"),
+        );
+        let mut ctx = ctx();
+        ctx.set(PendingCalls(vec![call("c1", "take_photo", "{}")]));
+
+        ToolRound::new(Arc::new(registry))
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        let payload = framed_payload(ctx.response.as_deref().unwrap());
+        assert_eq!(payload["executor_id"], "robot");
     }
 
     /// The framing and the gate share one outstanding-call set, so the result

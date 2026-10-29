@@ -160,14 +160,15 @@ async fn main() -> anyhow::Result<()> {
         !std::env::var("MINDROID_DISABLE_GATE").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
 
     // Build the persona stage once. Three modes are supported via [persona] config:
-    //   type = "magickmind"                → PersonaContextBuilder formats the prompt in-process
-    //   type = "magickmind-prepared"       → MagickmindPersonaStage delegates prompt construction
-    //                                        to the server (persona-keyed) and uses the returned
-    //                                        system_prompt verbatim
-    //   type = "magickmind-prepared-agent" → MagickmindAgentPersonaStage, same server-prepared
-    //                                        prompt but agent-keyed; the route follows auth.type
-    //                                        (service-user names agent_id, "enduser" uses the
-    //                                        id-less end-user route)
+    //   type = "magickmind-prepared-agent" → MagickmindAgentPersonaStage uses the server-prepared
+    //                                        system_prompt verbatim, agent-keyed; the route
+    //                                        follows auth.type (service-user names agent_id,
+    //                                        "enduser" uses the id-less end-user route)
+    //   type = "magickmind-prepared"       → MagickmindPersonaStage, same server-prepared prompt
+    //                                        but persona-keyed (authored values only)
+    //   type = "local"                     → PersonaContextBuilder formats the prompt in-process
+    //                                        from a local persona.md
+    // The deprecated type = "magickmind" resolves to one of the two prepared modes.
     // All implement PipelineStage, so we hold whichever is configured as a
     // trait object. Per-request conversation history is injected via the
     // ConversationHistory context extension, so the respond pipeline is built
@@ -184,9 +185,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(prepared)
     } else {
         let persona_client = builder.build_persona_stage().await?.expect(
-                "persona_agent requires [persona] config with type = \"magickmind\", \"magickmind-prepared\", or \"magickmind-prepared-agent\"",
+                "persona_agent requires [persona] config with type = \"magickmind-prepared-agent\", \"magickmind-prepared\", or \"local\"",
             );
-        tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
+        tracing::info!("Using local persona stage (type = \"local\")");
         Arc::new(persona_client)
     };
 
@@ -212,10 +213,7 @@ async fn main() -> anyhow::Result<()> {
         .add_stage(SharedStage(Arc::clone(&persona_stage)))
         .add_streaming_stage(GenericLlmProcessor::new(LlmClient::new(respond_llm)?))
         .add_stage(PostProcessor);
-    if let Some(mut reply_ingest) = builder.build_episode_reply_ingest_stage()? {
-        if let Some(inbound) = &inbound_ingest {
-            reply_ingest = reply_ingest.with_runtime_state_of(inbound);
-        }
+    if let Some(reply_ingest) = builder.build_episode_reply_ingest_stage()? {
         respond = respond.add_stage(reply_ingest);
     }
     let respond_pipeline =

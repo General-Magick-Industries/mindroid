@@ -1,4 +1,4 @@
-# ADR-0010: AgentLoop is a separate execution model
+# ADR-0011: AgentLoop is a separate execution model
 
 **Status:** Proposed
 **Date:** 2026-09-10

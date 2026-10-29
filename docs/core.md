@@ -934,14 +934,24 @@ pub struct ObserverConfig {
 **PersonaConfig** — Persona subsystem settings:
 ```rust
 pub struct PersonaConfig {
-    pub persona_type: Option<String>,   // "magickmind", "magickmind-prepared", "local"
+    pub persona_type: Option<String>,   // "magickmind-prepared-agent", "magickmind-prepared", "local"
+                                        // ("magickmind": deprecated alias, see below)
     pub persona_id: Option<String>,
     pub base_url: Option<String>,       // falls back to memory.base_url, then auth.base_url
     pub data_dir: Option<String>,       // for "local" personas
-    pub cache_ttl_secs: Option<u64>,    // prepared-prompt cache TTL (default 600; 0 disables)
+    pub cache_ttl_secs: Option<u64>,    // prepared-prompt cache TTL (default 300; 0 disables)
     pub allow_insecure: bool,           // permit auth headers over plaintext http:// (local dev only)
 }
 ```
+
+Both `magickmind-prepared*` types use the system prompt the MagickMind server
+prepares, verbatim; only `"local"` formats the prompt in the SDK
+(`PersonaContextBuilder`). `"magickmind"` no longer formats locally: it resolves
+to `"magickmind-prepared-agent"` when `auth.type = "enduser"` or
+`agent.agent_id` is set, else to `"magickmind-prepared"` (authored values only),
+and logs a deprecation warning. It now requires an `https` base URL unless
+`allow_insecure = true`, and honours `cache_ttl_secs`. See
+[Migrating from `type = "magickmind"`](guides/persona.md#migrating-from-type--magickmind).
 
 ## Runtime
 

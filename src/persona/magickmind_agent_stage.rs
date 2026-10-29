@@ -33,9 +33,12 @@ use crate::pipeline::PipelineStage;
 ///
 /// Identical policy to [`MagickmindPersonaStage`](super::MagickmindPersonaStage):
 /// prepared prompts are cached per `(agent_key, user_id)` for [`with_ttl`]
-/// (default 10 minutes), a failed re-fetch degrades to the last-good prompt, and
-/// a zero TTL disables caching. On the end-user route the agent id is fixed by
-/// the token, so the cache key uses a constant marker for it.
+/// (default 5 minutes), a failed re-fetch degrades to the last-good prompt, and
+/// a zero TTL disables caching. The server's `ttl_seconds` for a prompt caps
+/// how long it stays fresh, so an evolved personality reaches the prompt within
+/// the server's freshness limit even under a longer configured TTL. On the
+/// end-user route the agent id is fixed by the token, so the cache key uses a
+/// constant marker for it.
 ///
 /// [`with_ttl`]: MagickmindAgentPersonaStage::with_ttl
 pub struct MagickmindAgentPersonaStage {
@@ -77,8 +80,9 @@ impl MagickmindAgentPersonaStage {
         }
     }
 
-    /// Default prepared-prompt cache TTL in seconds (10 minutes).
-    pub const DEFAULT_TTL_SECS: u64 = 600;
+    /// Default prepared-prompt cache TTL in seconds (5 minutes), the persona
+    /// service's freshness limit for an evolved personality.
+    pub const DEFAULT_TTL_SECS: u64 = 300;
 
     /// Total HTTP request timeout in seconds. The prepare call gates message
     /// processing, so a hung server must not stall pipelines indefinitely.
@@ -96,7 +100,8 @@ impl MagickmindAgentPersonaStage {
         self
     }
 
-    /// Override the prepared-prompt cache TTL (default 10 minutes).
+    /// Override the prepared-prompt cache TTL (default 5 minutes). A shorter
+    /// `ttl_seconds` from the server still wins for that prompt.
     ///
     /// A TTL of zero disables caching: every message re-fetches, nothing is
     /// stored, and there is no stale fallback.
@@ -141,9 +146,11 @@ impl MagickmindAgentPersonaStage {
         }
 
         match self.prepare(user_id).await {
-            Ok(prompt) => {
-                self.cache.insert(key, prompt.clone());
-                Ok(prompt)
+            Ok(prepared) => {
+                let server_ttl = prepared.server_ttl();
+                self.cache
+                    .insert_with_server_ttl(key, prepared.system_prompt.clone(), server_ttl);
+                Ok(prepared.system_prompt)
             }
             Err(e) => {
                 if let Some(stale) = self.cache.get_any(&key) {
@@ -183,7 +190,7 @@ impl MagickmindAgentPersonaStage {
     }
 
     /// Call the prepare endpoint and return the finished system prompt.
-    async fn prepare(&self, user_id: Option<&str>) -> Result<String> {
+    async fn prepare(&self, user_id: Option<&str>) -> Result<PreparePersonaResponse> {
         // Defense in depth: the builder already refuses a non-TLS base_url at
         // startup, but a directly-constructed stage has not been through it.
         crate::core::net::require_secure_url(
@@ -237,12 +244,10 @@ impl MagickmindAgentPersonaStage {
             });
         }
 
-        let prepared: PreparePersonaResponse =
-            resp.json().await.map_err(|e| MindroidError::Api {
-                message: format!("error decoding prepare-persona response: {e}"),
-                status_code: None,
-            })?;
-        Ok(prepared.system_prompt)
+        resp.json().await.map_err(|e| MindroidError::Api {
+            message: format!("error decoding prepare-persona response: {e}"),
+            status_code: None,
+        })
     }
 }
 
@@ -291,10 +296,23 @@ struct PreparePersonaRequest<'a> {
 }
 
 /// Response body. The prepare endpoint returns richer metadata, but only the
-/// finished prompt is used here.
-#[derive(Deserialize)]
+/// finished prompt and how long it may be served are used here.
+#[derive(Debug, Deserialize)]
 struct PreparePersonaResponse {
     system_prompt: String,
+    /// Absent from older servers. Zero or negative is read as "no limit
+    /// given", not "do not cache": an unset field must not turn every message
+    /// into a prepare call.
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+}
+
+impl PreparePersonaResponse {
+    fn server_ttl(&self) -> Option<Duration> {
+        self.ttl_seconds
+            .filter(|secs| *secs > 0)
+            .map(|secs| Duration::from_secs(secs.unsigned_abs()))
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +376,31 @@ mod tests {
         let resp: PreparePersonaResponse =
             serde_json::from_str(r#"{"system_prompt":"You are Aria.","agent_id":"a"}"#).unwrap();
         assert_eq!(resp.system_prompt, "You are Aria.");
+    }
+
+    #[test]
+    fn the_servers_ttl_bounds_the_prompt_and_an_unset_one_does_not() {
+        let ttl = |body: &str| {
+            serde_json::from_str::<PreparePersonaResponse>(body)
+                .unwrap()
+                .server_ttl()
+        };
+        assert_eq!(
+            ttl(r#"{"system_prompt":"p","ttl_seconds":120}"#),
+            Some(Duration::from_secs(120))
+        );
+        // An older server, or an unset field, must not disable caching.
+        assert_eq!(ttl(r#"{"system_prompt":"p"}"#), None);
+        assert_eq!(ttl(r#"{"system_prompt":"p","ttl_seconds":0}"#), None);
+        assert_eq!(ttl(r#"{"system_prompt":"p","ttl_seconds":-5}"#), None);
+    }
+
+    #[test]
+    fn default_ttl_is_the_freshness_limit() {
+        assert_eq!(
+            stage(CredentialKind::ServiceUser).cache.ttl(),
+            Duration::from_secs(300)
+        );
     }
 
     #[tokio::test]

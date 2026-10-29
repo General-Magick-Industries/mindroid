@@ -136,9 +136,12 @@ fn api_err(message: String, status: Option<StatusCode>) -> MindroidError {
 }
 
 async fn send(req: RequestBuilder, step: &str) -> Result<Response> {
-    req.send()
-        .await
-        .map_err(|e| api_err(format!("artifact {step} request failed: {e}"), None))
+    req.send().await.map_err(|e| {
+        api_err(
+            format!("artifact {step} request failed: {}", e.without_url()),
+            None,
+        )
+    })
 }
 
 async fn checked(resp: Response, step: &str) -> Result<Response> {
@@ -157,6 +160,59 @@ async fn json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T> {
     resp.json()
         .await
         .map_err(|e| api_err(format!("artifact response decode failed: {e}"), None))
+}
+
+impl MagickmindArtifactStore {
+    async fn fetch(&self, scope: &str, id: &str, limit: usize) -> Result<Artifact> {
+        let id = path_safe_id(id)?;
+        // The owned route also serves this caller's uploads that no message has attached yet.
+        let space = if self.end_user() {
+            self.download(&self.space_url(scope, &format!("{id}/download"))?)
+                .await?
+        } else {
+            None
+        };
+        let download = match space {
+            Some(d) => d,
+            None => self
+                .download(&self.owned_url(&format!("{id}/download")))
+                .await?
+                .ok_or_else(|| MindroidError::artifact(format!("artifact '{id}' not found")))?,
+        };
+
+        let mut resp = checked(
+            send(self.http.get(&download.download_url), "fetch").await?,
+            "fetch",
+        )
+        .await?;
+        let too_large =
+            || MindroidError::artifact(format!("artifact '{id}' exceeds {limit} bytes"));
+        if resp.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(too_large());
+        }
+        let header_mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let mut data = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            api_err(
+                format!("artifact fetch body failed: {}", e.without_url()),
+                None,
+            )
+        })? {
+            if data.len() + chunk.len() > limit {
+                return Err(too_large());
+            }
+            data.extend_from_slice(&chunk);
+        }
+        let mime_type = Some(download.content_type)
+            .filter(|m| !m.is_empty())
+            .or(header_mime)
+            .unwrap_or_else(|| "application/octet-stream".into());
+        Ok(Artifact { data, mime_type })
+    }
 }
 
 #[async_trait]
@@ -209,59 +265,12 @@ impl ArtifactStore for MagickmindArtifactStore {
     }
 
     async fn load(&self, scope: &str, id: &str) -> Result<Artifact> {
-        let id = path_safe_id(id)?;
-        // The owned route also serves this caller's uploads that no message has attached yet.
-        let space = if self.end_user() {
-            self.download(&self.space_url(scope, &format!("{id}/download"))?)
-                .await?
-        } else {
-            None
-        };
-        let download = match space {
-            Some(d) => d,
-            None => self
-                .download(&self.owned_url(&format!("{id}/download")))
-                .await?
-                .ok_or_else(|| MindroidError::artifact(format!("artifact '{id}' not found")))?,
-        };
+        self.fetch(scope, id, MAX_DOWNLOAD_BYTES).await
+    }
 
-        let mut resp = checked(
-            send(self.http.get(&download.download_url), "fetch").await?,
-            "fetch",
-        )
-        .await?;
-        let too_large = || {
-            MindroidError::artifact(format!(
-                "artifact '{id}' exceeds {MAX_DOWNLOAD_BYTES} bytes"
-            ))
-        };
-        if resp
-            .content_length()
-            .is_some_and(|n| n > MAX_DOWNLOAD_BYTES as u64)
-        {
-            return Err(too_large());
-        }
-        let header_mime = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let mut data = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
+    async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
+        self.fetch(scope, id, max_bytes.min(MAX_DOWNLOAD_BYTES))
             .await
-            .map_err(|e| api_err(format!("artifact fetch body failed: {e}"), None))?
-        {
-            if data.len() + chunk.len() > MAX_DOWNLOAD_BYTES {
-                return Err(too_large());
-            }
-            data.extend_from_slice(&chunk);
-        }
-        let mime_type = Some(download.content_type)
-            .filter(|m| !m.is_empty())
-            .or(header_mime)
-            .unwrap_or_else(|| "application/octet-stream".into());
-        Ok(Artifact { data, mime_type })
     }
 
     async fn delete(&self, _scope: &str, id: &str) -> Result<()> {
@@ -493,6 +502,23 @@ mod tests {
         assert!(!seen[2].headers.contains("authorization"));
         assert_eq!(artifact.data, b"jpeg-bytes");
         assert_eq!(artifact.mime_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn a_bounded_load_stops_at_the_limit() {
+        let (base, server) = serve(|base| {
+            let download = serde_json::json!({ "download_url": format!("{base}/s3-get") });
+            vec![(200, download.to_string()), (200, "0123456789".into())]
+        })
+        .await;
+
+        let err = store(&base, CredentialKind::EndUser)
+            .load_bounded("space1", "a1", 4)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(err.to_string().contains("exceeds 4 bytes"), "{err}");
     }
 
     #[tokio::test]

@@ -285,7 +285,7 @@ fn has_multimodal_content(content: &[ContentPart]) -> bool {
 const MAX_LLM_VISIBLE_FIELD: usize = 256;
 
 /// Flatten a store-supplied value to one bounded, structure-free fragment.
-fn sanitize_llm_visible(s: &str) -> String {
+pub(crate) fn sanitize_llm_visible(s: &str) -> String {
     let flattened: String = s
         .chars()
         .map(|c| match c {
@@ -309,7 +309,7 @@ fn sanitize_llm_visible(s: &str) -> String {
 /// Values are store-supplied and land in a line the model reads as runtime-
 /// authored, so each is flattened and capped: newlines and brackets would
 /// otherwise let a caption close the reference and forge prompt structure.
-fn render_llm_metadata(metadata: &crate::core::content::ContentMetadata) -> String {
+pub(crate) fn render_llm_metadata(metadata: &crate::core::content::ContentMetadata) -> String {
     let pairs: Vec<String> = metadata
         .iter()
         .filter(|(k, _)| !k.starts_with('_'))

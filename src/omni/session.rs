@@ -1,4 +1,5 @@
 use crate::core::config::AgentConfig;
+use crate::core::content::{inline_image_type, visible_mime_type};
 use crate::core::error::MindroidError;
 use crate::core::models::{Message, SenderType};
 use crate::memory::Memory;
@@ -9,7 +10,7 @@ use crate::omni::types::{
     TranscriptSource, TurnDetection, Usage,
 };
 use crate::pipeline::stages::stt::SttProvider;
-use crate::tools::{Tool, ToolContext};
+use crate::tools::{Tool, ToolContext, ToolImage, ToolOutput};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -702,12 +703,10 @@ impl OmniSession {
                         Some(OmniEvent::ToolCall { id, name, args }) => {
                             tracing::info!(%channel, %sender, %id, %name, "tool call");
                             self.state = SessionState::ToolCall;
-                            let result = self.execute_tool(&name, args).await;
-                            let result_value = match result {
-                                Ok(r) => Value::String(r),
-                                Err(e) => serde_json::json!({"error": e.to_string()}),
-                            };
-                            self.provider.send_tool_result(&id, result_value).await?;
+                            let (result_value, images) = tool_result(self.execute_tool(&name, args).await);
+                            self.provider
+                                .send_tool_result_with_images(&id, result_value, images)
+                                .await?;
                             // Return to Listening after tool call is dispatched.
                             self.state = SessionState::Listening;
                         }
@@ -782,13 +781,13 @@ impl OmniSession {
     }
 
     /// Find a tool by name and invoke it with the given arguments.
-    async fn execute_tool(&self, name: &str, args: Value) -> Result<String, MindroidError> {
+    async fn execute_tool(&self, name: &str, args: Value) -> Result<ToolOutput, MindroidError> {
         let tool = self
             .tools
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| MindroidError::pipeline(format!("tool not found: {name}")))?;
-        tool.execute(args, &self.tool_context()).await
+        tool.execute_with_images(args, &self.tool_context()).await
     }
 
     /// Test-only entry point that injects a pre-populated VAD results channel,
@@ -929,12 +928,10 @@ impl OmniSession {
                         }
                         Some(OmniEvent::ToolCall { id, name, args }) => {
                             self.state = SessionState::ToolCall;
-                            let result = self.execute_tool(&name, args).await;
-                            let result_value = match result {
-                                Ok(r) => Value::String(r),
-                                Err(e) => serde_json::json!({"error": e.to_string()}),
-                            };
-                            self.provider.send_tool_result(&id, result_value).await?;
+                            let (result_value, images) = tool_result(self.execute_tool(&name, args).await);
+                            self.provider
+                                .send_tool_result_with_images(&id, result_value, images)
+                                .await?;
                             self.state = SessionState::Listening;
                         }
                         Some(OmniEvent::UserSpeechEnded) => {}
@@ -1183,8 +1180,83 @@ impl Default for OmniSessionBuilder {
     }
 }
 
+/// Most images one tool result shows the model.
+const MAX_TOOL_IMAGES: usize = 4;
+/// Largest image one tool result shows the model.
+const MAX_TOOL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// A tool call's outcome as the provider gets it: the text (or the error) and
+/// the images the model may be shown.
+fn tool_result(outcome: Result<ToolOutput, MindroidError>) -> (Value, Vec<ToolImage>) {
+    match outcome {
+        Ok(out) => {
+            let mut text = out.text;
+            let images = shown_images(&mut text, out.images);
+            (Value::String(text), images)
+        }
+        Err(e) => (serde_json::json!({"error": e.to_string()}), Vec::new()),
+    }
+}
+
+/// The images a provider may send: each read as the type its bytes show, not
+/// the type the tool declared, within [`MAX_TOOL_IMAGE_BYTES`] and
+/// [`MAX_TOOL_IMAGES`]. One a provider would reject can close the whole
+/// session, so each one dropped is noted in `text` for the model instead.
+fn shown_images(text: &mut String, images: Vec<ToolImage>) -> Vec<ToolImage> {
+    let mut shown = Vec::new();
+    for image in images {
+        let refused = match inline_image_type(&image.data) {
+            None => Some(visible_mime_type(&image.mime_type).to_string()),
+            Some(_) if image.data.len() > MAX_TOOL_IMAGE_BYTES => {
+                Some(format!("over {} MiB", MAX_TOOL_IMAGE_BYTES / (1024 * 1024)))
+            }
+            Some(_) if shown.len() == MAX_TOOL_IMAGES => {
+                Some(format!("only {MAX_TOOL_IMAGES} images are shown"))
+            }
+            Some(mime_type) => {
+                shown.push(ToolImage::new(mime_type, image.data));
+                None
+            }
+        };
+        if let Some(why) = refused {
+            tracing::warn!(%why, "a tool's image is not shown to the model");
+            text.push_str(&format!("\n(an image could not be shown to you: {why})"));
+        }
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_images_a_model_takes_are_shown_and_the_rest_are_noted() {
+        use super::{MAX_TOOL_IMAGE_BYTES, MAX_TOOL_IMAGES, ToolImage, shown_images};
+
+        let jpeg = |n: usize| [vec![0xFF, 0xD8, 0xFF], vec![0; n]].concat();
+        let mut images = vec![
+            ToolImage::new("image/png", jpeg(1)),
+            ToolImage::new("image/svg+xml", b"<svg/>".to_vec()),
+            ToolImage::new("image/jpeg", jpeg(MAX_TOOL_IMAGE_BYTES)),
+        ];
+        images.extend((0..MAX_TOOL_IMAGES).map(|_| ToolImage::new("image/jpeg", jpeg(1))));
+        let mut text = "photo taken".to_string();
+
+        let shown = shown_images(&mut text, images);
+
+        assert_eq!(shown.len(), MAX_TOOL_IMAGES);
+        assert!(
+            shown.iter().all(|i| i.mime_type == "image/jpeg"),
+            "the bytes' type wins"
+        );
+        assert!(
+            text.contains("could not be shown to you: image/svg+xml"),
+            "{text}"
+        );
+        assert!(text.contains("over 2 MiB"), "{text}");
+        assert!(text.contains("only 4 images are shown"), "{text}");
+        assert!(text.starts_with("photo taken"));
+    }
+
     #[test]
     fn utterance_capture_slices_with_lead_and_writes_a_wav_header() {
         let mut cap = super::UtteranceCapture::new();
@@ -1242,6 +1314,7 @@ mod tests {
 
     use super::*;
     use crate::omni::types::{AudioChunk, OmniEvent};
+    use crate::tools::ToolImage;
     use async_stream::stream;
     use async_trait::async_trait;
     use futures::Stream;
@@ -1266,9 +1339,12 @@ mod tests {
     // Tracks send_audio calls and send_tool_result calls; events are driven via
     // an mpsc channel the test owns.
 
+    type RecordedImages = (String, Vec<ToolImage>);
+
     struct RecordingProvider {
         pub recorded_chunks: Arc<Mutex<Vec<AudioChunk>>>,
         pub recorded_tool_results: Arc<Mutex<Vec<(String, Value)>>>,
+        pub recorded_tool_images: Arc<Mutex<Vec<RecordedImages>>>,
         pub disconnected: Arc<Mutex<bool>>,
         event_rx: Option<mpsc::Receiver<OmniEvent>>,
     }
@@ -1279,6 +1355,7 @@ mod tests {
             let p = RecordingProvider {
                 recorded_chunks: Arc::new(Mutex::new(Vec::new())),
                 recorded_tool_results: Arc::new(Mutex::new(Vec::new())),
+                recorded_tool_images: Arc::new(Mutex::new(Vec::new())),
                 disconnected: Arc::new(Mutex::new(false)),
                 event_rx: Some(rx),
             };
@@ -1311,6 +1388,19 @@ mod tests {
                 .unwrap()
                 .push((call_id.to_string(), result));
             Ok(())
+        }
+
+        async fn send_tool_result_with_images(
+            &self,
+            call_id: &str,
+            result: Value,
+            images: Vec<ToolImage>,
+        ) -> Result<(), MindroidError> {
+            self.recorded_tool_images
+                .lock()
+                .unwrap()
+                .push((call_id.to_string(), images));
+            self.send_tool_result(call_id, result).await
         }
 
         async fn end_audio_stream(&self) -> Result<(), MindroidError> {
@@ -1494,6 +1584,45 @@ mod tests {
         }
     }
 
+    struct PhotoTool;
+
+    #[async_trait]
+    impl Tool for PhotoTool {
+        fn name(&self) -> &str {
+            "take_photo"
+        }
+
+        fn description(&self) -> &str {
+            "Takes a photo"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
+            Ok("photo taken".into())
+        }
+
+        async fn execute_with_images(
+            &self,
+            args: Value,
+            ctx: &crate::tools::ToolContext,
+        ) -> crate::error::Result<ToolOutput> {
+            Ok(ToolOutput {
+                images: vec![ToolImage {
+                    mime_type: "image/jpeg".into(),
+                    data: vec![0xFF, 0xD8, 0xFF],
+                }],
+                ..self.execute(args, ctx).await?.into()
+            })
+        }
+    }
+
     // ── Builder tests ─────────────────────────────────────────────────────────
 
     /// Building without a provider must return an error.
@@ -1638,6 +1767,42 @@ mod tests {
             results[0].1,
             Value::String(r#"{"msg":"hello"}"#.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_tools_images_reach_the_provider_with_its_result() {
+        let (provider, tx) = RecordingProvider::new();
+        let results = Arc::clone(&provider.recorded_tool_results);
+        let images = Arc::clone(&provider.recorded_tool_images);
+
+        let mut session = OmniSession::builder()
+            .provider(provider)
+            .tool(EchoTool)
+            .tool(PhotoTool)
+            .build()
+            .unwrap();
+
+        for (id, name) in [("c1", "take_photo"), ("c2", "echo")] {
+            tx.send(OmniEvent::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                args: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        session.run().await.expect("run() should succeed");
+
+        assert_eq!(
+            results.lock().unwrap()[0],
+            ("c1".to_string(), Value::String("photo taken".into()))
+        );
+        let images = images.lock().unwrap();
+        assert_eq!(images[0].0, "c1");
+        assert_eq!(images[0].1[0].data, vec![0xFF, 0xD8, 0xFF]);
+        assert_eq!(images[1], ("c2".to_string(), Vec::new()));
     }
 
     /// AudioChunk followed by Interrupted → sink.stop() is called, state → Listening.
