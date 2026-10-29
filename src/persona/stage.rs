@@ -18,6 +18,13 @@ use super::provider::PersonaProvider;
 /// Replaces `SimpleContextBuilder` when a persona is configured.
 /// Fetches the effective personality per-request using the sender's user_id
 /// for dyadic (per-user) adaptation.
+///
+/// Config builds this stage only for `persona.type = "local"`. The MagickMind
+/// service path uses the server-prepared prompt
+/// ([`MagickmindAgentPersonaStage`](super::MagickmindAgentPersonaStage) or
+/// [`MagickmindPersonaStage`](super::MagickmindPersonaStage)), so the SDK and
+/// the server render the same wording; this stage's formatting has no trait
+/// bands or descriptions.
 pub struct PersonaContextBuilder {
     provider: Arc<dyn PersonaProvider>,
     cache: Arc<PersonaCache>,

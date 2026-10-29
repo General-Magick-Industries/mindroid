@@ -16,7 +16,7 @@ pub mod cpal_audio;
 #[cfg(feature = "transport-audio")]
 pub use audio::SileroDetector;
 pub use audio::{AudioSink, AudioSource, SpeechDetector};
-pub use gate::{VoiceGate, VoiceGateBuilder};
+pub use gate::{DeclareTools, VoiceGate, VoiceGateBuilder};
 #[cfg(feature = "omni-gemini")]
 pub use gemini::{GeminiLiveConfig, GeminiLiveProvider};
 #[cfg(feature = "omni-openai")]

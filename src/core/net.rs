@@ -33,6 +33,15 @@ pub(crate) type PromptCacheKey = (String, Option<String>);
 struct CacheEntry {
     prompt: String,
     fetched_at: Instant,
+    /// How long this entry stays fresh: the cache's TTL, or the server's own
+    /// `ttl_seconds` for this prompt when that is shorter.
+    fresh_for: Duration,
+}
+
+impl CacheEntry {
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.duration_since(self.fetched_at) < self.fresh_for
+    }
 }
 
 /// TTL cache of server-prepared prompts, with stale-serve degradation.
@@ -72,9 +81,10 @@ impl PreparedPromptCache {
     /// entry stays available to [`Self::get_any`] as a stale fallback.
     pub(crate) fn get_fresh(&self, key: &PromptCacheKey) -> Option<String> {
         let entries = self.entries.lock().expect("prompt cache mutex poisoned");
+        let now = Instant::now();
         entries
             .get(key)
-            .filter(|e| e.fetched_at.elapsed() < self.ttl)
+            .filter(|e| e.is_fresh(now))
             .map(|e| e.prompt.clone())
     }
 
@@ -84,23 +94,40 @@ impl PreparedPromptCache {
         entries.get(key).map(|e| e.prompt.clone())
     }
 
-    /// Store a prompt. No-op when caching is disabled (zero TTL); sweeps
-    /// expired entries once the map grows past [`Self::SWEEP_THRESHOLD`].
+    /// Store a prompt for the cache's TTL. See [`Self::insert_with_server_ttl`].
+    #[cfg(test)]
     pub(crate) fn insert(&self, key: PromptCacheKey, prompt: String) {
-        if self.ttl.is_zero() {
+        self.insert_with_server_ttl(key, prompt, None);
+    }
+
+    /// Store a prompt, fresh for the cache's TTL or `server_ttl` when the
+    /// server sent a shorter one: the server's `ttl_seconds` is how long the
+    /// personality behind the prompt may be served, so caching past it would
+    /// break the freshness limit. No-op when caching is disabled (zero TTL);
+    /// sweeps expired entries once the map grows past
+    /// [`Self::SWEEP_THRESHOLD`].
+    pub(crate) fn insert_with_server_ttl(
+        &self,
+        key: PromptCacheKey,
+        prompt: String,
+        server_ttl: Option<Duration>,
+    ) {
+        let fresh_for = server_ttl.map_or(self.ttl, |server| server.min(self.ttl));
+        if fresh_for.is_zero() {
             return;
         }
 
         let mut entries = self.entries.lock().expect("prompt cache mutex poisoned");
+        let now = Instant::now();
         if entries.len() > Self::SWEEP_THRESHOLD {
-            let now = Instant::now();
-            entries.retain(|_, e| now.duration_since(e.fetched_at) < self.ttl);
+            entries.retain(|_, e| e.is_fresh(now));
         }
         entries.insert(
             key,
             CacheEntry {
                 prompt,
-                fetched_at: Instant::now(),
+                fetched_at: now,
+                fresh_for,
             },
         );
     }
@@ -304,6 +331,32 @@ mod tests {
             Some("for bob")
         );
         // The non-personalized slot is separate from both.
+        assert_eq!(c.get_fresh(&key("a1", None)), None);
+    }
+
+    #[test]
+    fn a_shorter_server_ttl_bounds_freshness() {
+        let c = PreparedPromptCache::new(Duration::from_secs(60));
+        c.insert_with_server_ttl(
+            key("a1", Some("u1")),
+            "prompt".into(),
+            Some(Duration::from_millis(1)),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(c.get_fresh(&key("a1", Some("u1"))), None);
+        // Still the last-good prompt if the re-fetch fails.
+        assert_eq!(c.get_any(&key("a1", Some("u1"))).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn a_longer_server_ttl_never_extends_the_cache_ttl() {
+        let c = PreparedPromptCache::new(Duration::from_millis(1));
+        c.insert_with_server_ttl(
+            key("a1", None),
+            "prompt".into(),
+            Some(Duration::from_secs(3_600)),
+        );
+        std::thread::sleep(Duration::from_millis(5));
         assert_eq!(c.get_fresh(&key("a1", None)), None);
     }
 

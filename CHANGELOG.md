@@ -10,6 +10,37 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- Tool results that carry images. `Tool::execute_with_images` returns a
+  `ToolOutput` (text plus `ToolImage`s); its default is `execute`'s text and no
+  images. `OmniSession` sends a tool's images to the new
+  `OmniProvider::send_tool_result_with_images`, after checking each one: its
+  bytes' type replaces the declared one, and an image a model would not take,
+  one over 2 MiB, or one past the fourth is dropped, with a note in the result's
+  text. `GeminiLiveProvider` sends them as `inlineData` in the function
+  response's `parts`; the default, for every other provider, says in the result
+  that they could not be shown. `ToolOutput` and `ToolImage` are
+  `#[non_exhaustive]`: build them with `ToolOutput::new(..).with_images(..)` and
+  `ToolImage::new`.
+- `VoiceGateBuilder::dynamic_tools(registry, declare)` (with `DeclareTools`):
+  each session the gate opens offers the registry's tools as they stand,
+  declared with the provider's renderer, so tools that change during a stream
+  reach the next session. Remote tools are left out, since a session runs every
+  call itself; `build` refuses `dynamic_tools` together with `tools`.
+- `artifacts::inline_image_type` is public, and lives in `core::content` so omni
+  builds without `artifacts` can use it.
+- The turn's own tool calls are saved. `ToolExecutorStage` records each call it
+  runs itself in `LocalToolCalls` (on by default; `with_recorded_calls(false)`
+  turns it off; a tool that ends the turn is left out), and clears them when a
+  turn starts. A result is kept only when its tool opts in with the new
+  `Tool::keeps_result_in_history` (off by default, since a result such as a
+  memory search across conversations would otherwise be readable by everyone in
+  the space); otherwise the call is kept with a placeholder, and a failed call
+  with "the call failed" rather than its error. `MagickmindPersistence` saves
+  each as a `TOOL_CALL`, naming the agent as its `executor_id` and threaded to
+  the inbound message, and a `TOOL_RESULT` (cut to 4 KiB) threaded to it.
+- A framed remote call names its `executor_id`: the tool's executor, or else
+  the person whose message the agent is answering.
+
 - `InlineArtifacts` (feature `artifacts`): loads the images an inbound message
   attaches by reference (`artifact_data`) and puts them inline on the current user
   turn, so the model sees a photo the turn it arrives instead of calling
@@ -21,6 +52,10 @@ listed under **Breaking Changes** with a migration note.
   metadata; anything else stays a reference. A later `ArtifactOffload` turns an
   inlined image back into a reference to the sender's artifact instead of storing
   it again. See ADR-0010.
+- `MagickmindClient::prepare_context_keeping_inbound`: `prepare_context` without
+  dropping the newest message as the turn being answered. A caller that fetches
+  mid-turn to cache history for the next turn needs that message kept, with its
+  attachments; `prepare_context` drops it because the caller appends it itself.
 - `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
   The default loads and then checks; `LocalArtifactStore` and
   `MagickmindArtifactStore` stop reading at the limit.
@@ -157,7 +192,61 @@ Both non-streaming calls (`chat`, `chat_with_tools`) are now bounded by a
 `stream_chat` keeps its unbounded body read and long generations are not
 truncated.
 
-#### 7. `VadStateMachine` takes the chunk duration per call
+#### 7. Live affect is expressed only toward the user it was felt with
+
+A sender with no affect state of their own now gets none, instead of the
+agent's own state: the persona service holds mood per agent and user, and the
+agent's own row mixes every conversation without a single counterpart.
+`EpisodeReplyIngestStage::with_runtime_state_of` is deprecated and does
+nothing, so the reply's state is no longer kept.
+
+```rust
+// before
+let reply = EpisodeReplyIngestStage::new(url, auth, kind).with_runtime_state_of(&inbound);
+// after
+let reply = EpisodeReplyIngestStage::new(url, auth, kind);
+```
+
+#### 8. `persona.type = "magickmind"` uses the server-prepared prompt
+
+The SDK no longer formats a prompt for MagickMind personas. It rendered
+`- warmth: 50.0` with no bands or trait descriptions, and its wording had
+drifted from the server's. `"magickmind"` is now a deprecated alias that logs a
+warning at build time and resolves to `"magickmind-prepared-agent"` when
+`auth.type = "enduser"` or `agent.agent_id` is set, else to
+`"magickmind-prepared"`. Config no longer creates `MagickmindPersonaClient`;
+it and `PersonaContextBuilder` stay public, and `"local"` is unchanged.
+
+- The base URL must be `https://` unless `persona.allow_insecure = true`.
+- `persona.cache_ttl_secs` applies, with the prepared stages' 5-minute default.
+- Without an agent id, the persona-keyed route serves authored trait values
+  only, with no evolution or per-user adjustment. Set `agent.agent_id` for the
+  evolved prompt.
+- On the agent route `persona.persona_id` is ignored: the server uses the
+  agent's active persona. The warning says so when one is set.
+- `RuntimeBuilder::build_persona_stage()` returns `Ok(None)` for
+  `"magickmind"` and logs a warning; it serves `"local"` personas only.
+
+```rust
+// before
+let stage = builder.build_persona_stage().await?.expect("persona");
+// after
+let stage: Arc<dyn PipelineStage> = match builder.build_magickmind_agent_persona_stage() {
+    Some(s) => Arc::new(s),
+    None => Arc::new(builder.build_magickmind_persona_stage().expect("persona")),
+};
+```
+
+```toml
+# before
+[persona]
+type = "magickmind"
+# after: agent-keyed (agent.agent_id, or auth.type = "enduser")
+[persona]
+type = "magickmind-prepared-agent"
+```
+
+#### 9. `VadStateMachine` takes the chunk duration per call
 
 It counted silence in frames of a duration fixed at construction, which
 `VoiceGate` froze from the first chunk it saw. Silence is now counted in time,
@@ -174,7 +263,7 @@ let mut vad = VadStateMachine::new(config);
 vad.process(probability, Duration::from_millis(30));
 ```
 
-#### 8. `voice::encode_wav` moved to `omni::audio::wav`
+#### 10. `voice::encode_wav` moved to `omni::audio::wav`
 
 The crate had two PCM16 WAV encoders; `omni::audio::wav` is now the only
 one, and it no longer needs `transport-audio` or `hound`. Output is
@@ -323,6 +412,28 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 
 ### Changed
 
+- Prepared-prompt caches default to 5 minutes (`DEFAULT_TTL_SECS = 300`, and
+  `persona.cache_ttl_secs`), down from 10, matching the persona service's
+  freshness limit for an evolved personality. `MagickmindAgentPersonaStage`
+  also honours the agent-route response's `ttl_seconds` when it is shorter, so
+  a longer configured TTL can no longer hold a prompt past the server's limit.
+  The stale-prompt fallback on a failed re-fetch is unchanged.
+- History says who called a tool. A participant's `TOOL_RESULT` answering one of
+  the agent's own calls replays as `[Lynn, answering your take_photo call]: ...`,
+  but only when Lynn is the call's `executor_id`; a result from anyone else, or
+  to a call that names no executor, replays as a plain `[Bob]: ...` turn. A
+  participant's own `TOOL_CALL` replays as `[Bob called drive]: ...`, with
+  brackets stripped from tool and display names, and the agent's own `TOOL_RESULT` as a
+  user turn, `[result of your lookup call]: ...`. The agent's own recorded
+  calls replay ahead of the reply they were saved after, and one whose result
+  was never saved is not replayed. The attribution note explains the labels.
+- `MagickmindPersistence` saves the reply first and the turn's recorded calls
+  after it, two more writes per call, so they no longer delay the reply. It
+  keeps in `LocalToolCalls` only the calls it saved, so `push_agent_turn`
+  caches what a fetch would replay.
+- A Gemini Live close frame with an error code arrives as `OmniEvent::Error`
+  instead of ending the event stream as if the session had closed normally.
+  `Normal` (1000) and `Away` (1001) closes still end it cleanly.
 - `MagickmindContextConfig::default()` no longer requests pelican:
   `include_pelican` is `false`. The backend retired the fetcher and ignored the
   field; set it to `true` to send the old request.

@@ -13,6 +13,11 @@ use super::provider::PersonaProvider;
 ///
 /// Follows the same pattern as `MagickmindMemory` — uses `reqwest` + `Auth`
 /// for authenticated requests against the magickmind REST API.
+///
+/// Config no longer creates this client: `persona.type = "magickmind"` now
+/// uses the server-prepared prompt, and config builds `PersonaContextBuilder`
+/// only for `"local"` personas. It stays available for code that wires a
+/// [`PersonaProvider`] by hand.
 pub struct MagickmindPersonaClient {
     http: reqwest::Client,
     base_url: String,
