@@ -2071,23 +2071,38 @@ mod tests {
         assert_eq!(outcome.response.as_deref(), Some("round 3"));
     }
 
+    /// A stage that recovers from a refusal through `lift` leaves nothing that
+    /// turns a later plain halt into a refusal.
     #[tokio::test]
-    async fn lifting_a_refusal_takes_the_mark_with_the_halt() {
-        let mut ctx = ctx();
-        Refused::halt(&mut ctx);
-        Refused::lift(&mut ctx);
+    async fn after_a_lifted_refusal_a_plain_halt_still_runs_finish() {
+        struct RefusesThenRecovers;
 
-        assert!(!ctx.halted);
-        assert!(!Refused::covers(&ctx));
+        #[async_trait]
+        impl PipelineStage for RefusesThenRecovers {
+            fn name(&self) -> &str {
+                "refuses-then-recovers"
+            }
 
-        let outcome = AgentLoop::new(Pipeline::new().add_stage(PlainHalt))
-            .run(&mut ctx)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.reason,
-            StopReason::Halted,
-            "a later halt is a plain halt"
-        );
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                Refused::halt(ctx);
+                Refused::lift(ctx);
+                assert!(!ctx.halted && !Refused::covers(ctx));
+                Ok(())
+            }
+        }
+
+        let finish_hits = Arc::new(AtomicUsize::new(0));
+        let outcome = AgentLoop::new(
+            Pipeline::new()
+                .add_stage(RefusesThenRecovers)
+                .add_stage(PlainHalt),
+        )
+        .with_finish(Pipeline::new().add_stage(Marker("persist", finish_hits.clone())))
+        .run(&mut ctx())
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reason, StopReason::Halted);
+        assert_eq!(finish_hits.load(Ordering::SeqCst), 1);
     }
 }

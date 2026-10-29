@@ -395,18 +395,37 @@ mod tests {
         assert_eq!(history.len(), 1, "only the user turn: {history:?}");
     }
 
-    /// A manifest swaps tools; saving it would replay it as a user turn.
+    /// A manifest swaps tools; saving it would replay it as a user turn. An
+    /// accepted one is a plain halt, so a loop's `finish` still runs over it.
     #[tokio::test]
-    async fn persistence_skips_a_tool_manifest() {
+    async fn a_loop_persists_nothing_for_an_accepted_manifest() {
+        struct AcceptsManifest;
+
+        #[async_trait]
+        impl PipelineStage for AcceptsManifest {
+            fn name(&self) -> &str {
+                "accepts-manifest"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                ctx.halted = true;
+                Ok(())
+            }
+        }
+
         let mem = Arc::new(SqliteMemory::new(":memory:").unwrap());
         let persistence = MemoryPersistence::new(Arc::new(MemoryClient::new(mem.clone())));
 
         let mut message = test_message("chan1", "robot", r#"{"tools":[]}"#);
         message.message_type = MessageType::ToolManifest;
         let mut pctx = Context::new(message.into(), crate::config::AgentConfig::default().into());
-        pctx.halted = true;
-        persistence.process(&mut pctx).await.unwrap();
+        let outcome = crate::AgentLoop::new(crate::Pipeline::new().add_stage(AcceptsManifest))
+            .with_finish(crate::Pipeline::new().add_stage(persistence))
+            .run(&mut pctx)
+            .await
+            .unwrap();
 
+        assert_eq!(outcome.reason, crate::StopReason::Halted, "finish ran");
         assert!(mem.get_history("chan1", 10).await.unwrap().is_empty());
     }
 
