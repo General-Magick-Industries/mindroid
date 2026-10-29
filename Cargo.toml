@@ -57,7 +57,7 @@ transport-ws = ["dep:tokio-tungstenite", "dep:base64"]
 # neither the Centrifugo transport nor Gemini should drag the other in.
 omni-gemini = ["dep:tokio-tungstenite", "dep:base64"]
 omni-openai = ["dep:tokio-tungstenite", "dep:base64"]
-transport-audio = ["dep:cpal", "dep:hound", "dep:base64", "dep:voice_activity_detector", "dep:rodio"]
+transport-audio = ["dep:cpal", "dep:base64", "dep:voice_activity_detector", "dep:rodio"]
 # LLM (base64 needed for inline image encoding + ingest)
 llm-client = ["dep:async-openai", "dep:reqwest", "dep:base64"]
 llm-local = ["llm-client"]
@@ -109,7 +109,6 @@ base64 = { version = "0.22", optional = true }
 
 # Optional: audio transport (mic capture + Silero VAD)
 cpal = { version = "0.15", optional = true }
-hound = { version = "3.5", optional = true }
 voice_activity_detector = { version = "0.2", optional = true }
 # NOTE: pv_cobra (Picovoice Cobra VAD) has all crates.io versions yanked.
 # The `cobra` feature provides the dispatch infrastructure; to enable real
