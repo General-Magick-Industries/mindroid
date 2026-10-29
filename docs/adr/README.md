@@ -34,3 +34,4 @@ that a future contributor (human or agent) would otherwise have to reverse-engin
 | [0008](0008-pipeline-admission.md) | The pipeline refuses unconsumable control traffic before any stage runs | Accepted |
 | [0009](0009-artifact-scope-per-store.md) | An artifact store chooses its scope; the SDK ships a hosted store | Accepted |
 | [0010](0010-inline-referenced-artifacts.md) | Referenced images may be inlined by an opt-in stage | Accepted |
+| [0011](0011-agent-loop.md) | `AgentLoop` as a separate execution model composed of pipelines | Proposed |
