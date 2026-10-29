@@ -10,6 +10,8 @@ mod inline_artifacts;
 #[cfg(feature = "llm-client")]
 mod llm_processor;
 mod post_processor;
+#[cfg(feature = "artifacts")]
+mod reattach;
 pub mod stt;
 #[cfg(feature = "llm-client")]
 mod tool_executor;

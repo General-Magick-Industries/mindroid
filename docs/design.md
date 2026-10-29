@@ -183,11 +183,13 @@ same store:
    the LLM, so only history keeps the reference). Decoupled from persistence — it
    has no memory knowledge; `MemoryPersistence` later saves whatever the parts
    became.
-3. **`GetArtifactTool`** (`get_artifact`) — the model calls it with an id;
-   `XmlToolExecutorStage` resolves the bytes via the store's `load` and re-injects
-   them as a multimodal `Role::Tool` message the model can see. A round
-   re-attaches at most 8 artifacts, deduplicated — every one is held in memory
-   and base64-expanded into the request — and the message names any left out.
+3. **`GetArtifactTool`** (`get_artifact`) — the model calls it with an id; the
+   executor loads the bytes with `load_bounded` and re-injects them (on the
+   `Role::Tool` message for `XmlToolExecutorStage`, as a follow-up user turn for
+   `ToolExecutorStage`). A round re-attaches at most 8 artifacts, deduplicated,
+   and the message names any left out. With `InlineArtifacts` in the pipeline,
+   the turn's images, inlined or re-attached, share its byte allowance, and an
+   image already in the conversation is not sent again.
    Only PNG, JPEG, GIF and WebP are re-attached, by byte signature; anything else
    is described as text.
 4. **`InlineArtifacts`** (pipeline stage, opt-in) — for media a sender attached by

@@ -18,10 +18,16 @@ use crate::pipeline::extensions::CurrentUserMessage;
 use crate::pipeline::stages::tool_executor_xml::MAX_REINJECTED_ARTIFACTS;
 use crate::{PipelineStage, Result};
 
-/// Default cap on the bytes this stage inlines per turn: base64 grows it by a
-/// third, and a 1 MiB request cap must also fit the prompt, history and any
-/// `get_artifact` re-attachment.
+/// Default cap on the image bytes a turn's requests carry: base64 grows it by a
+/// third, and a 1 MiB request cap must also fit the prompt and history. The
+/// executors' `get_artifact` re-attachment spends what this stage leaves.
 pub const DEFAULT_MAX_INLINE_BYTES: usize = 512 * 1024;
+
+/// The image bytes this turn's requests may carry, set by [`InlineArtifacts`]
+/// from [`with_max_bytes`](InlineArtifacts::with_max_bytes). Without it, the
+/// executors re-attach with no byte bound.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageAllowance(pub(crate) usize);
 
 /// Loads the images in the inbound message's `artifact_data` and attaches them
 /// inline to the current user turn; with
@@ -65,7 +71,10 @@ impl InlineArtifacts {
         Self::new(manager.store().clone())
     }
 
-    /// Cap the bytes inlined in one turn. Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
+    /// Cap the image bytes a turn's requests carry: what this stage inlines, plus
+    /// what both tool executors re-attach for `get_artifact` after any image
+    /// already inline in the conversation (anything they load counts, image or
+    /// not). Defaults to [`DEFAULT_MAX_INLINE_BYTES`].
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
@@ -166,6 +175,7 @@ impl PipelineStage for InlineArtifacts {
     }
 
     async fn process(&self, ctx: &mut Context) -> Result<()> {
+        ctx.set(ImageAllowance(self.max_bytes));
         let mut ids = HashSet::new();
         let references: Vec<ContentPart> = ctx
             .message
@@ -243,9 +253,26 @@ impl PipelineStage for InlineArtifacts {
             "InlineArtifacts: inlined {} images, {} bytes left",
             budget.inlined, budget.bytes
         );
+        if budget.inlined > 0 {
+            match ctx.llm_messages.iter_mut().find(|m| m.role == Role::System) {
+                Some(system) => system.append_text(&format!("\n\n{CAN_SEE_IMAGES}")),
+                None => {
+                    ctx.llm_messages
+                        .insert(0, crate::LlmMessage::system(CAN_SEE_IMAGES));
+                    if let Some(current) = current {
+                        ctx.set(CurrentUserMessage(current + 1));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
+
+/// Persona prompts lead some vision models (gpt-4o-mini among them) to answer
+/// "I can't see images" about a photo in the same request.
+const CAN_SEE_IMAGES: &str = "You can see images. When a message has an image attached, it is \
+    shown to you in that message: look at it and answer from it directly.";
 
 #[cfg(test)]
 mod tests {
@@ -373,6 +400,77 @@ mod tests {
             "{label}"
         );
         assert!(!label.contains("get_artifact"), "{label}");
+    }
+
+    #[tokio::test]
+    async fn the_inserted_system_note_keeps_the_current_turn_pointed_at() {
+        use crate::pipeline::extensions::PersistedUserTurn;
+
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut msg = Message::new("mine", "u1", "space1");
+        msg.metadata.insert(
+            ARTIFACT_DATA_METADATA_KEY.into(),
+            serde_json::json!([{"id": ids[0]}]),
+        );
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        ctx.llm_messages = vec![LlmMessage::user("someone else's"), LlmMessage::user("mine")];
+        ctx.set(CurrentUserMessage(1));
+
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        crate::pipeline::stages::ArtifactOffload::new(store)
+            .process(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.get_run::<CurrentUserMessage>().map(|c| c.0), Some(2));
+        let persisted = &ctx.get_run::<PersistedUserTurn>().unwrap().0;
+        assert!(
+            persisted.contains("mine") && persisted.contains(&ids[0]),
+            "{persisted}"
+        );
+        assert!(!persisted.contains("someone else"), "{persisted}");
+    }
+
+    #[tokio::test]
+    async fn without_a_system_prompt_the_note_gets_its_own_not_the_users_turn() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut msg = Message::new("look", "u1", "space1");
+        msg.metadata.insert(
+            ARTIFACT_DATA_METADATA_KEY.into(),
+            serde_json::json!([{"id": ids[0]}]),
+        );
+        let mut ctx = Context::new(Arc::new(msg), Arc::new(AgentConfig::default()));
+        ctx.llm_messages = vec![LlmMessage::user("look")];
+
+        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.llm_messages[0].role, Role::System);
+        assert_eq!(ctx.llm_messages[0].text(), CAN_SEE_IMAGES);
+        assert!(!ctx.llm_messages[1].text().contains(CAN_SEE_IMAGES));
+        assert_eq!(inline_images(&ctx, 1), vec![jpeg(&[1])]);
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_it_can_see_only_when_an_image_was_inlined() {
+        let (_tmp, store, ids) = setup(&[(jpeg(&[1]), "image/jpeg")]).await;
+        let mut ctx = ctx_with(serde_json::json!([{"id": ids[0]}]));
+        InlineArtifacts::new(store.clone())
+            .process(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.llm_messages[0].text().ends_with(CAN_SEE_IMAGES));
+        assert!(!ctx.llm_messages[1].text().contains(CAN_SEE_IMAGES));
+
+        let mut ctx = ctx_with(serde_json::json!([{"id": "missing"}]));
+        InlineArtifacts::new(store).process(&mut ctx).await.unwrap();
+        assert!(
+            ctx.llm_messages
+                .iter()
+                .all(|m| !m.text().contains(CAN_SEE_IMAGES))
+        );
     }
 
     #[tokio::test]
