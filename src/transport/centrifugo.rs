@@ -342,12 +342,10 @@ async fn handshake(
     // wrong `agent_id` connects, logs "Listening on channel", and then receives
     // nothing forever, indistinguishable from an idle channel.
     if kind == crate::models::CredentialKind::EndUser && service_user_id != agent_id {
-        warn!(
-            agent_id = %agent_id,
-            token_subject = %service_user_id,
-            "Configured agent_id does not match the token subject; this agent will \
-             listen on a channel nothing publishes to"
-        );
+        return Err(transport_err(format!(
+            "configured agent_id {agent_id} does not match the token subject \
+             {service_user_id}; refusing to listen on a channel nothing publishes to"
+        )));
     }
 
     let url = if ws_url.contains('?') {
@@ -1202,6 +1200,26 @@ mod tests {
 
     /// A credential with no notion of terminal failure must not stop a
     /// reconnect loop — the default keeps a static token retrying.
+    #[tokio::test]
+    async fn end_user_handshake_refuses_agent_id_not_matching_token_subject() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"someone-else"}"#);
+        let auth = crate::auth::static_id::StaticAuth::new(format!("h.{payload}.s"));
+
+        let err = handshake(
+            "ws://127.0.0.1:1/ws",
+            "agent",
+            &auth,
+            crate::models::CredentialKind::EndUser,
+            &ProxyChannelNaming,
+            true,
+        )
+        .await
+        .err()
+        .expect("a mismatched subject must not start a session");
+        assert!(err.to_string().contains("does not match the token subject"));
+    }
+
     #[test]
     fn auth_is_not_terminal_by_default() {
         let auth = crate::auth::static_id::StaticAuth::new("tok");

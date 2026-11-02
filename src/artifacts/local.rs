@@ -120,7 +120,12 @@ impl LocalArtifactStore {
 
         if create {
             // Recursive, so this makes the base too.
-            tokio::fs::create_dir_all(&dir)
+            let mut builder = tokio::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder
+                .create(&dir)
                 .await
                 .map_err(|e| MindroidError::artifact(format!("create_dir_all failed: {e}")))?;
         }
@@ -261,11 +266,11 @@ impl LocalArtifactStore {
                 "artifact exceeds the size limit",
             ));
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .await?;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(path).await?;
         file.write_all(data).await?;
         file.flush().await
     }
@@ -540,6 +545,24 @@ mod tests {
     /// flushing still lands the bytes almost every time, so this passes either
     /// way. `flush_surfaces_a_deferred_write_error` covers what the flush is
     /// actually for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_keeps_directories_and_files_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("store");
+        let store = LocalArtifactStore::new(&base);
+
+        let id = store.save("chan", b"img", "image/png").await.unwrap().id;
+
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(base.clone()), 0o700);
+        assert_eq!(mode(base.join("chan")), 0o700);
+        assert_eq!(mode(base.join("chan").join(&id)), 0o600);
+        assert_eq!(mode(base.join("chan").join(format!("{id}.json"))), 0o600);
+    }
+
     #[tokio::test]
     async fn write_new_persists_the_bytes() {
         let tmp = tempfile::tempdir().unwrap();

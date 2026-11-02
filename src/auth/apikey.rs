@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{Auth, MindroidError, Result};
+use crate::{Auth, MindroidError, Result, core::net::require_secure_url};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -246,7 +246,7 @@ impl ApiKeyAuth {
     /// infallible for backwards compatibility and only warns.
     pub fn new(base_url: &str, email: &str, password: &str) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
-        if is_plaintext(&base_url) {
+        if require_secure_url(&base_url, false, "auth.allow_insecure").is_err() {
             warn!(
                 "auth base_url {base_url} is plaintext; credentials will cross \
                  the network unprotected — use https:// (see try_new)"
@@ -270,12 +270,7 @@ impl ApiKeyAuth {
         allow_insecure: bool,
     ) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
-        if is_plaintext(&base_url) && !allow_insecure {
-            return Err(MindroidError::config(format!(
-                "refusing to send credentials over plaintext {base_url}: use https://, \
-                 or set auth.allow_insecure = true for local development"
-            )));
-        }
+        require_secure_url(&base_url, allow_insecure, "auth.allow_insecure")?;
         Ok(Self::build(base_url, email, password))
     }
 
@@ -510,10 +505,6 @@ fn with_cause(err: MindroidError, cause: MindroidError) -> MindroidError {
         },
         other => other,
     }
-}
-
-fn is_plaintext(base_url: &str) -> bool {
-    base_url.starts_with("http://")
 }
 
 #[async_trait]
@@ -1135,6 +1126,12 @@ mod tests {
     #[test]
     fn try_new_refuses_plaintext_without_opt_in() {
         assert!(ApiKeyAuth::try_new("http://gateway.internal", "u", "p", false).is_err());
+    }
+
+    #[test]
+    fn try_new_refuses_uppercase_plaintext_scheme() {
+        assert!(ApiKeyAuth::try_new("HTTP://gateway.internal", "u", "p", false).is_err());
+        assert!(ApiKeyAuth::try_new("Http://gateway.internal", "u", "p", false).is_err());
     }
 
     #[test]
