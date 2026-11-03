@@ -50,6 +50,13 @@ anyway, wrongly. Matching a question to an earlier photo has the same failure.
 
 - With a history window, the window's images are resent every turn, bounded by the
   stage's budgets; that cost is the embedder's choice.
-- The stage's byte budget does not cover `get_artifact` re-attachment, which still
-  has only a count cap.
+- The stage's byte budget is the turn's image allowance, and `get_artifact`
+  re-attachment in both executors spends what the stage leaves (amended
+  2026-10-08). An image already in the conversation is not re-attached, and a
+  repeat request for one that could not be shown is answered from the first
+  attempt. Without the stage, re-attachment has no byte bound.
+- On a turn where the stage inlined an image, it adds one sentence to the system
+  prompt saying the model can see attached images: with a persona prompt,
+  gpt-4o-mini otherwise denied seeing an image in the same request. It goes on
+  the first system message, which a backend that keeps only one still sends.
 - An image with a valid signature but a corrupt body can still fail a request.
