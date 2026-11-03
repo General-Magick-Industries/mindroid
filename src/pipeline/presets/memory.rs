@@ -223,7 +223,7 @@ impl PipelineStage for MemoryPersistence {
         let user_content = ctx
             .get_run::<crate::pipeline::extensions::PersistedUserTurn>()
             .map(|turn| turn.0.clone())
-            .unwrap_or_else(|| ctx.message.content.clone());
+            .unwrap_or_else(|| LlmMessage::user(ctx.message.content.as_str()).to_stored());
 
         // Save user message
         self.client
@@ -241,7 +241,7 @@ impl PipelineStage for MemoryPersistence {
                 .save_message(
                     channel_id,
                     &ctx.agent_config.agent_id,
-                    response,
+                    &LlmMessage::assistant(response).to_stored(),
                     Some(&ctx.message.id),
                 )
                 .await

@@ -342,12 +342,10 @@ async fn handshake(
     // wrong `agent_id` connects, logs "Listening on channel", and then receives
     // nothing forever, indistinguishable from an idle channel.
     if kind == crate::models::CredentialKind::EndUser && service_user_id != agent_id {
-        warn!(
-            agent_id = %agent_id,
-            token_subject = %service_user_id,
-            "Configured agent_id does not match the token subject; this agent will \
-             listen on a channel nothing publishes to"
-        );
+        return Err(MindroidError::config(format!(
+            "configured agent_id {agent_id} does not match the token subject \
+             {service_user_id}; refusing to listen on a channel nothing publishes to"
+        )));
     }
 
     let url = if ws_url.contains('?') {
@@ -1003,6 +1001,13 @@ impl Transport for CentrifugoTransport {
                     }
                     Err(e) => {
                         error!("Centrifugo handshake failed: {e}");
+                        if matches!(e, MindroidError::Config { .. }) {
+                            error!(
+                                "A configuration error cannot be fixed by retrying; \
+                                 stopping the Centrifugo listener"
+                            );
+                            break;
+                        }
                         if let Some(h) = &health {
                             h.set(crate::core::health::Health::Reconnecting);
                         }
@@ -1198,6 +1203,56 @@ mod tests {
         // Defaulted methods keep the conservative behavior: subscribe and refresh.
         assert!(n.needs_explicit_subscribe(crate::models::CredentialKind::EndUser));
         assert!(n.sends_refresh_frames(crate::models::CredentialKind::EndUser));
+    }
+
+    #[tokio::test]
+    async fn end_user_handshake_refuses_agent_id_not_matching_token_subject() {
+        let auth = crate::auth::static_id::StaticAuth::new(fake_jwt("someone-else"));
+
+        let err = handshake(
+            "ws://127.0.0.1:1/ws",
+            "agent",
+            &auth,
+            crate::models::CredentialKind::EndUser,
+            &ProxyChannelNaming,
+            true,
+        )
+        .await
+        .err()
+        .expect("a mismatched subject must not start a session");
+        assert!(matches!(err, MindroidError::Config { .. }), "{err:?}");
+        assert!(err.to_string().contains("does not match the token subject"));
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_agent_id_stops_the_listener_for_good() {
+        let (reporter, watcher) = crate::core::health::HealthReporter::new();
+        let auth = Arc::new(crate::auth::static_id::StaticAuth::new(fake_jwt(
+            "someone-else",
+        )));
+        let mut transport = CentrifugoTransport::new("ws://127.0.0.1:1/ws", "agent", auth)
+            .with_credential_kind(crate::models::CredentialKind::EndUser)
+            .with_channel_naming(Arc::new(ProxyChannelNaming))
+            .with_allow_insecure(true);
+        transport.set_health_reporter(reporter);
+
+        let (tx, _rx) = mpsc::channel(8);
+        transport.listen(tx).await.unwrap();
+
+        let finished = || {
+            matches!(
+                &*transport.listener.lock().unwrap(),
+                Listener::Running { handle, .. } if handle.is_finished()
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !finished() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a misconfigured agent must stop, not back off and retry");
+        assert_eq!(watcher.get(), crate::core::health::Health::Stopped);
     }
 
     /// A credential with no notion of terminal failure must not stop a
