@@ -145,6 +145,46 @@ impl Refused {
     }
 }
 
+/// Set in run scope by a `finish` stage that supplies the answer a loop which
+/// hit its cap never gave, as
+/// [`CapSummary`](crate::pipeline::stages::CapSummary) does.
+///
+/// [`AgentLoop::run_streaming`] speaks the turn's final text at the cap only
+/// when this is set. Every other rewrite `finish` makes — a trim, a filter —
+/// is of text the passes already spoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapAnswered;
+
+/// Marks `ctx.response` as a gate's pass signal, the inbound message echoed
+/// back, rather than a reply.
+///
+/// `RelevanceGate`, `OrGate` and `AndGate` pass a turn by echoing the message
+/// into `ctx.response`, so a plain [`Pipeline`] caller can tell a pass
+/// (`Some`) from a halt (`None`). Inside an [`AgentLoop`] that echo is never
+/// the turn's reply: the loop neither speaks it nor hands it to `finish`, so a
+/// later stage that halts does not leave the user's own words to be persisted
+/// as the agent's.
+///
+/// The mark names the message it was made for, so a [`Context`] reused for the
+/// next message is not affected by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatePass(String);
+
+impl GatePass {
+    /// Pass the turn: echo the message into `ctx.response` and mark the echo.
+    pub fn echo(ctx: &mut Context) {
+        ctx.response = Some(ctx.message.content.clone());
+        ctx.set(GatePass(ctx.message.id.clone()));
+    }
+
+    /// Whether `text` is this message's gate echo.
+    fn covers(ctx: &Context, text: &str) -> bool {
+        ctx.get_run::<GatePass>()
+            .is_some_and(|mark| mark.0 == ctx.message.id)
+            && text == ctx.message.content
+    }
+}
+
 fn append_spoken(spoken: &mut String, text: &str) {
     if !spoken.is_empty()
         && !spoken.ends_with(char::is_whitespace)
@@ -337,7 +377,9 @@ impl AgentLoop {
 
             // `Pipeline::run` takes the response, so a pass that produces none
             // must not erase the one before it.
-            if let Some(text) = self.body.run(ctx).await? {
+            if let Some(text) = self.body.run(ctx).await?
+                && !GatePass::covers(ctx, &text)
+            {
                 carried = Some(text);
             }
             iterations += 1;
@@ -381,8 +423,9 @@ impl AgentLoop {
     /// a streaming stage is left to it: that stage already chose what to speak.
     /// Like `Pipeline::run_streaming`'s chunks, these carry the text before
     /// `finish`; the final `Complete` carries it after. The one exception is the
-    /// cap: `finish` text that the last pass did not already say — a
-    /// `CapSummary` answer — is spoken as a last `Chunk`, since no pass will.
+    /// cap: an answer a `finish` stage supplies there and marks [`CapAnswered`]
+    /// — a `CapSummary` answer — is spoken as a last `Chunk`, since no pass
+    /// will. A gate's echo ([`GatePass`]) is never spoken.
     /// What `finish` receives as the reply is every pass that was spoken,
     /// joined, as `ToolExecutorStage`'s streamed rounds keep it, so persistence
     /// stores what the caller heard; a turn that ends on a framed remote call
@@ -461,7 +504,7 @@ impl AgentLoop {
                     // rather than returning it; carry it the way `run` does.
                     let control = ControlResponse::covers(ctx, ctx.response.as_deref());
                     ctx.take::<ControlResponse>();
-                    if let Some(text) = ctx.response.take() {
+                    if let Some(text) = ctx.response.take().filter(|t| !GatePass::covers(ctx, t)) {
                         if speaks_passes
                             && !control
                             && !ctx.cancel.is_cancelled()
@@ -492,9 +535,8 @@ impl AgentLoop {
             if !carried_control && !spoken.is_empty() {
                 carried = Some(spoken);
             }
-            let last_pass = carried.clone();
-            let content = match self.run_finish(ctx, carried, reason).await {
-                Ok(text) => text.unwrap_or_default(),
+            let (content, answered) = match self.run_finish(ctx, carried, reason).await {
+                Ok((text, answered)) => (text.unwrap_or_default(), answered),
                 Err(e) => {
                     yield StreamEvent::Error { message: e.to_string() };
                     return;
@@ -502,14 +544,14 @@ impl AgentLoop {
             };
             // At the cap the last pass only promised an answer, and `finish`
             // (`CapSummary`) may supply it. That is new speech, and nothing has
-            // spoken it — `finish` is not a pass. On any other exit `finish`
-            // only rewrites what was already said, so it stays unspoken.
+            // spoken it — `finish` is not a pass. Any other rewrite `finish`
+            // makes is of what was already said, so it stays unspoken.
             let control = ControlResponse::covers(ctx, Some(&content));
             ctx.take::<ControlResponse>();
             if reason == StopReason::MaxIterations
+                && answered
                 && !control
                 && !content.trim().is_empty()
-                && last_pass.as_deref() != Some(content.as_str())
             {
                 yield StreamEvent::Chunk { content: content.clone() };
             }
@@ -526,13 +568,13 @@ impl AgentLoop {
     }
 
     /// Restore the carried response, run `finish` over it, and take the turn's
-    /// text.
+    /// text, with whether `finish` supplied the answer the cap cut off.
     async fn run_finish(
         &self,
         ctx: &mut Context,
         carried: Option<String>,
         reason: StopReason,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, bool)> {
         // A pass that halted or hit the cap can leave its request behind. Left
         // there it is a stale instruction to whoever reads run scope next —
         // an enclosing loop would take it as its own and run again.
@@ -540,11 +582,12 @@ impl AgentLoop {
 
         if reason == StopReason::Refused {
             ctx.response = None;
-            return Ok(None);
+            return Ok((None, false));
         }
+        let carried = carried.filter(|text| !GatePass::covers(ctx, text));
         if reason == StopReason::Cancelled {
             ctx.response = None;
-            return Ok(carried);
+            return Ok((carried, false));
         }
 
         // `finish` post-processes the turn's response, so it has to be back on
@@ -558,14 +601,19 @@ impl AgentLoop {
         // A loop nested in its parent's `finish` sets the parent's reason aside
         // and hands it back, so the parent's later finish stages still see it.
         let enclosing = ctx.take::<StopReason>();
+        let enclosing_answer = ctx.take::<CapAnswered>();
         ctx.set(reason);
         let finished = self.finish.run(ctx).await;
         ctx.take::<StopReason>();
+        let answered = ctx.take::<CapAnswered>().is_some();
         if let Some(reason) = enclosing {
             ctx.set(reason);
         }
+        if let Some(answer) = enclosing_answer {
+            ctx.set(answer);
+        }
         ctx.halted |= halted;
-        Ok(finished?.or_else(|| ctx.response.take()))
+        Ok((finished?.or_else(|| ctx.response.take()), answered))
     }
 
     /// Run `finish` and report.
@@ -577,7 +625,7 @@ impl AgentLoop {
         iterations: usize,
         started: Instant,
     ) -> Result<LoopOutcome> {
-        let response = self.run_finish(ctx, carried, reason).await?;
+        let (response, _) = self.run_finish(ctx, carried, reason).await?;
 
         let elapsed = started.elapsed();
         ctx.emit_event(PipelineEvent::LoopCompleted {
@@ -1086,9 +1134,104 @@ mod tests {
         }
 
         async fn process(&self, ctx: &mut Context) -> Result<()> {
-            ctx.response = Some(ctx.message.content.clone());
+            GatePass::echo(ctx);
             Ok(())
         }
+    }
+
+    struct Passes;
+
+    #[async_trait]
+    impl crate::pipeline::stages::gate::Gate for Passes {
+        async fn classify(&self, _ctx: &Context) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A passing gate echoes the message so a plain pipeline can tell a pass
+    /// from a halt. In a loop a later plain halt must not hand that echo to
+    /// `finish`, or persistence saves the user's words as the agent's reply.
+    #[tokio::test]
+    async fn a_plain_halt_after_a_passing_gate_hands_finish_no_echo() {
+        let setups: [fn() -> Pipeline; 2] = [
+            || Pipeline::new().add_stage(EchoingGate).add_stage(PlainHalt),
+            || {
+                Pipeline::new()
+                    .add_stage(crate::pipeline::stages::gate::AndGate::new(vec![Box::new(
+                        Passes,
+                    )]))
+                    .add_stage(PlainHalt)
+            },
+        ];
+        for setup in setups {
+            let seen = Arc::new(std::sync::Mutex::new(Some("finish never ran".to_string())));
+            let agent = || {
+                AgentLoop::new(Pipeline::new())
+                    .with_setup(setup())
+                    .with_finish(Pipeline::new().add_stage(SeesReply(seen.clone())))
+            };
+
+            let outcome = agent().run(&mut ctx()).await.unwrap();
+            assert_eq!(outcome.reason, StopReason::Halted);
+            assert_eq!(outcome.response, None);
+            assert_eq!(*seen.lock().unwrap(), None);
+            *seen.lock().unwrap() = Some("finish never ran".to_string());
+
+            let events: Vec<_> = agent().run_streaming(&mut ctx()).collect().await;
+            assert!(chunks(&events).is_empty(), "{events:?}");
+            assert_eq!(*seen.lock().unwrap(), None);
+        }
+    }
+
+    /// A gate in the body passes the same way; its echo is neither spoken nor
+    /// allowed to replace an earlier pass's reply.
+    #[tokio::test]
+    async fn a_gate_in_the_body_is_not_spoken_or_carried() {
+        struct SpeaksThenGates(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl PipelineStage for SpeaksThenGates {
+            fn name(&self) -> &str {
+                "speaks-then-gates"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ctx.response = Some("let me check".into());
+                    ctx.set(Continue);
+                } else {
+                    GatePass::echo(ctx);
+                    ctx.halted = true;
+                }
+                Ok(())
+            }
+        }
+
+        let body = || Pipeline::new().add_stage(SpeaksThenGates(Arc::new(AtomicUsize::new(0))));
+        let outcome = AgentLoop::new(body()).run(&mut ctx()).await.unwrap();
+        assert_eq!(outcome.response.as_deref(), Some("let me check"));
+
+        let events: Vec<_> = AgentLoop::new(body())
+            .run_streaming(&mut ctx())
+            .collect()
+            .await;
+        assert_eq!(chunks(&events), ["let me check"]);
+    }
+
+    /// The mark names its message, so a reply that happens to repeat an
+    /// earlier message's words is still a reply.
+    #[tokio::test]
+    async fn an_earlier_messages_gate_pass_does_not_cover_this_reply() {
+        let mut ctx = ctx();
+        GatePass::echo(&mut ctx);
+        ctx.response = None;
+        ctx.message = Arc::new(Message::new("hello", "u1", "c1"));
+
+        let outcome = AgentLoop::new(Pipeline::new().add_stage(Says("hello")))
+            .run(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(outcome.response.as_deref(), Some("hello"));
     }
 
     fn gated_then_refused() -> AgentLoop {
@@ -1835,9 +1978,60 @@ mod tests {
         async fn process(&self, ctx: &mut Context) -> Result<()> {
             if ctx.get_run::<StopReason>() == Some(&StopReason::MaxIterations) {
                 ctx.response = Some("the answer".into());
+                ctx.set(CapAnswered);
             }
             Ok(())
         }
+    }
+
+    /// Asks for another pass every time, saying the same thing.
+    struct KeepsChecking;
+
+    #[async_trait]
+    impl PipelineStage for KeepsChecking {
+        fn name(&self) -> &str {
+            "keeps-checking"
+        }
+
+        async fn process(&self, ctx: &mut Context) -> Result<()> {
+            ctx.response = Some("let me check\n".into());
+            ctx.set(Continue);
+            Ok(())
+        }
+    }
+
+    /// With no answer supplied at the cap, a `finish` that only rewrites the
+    /// carried text (`PostProcessor` trims) must not say the whole turn again.
+    #[tokio::test]
+    async fn at_the_cap_a_rewriting_finish_does_not_repeat_the_turn() {
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_stage(KeepsChecking))
+            .with_max_iterations(3)
+            .with_finish(Pipeline::new().add_stage(crate::pipeline::stages::PostProcessor))
+            .run_streaming(&mut ctx())
+            .collect()
+            .await;
+
+        assert_eq!(chunks(&events), ["let me check\n"; 3]);
+    }
+
+    /// An answer supplied at the cap is still spoken after `finish` rewrites it.
+    #[tokio::test]
+    async fn at_the_cap_a_rewritten_answer_is_spoken_once() {
+        let events: Vec<_> = AgentLoop::new(Pipeline::new().add_stage(KeepsChecking))
+            .with_max_iterations(2)
+            .with_finish(
+                Pipeline::new()
+                    .add_stage(AnswersAtTheCap)
+                    .add_stage(crate::pipeline::stages::PostProcessor),
+            )
+            .run_streaming(&mut ctx())
+            .collect()
+            .await;
+
+        assert_eq!(
+            chunks(&events),
+            ["let me check\n", "let me check\n", "the answer"]
+        );
     }
 
     /// A pass the token cut short may hold half a thought; it is not spoken.

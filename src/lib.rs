@@ -67,7 +67,8 @@ pub use config::{
     ToolsConfig,
 };
 pub use core::agent_loop::{
-    AgentLoop, Continue, ControlResponse, DEFAULT_LOOP_ITERATIONS, LoopOutcome, Refused, StopReason,
+    AgentLoop, CapAnswered, Continue, ControlResponse, DEFAULT_LOOP_ITERATIONS, GatePass,
+    LoopOutcome, Refused, StopReason,
 };
 pub use core::content::{ArtifactReference, ContentPart, ContentSource};
 pub use core::context::Context;

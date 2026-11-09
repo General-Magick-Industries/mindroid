@@ -77,7 +77,7 @@ use super::tool_executor_xml::{
     PendingRemoteCalls, RemoteResultGate, SUMMARY_PROMPT, declares_tool_result, frame_remote_call,
     registry_for_turn, remote_executor_for, remote_timeout_for, tool_context_for, truncate_str,
 };
-use crate::core::agent_loop::{Continue, ControlResponse, Refused, StopReason};
+use crate::core::agent_loop::{CapAnswered, Continue, ControlResponse, Refused, StopReason};
 use crate::core::context::Context;
 use crate::error::Result;
 use crate::llm_client::{LlmClient, NativeToolCall};
@@ -278,6 +278,7 @@ impl PipelineStage for CapSummary {
         {
             Ok(outcome) if !outcome.content.trim().is_empty() => {
                 ctx.response = Some(outcome.content);
+                ctx.set(CapAnswered);
             }
             Ok(_) => debug!("CapSummary: empty answer, keeping the last round's text"),
             Err(e) => {
@@ -950,12 +951,32 @@ mod tests {
             "http://{addr}/v1"
         )))
         .unwrap();
+        struct SeesAnswered(Arc<std::sync::atomic::AtomicBool>);
+
+        #[async_trait]
+        impl PipelineStage for SeesAnswered {
+            fn name(&self) -> &str {
+                "sees-answered"
+            }
+
+            async fn process(&self, ctx: &mut Context) -> Result<()> {
+                self.0
+                    .store(ctx.get_run::<CapAnswered>().is_some(), Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let llm = LlmRound::new(client, reg);
         let tools = llm.tool_round();
         let summary = llm.cap_summary();
         let agent = AgentLoop::new(Pipeline::new().add_stage(llm).add_stage(tools))
             .with_max_iterations(1)
-            .with_finish(Pipeline::new().add_stage(summary));
+            .with_finish(
+                Pipeline::new()
+                    .add_stage(summary)
+                    .add_stage(SeesAnswered(answered.clone())),
+            );
 
         let outcome = agent.run(&mut ctx()).await.unwrap();
         let bodies = server.await.unwrap();
@@ -966,6 +987,10 @@ mod tests {
             outcome.response.as_deref(),
             Some("It is forty-two."),
             "the turn ends on an answer, not on the round's \"Let me check\""
+        );
+        assert!(
+            answered.load(Ordering::SeqCst),
+            "the answer is marked, so a streaming loop speaks it"
         );
         assert_eq!(bodies.len(), 2, "one round, then one summary call");
         let request: Value = serde_json::from_str(&bodies[1]).unwrap();

@@ -299,7 +299,14 @@ parsing the event stream sees it as a string field. Both loop events carry
   when the loop stopped at its iteration cap. An empty or failed answer keeps
   the text the turn already had. The loop puts its `StopReason` in run scope
   while `finish` runs, and a loop nested in `finish` hands the enclosing loop's
-  back.
+  back. Its answer is marked `CapAnswered`, and `run_streaming` speaks text at
+  the cap only when that is set, so a `finish` that only rewrites the carried
+  text (`PostProcessor` trims it) does not say the whole turn again.
+- `GatePass`: `RelevanceGate`, `OrGate` and `AndGate` mark the message they
+  echo into `ctx.response` when they pass. A plain `Pipeline` still returns
+  that echo. An `AgentLoop` neither speaks it nor hands it to `finish`, so a
+  later stage that halts without refusing does not persist the user's message
+  as the agent's reply.
 - `Refused` and `StopReason::Refused`: a refusal is a halt that skips
   `finish`. Admission control, `RemoteResultGate` dropping an unsolicited or
   expired `tool_result`, `LlmRound` refusing an unclaimed one and `ManifestStage`
