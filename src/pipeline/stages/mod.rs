@@ -1,5 +1,7 @@
 #[cfg(feature = "artifacts")]
 mod artifact_offload;
+#[cfg(feature = "llm-client")]
+mod compaction;
 mod context;
 #[cfg(feature = "llm-client")]
 pub mod gate;
@@ -10,6 +12,8 @@ mod inline_artifacts;
 #[cfg(feature = "llm-client")]
 mod llm_processor;
 mod post_processor;
+#[cfg(feature = "llm-client")]
+mod round;
 pub mod stt;
 #[cfg(feature = "llm-client")]
 mod tool_executor;
@@ -19,6 +23,8 @@ pub mod tts;
 
 #[cfg(feature = "artifacts")]
 pub use artifact_offload::ArtifactOffload;
+#[cfg(feature = "llm-client")]
+pub use compaction::TranscriptCompaction;
 #[cfg(feature = "llm-client")]
 pub use context::AttachMedia;
 pub use context::SimpleContextBuilder;
@@ -31,6 +37,8 @@ pub use inline_artifacts::{DEFAULT_MAX_INLINE_BYTES, InlineArtifacts};
 #[cfg(feature = "llm-client")]
 pub use llm_processor::{GenericLlmProcessor, collect_stream};
 pub use post_processor::PostProcessor;
+#[cfg(feature = "llm-client")]
+pub use round::{CapSummary, LlmRound, PendingCalls, ToolRound, Transcript};
 #[cfg(feature = "speech")]
 pub use stt::DeepgramStt;
 #[cfg(feature = "speech")]

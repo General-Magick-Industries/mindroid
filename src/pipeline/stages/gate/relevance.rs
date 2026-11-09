@@ -52,7 +52,7 @@ use std::sync::Arc;
 use async_openai::types::chat::{ResponseFormat, ResponseFormatJsonSchema};
 use serde::Deserialize;
 
-use crate::core::context::Context;
+use crate::core::{agent_loop::GatePass, context::Context};
 use crate::llm_client::{AuthStyle, ChatRequest, LlmClient, LlmClientConfig};
 use crate::{LlmMessage, MindroidError, PipelineStage, Result, Role};
 
@@ -311,7 +311,7 @@ impl PipelineStage for RelevanceGate {
             );
             // Signal that the gate passed so callers can distinguish
             // "gate passed" (Some) from "gate halted" (None).
-            ctx.response = Some(ctx.message.content.clone());
+            GatePass::echo(ctx);
         } else {
             tracing::info!("RelevanceGate [{}]: not relevant", self.role,);
             ctx.halted = true;
