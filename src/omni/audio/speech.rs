@@ -90,6 +90,26 @@ impl Framer {
     }
 }
 
+#[cfg(feature = "transport-audio")]
+fn first_channel(chunk: &AudioChunk) -> impl Iterator<Item = i16> + '_ {
+    chunk
+        .data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .step_by(usize::from(chunk.channels.max(1)))
+        .map(|b| i16::from_le_bytes(*b))
+}
+
+/// The first channel of a PCM16 frame as `f32`, which is what `AudioFrontend`
+/// takes: its utterance limits count mono samples.
+#[cfg(feature = "transport-audio")]
+pub(crate) fn frontend_samples(chunk: &AudioChunk) -> Vec<f32> {
+    first_channel(chunk)
+        .map(|s| f32::from(s) / f32::from(i16::MAX))
+        .collect()
+}
+
 /// Silero VAD. The model takes 8 or 16 kHz audio in fixed frames, so the first
 /// channel of the microphone's PCM16 is resampled to the model's rate and framed
 /// here; a chunk too short to complete a frame reports the previous probability.
@@ -136,14 +156,8 @@ impl SileroDetector {
 #[cfg(feature = "transport-audio")]
 impl SpeechDetector for SileroDetector {
     fn speech_probability(&mut self, chunk: &AudioChunk) -> f32 {
-        let first_channel = chunk
-            .data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .step_by(usize::from(chunk.channels.max(1)))
-            .map(|b| i16::from_le_bytes(*b));
-        self.resampler.process(first_channel, &mut self.pending);
+        self.resampler
+            .process(first_channel(chunk), &mut self.pending);
         let whole = self.pending.len() - self.pending.len() % self.frame;
         let best = self.pending[..whole]
             .chunks_exact(self.frame)
@@ -241,6 +255,52 @@ mod tests {
         let p = d.speech_probability(&silence);
         assert!(p < 0.3, "silence scored {p}");
         assert!(SileroDetector::new(44_100).is_err());
+    }
+
+    /// The frontend's utterance limits count mono samples, so a stereo frame must
+    /// reach it as its first channel or every limit runs at half its time.
+    #[cfg(feature = "transport-audio")]
+    #[test]
+    fn a_stereo_mic_keeps_the_frontends_max_utterance_at_its_configured_time() {
+        use crate::voice::{
+            frontend::{AudioFrontend, FrontendEvent},
+            types::{BargeInMode, TurnDetection, VadConfig},
+        };
+        use std::time::Instant;
+
+        let stereo = |left: i16, right: i16| AudioChunk {
+            data: [left.to_le_bytes(), right.to_le_bytes()]
+                .concat()
+                .repeat(1_536),
+            sample_rate: 48_000,
+            channels: 2,
+            bits_per_sample: 16,
+        };
+        let frame = Framer::new(48_000, 2).push(&stereo(100, -100)).remove(0);
+        let samples = frontend_samples(&frame);
+        assert_eq!(samples.len(), 1_536);
+        assert!(samples.iter().all(|&s| s > 0.0));
+
+        let mut fe = AudioFrontend::builder(VadConfig::default(), u64::from(FRAME_MS))
+            .sample_rate_hz(48_000)
+            .barge_in_mode(BargeInMode::LocalVad)
+            .turn_detection(TurnDetection::Server)
+            .build();
+        let now = Instant::now();
+        fe.process(&frontend_samples(&stereo(3_000, 3_000)), 0.9, false, now);
+        let silence = frontend_samples(&stereo(0, 0));
+        let frames = (1..2_000)
+            .find(|_| {
+                fe.process(&silence, 0.0, false, now)
+                    .iter()
+                    .any(|e| matches!(e, FrontendEvent::UtteranceComplete { .. }))
+            })
+            .unwrap();
+        let elapsed_ms = (frames + 1) * FRAME_MS;
+        assert!(
+            elapsed_ms >= 30_000,
+            "max utterance cut after {elapsed_ms} ms"
+        );
     }
 
     #[cfg(feature = "transport-audio")]

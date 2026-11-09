@@ -545,6 +545,12 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   counts frames as 32 ms: `CpalAudioSource`'s 10.7 ms chunks at 48 kHz made
   barge-in fire after about 110 ms of speech instead of 320 ms, and ended
   turns after a third of the configured silence.
+- The local VAD's frontend gets the microphone's first channel. It was handed
+  stereo frames interleaved, so its sample-counted `min_speech` and
+  `max_utterance` ran at half their configured time. Without
+  `TurnDetection::Local` its max-utterance cut no longer calls
+  `end_audio_stream`: there the frontend runs for barge-in only, and the cut
+  ended the user's turn on the provider 30 s after each speech onset.
 - `Pipeline::run_streaming` stops after a streaming stage that halts, as
   `Pipeline::run` stops after any stage that does. The post-streaming stages
   used to run regardless, so a streaming executor dropping a forged

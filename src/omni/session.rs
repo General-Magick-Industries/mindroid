@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use {
     crate::omni::audio::{
         SileroDetector,
-        speech::{FRAME_MS, spawn_worker},
+        speech::{FRAME_MS, frontend_samples, spawn_worker},
     },
     crate::voice::frontend::{AudioFrontend, FrontendEvent},
     crate::voice::types::VadConfig,
@@ -532,13 +532,7 @@ impl OmniSession {
                     {
                         if let Some((chunk, probability)) = vad_result {
                             if let Some(ref mut fe) = audio_frontend {
-                                let f32_samples: Vec<f32> = chunk
-                                    .data
-                                    .as_chunks::<2>()
-                                    .0
-                                    .iter()
-                                    .map(|b| f32::from(i16::from_le_bytes(*b)) / f32::from(i16::MAX))
-                                    .collect();
+                                let f32_samples = frontend_samples(&chunk);
                                 let agent_speaking = self.state == SessionState::Speaking;
                                 let now = Instant::now();
                                 let events =
@@ -568,7 +562,9 @@ impl OmniSession {
                                             // Local turn detection: tell the provider that
                                             // the user's turn is complete so it can start
                                             // generating a response.
-                                            self.provider.end_audio_stream().await?;
+                                            if has_local_turn_detection {
+                                                self.provider.end_audio_stream().await?;
+                                            }
                                         }
                                         FrontendEvent::SpeechStarted => {
                                             // Speech onset: open the utterance slice for the
@@ -838,7 +834,9 @@ impl OmniSession {
                                             &mut self.capture,
                                             &mut self.pending_transcriptions,
                                         );
-                                        self.provider.end_audio_stream().await?;
+                                        if has_local_turn_detection {
+                                            self.provider.end_audio_stream().await?;
+                                        }
                                     }
                                     FrontendEvent::SpeechStarted => {
                                         self.capture.mark_start();
@@ -1928,6 +1926,40 @@ mod tests {
         assert_eq!(session.state(), SessionState::Closed);
     }
 
+    /// Counts `end_audio_stream` calls.
+    #[cfg(feature = "transport-audio")]
+    struct CountingProvider {
+        inner: RecordingProvider,
+        count: Arc<Mutex<u32>>,
+    }
+
+    #[cfg(feature = "transport-audio")]
+    #[async_trait]
+    impl OmniProvider for CountingProvider {
+        async fn connect(&mut self, cfg: &OmniConfig) -> Result<(), MindroidError> {
+            self.inner.connect(cfg).await
+        }
+        async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
+            self.inner.send_audio(chunk).await
+        }
+        async fn send_text(&self, t: &str) -> Result<(), MindroidError> {
+            self.inner.send_text(t).await
+        }
+        async fn send_tool_result(&self, id: &str, r: Value) -> Result<(), MindroidError> {
+            self.inner.send_tool_result(id, r).await
+        }
+        async fn end_audio_stream(&self) -> Result<(), MindroidError> {
+            *self.count.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>> {
+            self.inner.events()
+        }
+        async fn disconnect(&mut self) -> Result<(), MindroidError> {
+            self.inner.disconnect().await
+        }
+    }
+
     // ── Local-VAD integration tests (transport-audio feature required) ────────
     //
     // These tests bypass the Silero ONNX worker by using `run_with_vad_rx`,
@@ -2027,38 +2059,6 @@ mod tests {
         let (_provider, tx) = RecordingProvider::new();
         let recorded_eos = Arc::new(Mutex::new(0u32));
 
-        // Wrap RecordingProvider to count end_audio_stream calls.
-        struct CountingProvider {
-            inner: RecordingProvider,
-            count: Arc<Mutex<u32>>,
-        }
-
-        #[async_trait]
-        impl OmniProvider for CountingProvider {
-            async fn connect(&mut self, cfg: &OmniConfig) -> Result<(), MindroidError> {
-                self.inner.connect(cfg).await
-            }
-            async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
-                self.inner.send_audio(chunk).await
-            }
-            async fn send_text(&self, t: &str) -> Result<(), MindroidError> {
-                self.inner.send_text(t).await
-            }
-            async fn send_tool_result(&self, id: &str, r: Value) -> Result<(), MindroidError> {
-                self.inner.send_tool_result(id, r).await
-            }
-            async fn end_audio_stream(&self) -> Result<(), MindroidError> {
-                *self.count.lock().unwrap() += 1;
-                Ok(())
-            }
-            fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>> {
-                self.inner.events()
-            }
-            async fn disconnect(&mut self) -> Result<(), MindroidError> {
-                self.inner.disconnect().await
-            }
-        }
-
         let (inner_provider, tx2) = RecordingProvider::new();
         let eos_count = Arc::clone(&recorded_eos);
         let counting = CountingProvider {
@@ -2107,6 +2107,43 @@ mod tests {
             *eos_count.lock().unwrap() >= 1,
             "end_audio_stream should be called at least once on local UtteranceComplete"
         );
+    }
+
+    /// Under server turn detection the frontend runs for barge-in only; its
+    /// max-utterance cut must not end the provider's turn.
+    #[cfg(feature = "transport-audio")]
+    #[tokio::test]
+    async fn server_turn_detection_ignores_the_frontends_max_utterance_cut() {
+        let (inner, tx) = RecordingProvider::new();
+        let count = Arc::new(Mutex::new(0u32));
+        let mut session = OmniSession::builder()
+            .provider(CountingProvider {
+                inner,
+                count: Arc::clone(&count),
+            })
+            .barge_in(BargeInMode::LocalVad)
+            .turn_detection(TurnDetection::Server)
+            .build()
+            .unwrap();
+
+        let (vad_tx, vad_rx) = mpsc::channel::<(Vec<f32>, f32)>(64);
+        let session_task = tokio::spawn(async move {
+            session.run_with_vad_rx(vad_rx).await.unwrap();
+        });
+
+        let frame = |level| vec![level; 512];
+        for _ in 0..12 {
+            vad_tx.send((frame(0.1), 0.9)).await.unwrap();
+        }
+        // Past the default 30 s max utterance at 16 kHz.
+        for _ in 0..1_000 {
+            vad_tx.send((frame(0.0), 0.0)).await.unwrap();
+        }
+        drop(vad_tx);
+        drop(tx);
+        session_task.await.unwrap();
+
+        assert_eq!(*count.lock().unwrap(), 0);
     }
 
     /// The shadow transcriber's utterance boundaries come from the local audio
