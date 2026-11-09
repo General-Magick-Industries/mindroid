@@ -166,7 +166,7 @@ fn inline_media(part: &ContentPart) -> Option<(&[u8], &str)> {
 #[cfg(all(test, feature = "llm-client"))]
 mod tests {
     use super::*;
-    use crate::artifacts::LocalArtifactStore;
+    use crate::artifacts::{Artifact, LocalArtifactStore, StoredArtifact};
     use crate::config::AgentConfig;
     use crate::models::{LlmMessage, Message, Role};
     use crate::pipeline::PipelineStage;
@@ -227,5 +227,49 @@ mod tests {
             .unwrap()
             .data;
         assert_eq!(bytes, vec![9, 9, 9]);
+    }
+
+    struct BoundRecordingStore {
+        inner: LocalArtifactStore,
+        bounds: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactStore for BoundRecordingStore {
+        async fn save(&self, scope: &str, data: &[u8], mime_type: &str) -> Result<StoredArtifact> {
+            self.inner.save(scope, data, mime_type).await
+        }
+        async fn load(&self, scope: &str, id: &str) -> Result<Artifact> {
+            self.load_bounded(scope, id, usize::MAX).await
+        }
+        async fn load_bounded(&self, scope: &str, id: &str, max_bytes: usize) -> Result<Artifact> {
+            self.bounds.lock().unwrap().push(max_bytes);
+            self.inner.load_bounded(scope, id, max_bytes).await
+        }
+        async fn delete(&self, scope: &str, id: &str) -> Result<()> {
+            self.inner.delete(scope, id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn load_described_checks_existence_without_downloading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = LocalArtifactStore::new(tmp.path());
+        let id = inner
+            .save("chan1", &[1, 2, 3], "image/png")
+            .await
+            .unwrap()
+            .id;
+        let store = Arc::new(BoundRecordingStore {
+            inner,
+            bounds: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let out = ArtifactManager::new(store.clone())
+            .load_described("chan1", &id)
+            .await;
+
+        assert_eq!(out, format!("Loaded artifact {id}"));
+        assert_eq!(*store.bounds.lock().unwrap(), [0]);
     }
 }

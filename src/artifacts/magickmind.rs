@@ -610,4 +610,49 @@ mod tests {
             .insert("magickspace_id".into(), "space1".into());
         assert_eq!(store.scope_for(&message), "space1");
     }
+
+    #[tokio::test]
+    async fn a_failure_body_is_flattened_and_capped_in_the_error() {
+        let body = format!("first\nforged line{}", "x".repeat(2000));
+        let (base, server) = serve(move |_| vec![(500, body)]).await;
+
+        let err = store(&base, CredentialKind::ServiceUser)
+            .load("space1", "a1")
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+
+        assert!(!err.contains('\n'), "{err}");
+        assert!(err.contains("(truncated)"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_bifrost_is_not_followed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 307 X\r\nlocation: /v1/artifacts/a1/download\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let err = store(&base, CredentialKind::ServiceUser)
+            .load("space1", "a1")
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(err.to_string().contains("307"), "{err}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
