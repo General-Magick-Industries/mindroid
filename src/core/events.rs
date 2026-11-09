@@ -1,13 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::core::agent_loop::StopReason;
+
 /// System-level pipeline events for observability, metrics, and debugging.
 ///
 /// Separate from the `Observer` trait (which is user-facing lifecycle hooks).
 /// Events are sent via an opt-in `mpsc::UnboundedSender` on `Context` —
 /// if nobody subscribes, zero cost.
+///
+/// `#[non_exhaustive]`: new execution models add events, so a `match` outside
+/// this crate needs a wildcard arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PipelineEvent {
     PipelineStarted {
         stage_count: usize,
@@ -32,6 +38,27 @@ pub enum PipelineEvent {
     PipelineCompleted {
         #[serde(with = "duration_millis")]
         elapsed: Duration,
+    },
+    /// One [`AgentLoop`](crate::core::agent_loop::AgentLoop) body pass is
+    /// starting. Emitted around the pass, not by it, so a body with no
+    /// loop-aware stage still reports its single iteration.
+    LoopIterationStarted {
+        /// The loop's [`with_name`](crate::core::agent_loop::AgentLoop::with_name),
+        /// so nested loops' events can be told apart.
+        loop_name: String,
+        iteration: usize,
+    },
+    /// The loop finished. `finish` ran first unless `reason` is `Cancelled` or
+    /// `Refused`, which skip it, so do not read this as "the turn was
+    /// persisted". `reason` is why — the only way a
+    /// [`run_streaming`](crate::core::agent_loop::AgentLoop::run_streaming)
+    /// caller learns it, since that returns events, not a `LoopOutcome`.
+    LoopCompleted {
+        loop_name: String,
+        iterations: usize,
+        #[serde(with = "duration_millis")]
+        elapsed: Duration,
+        reason: StopReason,
     },
 }
 
@@ -121,6 +148,16 @@ mod tests {
             PipelineEvent::PipelineCompleted {
                 elapsed: Duration::from_millis(100),
             },
+            PipelineEvent::LoopIterationStarted {
+                loop_name: "planner".into(),
+                iteration: 2,
+            },
+            PipelineEvent::LoopCompleted {
+                loop_name: "planner".into(),
+                iterations: 3,
+                elapsed: Duration::from_millis(250),
+                reason: StopReason::MaxIterations,
+            },
         ];
 
         for event in &events {
@@ -129,5 +166,23 @@ mod tests {
             // Just verify it roundtrips without panic
             let _ = format!("{:?}", deserialized);
         }
+    }
+
+    /// The stop reason is wire-visible, so its spelling is part of the event
+    /// format a dashboard parses.
+    #[test]
+    fn loop_completed_serializes_its_reason_in_snake_case() {
+        let json = serde_json::to_value(PipelineEvent::LoopCompleted {
+            loop_name: "planner".into(),
+            iterations: 3,
+            elapsed: Duration::from_millis(250),
+            reason: StopReason::MaxIterations,
+        })
+        .unwrap();
+
+        assert_eq!(json["event"], "loop_completed");
+        assert_eq!(json["loop_name"], "planner");
+        assert_eq!(json["reason"], "max_iterations");
+        assert_eq!(json["elapsed"], 250);
     }
 }

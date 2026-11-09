@@ -13,6 +13,7 @@ autoexamples = false
 
 [workspace]
 members = [
+    "examples/agent_loop",
     "examples/minimal",
     "examples/custom_pipeline",
     "examples/magickmind",

@@ -246,7 +246,18 @@ type = "magickmind"
 type = "magickmind-prepared-agent"
 ```
 
-#### 9. `VadStateMachine` takes the chunk duration per call
+#### 9. `PipelineEvent` is now `#[non_exhaustive]`
+
+`AgentLoop` added `LoopIterationStarted` and `LoopCompleted`, and each execution
+model adds its own events. A `match` on `PipelineEvent` outside this crate needs a
+wildcard arm; this is the last release in which adding an event breaks you.
+
+`LoopCompleted` carries `reason: StopReason`. `StopReason` is exported from the
+crate root and serializes in snake_case (`"max_iterations"`), so a consumer
+parsing the event stream sees it as a string field. Both loop events carry
+`loop_name`, the loop's `with_name`, so nested loops can be told apart.
+
+#### 10. `VadStateMachine` takes the chunk duration per call
 
 It counted silence in frames of a duration fixed at construction, which
 `VoiceGate` froze from the first chunk it saw. Silence is now counted in time,
@@ -263,7 +274,7 @@ let mut vad = VadStateMachine::new(config);
 vad.process(probability, Duration::from_millis(30));
 ```
 
-#### 10. `voice::encode_wav` moved to `omni::audio::wav`
+#### 11. `voice::encode_wav` moved to `omni::audio::wav`
 
 The crate had two PCM16 WAV encoders; `omni::audio::wav` is now the only
 one, and it no longer needs `transport-audio` or `hound`. Output is
@@ -303,6 +314,58 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   24 → 16 kHz or 44.1 → 24 kHz, is refused with `ResampleError`, as is a
   factor above `MAX_FACTOR` (12; 192 → 16 kHz is the largest accepted).
 - `SileroDetector` accepts an 8 kHz microphone, running Silero's 8 kHz model.
+- **`AgentLoop`**, an iterative execution model composed of pipelines
+  (ADR-0011): `setup` once, a `body` per pass, `finish` once, over one
+  `Context`. A body stage asks for another pass by setting `Continue`; a body
+  that never asks runs exactly once, like a plain `Pipeline`. `run` returns a
+  `LoopOutcome` carrying the `StopReason`; `run_streaming` yields each pass's
+  events and one `Complete` for the turn. A loop is also a `PipelineStage`, so
+  loops nest.
+- `LlmRound` and `ToolRound`: the native tool round split in two, so stages can
+  run between the model call and the tools. Pair them with
+  `LlmRound::tool_round()`, and wire `ToolRound::result_gate()` into `setup` —
+  `LlmRound` refuses a turn whose declared `tool_result` nothing claimed.
+  `ToolRound` runs tools through the same path as `ToolExecutorStage`, so errors
+  read the same to the model.
+- `TranscriptCompaction`: drops the oldest whole rounds once the transcript
+  passes a budget, keeping every system message, the newest user message and
+  the newest round. A cut through the history never keeps a reply without the
+  user turn it answers.
+- `CapSummary`, from `LlmRound::cap_summary()`: a `finish` stage that makes
+  the executor's closing request — the same instruction to answer, no tools —
+  when the loop stopped at its iteration cap. An empty or failed answer keeps
+  the text the turn already had. The loop puts its `StopReason` in run scope
+  while `finish` runs, and a loop nested in `finish` hands the enclosing loop's
+  back. Its answer is marked `CapAnswered`, and `run_streaming` speaks text at
+  the cap only when that is set, so a `finish` that only rewrites the carried
+  text (`PostProcessor` trims it) does not say the whole turn again.
+- `GatePass`: `RelevanceGate`, `OrGate` and `AndGate` mark the message they
+  echo into `ctx.response` when they pass. A plain `Pipeline` still returns
+  that echo. An `AgentLoop` neither speaks it nor hands it to `finish`, so a
+  later stage that halts without refusing does not persist the user's message
+  as the agent's reply.
+- `Refused` and `StopReason::Refused`: a refusal is a halt that skips
+  `finish`. Admission control, `RemoteResultGate` dropping an unsolicited or
+  expired `tool_result`, `LlmRound` refusing an unclaimed one and `ManifestStage`
+  rejecting a manifest halt through `Refused::halt`, so persistence in a loop's
+  `finish` never stores what was refused. A refused turn also returns no
+  response, from a loop or a plain `Pipeline`, so a gate's echo of the refused
+  message is never sent back as the reply. A plain `ctx.halted` still runs
+  `finish` in full. `Refused::lift(ctx)` lifts a refusal's halt and its mark
+  together, as `BranchStage` does; a stage of your own that recovers from a
+  refusal should use it rather than clear `ctx.halted` alone, or a later halt
+  in the turn is taken for the refusal (no `finish`, no reply). Lifting the halt hands that stage
+  `ctx.response`: a gate's echo it leaves there is returned as the reply.
+- `run_streaming` speaks a body with no streaming stage one pass at a time:
+  each pass's prose becomes one `Chunk`, and at the cap the answer `finish`
+  supplies is spoken as the last one. A response marked with
+  `ControlResponse::mark` — a framed remote call — is never spoken. `ToolRound`
+  and both tool executors mark theirs; a stage of your own calls
+  `ControlResponse::mark(ctx)` after setting `ctx.response`. `finish` and the
+  final `Complete` get every spoken pass joined, so persistence keeps what the
+  caller heard (an empty settling round no longer leaves nothing to save); a
+  turn that ends on a framed call hands them the call. `run` is unchanged and
+  hands `finish` the last pass.
 - `GeminiLiveProvider` (feature `omni-gemini`) and `OpenAiRealtimeProvider`
   (feature `omni-openai`): the first concrete `OmniProvider`s. Both speak
   WebSocket; the OpenAI one also works through a LiteLLM `/v1/realtime`
@@ -412,6 +475,10 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 
 ### Changed
 
+- `MemoryPersistence` and `MagickmindPersistence` skip a `ToolManifest` turn.
+  An accepted manifest is a plain halt, so a loop's `finish` runs over it, and
+  `MemoryPersistence` saved the manifest as a user turn. `MemoryPersistence`
+  also drops a whitespace-only reply now, as `MagickmindPersistence` does.
 - Prepared-prompt caches default to 5 minutes (`DEFAULT_TTL_SECS = 300`, and
   `persona.cache_ttl_secs`), down from 10, matching the persona service's
   freshness limit for an evolved personality. `MagickmindAgentPersonaStage`
@@ -478,6 +545,20 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   counts frames as 32 ms: `CpalAudioSource`'s 10.7 ms chunks at 48 kHz made
   barge-in fire after about 110 ms of speech instead of 320 ms, and ended
   turns after a third of the configured silence.
+- `Pipeline::run_streaming` stops after a streaming stage that halts, as
+  `Pipeline::run` stops after any stage that does. The post-streaming stages
+  used to run regardless, so a streaming executor dropping a forged
+  `tool_result` still reached a persistence stage after it.
+- `MagickmindPersistence` no longer posts an empty agent message. Saving goes
+  through the space's send endpoint, which fans out to every member, and it
+  saved `ctx.response` unconditionally — so any turn with no reply that still
+  reached it (a gate declining inside a loop's `finish`, a silent final round)
+  broadcast an empty message. It now skips a blank response, as
+  `MemoryPersistence` already did.
+- Every stage that honours a remote-result claim — `ToolExecutorStage`, both
+  paths of `XmlToolExecutorStage`, and `LlmRound` — now checks that the claim
+  was granted for the message being processed, as admission control already
+  did.
 - The shadow transcriber's utterance boundaries. Only the OpenAI provider emits
   `UserSpeechEnded` and `mark_start` ran solely on barge-in, so with Gemini a
   configured `transcriber` produced nothing while the provider's own input

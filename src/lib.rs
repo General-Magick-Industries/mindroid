@@ -66,6 +66,10 @@ pub use config::{
     AgentConfig, MindroidConfig, ModelConfig, OpenToolConfig, ProviderConfig, ShellToolConfig,
     ToolsConfig,
 };
+pub use core::agent_loop::{
+    AgentLoop, CapAnswered, Continue, ControlResponse, DEFAULT_LOOP_ITERATIONS, GatePass,
+    LoopOutcome, Refused, StopReason,
+};
 pub use core::content::{ArtifactReference, ContentPart, ContentSource};
 pub use core::context::Context;
 pub use core::coordinator::{CoordinatorPermit, PerKey, SessionCoordinator};
@@ -125,6 +129,8 @@ pub use pipeline::stages::{
     GenericLlmProcessor, IngestStage, OpenAiStt, OpenAiSttConfig, OpenAiTts, OpenAiTtsConfig,
     collect_stream,
 };
+#[cfg(feature = "llm-client")]
+pub use pipeline::stages::{LlmRound, PendingCalls, ToolRound, Transcript, TranscriptCompaction};
 pub use pipeline::stages::{PostProcessor, SimpleContextBuilder};
 pub use pipeline::stages::{SttProvider, SttStage, TtsProvider, TtsStage};
 pub use pipeline::{Pipeline, PipelineContext, PipelineStage, StreamingStage};
