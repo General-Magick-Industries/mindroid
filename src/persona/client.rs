@@ -90,7 +90,10 @@ impl MagickmindPersonaClient {
 
     /// Fetch the effective (blended) personality from the runtime service.
     ///
-    /// `GET /v1/runtime/effective-personality/{persona_id}[?user_id=...]`
+    /// `GET /v1/runtime/effective-personality/{agent_id}[?user_id=...]`
+    ///
+    /// MagickMind keys this route by **agent id**: pass an agent id here, even
+    /// though the parameter is named for the [`PersonaProvider`] trait.
     pub async fn get_effective_personality(
         &self,
         persona_id: &str,

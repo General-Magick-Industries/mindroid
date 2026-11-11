@@ -226,13 +226,7 @@ impl RuntimeBuilder {
     pub async fn build_persona_stage(&self) -> Result<Option<PersonaContextBuilder>> {
         let config = self.config.as_ref();
         if config.and_then(|c| c.persona.persona_type.as_deref()) == Some("magickmind") {
-            // This used to be the "magickmind" stage, so an app that calls only
-            // this builder would otherwise lose its persona without a word.
-            tracing::warn!(
-                "build_persona_stage() serves persona.type = \"local\" only and returns None \
-                 for \"magickmind\", which now uses the server-prepared prompt; build it with \
-                 build_magickmind_agent_persona_stage() or build_magickmind_persona_stage()"
-            );
+            tracing::warn!("{BUILD_PERSONA_STAGE_MAGICKMIND_WARNING}");
             return Ok(None);
         }
         let persona_id = config.and_then(|c| c.persona.persona_id.as_deref());
@@ -669,35 +663,11 @@ impl Runtime {
                 // wording; it now takes Bifrost's prepared prompt so there is
                 // one copy of that wording.
                 Some("magickmind") => {
-                    let agent_keyed = crate::core::factory::credential_kind_from_config(&config)
-                        == crate::models::CredentialKind::EndUser
-                        || !config.agent.agent_id.is_empty();
-                    if agent_keyed {
+                    if magickmind_alias_is_agent_keyed(&config) {
                         builder.magickmind_agent_persona =
                             Some(prepared_agent_persona(&config, "magickmind")?);
-                        // Old configs set persona_id beside agent_id; the agent
-                        // route takes the agent's active persona, so a different
-                        // persona_id would change the personality silently.
-                        let ignored = if config.persona.persona_id.is_some() {
-                            "; persona.persona_id is ignored on this route, which uses the \
-                             agent's active persona"
-                        } else {
-                            ""
-                        };
-                        tracing::warn!(
-                            "persona.type = \"magickmind\" is deprecated and now resolves to \
-                             \"magickmind-prepared-agent\" (the server-prepared prompt); set \
-                             persona.type = \"magickmind-prepared-agent\" explicitly{ignored}"
-                        );
                     } else {
                         builder.magickmind_persona = Some(prepared_persona(&config, "magickmind")?);
-                        tracing::warn!(
-                            "persona.type = \"magickmind\" is deprecated and now resolves to \
-                             \"magickmind-prepared\" (the server-prepared prompt), whose \
-                             persona-keyed route serves authored trait values only, with no \
-                             evolution or per-user adjustment; set agent.agent_id to get the \
-                             evolved per-user prompt, and set persona.type explicitly"
-                        );
                     }
                 }
                 Some("magickmind-prepared") => {
@@ -728,6 +698,9 @@ impl Runtime {
                 }
                 _ => {}
             }
+            if let Some(warning) = magickmind_alias_warning(&config) {
+                tracing::warn!("{warning}");
+            }
         }
 
         #[cfg(feature = "identity")]
@@ -751,6 +724,73 @@ impl Runtime {
         Ok(builder)
     }
 }
+
+// -- deprecated `persona.type = "magickmind"` warnings --------------------------
+//
+// The texts live here, not inline in `warn!`, so tests assert on them directly.
+// Capturing the log is unreliable under parallel tests: while one test's scoped
+// subscriber is the only dispatcher, a sibling thread with none that first hits
+// the same callsite caches `Interest::never` for every thread.
+
+/// Whether the deprecated alias takes the agent-keyed route: an end-user
+/// credential, or an agent id (which most Centrifugo agents set anyway).
+#[cfg(feature = "persona")]
+fn magickmind_alias_is_agent_keyed(config: &MindroidConfig) -> bool {
+    crate::core::factory::credential_kind_from_config(config)
+        == crate::models::CredentialKind::EndUser
+        || !config.agent.agent_id.is_empty()
+}
+
+/// The build-time warning for `config`, or `None` unless it uses the deprecated
+/// alias. It is the only signal that an old config changed route, so it names
+/// what the alias resolved to and what is now ignored or lost.
+#[cfg(feature = "persona")]
+fn magickmind_alias_warning(config: &MindroidConfig) -> Option<String> {
+    if config.persona.persona_type.as_deref() != Some("magickmind") {
+        return None;
+    }
+    if !magickmind_alias_is_agent_keyed(config) {
+        return Some(
+            "persona.type = \"magickmind\" is deprecated and now resolves to \
+             \"magickmind-prepared\" (the server-prepared prompt), whose persona-keyed route \
+             serves authored trait values only, with no evolution or per-user adjustment; set \
+             agent.agent_id to get the evolved per-user prompt, and set persona.type explicitly"
+                .to_string(),
+        );
+    }
+    // Old configs set persona_id beside agent_id, and the agent route takes the
+    // agent's active persona, so a different persona_id would change the
+    // personality silently.
+    let mut ignored = String::new();
+    if config.persona.persona_id.is_some() {
+        ignored.push_str(
+            "; persona.persona_id is ignored on this route, which uses the agent's active \
+             persona. To keep persona_id, set persona.type = \"magickmind-prepared\" instead \
+             (authored trait values only)",
+        );
+        // Dropping agent_id would also reach the persona route, but the
+        // transport's inbound channel, the self-echo filter and the episode
+        // owner use it too.
+        if !config.agent.agent_id.is_empty() {
+            ignored
+                .push_str("; do not drop agent.agent_id to get there, as the transport needs it");
+        }
+    }
+    Some(format!(
+        "persona.type = \"magickmind\" is deprecated and now resolves to \
+         \"magickmind-prepared-agent\" (the server-prepared prompt); set \
+         persona.type = \"magickmind-prepared-agent\" explicitly{ignored}"
+    ))
+}
+
+/// Logged by `build_persona_stage()` for `"magickmind"`. That builder used to be
+/// the "magickmind" stage, so an app that calls only it would otherwise lose its
+/// persona without a word.
+#[cfg(feature = "persona")]
+const BUILD_PERSONA_STAGE_MAGICKMIND_WARNING: &str = "build_persona_stage() serves persona.type = \
+     \"local\" only and returns None for \"magickmind\", which now uses the server-prepared \
+     prompt; build it with build_magickmind_agent_persona_stage() or \
+     build_magickmind_persona_stage()";
 
 // -- server-prepared persona settings ------------------------------------------
 
@@ -1077,71 +1117,58 @@ mod tests {
         assert_eq!(via_alias, via_explicit);
     }
 
-    /// Collects formatted log output so a test can assert on a warning.
-    #[cfg(feature = "persona")]
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    #[cfg(feature = "persona")]
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[cfg(feature = "persona")]
-    impl CapturedLogs {
-        /// Routes this thread's events here until the guard drops.
-        fn capture(&self) -> tracing::subscriber::DefaultGuard {
-            let logs = self.clone();
-            tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(move || logs.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::WARN)
-                    .finish(),
-            )
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
     /// The warning is the only signal that an old config changed route, so it
-    /// must name what it resolved to, and what is now ignored or lost.
+    /// must name what it resolved to, what is now ignored or lost, and the way
+    /// to keep `persona_id` that does not cost the agent its `agent_id`.
     #[cfg(feature = "persona")]
-    #[tokio::test]
-    async fn magickmind_warns_with_the_type_it_resolved_to() {
-        let agent_keyed = CapturedLogs::default();
-        {
-            let _guard = agent_keyed.capture();
-            let mut config = magickmind_persona_config();
-            config.agent.agent_id = "agent-1".into();
-            let builder = Runtime::from_config(config).unwrap();
-            builder.build_persona_stage().await.unwrap();
-        }
-        let text = agent_keyed.text();
+    #[test]
+    fn magickmind_warns_with_the_type_it_resolved_to() {
+        let warning = |config: &MindroidConfig| magickmind_alias_warning(config).unwrap();
+
+        let mut agent_keyed = magickmind_persona_config();
+        agent_keyed.agent.agent_id = "agent-1".into();
+        let text = warning(&agent_keyed);
         assert!(
             text.contains("now resolves to \"magickmind-prepared-agent\""),
             "{text}"
         );
         assert!(text.contains("persona.persona_id is ignored"), "{text}");
         assert!(
-            text.contains("build_magickmind_agent_persona_stage()"),
-            "build_persona_stage must point at the prepared builders: {text}"
+            text.contains("set persona.type = \"magickmind-prepared\" instead"),
+            "the escape must be the persona-keyed type: {text}"
+        );
+        assert!(
+            text.contains("do not drop agent.agent_id"),
+            "dropping agent_id breaks the transport: {text}"
         );
 
-        let persona_keyed = CapturedLogs::default();
-        {
-            let _guard = persona_keyed.capture();
-            Runtime::from_config(magickmind_persona_config()).unwrap();
-        }
-        let text = persona_keyed.text();
+        let mut no_persona_id = agent_keyed.clone();
+        no_persona_id.persona.persona_id = None;
+        let text = warning(&no_persona_id);
+        assert!(
+            text.contains("now resolves to \"magickmind-prepared-agent\""),
+            "{text}"
+        );
+        assert!(
+            !text.contains("persona_id"),
+            "nothing is ignored without a persona_id: {text}"
+        );
+
+        // End-user auth takes the agent route with no agent id to drop.
+        let mut enduser = magickmind_persona_config();
+        enduser.auth.auth_type = Some("enduser".into());
+        let text = warning(&enduser);
+        assert!(
+            text.contains("now resolves to \"magickmind-prepared-agent\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("set persona.type = \"magickmind-prepared\" instead"),
+            "{text}"
+        );
+        assert!(!text.contains("agent.agent_id"), "{text}");
+
+        let text = warning(&magickmind_persona_config());
         assert!(
             text.contains("now resolves to \"magickmind-prepared\""),
             "{text}"
@@ -1149,18 +1176,18 @@ mod tests {
         assert!(text.contains("authored trait values only"), "{text}");
         assert!(text.contains("set agent.agent_id"), "{text}");
 
-        let explicit = CapturedLogs::default();
-        {
-            let _guard = explicit.capture();
-            let mut config = magickmind_persona_config();
-            config.agent.agent_id = "agent-1".into();
-            config.persona.persona_type = Some("magickmind-prepared-agent".into());
-            Runtime::from_config(config).unwrap();
+        for explicit in ["magickmind-prepared", "magickmind-prepared-agent"] {
+            let mut config = agent_keyed.clone();
+            config.persona.persona_type = Some(explicit.into());
+            assert_eq!(magickmind_alias_warning(&config), None, "{explicit}");
         }
+
         assert!(
-            !explicit.text().contains("deprecated"),
-            "{}",
-            explicit.text()
+            BUILD_PERSONA_STAGE_MAGICKMIND_WARNING
+                .contains("build_magickmind_agent_persona_stage()")
+                && BUILD_PERSONA_STAGE_MAGICKMIND_WARNING
+                    .contains("build_magickmind_persona_stage()"),
+            "build_persona_stage must point at the prepared builders"
         );
     }
 

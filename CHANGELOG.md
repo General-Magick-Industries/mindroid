@@ -223,9 +223,23 @@ it and `PersonaContextBuilder` stay public, and `"local"` is unchanged.
   only, with no evolution or per-user adjustment. Set `agent.agent_id` for the
   evolved prompt.
 - On the agent route `persona.persona_id` is ignored: the server uses the
-  agent's active persona. The warning says so when one is set.
+  agent's active persona. The warning says so when one is set. To keep that
+  `persona_id`, set `persona.type = "magickmind-prepared"` explicitly; do not
+  drop `agent.agent_id`, which the Centrifugo channel, the self-echo filter and
+  the episode owner also use.
+- **New build error for `agent.agent_id` characters.** With an agent id and a
+  service-user credential, the alias takes the agent route, which sends the id
+  as a URL path segment (end-user auth uses an id-less route). An id
+  with any character outside `[A-Za-z0-9_-]` (`bot.v2`, say) used to build and
+  now fails with "must contain only ASCII letters, digits, '-' or '_'", even if
+  the id is set only for the transport. Rename it, or use `"magickmind-prepared"`.
+- **No startup fail-fast.** The old stage fetched the persona schema at build
+  time, so a bad id, bad auth or an unreachable server stopped startup. The
+  prepared stages make no call at build time; those faults now fail the first
+  message.
 - `RuntimeBuilder::build_persona_stage()` returns `Ok(None)` for
   `"magickmind"` and logs a warning; it serves `"local"` personas only.
+- `RuntimeBuilder::persona_provider()` returns `None` for `"magickmind"`.
 
 ```rust
 // before

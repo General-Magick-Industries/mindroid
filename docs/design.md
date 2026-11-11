@@ -425,12 +425,14 @@ let provider = MagickmindPersonaClient::new(api_url, identity);
 
 Calls:
 - `GET /v1/persona/{persona_id}` — fetch static persona schema
-- `GET /v1/runtime/effective-personality/{persona_id}?user_id={user_id}` — fetch blended personality
+- `GET /v1/runtime/effective-personality/{agent_id}?user_id={user_id}` — fetch blended personality
 
-Config no longer builds this client: `persona.type = "magickmind"` now uses the
+The effective personality is keyed by agent id, not persona id, so
+`PersonaContextBuilder` (which passes one id to both calls) cannot drive this
+client. Config no longer builds it: `persona.type = "magickmind"` now uses the
 server-prepared prompt (`MagickmindAgentPersonaStage` / `MagickmindPersonaStage`),
 so the agent's wording matches the server's. Wire the client by hand only if you
-need the raw schema or effective personality. See
+need the raw persona schema. See
 [Persona guide](./guides/persona.md#migrating-from-type--magickmind).
 
 Both implementations blend authored traits with optional per-user dyadic overrides. Lock levels control how much dyadic learning can adapt each trait:
