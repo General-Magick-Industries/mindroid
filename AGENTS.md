@@ -373,6 +373,10 @@ src/
 
 **Scope:** ADRs here cover the **SDK's own architecture** only. Decisions about Magick Mind service integration (billing, cross-service wiring) live in the private monorepo, not this public repo.
 
+## Writing PRs, commits and docs
+
+Write PR descriptions, commit messages and docs for people who use the SDK: what they would see, what changed, and how to use it.
+
 ## Git
 
 Gita repo (own `.git`). PRs go to `General-Magick-Industries/mindroid` on GitHub and target `develop`; `feat/mindroid-v2` and its PR #31 are gone. Pin downstream to a merge commit on `develop`, never a PR head.
