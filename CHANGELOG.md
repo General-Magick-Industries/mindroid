@@ -631,6 +631,14 @@ parsing the event stream sees it as a string field. Both loop events carry
   off partway through a tool call". Point such deployments at a conformant
   endpoint.
 
+### Security
+
+- `rusqlite` 0.32 → 0.42 for the `persistence` feature, which brings the
+  bundled SQLite in `libsqlite3-sys` to 0.40 (RUSTSEC-2026-0459). `SqliteMemory`
+  keeps the same API; `rusqlite` is not part of this crate's public surface.
+- `openssl` 0.10.76 → 0.10.82 in `Cargo.lock` (RUSTSEC-2026-0463, -0473 to
+  -0479). A lockfile-only update.
+
 ## [0.0.2-a.1] — 2026-08-06
 
 The "v2" release. Four breaking API changes, plus one silent behavior change —
