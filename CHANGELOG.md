@@ -484,6 +484,11 @@ parsing the event stream sees it as a string field. Both loop events carry
 
 ### Fixed
 
+- Windows CI prepares the DLL destinations used by the pinned ONNX Runtime
+  build script and makes its DLLs discoverable during tests on newer Cargo layouts.
+- Updated `rusqlite` to 0.41 and refreshed the locked SQLite and OpenSSL
+  dependencies to address the vulnerabilities reported by the security audit.
+
 - Builds without `transport-audio` failed with three unresolved `tts` imports. A
   `cfg` attribute left behind when a re-export was removed gated `pipeline::stages::tts`
   on `transport-audio`, while its re-exports still compiled without it.

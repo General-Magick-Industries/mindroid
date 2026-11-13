@@ -171,6 +171,25 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
 
+      # ort-sys rc.10 copies DLLs without creating the destination directories.
+      # Its fixed OUT_DIR ancestor count also puts them under debug/build with
+      # newer Cargo layouts. Cover both layouts and expose that location to tests
+      # until voice_activity_detector moves off its exact ort/ort-sys rc.10 pins.
+      - name: Prepare ONNX Runtime DLL destinations
+        if: needs.changes.outputs.rust == 'true'
+        shell: pwsh
+        run: |
+          @(
+            "target/debug/examples",
+            "target/debug/deps",
+            "target/debug/build/examples",
+            "target/debug/build/deps"
+          ) | ForEach-Object {
+            New-Item -ItemType Directory -Force -Path $_ | Out-Null
+          }
+          (Join-Path $env:GITHUB_WORKSPACE "target/debug/build") |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       # The `#[cfg(windows)]` blocks are invisible to the ubuntu job's clippy.
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
