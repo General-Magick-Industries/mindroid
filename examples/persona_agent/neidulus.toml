@@ -1,5 +1,5 @@
 # Persona-driven agent configuration
-# Run with: cargo run --example persona_agent --features full -- --config examples/persona_agent/neidulus.toml
+# Run with: cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/neidulus.toml
 
 [agent]
 agent_id = "example-agent-id"
@@ -23,16 +23,17 @@ base_url = "https://magickmind.example.com"
 type = "magickmind"
 base_url = "https://magickmind.example.com"
 
-# -- Persona (magickmind runtime service) -------------------------------------
-# Fetches the effective personality per-request with dyadic per-user adaptation.
-# Replace persona_id with an actual persona from the magickmind persona service.
+# -- Persona (agent-keyed prepare endpoint) -----------------------------------
+# Uses the system prompt MagickMind prepares for agent.agent_id above, verbatim:
+# the agent's evolved personality, adapted per user. Replace agent.agent_id with
+# an actual agent id; passing a persona id there yields a 404.
 # If the persona service is unavailable, the last-good cached prompt is served;
 # with no cached prompt, the message fails.
 
 [persona]
-type = "magickmind"
-persona_id = "example-persona-id"
+type = "magickmind-prepared-agent"
 # base_url is optional — falls back to memory.base_url or auth.base_url
+# cache_ttl_secs = 600
 
 [observer]
 type = "log"

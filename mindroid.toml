@@ -34,8 +34,8 @@ type = "magickmind"                       # Options: "none", "sqlite", "magickmi
 # base_url = "https://api.magickmind.io"  # For magickmind memory
 
 # [persona]
-# type = "magickmind"
-# persona_id = "your-persona-id"
+# type = "magickmind-prepared-agent"      # server-prepared prompt keyed by agent.agent_id
+#                                         # ("magickmind-prepared" + persona_id: authored values only)
 # base_url = "https://api.magickmind.com"  # optional, falls back to memory.base_url
 
 [observer]

@@ -19,3 +19,202 @@ pub struct AudioOutput(pub Vec<u8>);
 /// placeholder in `message.content`.
 #[cfg(feature = "transport-audio")]
 pub struct TextInput(pub String);
+
+/// Index of the current inbound user turn in [`Context::llm_messages`].
+///
+/// Context builders set this after assembling history so stages that transform
+/// message content never mistake an older user message for the active turn.
+/// Custom context builders should set it when they append the inbound message.
+///
+/// [`Context::llm_messages`]: crate::Context::llm_messages
+#[derive(Debug, Clone, Copy)]
+pub struct CurrentUserMessage(pub usize);
+
+pub(crate) struct PersistedUserTurn(pub String);
+
+/// Set by `RemoteResultGate` after it authenticates and claims a remote tool
+/// result, carrying the id of the message it claimed. Readers must compare that
+/// id: run scope outlives a single `Pipeline::run`, so presence alone would let
+/// one genuine claim exempt a later, unrelated message.
+pub(crate) struct CorrelatedRemoteResult(pub(crate) String);
+
+/// Set by a tool executor that leaves a framed remote call as `ctx.response`,
+/// carrying that exact text. Readers must compare it to the response they act
+/// on: run scope outlives a single `Pipeline::run`, so a later stage that
+/// replaces the response must not inherit the call's type.
+pub(crate) struct FramedRemoteCall(String);
+
+impl FramedRemoteCall {
+    /// Mark the current `ctx.response`. Set the response first.
+    pub(crate) fn mark(ctx: &mut crate::Context) {
+        if let Some(framed) = ctx.response.clone() {
+            ctx.set(Self(framed));
+        }
+    }
+
+    /// A new turn on a reused context starts unmarked.
+    pub(crate) fn clear(ctx: &mut crate::Context) {
+        ctx.take::<Self>();
+    }
+
+    pub(crate) fn covers(ctx: &crate::Context, text: &str) -> bool {
+        ctx.get_run::<Self>().is_some_and(|marked| marked.0 == text)
+    }
+}
+
+/// Longest tool result kept in a turn's history; the rest is cut off.
+pub const MAX_RECORDED_RESULT_BYTES: usize = 4 * 1024;
+
+pub(crate) const RESULT_NOT_KEPT: &str = "(not kept in this conversation's history)";
+pub(crate) const CALL_FAILED: &str = "the call failed";
+
+/// A tool call the turn's [`ToolExecutorStage`] ran itself, with its result.
+/// A call that leaves the process (a remote tool) is not one, nor is a call to
+/// a tool that delivers the reply itself ([`Tool::ends_turn`]).
+///
+/// `result` is the tool's output only when the tool opts in with
+/// [`Tool::keeps_result_in_history`]; otherwise it is a placeholder, and a
+/// failed call's is a generic note rather than the error.
+///
+/// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
+/// [`Tool::ends_turn`]: crate::tools::Tool::ends_turn
+/// [`Tool::keeps_result_in_history`]: crate::tools::Tool::keeps_result_in_history
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub result: String,
+}
+
+impl LocalToolCall {
+    /// The call as the agent's `TOOL_CALL` message: a framed call that names
+    /// `agent_id` as its executor, so a reader waiting on a device's result
+    /// knows not to.
+    pub fn call_message(&self, agent_id: &str) -> String {
+        serde_json::json!({
+            "type": "tool_call",
+            "payload": {
+                "tool_call_id": self.id,
+                "name": self.name,
+                "args": self.arguments,
+                "executor_id": agent_id,
+            }
+        })
+        .to_string()
+    }
+
+    /// The result as its `TOOL_RESULT` message, cut to
+    /// [`MAX_RECORDED_RESULT_BYTES`].
+    pub fn result_message(&self) -> String {
+        let mut end = self.result.len().min(MAX_RECORDED_RESULT_BYTES);
+        while !self.result.is_char_boundary(end) {
+            end -= 1;
+        }
+        let content = if end < self.result.len() {
+            format!("{} [truncated]", &self.result[..end])
+        } else {
+            self.result.clone()
+        };
+        serde_json::json!({
+            "type": "tool_result",
+            "payload": { "tool_call_id": self.id, "name": self.name, "content": content }
+        })
+        .to_string()
+    }
+}
+
+/// The turn's [`LocalToolCall`]s, in the order they ran. Whoever saves the turn
+/// saves them after its reply, as `MagickmindPersistence` does, so the
+/// conversation's history holds what the agent looked up without delaying the
+/// reply. [`ToolExecutorStage`] clears them when a turn starts.
+///
+/// [`ToolExecutorStage`]: crate::pipeline::stages::ToolExecutorStage
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalToolCalls(pub Vec<LocalToolCall>);
+
+/// A single binary attachment (image, audio, video, or arbitrary file) to send
+/// to the LLM, stored in [`PipelineContext`] extensions as part of [`FileInputs`].
+///
+/// Set by a transport or any upstream stage. Consumed by `AttachMedia`, which
+/// maps `mime_type` to the matching [`crate::core::content::ContentPart`] variant
+/// (`image/*` → Image, `audio/*` → Audio, `video/*` → Video, else File) and
+/// appends it to the user [`crate::LlmMessage`].
+///
+/// `data` is the raw bytes; `mime_type` is e.g. `"image/png"`. Inline bytes are
+/// base64-encoded into a `data:` URL by the LLM client, which requires the
+/// `transport-ws` feature. `filename` is used for the `File` variant.
+///
+/// Note: the LLM client currently only converts `image/*` to the OpenAI wire
+/// format; other types are accepted here but dropped during conversion until the
+/// client gains support for them.
+#[cfg(feature = "llm-client")]
+#[derive(Debug, Clone)]
+pub struct FileInput {
+    pub data: Vec<u8>,
+    pub mime_type: String,
+    pub filename: Option<String>,
+}
+
+#[cfg(feature = "llm-client")]
+impl FileInput {
+    /// Convenience constructor for an image attachment (no filename).
+    pub fn image(data: Vec<u8>, mime_type: impl Into<String>) -> Self {
+        Self {
+            data,
+            mime_type: mime_type.into(),
+            filename: None,
+        }
+    }
+}
+
+/// Context extension holding one or more [`FileInput`] attachments for the
+/// current turn. Consumed by `AttachMedia`.
+#[cfg(feature = "llm-client")]
+#[derive(Debug, Clone, Default)]
+pub struct FileInputs(pub Vec<FileInput>);
+
+#[cfg(feature = "llm-client")]
+impl FileInputs {
+    pub fn new(files: Vec<FileInput>) -> Self {
+        Self(files)
+    }
+
+    /// Wrap a single file as a one-element [`FileInputs`].
+    pub fn one(file: FileInput) -> Self {
+        Self(vec![file])
+    }
+}
+
+#[cfg(all(test, feature = "llm-client"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_constructor_sets_mime_and_leaves_filename_unset() {
+        let f = FileInput::image(b"png-bytes".to_vec(), "image/png");
+        assert_eq!(f.data, b"png-bytes");
+        assert_eq!(f.mime_type, "image/png");
+        assert!(f.filename.is_none(), "images carry no filename");
+    }
+
+    #[test]
+    fn one_wraps_a_single_file_and_new_preserves_order() {
+        let single = FileInputs::one(FileInput::image(vec![1], "image/png"));
+        assert_eq!(single.0.len(), 1);
+
+        let many = FileInputs::new(vec![
+            FileInput::image(vec![1], "image/png"),
+            FileInput::image(vec![2], "image/jpeg"),
+        ]);
+        let mimes: Vec<&str> = many.0.iter().map(|f| f.mime_type.as_str()).collect();
+        assert_eq!(mimes, ["image/png", "image/jpeg"]);
+    }
+
+    /// `Default` is what a stage gets when no attachment was set, so it must be
+    /// empty rather than a one-element placeholder.
+    #[test]
+    fn default_is_empty() {
+        assert!(FileInputs::default().0.is_empty());
+    }
+}

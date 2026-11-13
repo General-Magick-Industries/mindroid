@@ -16,15 +16,13 @@
 //!   6. MagickmindPersistence — save response to MagickMind
 //!
 //! Run with:
-//!   cargo run --example persona_agent --features full -- --config examples/persona_agent/dazael.toml
+//!   cargo run -p mindroid-example-persona-agent --bin persona_agent -- --config examples/persona_agent/dazael.toml
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use mindroid::llm_client::LlmClient;
-use mindroid::pipeline::presets::magickmind::{
-    MagickmindClient, MagickmindContext, MagickmindPersistence,
-};
+use mindroid::pipeline::presets::magickmind::{MagickmindContext, MagickmindPersistence};
 use mindroid::{
     ContextPreparer, ConversationHistory, GenericLlmProcessor, MindroidConfig, Pipeline,
     PipelineContext, PipelineStage, PostProcessor, PrepareOutcome, Result, Runtime,
@@ -134,19 +132,13 @@ async fn main() -> anyhow::Result<()> {
     // Auto-build identity, transport, memory, observer from config
     let builder = Runtime::from_config(config)?;
 
-    // MagickmindClient for context preparation and persistence
-    let identity = builder.auth_arc().unwrap();
+    // MagickmindClient for context preparation and persistence, wired from config.
+    let magickmind = Arc::new(
+        builder
+            .magickmind_client()
+            .expect("auth + base_url required"),
+    );
     let config = builder.config_ref().unwrap();
-    let magickmind_url = config
-        .auth
-        .base_url
-        .as_deref()
-        .unwrap_or("https://magickmind.example.com");
-    let mut magickmind_client = MagickmindClient::new(magickmind_url, identity);
-    if let Some(api_key) = &config.auth.api_key {
-        magickmind_client = magickmind_client.with_api_key(api_key);
-    }
-    let magickmind = Arc::new(magickmind_client);
 
     // Mention gate: only respond when @mentioned
     let mention_gate = MentionGate::new(&config.agent.name, &config.agent.agent_id);
@@ -168,14 +160,15 @@ async fn main() -> anyhow::Result<()> {
         !std::env::var("MINDROID_DISABLE_GATE").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
 
     // Build the persona stage once. Three modes are supported via [persona] config:
-    //   type = "magickmind"                → PersonaContextBuilder formats the prompt in-process
-    //   type = "magickmind-prepared"       → MagickmindPersonaStage delegates prompt construction
-    //                                        to the server (persona-keyed) and uses the returned
-    //                                        system_prompt verbatim
-    //   type = "magickmind-prepared-agent" → MagickmindAgentPersonaStage, same server-prepared
-    //                                        prompt but agent-keyed; the route follows auth.type
-    //                                        (service-user names agent_id, "enduser" uses the
-    //                                        id-less end-user route)
+    //   type = "magickmind-prepared-agent" → MagickmindAgentPersonaStage uses the server-prepared
+    //                                        system_prompt verbatim, agent-keyed; the route
+    //                                        follows auth.type (service-user names agent_id,
+    //                                        "enduser" uses the id-less end-user route)
+    //   type = "magickmind-prepared"       → MagickmindPersonaStage, same server-prepared prompt
+    //                                        but persona-keyed (authored values only)
+    //   type = "local"                     → PersonaContextBuilder formats the prompt in-process
+    //                                        from a local persona.md
+    // The deprecated type = "magickmind" resolves to one of the two prepared modes.
     // All implement PipelineStage, so we hold whichever is configured as a
     // trait object. Per-request conversation history is injected via the
     // ConversationHistory context extension, so the respond pipeline is built
@@ -192,9 +185,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(prepared)
     } else {
         let persona_client = builder.build_persona_stage().await?.expect(
-                "persona_agent requires [persona] config with type = \"magickmind\", \"magickmind-prepared\", or \"magickmind-prepared-agent\"",
+                "persona_agent requires [persona] config with type = \"magickmind-prepared-agent\", \"magickmind-prepared\", or \"local\"",
             );
-        tracing::info!("Using magickmind persona stage (type = \"magickmind\")");
+        tracing::info!("Using local persona stage (type = \"local\")");
         Arc::new(persona_client)
     };
 
@@ -310,6 +303,11 @@ async fn main() -> anyhow::Result<()> {
                 // stage splices between the system prompt and the user message.
                 pctx.reset_output();
                 pctx.set_ext(ConversationHistory(history));
+                // reset_output cleared the run-scoped affect; rehydrate it
+                // from the ingest stage so the persona stage can express it.
+                if let Some(ingest) = &inbound_ingest {
+                    ingest.apply_runtime_state(&mut pctx).await;
+                }
 
                 match ctx.run_with_context(&respond, &mut pctx).await {
                     Ok(None) => {

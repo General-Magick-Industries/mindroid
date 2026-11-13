@@ -11,7 +11,7 @@
 //!   4. Full response — streaming Cortex call with persistence
 //!
 //! Run with:
-//!   cargo run --example cot_budget_agent --features full -- --config examples/cot_budget_agent/config.toml
+//!   cargo run -p mindroid-example-cot-budget-agent --bin cot_budget_agent -- --config examples/cot_budget_agent/config.toml
 
 use std::sync::Arc;
 

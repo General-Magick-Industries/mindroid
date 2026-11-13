@@ -1,0 +1,17 @@
+[package]
+name = "mindroid-example-remote-tool"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "remote_tool"
+path = "main.rs"
+
+[dependencies]
+mindroid = { workspace = true, features = ["persistence", "llm-local"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

@@ -3,7 +3,7 @@
 //! This example creates a simple echo pipeline that uppercases the input,
 //! showing how to implement `PipelineStage` for custom processing.
 //!
-//! Run with: `cargo run --example custom_pipeline --features stdio,static-auth`
+//! Run with: `cargo run -p mindroid-example-custom-pipeline --bin custom_pipeline`
 
 use async_trait::async_trait;
 use mindroid::auth::static_id::StaticAuth;

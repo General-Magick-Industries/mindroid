@@ -18,6 +18,9 @@ pub struct OpenAiSttConfig {
     /// Whisper model to use. Defaults to `"whisper-1"`.
     pub model: String,
     pub base_url: Option<String>,
+    /// ISO-639-1 language of the speech (`"en"`). Without it the model guesses per
+    /// clip, and short or noisy clips come back in random languages.
+    pub language: Option<String>,
 }
 
 impl Default for OpenAiSttConfig {
@@ -26,6 +29,7 @@ impl Default for OpenAiSttConfig {
             api_key: String::new(),
             model: "whisper-1".to_string(),
             base_url: None,
+            language: None,
         }
     }
 }
@@ -33,6 +37,7 @@ impl Default for OpenAiSttConfig {
 pub struct OpenAiStt {
     client: Client<OpenAIConfig>,
     model: String,
+    language: Option<String>,
 }
 
 impl OpenAiStt {
@@ -44,6 +49,7 @@ impl OpenAiStt {
         Self {
             client: Client::with_config(openai_config),
             model: config.model,
+            language: config.language,
         }
     }
 }
@@ -52,20 +58,23 @@ impl OpenAiStt {
 impl SttProvider for OpenAiStt {
     async fn transcribe(&self, audio: &[u8]) -> Result<String> {
         let audio = audio.to_vec();
-        let request = CreateTranscriptionRequestArgs::default()
+        let mut request = CreateTranscriptionRequestArgs::default();
+        request
             .file(AudioInput {
                 source: InputSource::VecU8 {
                     filename: "audio.wav".to_string(),
                     vec: audio,
                 },
             })
-            .model(self.model.clone())
-            .build()
-            .map_err(|e| MindroidError::Pipeline {
-                stage: "OpenAiStt".into(),
-                message: format!("Failed to build transcription request: {e}"),
-                source: None,
-            })?;
+            .model(self.model.clone());
+        if let Some(language) = &self.language {
+            request.language(language.clone());
+        }
+        let request = request.build().map_err(|e| MindroidError::Pipeline {
+            stage: "OpenAiStt".into(),
+            message: format!("Failed to build transcription request: {e}"),
+            source: None,
+        })?;
 
         let response = self
             .client
