@@ -35,7 +35,7 @@ Mindroid is a Rust framework for building AI agents that can reason, act, and co
 - **Artifact storage** -- Move images/audio out of conversation history after the model reads them, and re-fetch by id on demand instead of re-sending bytes every turn.
 - **Skills system** -- On-demand domain knowledge with deterministic prefiltering and trust-based authority.
 - **Multi-agent coordination** -- Gates and engagement tracking prevent feedback loops in multi-agent deployments.
-- **Persona system** -- Structured personality traits with per-user dyadic adaptation, formatted in-process or server-prepared (`magickmind-prepared`) with per-message persona selection and prompt caching.
+- **Persona system** -- Structured personality traits with per-user dyadic adaptation. MagickMind personas use the server-prepared prompt (`magickmind-prepared-agent`, `magickmind-prepared`) with prompt caching and, on `magickmind-prepared`, per-message persona selection; local file personas are formatted in-process.
 - **Streaming first** -- Token-by-token LLM output with transparent tool-call buffering.
 - **Transport agnostic** -- stdio, Centrifugo WebSocket, or audio (microphone + speaker).
 

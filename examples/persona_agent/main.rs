@@ -1,16 +1,16 @@
 //! Persona-driven agent: magickmind persona + runtime integration with @mention gate.
 //!
 //! Demonstrates using a rich, versioned persona from the magickmind persona
-//! service instead of a flat persona string. The `PersonaContextBuilder`
-//! fetches the effective personality per-request (with dyadic per-user
-//! adaptation) and builds a structured system prompt from blended traits.
+//! service instead of a flat persona string. The server prepares the system
+//! prompt per request (with dyadic per-user adaptation on the agent route);
+//! a `type = "local"` persona is formatted in-process by `PersonaContextBuilder`.
 //!
 //! The agent only responds when mentioned with `@name` or `@agent_id`.
 //!
 //! Flow:
 //!   1. MentionGate — check for @mention, skip if not mentioned (no API calls)
 //!   2. Context preparation — fetch MagickMind context (chat history, knowledge)
-//!   3. PersonaContextBuilder — fetch effective personality, build system prompt
+//!   3. Persona stage — fetch the server-prepared system prompt (or format a local one)
 //!   4. LLM processor — streaming inference
 //!   5. PostProcessor — format response
 //!   6. MagickmindPersistence — save response to MagickMind

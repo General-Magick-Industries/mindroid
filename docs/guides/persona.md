@@ -71,6 +71,13 @@ pub trait PersonaProvider: Send + Sync {
 | `get_persona` | Once at startup | Fetch static definition (name, role, tones, background) |
 | `get_effective_personality` | Per request | Return blended traits, optionally scoped to a user |
 
+The id passed to `get_effective_personality` is whatever the provider keys the
+personality by. `LocalPersonaProvider` takes a persona id. MagickMind keys the
+effective personality by **agent id**, so `MagickmindPersonaClient` must be given
+an agent id there, while its `get_persona` takes a persona id.
+`PersonaContextBuilder` passes one id to both methods, so it cannot drive
+`MagickmindPersonaClient`.
+
 ### MagickmindPersonaClient (cloud)
 
 Contacts the Magick Mind REST API for server-side dyadic computation:
@@ -82,7 +89,7 @@ let client = MagickmindPersonaClient::new("https://api.magickmind.io", auth);
 Config does not build this client. For MagickMind personas, use the
 [server-prepared prompt](#magickmind-prepared-prompt-server-formats) so the
 agent's wording matches the server's; the client remains for code that needs the
-raw schema or effective personality.
+raw persona schema.
 
 ### LocalPersonaProvider (file-based)
 
@@ -302,7 +309,7 @@ prompt in the SDK (`- warmth: 50.0`, no bands, no descriptions). It is now a
 | `auth.type = "enduser"`, or `agent.agent_id` set | `magickmind-prepared-agent` |
 | neither | `magickmind-prepared` (`persona_id` required) |
 
-Set the explicit type to silence the warning. Four behaviours change:
+Set the explicit type to silence the warning. Six behaviours change:
 
 - **TLS.** The base URL must be `https://` unless `persona.allow_insecure = true`,
   as for the prepared types. The old mapping did not check.
@@ -313,12 +320,27 @@ Set the explicit type to silence the warning. Four behaviours change:
   the evolved, per-user prompt.
 - **`persona_id` is ignored on the agent route.** The server uses the agent's
   active persona. If your config sets a `persona_id` that is not that persona,
-  the personality changes; make it the agent's active persona in MagickMind, or
-  drop `agent.agent_id` to keep the persona-keyed route.
+  the personality changes. Make it the agent's active persona in MagickMind, or
+  set `persona.type = "magickmind-prepared"` explicitly to keep the persona-keyed
+  route (authored trait values only). Do not drop `agent.agent_id` to get there:
+  the Centrifugo transport builds its inbound channel from it, and it also drives
+  the self-echo filter and the episode owner, so an agent without it receives
+  nothing.
+- **`agent.agent_id` must be a URL path segment.** With a service-user
+  credential the agent route sends it in the request path (end-user auth uses
+  an id-less route), so an id with any character outside `[A-Za-z0-9_-]`
+  (`bot.v2`, for example) now fails at build time, even if you set it only for
+  the transport. Rename the agent, or use `"magickmind-prepared"`.
+- **Faults show up on the first message, not at startup.** The old stage fetched
+  the persona schema at build time, so a bad id, bad auth or an unreachable
+  server stopped startup. The prepared stages make no call at build time; the
+  same faults now fail the first message instead.
 
 `build_persona_stage()` returns `None` for `type = "magickmind"` and logs a
 warning; build the stage with `build_magickmind_agent_persona_stage()` or
-`build_magickmind_persona_stage()`.
+`build_magickmind_persona_stage()`. `RuntimeBuilder::persona_provider()` also
+returns `None` for `"magickmind"`, because config no longer creates a
+`MagickmindPersonaClient`.
 
 ### Per-message persona selection (`PersonaId`)
 
