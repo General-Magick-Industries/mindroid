@@ -32,7 +32,7 @@
 //! so the 10th consecutive speech-while-agent-speaking frame fires `Interrupt` —
 //! matching run_vad's `barge_in_speech_frames = 1` at onset.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::voice::{
     conditioning::CaptureConditioner,
@@ -152,7 +152,7 @@ impl AudioFrontendBuilder {
 
     /// Consume the builder and produce an [`AudioFrontend`].
     pub fn build(self) -> AudioFrontend {
-        let vad = VadStateMachine::new(self.config.clone(), self.chunk_duration_ms);
+        let vad = VadStateMachine::new(self.config.clone());
         let echo_guard = EchoGuard::default_window();
         let gate = InterruptionGate::default();
 
@@ -253,7 +253,6 @@ pub struct AudioFrontend {
 
     // ── Config-derived thresholds ─────────────────────────────────────────────
     config: VadConfig,
-    #[allow(dead_code)]
     chunk_duration_ms: u64,
     silence_frames_threshold: usize,
     pad_frames: usize,
@@ -421,7 +420,9 @@ impl AudioFrontend {
 
         // ── 2. Feed probability to VAD state machine ──────────────────────────
 
-        let vad_decision = self.vad.process(probability);
+        let vad_decision = self
+            .vad
+            .process(probability, Duration::from_millis(self.chunk_duration_ms));
 
         // ── 3. Handle VAD onset (only if we haven't already started via inject) ─
 

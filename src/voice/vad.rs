@@ -5,6 +5,8 @@
 //! - [`VadStateMachine`]: pure logic that processes voice probability floats and
 //!   emits [`VadDecision`]s. Always available (no feature gate).
 
+use std::time::Duration;
+
 use crate::voice::types::VadConfig;
 
 // ─── State & Decision types ───────────────────────────────────────────────────
@@ -43,41 +45,25 @@ pub enum VadDecision {
 ///
 /// - Speech **starts** when `probability >= config.speech_threshold` (default 0.5).
 /// - Speech **ends** when `probability < config.speech_end_threshold` (default 0.3)
-///   for at least `silence_threshold_frames` consecutive frames.
+///   for at least `config.silence_duration` of consecutive audio.
 ///
-/// ## Frame-count semantics
-///
-/// `silence_threshold_frames` is computed as:
-/// ```text
-/// silence_threshold_frames = silence_duration_ms / chunk_duration_ms
-/// ```
-/// where `chunk_duration_ms` is the duration of a single audio chunk (e.g. 30 ms
-/// for 512 samples @ 16 kHz). This avoids coupling the state machine to the
-/// sample rate.
+/// Silence is counted in time, not frames: each call says how much audio its
+/// probability covers, so chunks of any length can be mixed.
 pub struct VadStateMachine {
     config: VadConfig,
     state: VadState,
-    silence_frames: u64,
+    silence: Duration,
     speech_frames: u64,
-    /// How many frames of sub-threshold probability are required to end speech.
-    silence_threshold_frames: u64,
 }
 
 impl VadStateMachine {
     /// Create a new state machine.
-    ///
-    /// `chunk_duration_ms` is how long each audio chunk is in milliseconds
-    /// (i.e. how often [`process`](Self::process) will be called per real-time
-    /// second). For example, 512 samples at 16 kHz → 32 ms chunks.
-    pub fn new(config: VadConfig, chunk_duration_ms: u64) -> Self {
-        let silence_threshold_frames =
-            config.silence_duration.as_millis() as u64 / chunk_duration_ms;
+    pub fn new(config: VadConfig) -> Self {
         Self {
             config,
             state: VadState::Idle,
-            silence_frames: 0,
+            silence: Duration::ZERO,
             speech_frames: 0,
-            silence_threshold_frames,
         }
     }
 
@@ -86,15 +72,16 @@ impl VadStateMachine {
         self.state
     }
 
-    /// Process one audio chunk's voice probability.
+    /// Process one audio chunk's voice probability; `chunk` is how much audio
+    /// that probability covers.
     ///
-    /// Returns the [`VadDecision`] for this frame.
-    pub fn process(&mut self, probability: f32) -> VadDecision {
+    /// Returns the [`VadDecision`] for this chunk.
+    pub fn process(&mut self, probability: f32, chunk: Duration) -> VadDecision {
         match self.state {
             VadState::Idle => {
                 if probability >= self.config.speech_threshold {
                     self.state = VadState::Speaking;
-                    self.silence_frames = 0;
+                    self.silence = Duration::ZERO;
                     self.speech_frames = 1;
                     VadDecision::SpeechStarted
                 } else {
@@ -104,15 +91,15 @@ impl VadStateMachine {
             VadState::Speaking => {
                 self.speech_frames += 1;
                 if probability < self.config.speech_end_threshold {
-                    self.silence_frames += 1;
-                    if self.silence_frames >= self.silence_threshold_frames {
+                    self.silence += chunk;
+                    if self.silence >= self.config.silence_duration {
                         self.state = VadState::Idle;
                         VadDecision::SpeechEnded
                     } else {
                         VadDecision::SpeechContinues
                     }
                 } else {
-                    self.silence_frames = 0;
+                    self.silence = Duration::ZERO;
                     VadDecision::SpeechContinues
                 }
             }
@@ -122,7 +109,7 @@ impl VadStateMachine {
     /// Reset to initial state.
     pub fn reset(&mut self) {
         self.state = VadState::Idle;
-        self.silence_frames = 0;
+        self.silence = Duration::ZERO;
         self.speech_frames = 0;
     }
 }
@@ -134,6 +121,8 @@ mod tests {
     use super::*;
     use crate::voice::types::VadConfig;
     use std::time::Duration;
+
+    const CHUNK: Duration = Duration::from_millis(30);
 
     fn default_config() -> VadConfig {
         VadConfig::default()
@@ -151,16 +140,16 @@ mod tests {
 
     #[test]
     fn test_vad_idle_to_speaking() {
-        let mut sm = VadStateMachine::new(default_config(), 30);
+        let mut sm = VadStateMachine::new(default_config());
         assert_eq!(sm.state(), VadState::Idle);
 
         // Below threshold → Silence
-        let d = sm.process(0.3);
+        let d = sm.process(0.3, CHUNK);
         assert_eq!(d, VadDecision::Silence);
         assert_eq!(sm.state(), VadState::Idle);
 
         // At threshold → SpeechStarted
-        let d = sm.process(0.5);
+        let d = sm.process(0.5, CHUNK);
         assert_eq!(d, VadDecision::SpeechStarted);
         assert_eq!(sm.state(), VadState::Speaking);
     }
@@ -168,20 +157,20 @@ mod tests {
     #[test]
     fn test_vad_speaking_to_ended() {
         // silence_duration=300ms, chunk=30ms → 10 frames needed
-        let mut sm = VadStateMachine::new(config_300ms_silence(), 30);
+        let mut sm = VadStateMachine::new(config_300ms_silence());
 
         // Start speaking
-        assert_eq!(sm.process(0.8), VadDecision::SpeechStarted);
+        assert_eq!(sm.process(0.8, CHUNK), VadDecision::SpeechStarted);
 
         // Feed 9 low-probability frames — still Speaking
         for _ in 0..9 {
-            let d = sm.process(0.1);
+            let d = sm.process(0.1, CHUNK);
             assert_eq!(d, VadDecision::SpeechContinues);
             assert_eq!(sm.state(), VadState::Speaking);
         }
 
         // 10th low-probability frame → SpeechEnded
-        let d = sm.process(0.1);
+        let d = sm.process(0.1, CHUNK);
         assert_eq!(d, VadDecision::SpeechEnded);
         assert_eq!(sm.state(), VadState::Idle);
     }
@@ -189,36 +178,36 @@ mod tests {
     #[test]
     fn test_vad_speech_continues() {
         // silence_duration=300ms, chunk=30ms → 10 frames needed
-        let mut sm = VadStateMachine::new(config_300ms_silence(), 30);
+        let mut sm = VadStateMachine::new(config_300ms_silence());
 
         // Start speaking
-        assert_eq!(sm.process(0.9), VadDecision::SpeechStarted);
+        assert_eq!(sm.process(0.9, CHUNK), VadDecision::SpeechStarted);
 
         // 5 low-probability frames accumulate silence
         for _ in 0..5 {
-            assert_eq!(sm.process(0.1), VadDecision::SpeechContinues);
+            assert_eq!(sm.process(0.1, CHUNK), VadDecision::SpeechContinues);
         }
 
         // A high-probability frame resets silence counter
-        assert_eq!(sm.process(0.7), VadDecision::SpeechContinues);
+        assert_eq!(sm.process(0.7, CHUNK), VadDecision::SpeechContinues);
         assert_eq!(sm.state(), VadState::Speaking);
 
         // 9 more low frames → still Speaking (counter was reset)
         for _ in 0..9 {
-            assert_eq!(sm.process(0.1), VadDecision::SpeechContinues);
+            assert_eq!(sm.process(0.1, CHUNK), VadDecision::SpeechContinues);
             assert_eq!(sm.state(), VadState::Speaking);
         }
 
         // 10th → ended
-        assert_eq!(sm.process(0.1), VadDecision::SpeechEnded);
+        assert_eq!(sm.process(0.1, CHUNK), VadDecision::SpeechEnded);
     }
 
     #[test]
     fn test_vad_reset() {
-        let mut sm = VadStateMachine::new(default_config(), 30);
+        let mut sm = VadStateMachine::new(default_config());
 
         // Transition to Speaking
-        sm.process(0.9);
+        sm.process(0.9, CHUNK);
         assert_eq!(sm.state(), VadState::Speaking);
 
         // Reset → back to Idle
@@ -226,34 +215,38 @@ mod tests {
         assert_eq!(sm.state(), VadState::Idle);
 
         // After reset, acts like a fresh machine
-        assert_eq!(sm.process(0.1), VadDecision::Silence);
-        assert_eq!(sm.process(0.9), VadDecision::SpeechStarted);
+        assert_eq!(sm.process(0.1, CHUNK), VadDecision::Silence);
+        assert_eq!(sm.process(0.9, CHUNK), VadDecision::SpeechStarted);
     }
 
     #[test]
-    fn test_vad_threshold_frames_calculation() {
-        // 500ms silence / 30ms chunk = 16 frames (integer division)
-        let cfg = VadConfig {
-            silence_duration: Duration::from_millis(500),
-            ..VadConfig::default()
-        };
-        let sm = VadStateMachine::new(cfg, 30);
-        assert_eq!(sm.silence_threshold_frames, 16);
+    fn silence_ends_speech_once_it_adds_up_to_the_configured_duration() {
+        // 500 ms of silence in 30 ms chunks: 480 ms after 16 chunks, 510 ms after 17.
+        let mut sm = VadStateMachine::new(default_config());
+        assert_eq!(sm.process(0.9, CHUNK), VadDecision::SpeechStarted);
+        for _ in 0..16 {
+            assert_eq!(sm.process(0.1, CHUNK), VadDecision::SpeechContinues);
+        }
+        assert_eq!(sm.process(0.1, CHUNK), VadDecision::SpeechEnded);
+    }
 
-        // 1200ms / 30ms = 40 frames
-        let cfg2 = VadConfig {
-            silence_duration: Duration::from_millis(1200),
-            ..VadConfig::default()
-        };
-        let sm2 = VadStateMachine::new(cfg2, 30);
-        assert_eq!(sm2.silence_threshold_frames, 40);
-
-        // 300ms / 30ms = 10 frames
-        let cfg3 = VadConfig {
-            silence_duration: Duration::from_millis(300),
-            ..VadConfig::default()
-        };
-        let sm3 = VadStateMachine::new(cfg3, 30);
-        assert_eq!(sm3.silence_threshold_frames, 10);
+    #[test]
+    fn chunks_of_different_lengths_count_by_their_own_duration() {
+        let mut sm = VadStateMachine::new(config_300ms_silence());
+        assert_eq!(
+            sm.process(0.9, Duration::from_millis(10)),
+            VadDecision::SpeechStarted
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                sm.process(0.1, Duration::from_millis(10)),
+                VadDecision::SpeechContinues
+            );
+        }
+        assert_eq!(
+            sm.process(0.1, Duration::from_millis(100)),
+            VadDecision::SpeechEnded,
+            "200 ms in 10 ms chunks plus one 100 ms chunk is 300 ms"
+        );
     }
 }

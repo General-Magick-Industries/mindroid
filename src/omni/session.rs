@@ -3,7 +3,7 @@ use crate::core::content::{inline_image_type, visible_mime_type};
 use crate::core::error::MindroidError;
 use crate::core::models::{Message, SenderType};
 use crate::memory::Memory;
-use crate::omni::audio::{AudioSink, AudioSource};
+use crate::omni::audio::{AudioSink, AudioSource, speech::Framer, wav};
 use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
     AudioChunk, BargeInMode, HistoryTurn, OmniConfig, OmniEvent, Role, SessionState,
@@ -23,7 +23,10 @@ use tokio_util::sync::CancellationToken;
 // Local-VAD imports — only compiled when the Silero ONNX feature is present.
 #[cfg(feature = "transport-audio")]
 use {
-    crate::omni::vad::VadInference,
+    crate::omni::audio::{
+        SileroDetector,
+        speech::{FRAME_MS, frontend_samples, spawn_worker},
+    },
     crate::voice::frontend::{AudioFrontend, FrontendEvent},
     crate::voice::types::VadConfig,
     std::time::Instant,
@@ -137,27 +140,8 @@ impl UtteranceCapture {
         let from = start.max(first) - first;
         let pcm: Vec<u8> = self.buf.range(from..).copied().collect();
         (pcm.len() >= self.bytes_per_sec() * Self::MIN_MS / 1000)
-            .then(|| wav_pcm16(&pcm, self.sample_rate, self.channels))
+            .then(|| wav::encode_pcm16(&pcm, self.sample_rate, self.channels))
     }
-}
-
-fn wav_pcm16(pcm: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
-    let block = channels * 2;
-    let mut w = Vec::with_capacity(44 + pcm.len());
-    w.extend_from_slice(b"RIFF");
-    w.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
-    w.extend_from_slice(b"WAVEfmt ");
-    w.extend_from_slice(&16u32.to_le_bytes());
-    w.extend_from_slice(&1u16.to_le_bytes());
-    w.extend_from_slice(&channels.to_le_bytes());
-    w.extend_from_slice(&sample_rate.to_le_bytes());
-    w.extend_from_slice(&(sample_rate * u32::from(block)).to_le_bytes());
-    w.extend_from_slice(&block.to_le_bytes());
-    w.extend_from_slice(&16u16.to_le_bytes());
-    w.extend_from_slice(b"data");
-    w.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    w.extend_from_slice(pcm);
-    w
 }
 
 /// An omnimodal session that connects an [`OmniProvider`] with optional audio
@@ -468,64 +452,25 @@ impl OmniSession {
         #[cfg_attr(not(feature = "transport-audio"), allow(unused_variables))]
         let use_local_vad = has_local_turn_detection || has_local_barge_in;
 
-        // 5. Set up the VAD inference offload.
-        //
-        //    The channel types are always declared so the select! arm compiles
-        //    regardless of features.  The channels are populated only when the
-        //    `transport-audio` feature (and hence `VadInference`) is available.
-        //
-        //    `vad_out_rx`: receives `(f32_samples, probability)` back from the
-        //    blocking worker.
-        //    `vad_in_tx`: sends raw `AudioChunk`s to the worker.
-        let mut vad_out_rx: Option<mpsc::Receiver<(Vec<f32>, f32)>> = None;
+        // 5. Score the microphone on the shared speech-detector worker. The
+        //    channels are always declared so the select! arm compiles without
+        //    `transport-audio`; only that feature populates them.
+        let mut vad_out_rx: Option<mpsc::Receiver<(AudioChunk, f32)>> = None;
         let mut vad_in_tx: Option<mpsc::Sender<AudioChunk>> = None;
+        let (sample_rate, channels) = self
+            .audio_source
+            .as_ref()
+            .map_or((16_000, 1), |s| (s.sample_rate(), s.channels()));
 
         #[cfg(feature = "transport-audio")]
         if use_local_vad {
-            let sample_rate = self
-                .audio_source
-                .as_ref()
-                .map(|s| s.sample_rate())
-                .unwrap_or(16_000);
-
-            // 32 ms frame — Silero's preferred stride.
-            let chunk_size = (sample_rate as u64 * 32 / 1_000) as usize;
-
-            let (in_tx, in_rx) = mpsc::channel::<AudioChunk>(8);
-            let (out_tx, out_rx) = mpsc::channel::<(Vec<f32>, f32)>(8);
-
-            match VadInference::new(sample_rate, chunk_size) {
-                Ok(mut vad) => {
-                    // Hand the inference to a blocking thread; it owns `in_rx` and
-                    // `out_tx` for its lifetime.
-                    tokio::task::spawn_blocking(move || {
-                        let mut in_rx = in_rx;
-                        while let Some(chunk) = in_rx.blocking_recv() {
-                            // Raw bytes → i16 (little-endian, as produced by CPAL).
-                            let i16_samples: Vec<i16> = chunk
-                                .data
-                                .as_chunks::<2>()
-                                .0
-                                .iter()
-                                .copied()
-                                .map(i16::from_le_bytes)
-                                .collect();
-                            // f32 copy for AudioFrontend::process.
-                            let f32_samples: Vec<f32> = i16_samples
-                                .iter()
-                                .map(|&s| s as f32 / i16::MAX as f32)
-                                .collect();
-                            let probability = vad.predict(&i16_samples);
-                            // If the async side is gone, the send silently fails.
-                            let _ = out_tx.blocking_send((f32_samples, probability));
-                        }
-                    });
-                    vad_in_tx = Some(in_tx);
-                    vad_out_rx = Some(out_rx);
+            match SileroDetector::new(sample_rate) {
+                Ok(detector) => {
+                    let (tx, rx) = spawn_worker(Box::new(detector));
+                    vad_in_tx = Some(tx);
+                    vad_out_rx = Some(rx);
                 }
-                Err(_) => {
-                    // VadInference construction failed — fall back to provider-only.
-                }
+                Err(e) => tracing::warn!(%e, "local VAD unavailable; relying on the provider's"),
             }
         }
 
@@ -534,17 +479,12 @@ impl OmniSession {
         //    actual construction is feature-gated.
         #[cfg(feature = "transport-audio")]
         let mut audio_frontend: Option<AudioFrontend> = if vad_in_tx.is_some() {
-            let sample_rate = self
-                .audio_source
-                .as_ref()
-                .map(|s| s.sample_rate())
-                .unwrap_or(16_000);
             let vad_config = match &self.config.turn_detection {
                 TurnDetection::Local(cfg) => cfg.clone(),
                 _ => VadConfig::default(),
             };
             Some(
-                AudioFrontend::builder(vad_config, 32)
+                AudioFrontend::builder(vad_config, u64::from(FRAME_MS))
                     .sample_rate_hz(sample_rate)
                     .barge_in_mode(self.config.barge_in.clone())
                     .turn_detection(self.config.turn_detection.clone())
@@ -553,6 +493,9 @@ impl OmniSession {
         } else {
             None
         };
+        let mut framer = vad_in_tx
+            .as_ref()
+            .map(|_| Framer::new(sample_rate, channels));
 
         let (mut mic_sq, mut mic_n, mut mic_last) = (0f64, 0usize, std::time::Instant::now());
 
@@ -580,15 +523,16 @@ impl OmniSession {
                 vad_result = async {
                     match vad_out_rx.as_mut() {
                         Some(rx) => rx.recv().await,
-                        None => std::future::pending::<Option<(Vec<f32>, f32)>>().await,
+                        None => std::future::pending::<Option<(AudioChunk, f32)>>().await,
                     }
                 } => {
                     // All processing in here is feature-gated because `AudioFrontend`
                     // and `FrontendEvent` only exist with `transport-audio`.
                     #[cfg(feature = "transport-audio")]
                     {
-                        if let Some((f32_samples, probability)) = vad_result {
+                        if let Some((chunk, probability)) = vad_result {
                             if let Some(ref mut fe) = audio_frontend {
+                                let f32_samples = frontend_samples(&chunk);
                                 let agent_speaking = self.state == SessionState::Speaking;
                                 let now = Instant::now();
                                 let events =
@@ -618,7 +562,9 @@ impl OmniSession {
                                             // Local turn detection: tell the provider that
                                             // the user's turn is complete so it can start
                                             // generating a response.
-                                            self.provider.end_audio_stream().await?;
+                                            if has_local_turn_detection {
+                                                self.provider.end_audio_stream().await?;
+                                            }
                                         }
                                         FrontendEvent::SpeechStarted => {
                                             // Speech onset: open the utterance slice for the
@@ -673,8 +619,12 @@ impl OmniSession {
                         // When local VAD is active, also send a copy to the inference
                         // worker.  `try_send` — skip the frame if the inbox is full
                         // rather than blocking the audio loop.
-                        if let Some(ref tx) = vad_in_tx {
-                            let _ = tx.try_send(chunk);
+                        if let (Some(tx), Some(framer)) = (&vad_in_tx, framer.as_mut()) {
+                            for frame in framer.push(&chunk) {
+                                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(frame) {
+                                    tracing::warn!("local VAD behind the microphone, frame dropped");
+                                }
+                            }
                         }
                     } else {
                         // Audio stream ended.
@@ -791,7 +741,7 @@ impl OmniSession {
     }
 
     /// Test-only entry point that injects a pre-populated VAD results channel,
-    /// bypassing the `VadInference` worker.  Used to verify that the run loop
+    /// bypassing the speech-detector worker.  Used to verify that the run loop
     /// correctly handles `FrontendEvent::BargeIn` and `FrontendEvent::UtteranceComplete`
     /// without requiring the `transport-audio` Silero feature at test time.
     ///
@@ -834,7 +784,7 @@ impl OmniSession {
         let mut audio_frontend: Option<AudioFrontend> =
             if has_local_turn_detection || has_local_barge_in {
                 Some(
-                    AudioFrontend::builder(vad_config, 32)
+                    AudioFrontend::builder(vad_config, u64::from(FRAME_MS))
                         .sample_rate_hz(sample_rate)
                         .barge_in_mode(self.config.barge_in.clone())
                         .turn_detection(self.config.turn_detection.clone())
@@ -884,7 +834,9 @@ impl OmniSession {
                                             &mut self.capture,
                                             &mut self.pending_transcriptions,
                                         );
-                                        self.provider.end_audio_stream().await?;
+                                        if has_local_turn_detection {
+                                            self.provider.end_audio_stream().await?;
+                                        }
                                     }
                                     FrontendEvent::SpeechStarted => {
                                         self.capture.mark_start();
@@ -1974,6 +1926,40 @@ mod tests {
         assert_eq!(session.state(), SessionState::Closed);
     }
 
+    /// Counts `end_audio_stream` calls.
+    #[cfg(feature = "transport-audio")]
+    struct CountingProvider {
+        inner: RecordingProvider,
+        count: Arc<Mutex<u32>>,
+    }
+
+    #[cfg(feature = "transport-audio")]
+    #[async_trait]
+    impl OmniProvider for CountingProvider {
+        async fn connect(&mut self, cfg: &OmniConfig) -> Result<(), MindroidError> {
+            self.inner.connect(cfg).await
+        }
+        async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
+            self.inner.send_audio(chunk).await
+        }
+        async fn send_text(&self, t: &str) -> Result<(), MindroidError> {
+            self.inner.send_text(t).await
+        }
+        async fn send_tool_result(&self, id: &str, r: Value) -> Result<(), MindroidError> {
+            self.inner.send_tool_result(id, r).await
+        }
+        async fn end_audio_stream(&self) -> Result<(), MindroidError> {
+            *self.count.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>> {
+            self.inner.events()
+        }
+        async fn disconnect(&mut self) -> Result<(), MindroidError> {
+            self.inner.disconnect().await
+        }
+    }
+
     // ── Local-VAD integration tests (transport-audio feature required) ────────
     //
     // These tests bypass the Silero ONNX worker by using `run_with_vad_rx`,
@@ -2073,38 +2059,6 @@ mod tests {
         let (_provider, tx) = RecordingProvider::new();
         let recorded_eos = Arc::new(Mutex::new(0u32));
 
-        // Wrap RecordingProvider to count end_audio_stream calls.
-        struct CountingProvider {
-            inner: RecordingProvider,
-            count: Arc<Mutex<u32>>,
-        }
-
-        #[async_trait]
-        impl OmniProvider for CountingProvider {
-            async fn connect(&mut self, cfg: &OmniConfig) -> Result<(), MindroidError> {
-                self.inner.connect(cfg).await
-            }
-            async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
-                self.inner.send_audio(chunk).await
-            }
-            async fn send_text(&self, t: &str) -> Result<(), MindroidError> {
-                self.inner.send_text(t).await
-            }
-            async fn send_tool_result(&self, id: &str, r: Value) -> Result<(), MindroidError> {
-                self.inner.send_tool_result(id, r).await
-            }
-            async fn end_audio_stream(&self) -> Result<(), MindroidError> {
-                *self.count.lock().unwrap() += 1;
-                Ok(())
-            }
-            fn events(&mut self) -> Pin<Box<dyn Stream<Item = OmniEvent> + Send>> {
-                self.inner.events()
-            }
-            async fn disconnect(&mut self) -> Result<(), MindroidError> {
-                self.inner.disconnect().await
-            }
-        }
-
         let (inner_provider, tx2) = RecordingProvider::new();
         let eos_count = Arc::clone(&recorded_eos);
         let counting = CountingProvider {
@@ -2153,6 +2107,43 @@ mod tests {
             *eos_count.lock().unwrap() >= 1,
             "end_audio_stream should be called at least once on local UtteranceComplete"
         );
+    }
+
+    /// Under server turn detection the frontend runs for barge-in only; its
+    /// max-utterance cut must not end the provider's turn.
+    #[cfg(feature = "transport-audio")]
+    #[tokio::test]
+    async fn server_turn_detection_ignores_the_frontends_max_utterance_cut() {
+        let (inner, tx) = RecordingProvider::new();
+        let count = Arc::new(Mutex::new(0u32));
+        let mut session = OmniSession::builder()
+            .provider(CountingProvider {
+                inner,
+                count: Arc::clone(&count),
+            })
+            .barge_in(BargeInMode::LocalVad)
+            .turn_detection(TurnDetection::Server)
+            .build()
+            .unwrap();
+
+        let (vad_tx, vad_rx) = mpsc::channel::<(Vec<f32>, f32)>(64);
+        let session_task = tokio::spawn(async move {
+            session.run_with_vad_rx(vad_rx).await.unwrap();
+        });
+
+        let frame = |level| vec![level; 512];
+        for _ in 0..12 {
+            vad_tx.send((frame(0.1), 0.9)).await.unwrap();
+        }
+        // Past the default 30 s max utterance at 16 kHz.
+        for _ in 0..1_000 {
+            vad_tx.send((frame(0.0), 0.0)).await.unwrap();
+        }
+        drop(vad_tx);
+        drop(tx);
+        session_task.await.unwrap();
+
+        assert_eq!(*count.lock().unwrap(), 0);
     }
 
     /// The shadow transcriber's utterance boundaries come from the local audio

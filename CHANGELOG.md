@@ -257,6 +257,37 @@ crate root and serializes in snake_case (`"max_iterations"`), so a consumer
 parsing the event stream sees it as a string field. Both loop events carry
 `loop_name`, the loop's `with_name`, so nested loops can be told apart.
 
+#### 10. `VadStateMachine` takes the chunk duration per call
+
+It counted silence in frames of a duration fixed at construction, which
+`VoiceGate` froze from the first chunk it saw. Silence is now counted in time,
+so chunks of any length can be mixed. Speech ends once the silent chunks add up
+to `silence_duration`; before, the frame count was rounded down, so 500 ms in
+30 ms chunks ended after 480 ms and now ends after 510 ms.
+
+```rust
+// before
+let mut vad = VadStateMachine::new(config, 30);
+vad.process(probability);
+// after
+let mut vad = VadStateMachine::new(config);
+vad.process(probability, Duration::from_millis(30));
+```
+
+#### 11. `voice::encode_wav` moved to `omni::audio::wav`
+
+The crate had two PCM16 WAV encoders; `omni::audio::wav` is now the only
+one, and it no longer needs `transport-audio` or `hound`. Output is
+byte-identical.
+
+```rust
+// before
+mindroid::voice::encode_wav(&samples, 16_000)
+// after
+mindroid::omni::audio::wav::encode_mono_f32(&samples, 16_000)
+mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
+```
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
@@ -277,6 +308,12 @@ parsing the event stream sees it as a string field. Both loop events carry
   `EpisodeIngestStage::apply_runtime_state` after `Context::reset_output`.
   `RuntimeAffectSnapshot` is the run-scoped extension; `RuntimeStateEnvelope`
   and `RuntimeAffectState` are the wire types, marked `#[non_exhaustive]`.
+- `omni::audio::Resampler`: integer-factor downsampling of PCM16 behind a
+  windowed-sinc anti-alias filter, streaming across chunks. The OpenAI provider
+  and `SileroDetector` both use it. A ratio that is not an integer, such as
+  24 → 16 kHz or 44.1 → 24 kHz, is refused with `ResampleError`, as is a
+  factor above `MAX_FACTOR` (12; 192 → 16 kHz is the largest accepted).
+- `SileroDetector` accepts an 8 kHz microphone, running Silero's 8 kHz model.
 - **`AgentLoop`**, an iterative execution model composed of pipelines
   (ADR-0011): `setup` once, a `body` per pass, `finish` once, over one
   `Context`. A body stage asks for another pass by setting `Continue`; a body
@@ -494,6 +531,26 @@ parsing the event stream sees it as a string field. Both loop events carry
   replay reads `message_type`: the agent's own `TOOL_CALL` replays as JSON with
   `\u003c`-style escapes and folded invisible controls instead of HTML
   entities, and a live `TOOL_RESULT` no longer reaches the prompt twice.
+
+- Downsampled audio no longer aliases. The OpenAI provider averaged sample
+  pairs, which leaves content above 12 kHz only partly attenuated, and
+  `SileroDetector` dropped samples with no filter at all, folding everything
+  above 8 kHz back into the band Silero listens to. Both now filter first.
+- `OmniSession`'s local VAD runs on the same `SileroDetector` and blocking
+  worker as `VoiceGate`. It built Silero at the microphone's own rate, which the
+  model refuses for anything but 8 or 16 kHz, so on a 48 kHz microphone local
+  barge-in and turn detection were silently off. They now work there; a rate
+  Silero still cannot take is logged as a warning instead of ignored. The
+  microphone is re-cut into 32 ms frames before scoring, because the frontend
+  counts frames as 32 ms: `CpalAudioSource`'s 10.7 ms chunks at 48 kHz made
+  barge-in fire after about 110 ms of speech instead of 320 ms, and ended
+  turns after a third of the configured silence.
+- The local VAD's frontend gets the microphone's first channel. It was handed
+  stereo frames interleaved, so its sample-counted `min_speech` and
+  `max_utterance` ran at half their configured time. Without
+  `TurnDetection::Local` its max-utterance cut no longer calls
+  `end_audio_stream`: there the frontend runs for barge-in only, and the cut
+  ended the user's turn on the provider 30 s after each speech onset.
 - `Pipeline::run_streaming` stops after a streaming stage that halts, as
   `Pipeline::run` stops after any stage that does. The post-streaming stages
   used to run regardless, so a streaming executor dropping a forged

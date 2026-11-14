@@ -1,3 +1,15 @@
+//! Audio I/O traits and the processing every realtime path shares: resampling,
+//! WAV encoding and speech detection.
+
+pub mod resample;
+pub mod speech;
+pub mod wav;
+
+pub use resample::{ResampleError, Resampler};
+#[cfg(feature = "transport-audio")]
+pub use speech::SileroDetector;
+pub use speech::SpeechDetector;
+
 use crate::core::error::MindroidError;
 use async_trait::async_trait;
 use futures::Stream;
