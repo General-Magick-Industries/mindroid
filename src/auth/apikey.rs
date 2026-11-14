@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{Auth, MindroidError, Result};
+use crate::{Auth, MindroidError, Result, core::net::require_secure_url};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -246,7 +246,7 @@ impl ApiKeyAuth {
     /// infallible for backwards compatibility and only warns.
     pub fn new(base_url: &str, email: &str, password: &str) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
-        if is_plaintext(&base_url) {
+        if require_secure_url(&base_url, false, "auth.allow_insecure").is_err() {
             warn!(
                 "auth base_url {base_url} is plaintext; credentials will cross \
                  the network unprotected — use https:// (see try_new)"
@@ -270,19 +270,15 @@ impl ApiKeyAuth {
         allow_insecure: bool,
     ) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
-        if is_plaintext(&base_url) && !allow_insecure {
-            return Err(MindroidError::config(format!(
-                "refusing to send credentials over plaintext {base_url}: use https://, \
-                 or set auth.allow_insecure = true for local development"
-            )));
-        }
+        require_secure_url(&base_url, allow_insecure, "auth.allow_insecure")?;
         Ok(Self::build(base_url, email, password))
     }
 
     fn build(base_url: String, email: &str, password: &str) -> Self {
         let builder = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT);
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
 
         // Tests talk to a loopback gateway on an ephemeral port. reqwest honours
         // HTTP_PROXY/ALL_PROXY and does not exempt loopback, so a proxied dev
@@ -291,10 +287,15 @@ impl ApiKeyAuth {
         #[cfg(test)]
         let builder = builder.no_proxy();
 
-        // Only timeouts are configured, so this build cannot realistically
-        // fail; fall back to a default client rather than panicking in a
-        // constructor callers expect to be infallible.
-        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+        // Only timeouts and the redirect policy are configured, so this build
+        // cannot realistically fail; fall back to a default client rather than
+        // panicking in a constructor callers expect to be infallible.
+        let client = builder.build().unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build HTTP client")
+        });
 
         Self {
             base_url,
@@ -510,10 +511,6 @@ fn with_cause(err: MindroidError, cause: MindroidError) -> MindroidError {
         },
         other => other,
     }
-}
-
-fn is_plaintext(base_url: &str) -> bool {
-    base_url.starts_with("http://")
 }
 
 #[async_trait]
@@ -1138,6 +1135,12 @@ mod tests {
     }
 
     #[test]
+    fn try_new_refuses_uppercase_plaintext_scheme() {
+        assert!(ApiKeyAuth::try_new("HTTP://gateway.internal", "u", "p", false).is_err());
+        assert!(ApiKeyAuth::try_new("Http://gateway.internal", "u", "p", false).is_err());
+    }
+
+    #[test]
     fn try_new_allows_plaintext_when_opted_in() {
         assert!(ApiKeyAuth::try_new("http://localhost:8080", "u", "p", true).is_ok());
     }
@@ -1145,6 +1148,66 @@ mod tests {
     #[test]
     fn try_new_accepts_tls_without_opt_in() {
         assert!(ApiKeyAuth::try_new("https://gateway.example", "u", "p", false).is_ok());
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn warnings_from_new(base_url: &str) -> String {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            ApiKeyAuth::new(base_url, "u", "p");
+        });
+        String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn new_warns_only_for_an_insecure_base_url() {
+        assert!(warnings_from_new("HTTP://gateway.internal").contains("auth base_url"));
+        assert!(warnings_from_new("https://gateway.example").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_redirecting_gateway_is_not_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 307 \r\nLocation: /v1/auth/login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let auth = ApiKeyAuth::new(&base_url, "user@example.com", "pw");
+        let err = with_deadline(auth.get_token()).await.unwrap_err();
+        server.abort();
+
+        assert!(err.to_string().contains("307"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the redirect was followed");
     }
 
     // ---- secret hygiene ----
