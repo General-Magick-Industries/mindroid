@@ -27,7 +27,7 @@ use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
     AudioChunk, HistoryTurn, OmniConfig, OmniEvent, Role, TranscriptSource, TurnDetection, Usage,
 };
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolImage};
 
 /// OpenAI Realtime WebSocket endpoint; a LiteLLM passthrough works at `/v1/realtime` too.
 pub const DEFAULT_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
@@ -384,6 +384,18 @@ impl OmniProvider for OpenAiRealtimeProvider {
     }
 
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError> {
+        self.send_tool_result_with_images(call_id, result, Vec::new())
+            .await
+    }
+
+    /// A `function_call_output` carries text only, so images follow it as a
+    /// user message of `input_image` parts, before the one `response.create`.
+    async fn send_tool_result_with_images(
+        &self,
+        call_id: &str,
+        result: Value,
+        images: Vec<ToolImage>,
+    ) -> Result<(), MindroidError> {
         // `output` must be a string; anything structured is serialized.
         let output = match result {
             Value::String(s) => s,
@@ -394,6 +406,26 @@ impl OmniProvider for OpenAiRealtimeProvider {
             "item": { "type": "function_call_output", "call_id": call_id, "output": output },
         }))
         .await?;
+        if !images.is_empty() {
+            let content: Vec<Value> = images
+                .iter()
+                .map(|image| {
+                    json!({
+                        "type": "input_image",
+                        "image_url": format!(
+                            "data:{};base64,{}",
+                            image.mime_type,
+                            STANDARD.encode(&image.data)
+                        ),
+                    })
+                })
+                .collect();
+            self.send_json(json!({
+                "type": "conversation.item.create",
+                "item": { "type": "message", "role": "user", "content": content },
+            }))
+            .await?;
+        }
         self.send_json(json!({ "type": "response.create" })).await
     }
 
@@ -967,6 +999,44 @@ mod tests {
         assert_eq!(output["item"]["type"], "function_call_output");
         assert_eq!(output["item"]["call_id"], "call_1");
         assert_eq!(output["item"]["output"], "{\"temp_c\":4}");
+
+        let create = seen.recv().await.expect("response.create");
+        assert_eq!(create["type"], "response.create");
+    }
+
+    #[tokio::test]
+    async fn tool_result_images_follow_the_output_as_a_user_message() {
+        let (provider, mut seen, _) = connected(|_| vec![]).await;
+        let _update = seen.recv().await;
+
+        provider
+            .send_tool_result_with_images(
+                "call_7",
+                json!("photo taken"),
+                vec![
+                    ToolImage::new("image/jpeg", vec![1, 2, 3]),
+                    ToolImage::new("image/png", vec![4]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let output = seen.recv().await.expect("function_call_output");
+        assert_eq!(output["item"]["type"], "function_call_output");
+        assert_eq!(output["item"]["call_id"], "call_7");
+        assert_eq!(output["item"]["output"], "photo taken");
+
+        let images = seen.recv().await.expect("image message");
+        assert_eq!(images["type"], "conversation.item.create");
+        assert_eq!(images["item"]["type"], "message");
+        assert_eq!(images["item"]["role"], "user");
+        assert_eq!(
+            images["item"]["content"],
+            json!([
+                { "type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", STANDARD.encode([1u8, 2, 3])) },
+                { "type": "input_image", "image_url": format!("data:image/png;base64,{}", STANDARD.encode([4u8])) },
+            ])
+        );
 
         let create = seen.recv().await.expect("response.create");
         assert_eq!(create["type"], "response.create");
