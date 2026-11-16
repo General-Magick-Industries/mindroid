@@ -171,13 +171,6 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
 
-      # ort-sys links its DLLs into target/debug/examples too, and its build
-      # script panics when that folder doesn't exist yet (a cold cache).
-      - name: Prepare target folders for ort-sys
-        if: needs.changes.outputs.rust == 'true'
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force target/debug/examples, target/debug/deps | Out-Null
-
       # The `#[cfg(windows)]` blocks are invisible to the ubuntu job's clippy.
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
