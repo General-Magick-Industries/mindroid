@@ -596,6 +596,8 @@ fn parse_server_message(
             output_tokens: n("responseTokenCount"),
             input_audio_tokens: audio("promptTokensDetails"),
             output_audio_tokens: audio("responseTokensDetails"),
+            cached_input_tokens: n("cachedContentTokenCount"),
+            cached_input_audio_tokens: audio("cacheTokensDetails"),
         }));
     }
 
@@ -1352,6 +1354,11 @@ mod tests {
                     { "modality": "TEXT", "tokenCount": 50 },
                 ],
                 "responseTokensDetails": [{ "modality": "AUDIO", "tokenCount": 80 }],
+                "cachedContentTokenCount": 120,
+                "cacheTokensDetails": [
+                    { "modality": "AUDIO", "tokenCount": 100 },
+                    { "modality": "TEXT", "tokenCount": 20 },
+                ],
             }}),
             &pending,
             &mut TranscriptAcc::default(),
@@ -1361,6 +1368,8 @@ mod tests {
             output_tokens: 80,
             input_audio_tokens: 250,
             output_audio_tokens: 80,
+            cached_input_tokens: 120,
+            cached_input_audio_tokens: 100,
         };
         assert!(
             matches!(events[0], OmniEvent::Usage(u) if u == want),

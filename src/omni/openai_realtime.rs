@@ -555,6 +555,10 @@ fn parse_server_event(value: &Value) -> Vec<OmniEvent> {
                     output_tokens: n("/output_tokens"),
                     input_audio_tokens: n("/input_token_details/audio_tokens"),
                     output_audio_tokens: n("/output_token_details/audio_tokens"),
+                    cached_input_tokens: n("/input_token_details/cached_tokens"),
+                    cached_input_audio_tokens: n(
+                        "/input_token_details/cached_tokens_details/audio_tokens",
+                    ),
                 }));
             }
             // Tool calls are surfaced here, not at `function_call_arguments.done`:
@@ -1278,7 +1282,10 @@ mod tests {
             "type": "response.done",
             "response": { "usage": {
                 "input_tokens": 120, "output_tokens": 45,
-                "input_token_details": { "audio_tokens": 100, "text_tokens": 20 },
+                "input_token_details": {
+                    "audio_tokens": 100, "text_tokens": 20, "cached_tokens": 64,
+                    "cached_tokens_details": { "audio_tokens": 48, "text_tokens": 16 },
+                },
                 "output_token_details": { "audio_tokens": 40, "text_tokens": 5 },
             }}
         }));
@@ -1287,6 +1294,8 @@ mod tests {
             output_tokens: 45,
             input_audio_tokens: 100,
             output_audio_tokens: 40,
+            cached_input_tokens: 64,
+            cached_input_audio_tokens: 48,
         };
         assert!(
             matches!(events[0], OmniEvent::Usage(u) if u == want),
