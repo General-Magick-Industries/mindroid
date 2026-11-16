@@ -257,6 +257,16 @@ crate root and serializes in snake_case (`"max_iterations"`), so a consumer
 parsing the event stream sees it as a string field. Both loop events carry
 `loop_name`, the loop's `with_name`, so nested loops can be told apart.
 
+#### 10. `omni::Usage` reports cached input
+
+`Usage` gained `cached_input_tokens` and `cached_input_audio_tokens`: the part of
+`input_tokens` and `input_audio_tokens` the provider served from its prompt
+cache, which it bills at a lower rate. OpenAI Realtime fills them from
+`input_token_details.cached_tokens` and its audio detail; Gemini Live from
+`cachedContentTokenCount` and the audio entry of `cacheTokensDetails`. A
+`Usage { .. }` literal outside this crate needs the new fields, or
+`..Usage::default()`.
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
