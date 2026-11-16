@@ -17,7 +17,9 @@ listed under **Breaking Changes** with a migration note.
   bytes' type replaces the declared one, and an image a model would not take,
   one over 2 MiB, or one past the fourth is dropped, with a note in the result's
   text. `GeminiLiveProvider` sends them as `inlineData` in the function
-  response's `parts`; the default, for every other provider, says in the result
+  response's `parts`; `OpenAiRealtimeProvider` sends them as a user message of
+  `input_image` parts right after the `function_call_output`, since that output
+  carries text only; the default, for every other provider, says in the result
   that they could not be shown. `ToolOutput` and `ToolImage` are
   `#[non_exhaustive]`: build them with `ToolOutput::new(..).with_images(..)` and
   `ToolImage::new`.
