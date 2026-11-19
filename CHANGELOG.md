@@ -10,6 +10,10 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- `CorpusTool::with_query_mode(QueryMode)` sends a retrieval mode with every
+  corpus query; unset, the backend picks its own. `QueryMode::Naive` returns
+  source passages only. The default graph modes put entity and relationship
+  summaries first, which can push the passages past the 16 KiB result cap.
 - Tool results that carry images. `Tool::execute_with_images` returns a
   `ToolOutput` (text plus `ToolImage`s); its default is `execute`'s text and no
   images. `OmniSession` sends a tool's images to the new
