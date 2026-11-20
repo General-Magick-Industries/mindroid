@@ -289,6 +289,31 @@ mindroid::omni::audio::wav::encode_mono_f32(&samples, 16_000)
 mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 ```
 
+#### 12. `ApiKeyAuth::try_new` refuses more base URLs
+
+It decided a URL was plaintext with `starts_with("http://")`, so `HTTP://host`
+passed and the API key went out unencrypted. It now uses the same
+`require_secure_url` check as `EndUserAuth`, which also refuses `ftp://`,
+`file://` and any URL it cannot parse. `ApiKeyAuth::new` warns for the same set
+instead of refusing.
+
+**Migration:** use an `https://` base URL. For a local plaintext gateway, pass
+`allow_insecure` (`auth.allow_insecure` in config).
+
+#### 13. An end-user `agent_id` must match the token subject
+
+On the end-user route, an `agent_id` that differed from the token's `sub` only
+logged a warning, and the agent listened on a channel that belongs to a
+different identity. The handshake now fails with a `Config` error before the
+WebSocket opens, and the Centrifugo listener stops with `Health::Stopped`
+instead of retrying. Only this mismatch stops the listener; any other handshake
+error, including a `Config` error from a host's `Auth::get_token`, still backs
+off and retries.
+
+**Migration:** set `agent_id` to the end user's id, the token's `sub`. A host
+with a custom `ChannelNaming` that ignored `agent_id` connected before and now
+fails at connect.
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
@@ -721,6 +746,20 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   keeps the same API; `rusqlite` is not part of this crate's public surface.
 - `openssl` 0.10.76 → 0.10.82 in `Cargo.lock` (RUSTSEC-2026-0463, -0473 to
   -0479). A lockfile-only update.
+- `ApiKeyAuth` refuses redirects, in its own client and its fallback. Its login
+  and refresh calls carry the account credentials, which a redirecting gateway
+  would have replayed to wherever `Location` pointed. A redirect now fails the
+  call, as it already did for the crate's other credential-bearing clients.
+- `to_stored` writes a single text part that begins with `STRUCTURED_PREFIX` in
+  structured form, so it reads back as the same text. Before, `from_stored` read
+  such text as real content parts, so a user could plant image URIs that reached
+  the model provider. Every other message is stored byte for byte as before, and
+  existing rows read the same. `MemoryPersistence` now saves both turns through
+  `to_stored`; it used to bypass it when no `ArtifactOffload` stage ran.
+- On Unix, `LocalArtifactStore` creates directories with mode `0700` and files
+  with `0600`. Windows is unchanged. Only directories and files it creates get
+  the new modes: tighten an existing store yourself, for example
+  `chmod -R go-rwx <base>`.
 
 ## [0.0.2-a.1] — 2026-08-06
 

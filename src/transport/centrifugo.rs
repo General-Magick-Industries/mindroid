@@ -235,6 +235,22 @@ struct HandshakeResult {
     ttl: Option<u64>,
 }
 
+/// Why a handshake failed, as the reconnect loop needs to know it.
+#[derive(Debug)]
+enum HandshakeError {
+    /// Retrying cannot fix it; the listener stops.
+    Fatal(MindroidError),
+    /// Back off and try again, whatever the error's kind — a host `Auth` may
+    /// return any kind for a passing failure.
+    Retry(MindroidError),
+}
+
+impl From<MindroidError> for HandshakeError {
+    fn from(e: MindroidError) -> Self {
+        Self::Retry(e)
+    }
+}
+
 pub struct CentrifugoTransport {
     ws_url: String,
     agent_id: String,
@@ -330,7 +346,7 @@ async fn handshake(
     kind: crate::models::CredentialKind,
     naming: &dyn ChannelNaming,
     allow_insecure: bool,
-) -> Result<HandshakeResult> {
+) -> std::result::Result<HandshakeResult, HandshakeError> {
     let token = identity.get_token().await?;
     check_url_security(ws_url, &token, allow_insecure)?;
 
@@ -342,10 +358,10 @@ async fn handshake(
     // wrong `agent_id` connects, logs "Listening on channel", and then receives
     // nothing forever, indistinguishable from an idle channel.
     if kind == crate::models::CredentialKind::EndUser && service_user_id != agent_id {
-        return Err(MindroidError::config(format!(
+        return Err(HandshakeError::Fatal(MindroidError::config(format!(
             "configured agent_id {agent_id} does not match the token subject \
              {service_user_id}; refusing to listen on a channel nothing publishes to"
-        )));
+        ))));
     }
 
     let url = if ws_url.contains('?') {
@@ -389,7 +405,7 @@ async fn handshake(
             let val: serde_json::Value = serde_json::from_str(text)
                 .map_err(|e| transport_err(format!("Invalid connect reply JSON: {e}")))?;
             if val.get("error").is_some() {
-                return Err(transport_err(format!("Centrifugo connect error: {val}")));
+                return Err(transport_err(format!("Centrifugo connect error: {val}")).into());
             }
             // Extract TTL if the connection expires
             let expires = val
@@ -402,9 +418,7 @@ async fn handshake(
             debug!("Centrifugo connected: {val} (ttl={ttl:?})");
         }
         other => {
-            return Err(transport_err(format!(
-                "Unexpected connect reply frame: {other:?}"
-            )));
+            return Err(transport_err(format!("Unexpected connect reply frame: {other:?}")).into());
         }
     }
 
@@ -438,13 +452,13 @@ async fn handshake(
                 let val: serde_json::Value = serde_json::from_str(text)
                     .map_err(|e| transport_err(format!("Invalid subscribe reply JSON: {e}")))?;
                 if val.get("error").is_some() {
-                    return Err(transport_err(format!("Centrifugo subscribe error: {val}")));
+                    return Err(transport_err(format!("Centrifugo subscribe error: {val}")).into());
                 }
             }
             other => {
-                return Err(transport_err(format!(
-                    "Unexpected subscribe reply frame: {other:?}"
-                )));
+                return Err(
+                    transport_err(format!("Unexpected subscribe reply frame: {other:?}")).into(),
+                );
             }
         }
     }
@@ -999,15 +1013,15 @@ impl Transport for CentrifugoTransport {
                             h.set(crate::core::health::Health::Reconnecting);
                         }
                     }
-                    Err(e) => {
+                    Err(HandshakeError::Fatal(e)) => {
+                        error!(
+                            "Centrifugo handshake failed: {e}; retrying cannot fix it, \
+                             stopping the Centrifugo listener"
+                        );
+                        break;
+                    }
+                    Err(HandshakeError::Retry(e)) => {
                         error!("Centrifugo handshake failed: {e}");
-                        if matches!(e, MindroidError::Config { .. }) {
-                            error!(
-                                "A configuration error cannot be fixed by retrying; \
-                                 stopping the Centrifugo listener"
-                            );
-                            break;
-                        }
                         if let Some(h) = &health {
                             h.set(crate::core::health::Health::Reconnecting);
                         }
@@ -1220,8 +1234,56 @@ mod tests {
         .await
         .err()
         .expect("a mismatched subject must not start a session");
+        let HandshakeError::Fatal(err) = err else {
+            panic!("a mismatched subject must stop the listener: {err:?}");
+        };
         assert!(matches!(err, MindroidError::Config { .. }), "{err:?}");
         assert!(err.to_string().contains("does not match the token subject"));
+    }
+
+    struct ConfigErrorAuth;
+
+    #[async_trait]
+    impl Auth for ConfigErrorAuth {
+        async fn get_token(&self) -> Result<String> {
+            Err(MindroidError::config("credential store not mounted yet"))
+        }
+        async fn get_auth_headers(&self) -> Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+        fn is_authenticated(&self) -> bool {
+            false
+        }
+        async fn refresh(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_config_error_from_the_token_keeps_the_listener_retrying() {
+        let (reporter, watcher) = crate::core::health::HealthReporter::new();
+        let mut transport =
+            CentrifugoTransport::new("ws://127.0.0.1:1/ws", "agent", Arc::new(ConfigErrorAuth))
+                .with_credential_kind(crate::models::CredentialKind::EndUser)
+                .with_allow_insecure(true);
+        transport.set_health_reporter(reporter);
+
+        let (tx, _rx) = mpsc::channel(8);
+        transport.listen(tx).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while watcher.get() != crate::core::health::Health::Reconnecting {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a failed token fetch must back off and retry");
+        assert!(matches!(
+            &*transport.listener.lock().unwrap(),
+            Listener::Running { handle, .. } if !handle.is_finished()
+        ));
+
+        transport.disconnect().await.unwrap();
     }
 
     #[tokio::test]
