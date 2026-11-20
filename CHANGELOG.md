@@ -21,7 +21,9 @@ listed under **Breaking Changes** with a migration note.
   bytes' type replaces the declared one, and an image a model would not take,
   one over 2 MiB, or one past the fourth is dropped, with a note in the result's
   text. `GeminiLiveProvider` sends them as `inlineData` in the function
-  response's `parts`; the default, for every other provider, says in the result
+  response's `parts`; `OpenAiRealtimeProvider` sends them as a user message of
+  `input_image` parts right after the `function_call_output`, since that output
+  carries text only; the default, for every other provider, says in the result
   that they could not be shown. `ToolOutput` and `ToolImage` are
   `#[non_exhaustive]`: build them with `ToolOutput::new(..).with_images(..)` and
   `ToolImage::new`.
@@ -291,6 +293,16 @@ mindroid::voice::encode_wav(&samples, 16_000)
 mindroid::omni::audio::wav::encode_mono_f32(&samples, 16_000)
 mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 ```
+
+#### 12. `omni::Usage` reports cached input
+
+`Usage` gained `cached_input_tokens` and `cached_input_audio_tokens`: the part of
+`input_tokens` and `input_audio_tokens` the provider served from its prompt
+cache, which it bills at a lower rate. OpenAI Realtime fills them from
+`input_token_details.cached_tokens` and its audio detail; Gemini Live from
+`cachedContentTokenCount` and the audio entry of `cacheTokensDetails`. A
+`Usage { .. }` literal outside this crate needs the new fields, or
+`..Usage::default()`.
 
 ### Added
 
