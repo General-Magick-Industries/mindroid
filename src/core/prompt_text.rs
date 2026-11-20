@@ -73,7 +73,7 @@ pub(crate) fn neutralize_line(s: &str) -> String {
     cap_escaped(escape_markup(&sanitize_line(s)), MAX_LINE_BYTES)
 }
 
-fn cap_escaped(escaped: String, max_bytes: usize) -> String {
+pub(crate) fn cap_escaped(escaped: String, max_bytes: usize) -> String {
     if escaped.len() <= max_bytes {
         return escaped;
     }
