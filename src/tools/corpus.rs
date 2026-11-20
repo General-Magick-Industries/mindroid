@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -24,6 +24,20 @@ const MAX_INLINE_BYTES: usize = 200;
 #[derive(Debug, Clone, Default)]
 pub struct CorpusCatalog(pub Vec<CorpusCatalogEntry>);
 
+/// How the backend retrieves for a query. `Naive` returns source passages
+/// only; the graph modes put entity and relationship summaries ahead of them,
+/// which can push the passages past the 16 KiB result cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum QueryMode {
+    Naive,
+    Local,
+    Global,
+    Hybrid,
+    Mix,
+}
+
 pub struct CorpusTool {
     base_url: String,
     /// Forwarded as `x-api-key` to fund Semantic Memory's retrieval; the
@@ -32,6 +46,7 @@ pub struct CorpusTool {
     activation_ids: Vec<String>,
     description: String,
     allow_insecure: bool,
+    mode: Option<QueryMode>,
     client: reqwest::Client,
 }
 
@@ -51,6 +66,7 @@ impl CorpusTool {
             activation_ids: Vec::new(),
             description: BASE_DESCRIPTION.to_string(),
             allow_insecure: false,
+            mode: None,
             client: secure_json_client(HTTP_TIMEOUT),
         }
     }
@@ -75,6 +91,13 @@ impl CorpusTool {
     /// Permit sending auth headers over plaintext `http://` (local dev only).
     pub fn with_allow_insecure(mut self, allow_insecure: bool) -> Self {
         self.allow_insecure = allow_insecure;
+        self
+    }
+
+    /// Retrieval mode sent with every query. Unset, the backend picks its own
+    /// default.
+    pub fn with_query_mode(mut self, mode: QueryMode) -> Self {
+        self.mode = Some(mode);
         self
     }
 
@@ -169,7 +192,7 @@ impl Tool for CorpusTool {
             .headers(headers)
             // only_need_context: the agent wants retrieved passages to reason
             // over itself, not a second LLM's answer generated corpus-side.
-            .json(&json!({ "query": query, "only_need_context": true }));
+            .json(&query_body(query, self.mode));
         if let Some(key) = &self.api_key {
             request = request.header("x-api-key", key);
         }
@@ -208,6 +231,14 @@ impl Tool for CorpusTool {
 
         Ok(wrap_untrusted("corpus", &render_results(&body)))
     }
+}
+
+fn query_body(query: &str, mode: Option<QueryMode>) -> Value {
+    let mut body = json!({ "query": query, "only_need_context": true });
+    if let Some(mode) = mode {
+        body["mode"] = json!(mode);
+    }
+    body
 }
 
 impl CorpusTool {
@@ -526,6 +557,18 @@ mod tests {
             assert!(req.contains("authorization: bearer t"), "{req}");
             assert!(req.contains("post /v1/end-user/corpus/c-1/query"), "{req}");
         }
+    }
+
+    #[test]
+    fn the_query_mode_is_sent_only_when_set() {
+        assert_eq!(
+            query_body("q", None),
+            json!({ "query": "q", "only_need_context": true })
+        );
+        assert_eq!(
+            query_body("q", Some(QueryMode::Naive)),
+            json!({ "query": "q", "only_need_context": true, "mode": "naive" })
+        );
     }
 
     #[test]

@@ -476,7 +476,7 @@ fn vad_loop(
     processor: &mut dyn VadProcessor,
     shutdown: Arc<AtomicBool>,
 ) {
-    use crate::voice::encode_wav;
+    use crate::omni::audio::wav::encode_mono_f32;
     use crate::voice::{
         AudioFrontend, FrontendEvent,
         types::{BargeInMode, TurnDetection},
@@ -519,7 +519,7 @@ fn vad_loop(
                         FrontendEvent::UtteranceComplete { samples, .. } => {
                             let dur = samples.len() as f32 / sample_rate as f32;
                             debug!("AudioTransport: utterance complete ({dur:.1}s)");
-                            let wav = encode_wav(&samples, sample_rate);
+                            let wav = encode_mono_f32(&samples, sample_rate);
                             let msg = build_message(wav, &agent_id);
                             if msg_tx.blocking_send(msg).is_err() {
                                 info!("AudioTransport: channel closed, exiting");
