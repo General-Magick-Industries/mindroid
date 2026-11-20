@@ -12,7 +12,7 @@
 //!   5. MagickmindPersistence — save response back to MagickMind
 //!
 //! Run with:
-//!   cargo run --example magickmind_cli --features full -- --config examples/magickmind_cli/config.toml
+//!   cargo run -p mindroid-example-magickmind-cli --bin magickmind_cli -- --config examples/magickmind_cli/config.toml
 
 use std::sync::Arc;
 

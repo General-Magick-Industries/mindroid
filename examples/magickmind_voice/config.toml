@@ -1,5 +1,5 @@
 # Magickmind Voice Agent configuration
-# Run with: cargo run --example magickmind_voice --features full -- --config examples/magickmind_voice/config.toml
+# Run with: cargo run -p mindroid-example-magickmind-voice --bin magickmind_voice -- --config examples/magickmind_voice/config.toml
 
 [agent]
 agent_id = "example-agent-id"          # Centrifugo channel / MagickMind agent ID

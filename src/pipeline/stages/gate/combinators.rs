@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 
-use crate::core::context::Context;
+use crate::core::{agent_loop::GatePass, context::Context};
 use crate::{PipelineStage, Result};
 
 use super::Gate;
@@ -36,7 +36,7 @@ impl PipelineStage for OrGate {
             });
             if passed {
                 // At least one gate passed — let the message through.
-                ctx.response = Some(ctx.message.content.clone());
+                GatePass::echo(ctx);
                 return Ok(());
             }
         }
@@ -75,7 +75,7 @@ impl PipelineStage for AndGate {
                 return Ok(());
             }
         }
-        ctx.response = Some(ctx.message.content.clone());
+        GatePass::echo(ctx);
         Ok(())
     }
 }

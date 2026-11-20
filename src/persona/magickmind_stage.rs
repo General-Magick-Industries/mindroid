@@ -36,7 +36,7 @@ use crate::pipeline::PipelineStage;
 /// ## Caching and degradation
 ///
 /// Prepared prompts are cached per `(persona_id, user_id)` for [`with_ttl`]
-/// (default 10 minutes) so voice/chat turns don't hit MagickMind on every
+/// (default 5 minutes) so voice/chat turns don't hit MagickMind on every
 /// message. If a re-fetch fails, the last-good (stale) prompt is served so a
 /// persona-service outage degrades gracefully instead of dropping messages.
 /// With a TTL of zero, caching is disabled entirely: every message fetches
@@ -97,8 +97,10 @@ impl MagickmindPersonaStage {
         }
     }
 
-    /// Default prepared-prompt cache TTL in seconds (10 minutes).
-    pub const DEFAULT_TTL_SECS: u64 = 600;
+    /// Default prepared-prompt cache TTL in seconds (5 minutes), the persona
+    /// service's freshness limit for an evolved personality. This route's
+    /// response carries no `ttl_seconds` of its own.
+    pub const DEFAULT_TTL_SECS: u64 = 300;
 
     /// Total HTTP request timeout in seconds. The prepare call gates message
     /// processing, so a hung server must not stall pipelines indefinitely.
@@ -113,7 +115,7 @@ impl MagickmindPersonaStage {
         self
     }
 
-    /// Override the prepared-prompt cache TTL (default 10 minutes).
+    /// Override the prepared-prompt cache TTL (default 5 minutes).
     ///
     /// A TTL of zero disables caching: every message re-fetches from
     /// MagickMind, nothing is stored, and there is no stale fallback.
@@ -144,7 +146,7 @@ impl MagickmindPersonaStage {
 
         match self.prepare(persona_id, user_id).await {
             Ok(prompt) => {
-                self.cache.insert(key, prompt.clone());
+                self.cache.insert_with_server_ttl(key, prompt.clone(), None);
                 Ok(prompt)
             }
             Err(e) => {
@@ -204,6 +206,7 @@ impl MagickmindPersonaStage {
             })?;
 
         let status = resp.status();
+        crate::core::net::note_auth_status(self.identity.as_ref(), status);
         if !status.is_success() {
             let text = crate::core::net::error_excerpt(&resp.text().await.unwrap_or_default());
             return Err(MindroidError::Api {
@@ -253,7 +256,11 @@ impl PipelineStage for MagickmindPersonaStage {
             messages.len(),
         );
 
+        let current_user = messages.len() - 1;
         ctx.llm_messages = messages;
+        ctx.set(crate::pipeline::extensions::CurrentUserMessage(
+            current_user,
+        ));
 
         Ok(())
     }
@@ -314,13 +321,13 @@ mod tests {
     }
 
     #[test]
-    fn default_ttl_is_ten_minutes() {
+    fn default_ttl_is_the_freshness_limit() {
         let s = MagickmindPersonaStage::new(
             "https://x",
             "p1",
             Arc::new(crate::auth::static_id::StaticAuth::new("t")),
         );
-        assert_eq!(s.cache.ttl(), Duration::from_secs(600));
+        assert_eq!(s.cache.ttl(), Duration::from_secs(300));
     }
 
     #[test]
