@@ -10,6 +10,10 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- `CorpusTool::with_query_mode(QueryMode)` sends a retrieval mode with every
+  corpus query; unset, the backend picks its own. `QueryMode::Naive` returns
+  source passages only. The default graph modes put entity and relationship
+  summaries first, which can push the passages past the 16 KiB result cap.
 - Tool results that carry images. `Tool::execute_with_images` returns a
   `ToolOutput` (text plus `ToolImage`s); its default is `execute`'s text and no
   images. `OmniSession` sends a tool's images to the new
@@ -695,6 +699,8 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
   keeps the same API; `rusqlite` is not part of this crate's public surface.
 - `openssl` 0.10.76 → 0.10.82 in `Cargo.lock` (RUSTSEC-2026-0463, -0473 to
   -0479). A lockfile-only update.
+- `quinn-udp` 0.5.14 → 0.5.16 in `Cargo.lock` (RUSTSEC-2026-0538: the receive
+  loop could spin after a truncated datagram). A lockfile-only update.
 
 ## [0.0.2-a.1] — 2026-08-06
 
