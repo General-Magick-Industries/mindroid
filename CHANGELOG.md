@@ -300,9 +300,10 @@ mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 `input_tokens` and `input_audio_tokens` the provider served from its prompt
 cache, which it bills at a lower rate. OpenAI Realtime fills them from
 `input_token_details.cached_tokens` and its audio detail; Gemini Live from
-`cachedContentTokenCount` and the audio entry of `cacheTokensDetails`. A
-`Usage { .. }` literal outside this crate needs the new fields, or
-`..Usage::default()`.
+`cachedContentTokenCount` and the audio entry of `cacheTokensDetails`. `Usage`
+is now `#[non_exhaustive]`, so later counters are not breaking: outside this
+crate, start from `Usage::default()` and set fields instead of writing a
+`Usage { .. }` literal.
 
 ### Added
 

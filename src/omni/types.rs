@@ -25,6 +25,7 @@ pub enum TranscriptSource {
 /// The cached counts are subsets of `input_tokens` and `input_audio_tokens`:
 /// input the provider served from its prompt cache and bills at a lower rate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
