@@ -642,6 +642,8 @@ parsing the event stream sees it as a string field. Both loop events carry
   keeps the same API; `rusqlite` is not part of this crate's public surface.
 - `openssl` 0.10.76 → 0.10.82 in `Cargo.lock` (RUSTSEC-2026-0463, -0473 to
   -0479). A lockfile-only update.
+- `quinn-udp` 0.5.14 → 0.5.16 in `Cargo.lock` (RUSTSEC-2026-0538: the receive
+  loop could spin after a truncated datagram). A lockfile-only update.
 
 ## [0.0.2-a.1] — 2026-08-06
 

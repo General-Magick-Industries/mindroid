@@ -29,6 +29,7 @@ pub struct CorpusCatalog(pub Vec<CorpusCatalogEntry>);
 /// which can push the passages past the 16 KiB result cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum QueryMode {
     Naive,
     Local,
