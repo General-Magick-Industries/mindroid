@@ -49,7 +49,7 @@ Default: `llm-local` only. Use `--all-features` for full build/test.
 | `transport-ws` | `tokio-tungstenite` | `CentrifugoTransport` |
 | `omni-gemini` | `tokio-tungstenite`, `base64` | `GeminiLiveProvider`, `GeminiLiveConfig`, `gemini::tool_declarations` |
 | `omni-openai` | `tokio-tungstenite`, `base64` | `OpenAiRealtimeProvider`, `OpenAiRealtimeConfig`, `openai_realtime::tool_declarations` |
-| `transport-audio` | `cpal`, `hound`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage` |
+| `transport-audio` | `cpal`, `rodio`, VAD | `AudioTransport`, `AudioOutputStage` |
 | `speech` | `reqwest` | `OpenAiStt`, `DeepgramTts`, etc. |
 | `apikey` | `reqwest` | `ApiKeyAuth` |
 | `persistence` | `reqwest`, `rusqlite` | `SqliteMemory`, `MagickmindMemory` |
@@ -220,7 +220,9 @@ async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>
 A tool whose result includes images (a camera, a screenshot) also overrides
 `execute_with_images`. Only `OmniSession` sends those images, through
 `OmniProvider::send_tool_result_with_images`: Gemini Live puts them in the
-function response's `parts`, and providers without image support drop them.
+function response's `parts`, OpenAI Realtime sends them as a user message of
+`input_image` parts after the text output, and providers without image support
+drop them and say so in the result.
 
 `ctx` carries the **trusted** per-message `channel_id` / `sender_id` plus a typed
 extension map for backend data (credentials, agent id) set by a stage. Never take
@@ -351,7 +353,7 @@ src/
 │   ├── combinators.rs  # Branch/Router/Retry/Approval (+ Parallel/Fusion)
 │   ├── context.rs  # ContextPreparer, ContextProvider
 │   └── coordination.rs  # EngagementTracker (multi-agent)
-├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio source/sink, VAD (ADR-0003)
+├── omni/           # OmniSession, OmniProvider, gemini (Live), openai_realtime, audio (source/sink, resample, WAV, speech detector), VAD (ADR-0003)
 ├── artifacts/      # ArtifactStore trait + local, magickmind, manager (ADR-0004, ADR-0009, ADR-0010)
 ├── ingest/         # Source/Encoder/MediaEncoder, Base64Source, ResolvedSource
 ├── memory/         # Memory trait + sqlite, magickmind impls

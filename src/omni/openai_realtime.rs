@@ -7,8 +7,8 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -23,11 +23,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::warn;
 
 use crate::core::error::MindroidError;
+use crate::omni::audio::Resampler;
 use crate::omni::provider::OmniProvider;
 use crate::omni::types::{
     AudioChunk, HistoryTurn, OmniConfig, OmniEvent, Role, TranscriptSource, TurnDetection, Usage,
 };
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolImage};
 
 /// OpenAI Realtime WebSocket endpoint; a LiteLLM passthrough works at `/v1/realtime` too.
 pub const DEFAULT_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
@@ -184,6 +185,8 @@ pub struct OpenAiRealtimeProvider {
     manual_turns: bool,
     /// Bytes appended since the last commit. An empty commit is a server error.
     uncommitted: Arc<AtomicUsize>,
+    /// Brings capture down to [`SAMPLE_RATE`], rebuilt when the capture rate changes.
+    capture: Mutex<Option<Resampler>>,
     tasks: JoinSet<()>,
 }
 
@@ -195,8 +198,40 @@ impl OpenAiRealtimeProvider {
             events: None,
             manual_turns: false,
             uncommitted: Arc::new(AtomicUsize::new(0)),
+            capture: Mutex::new(None),
             tasks: JoinSet::new(),
         }
+    }
+
+    /// The chunk's PCM at [`SAMPLE_RATE`]. A capture rate that is not an integer
+    /// multiple is refused loudly rather than sent at the wrong pitch — which the
+    /// server accepts without complaint and then fails to understand a word of.
+    fn to_wire_rate<'a>(&self, chunk: &'a AudioChunk) -> Result<Cow<'a, [u8]>, MindroidError> {
+        if chunk.sample_rate == SAMPLE_RATE {
+            return Ok(Cow::Borrowed(&chunk.data));
+        }
+        let mut capture = self.capture.lock().unwrap_or_else(PoisonError::into_inner);
+        let resampler = match capture.take() {
+            Some(r) if r.from_rate() == chunk.sample_rate => capture.insert(r),
+            _ => {
+                capture.insert(Resampler::new(chunk.sample_rate, SAMPLE_RATE).map_err(|e| {
+                    transport(format!("capture rate {e}; resample before send_audio"))
+                })?)
+            }
+        };
+        let mut out = Vec::with_capacity(chunk.data.len() / 2);
+        resampler.process(
+            chunk
+                .data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b)),
+            &mut out,
+        );
+        Ok(Cow::Owned(
+            out.iter().flat_map(|s| s.to_le_bytes()).collect(),
+        ))
     }
 
     fn session_update(&self, config: &OmniConfig) -> Value {
@@ -264,6 +299,10 @@ impl OpenAiRealtimeProvider {
 impl OmniProvider for OpenAiRealtimeProvider {
     async fn connect(&mut self, config: &OmniConfig) -> Result<(), MindroidError> {
         self.manual_turns = matches!(config.turn_detection, TurnDetection::Manual);
+        *self
+            .capture
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
 
         if self.config.endpoint.starts_with("ws://") && !self.config.allow_insecure {
             return Err(transport(
@@ -361,7 +400,7 @@ impl OmniProvider for OpenAiRealtimeProvider {
     }
 
     async fn send_audio(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
-        let data = downsample_to(&chunk.data, chunk.sample_rate, SAMPLE_RATE)?;
+        let data = self.to_wire_rate(&chunk)?;
         self.uncommitted.fetch_add(data.len(), Ordering::Relaxed);
         self.send_json(json!({
             "type": "input_audio_buffer.append",
@@ -384,6 +423,18 @@ impl OmniProvider for OpenAiRealtimeProvider {
     }
 
     async fn send_tool_result(&self, call_id: &str, result: Value) -> Result<(), MindroidError> {
+        self.send_tool_result_with_images(call_id, result, Vec::new())
+            .await
+    }
+
+    /// A `function_call_output` carries text only, so images follow it as a
+    /// user message of `input_image` parts, before the one `response.create`.
+    async fn send_tool_result_with_images(
+        &self,
+        call_id: &str,
+        result: Value,
+        images: Vec<ToolImage>,
+    ) -> Result<(), MindroidError> {
         // `output` must be a string; anything structured is serialized.
         let output = match result {
             Value::String(s) => s,
@@ -394,6 +445,26 @@ impl OmniProvider for OpenAiRealtimeProvider {
             "item": { "type": "function_call_output", "call_id": call_id, "output": output },
         }))
         .await?;
+        if !images.is_empty() {
+            let content: Vec<Value> = images
+                .iter()
+                .map(|image| {
+                    json!({
+                        "type": "input_image",
+                        "image_url": format!(
+                            "data:{};base64,{}",
+                            image.mime_type,
+                            STANDARD.encode(&image.data)
+                        ),
+                    })
+                })
+                .collect();
+            self.send_json(json!({
+                "type": "conversation.item.create",
+                "item": { "type": "message", "role": "user", "content": content },
+            }))
+            .await?;
+        }
         self.send_json(json!({ "type": "response.create" })).await
     }
 
@@ -468,38 +539,6 @@ fn history_item(turn: &HistoryTurn) -> Value {
     })
 }
 
-/// Integer-ratio decimation by averaging each group of `from / to` samples.
-///
-/// Interim until the crate has a real resampler. A non-integer ratio is refused
-/// loudly rather than sent at the wrong pitch — which the server accepts without
-/// complaint and then fails to understand a word of.
-fn downsample_to(pcm: &[u8], from: u32, to: u32) -> Result<Cow<'_, [u8]>, MindroidError> {
-    if from == to {
-        return Ok(Cow::Borrowed(pcm));
-    }
-    if from == 0 || to == 0 || !from.is_multiple_of(to) {
-        return Err(transport(format!(
-            "capture rate {from} Hz is not an integer multiple of {to} Hz; resample before send_audio"
-        )));
-    }
-    let n = (from / to) as usize;
-    let samples: Vec<i16> = pcm
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .copied()
-        .map(i16::from_le_bytes)
-        .collect();
-    let out: Vec<u8> = samples
-        .chunks_exact(n)
-        .flat_map(|group| {
-            let avg = group.iter().map(|&s| i32::from(s)).sum::<i32>() / n as i32;
-            (avg as i16).to_le_bytes()
-        })
-        .collect();
-    Ok(Cow::Owned(out))
-}
-
 fn frame_to_json(frame: WsMessage) -> Option<Value> {
     let bytes = match frame {
         WsMessage::Text(text) => text.into_bytes(),
@@ -555,6 +594,10 @@ fn parse_server_event(value: &Value) -> Vec<OmniEvent> {
                     output_tokens: n("/output_tokens"),
                     input_audio_tokens: n("/input_token_details/audio_tokens"),
                     output_audio_tokens: n("/output_token_details/audio_tokens"),
+                    cached_input_tokens: n("/input_token_details/cached_tokens"),
+                    cached_input_audio_tokens: n(
+                        "/input_token_details/cached_tokens_details/audio_tokens",
+                    ),
                 }));
             }
             // Tool calls are surfaced here, not at `function_call_arguments.done`:
@@ -968,6 +1011,44 @@ mod tests {
         assert_eq!(create["type"], "response.create");
     }
 
+    #[tokio::test]
+    async fn tool_result_images_follow_the_output_as_a_user_message() {
+        let (provider, mut seen, _) = connected(|_| vec![]).await;
+        let _update = seen.recv().await;
+
+        provider
+            .send_tool_result_with_images(
+                "call_7",
+                json!("photo taken"),
+                vec![
+                    ToolImage::new("image/jpeg", vec![1, 2, 3]),
+                    ToolImage::new("image/png", vec![4]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let output = seen.recv().await.expect("function_call_output");
+        assert_eq!(output["item"]["type"], "function_call_output");
+        assert_eq!(output["item"]["call_id"], "call_7");
+        assert_eq!(output["item"]["output"], "photo taken");
+
+        let images = seen.recv().await.expect("image message");
+        assert_eq!(images["type"], "conversation.item.create");
+        assert_eq!(images["item"]["type"], "message");
+        assert_eq!(images["item"]["role"], "user");
+        assert_eq!(
+            images["item"]["content"],
+            json!([
+                { "type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", STANDARD.encode([1u8, 2, 3])) },
+                { "type": "input_image", "image_url": format!("data:image/png;base64,{}", STANDARD.encode([4u8])) },
+            ])
+        );
+
+        let create = seen.recv().await.expect("response.create");
+        assert_eq!(create["type"], "response.create");
+    }
+
     #[test]
     fn audio_delta_decodes_at_24k() {
         let events = parse_server_event(&json!({
@@ -1164,19 +1245,32 @@ mod tests {
         provider.disconnect().await.unwrap();
     }
 
-    #[test]
-    fn downsample_passes_matching_rate_through_unchanged() {
-        let pcm = [1u8, 0, 2, 0, 3, 0];
-        let out = downsample_to(&pcm, 24_000, 24_000).unwrap();
-        assert!(matches!(out, Cow::Borrowed(_)));
-        assert_eq!(&*out, &pcm);
+    fn capture(data: Vec<u8>, sample_rate: u32) -> AudioChunk {
+        AudioChunk {
+            data,
+            sample_rate,
+            channels: 1,
+            bits_per_sample: 16,
+        }
     }
 
     #[test]
-    fn downsample_48k_to_24k_averages_pairs() {
-        let samples: [i16; 4] = [100, 300, 500, 700];
-        let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let out = downsample_to(&pcm, 48_000, 24_000).unwrap();
+    fn downsample_passes_matching_rate_through_unchanged() {
+        let provider = OpenAiRealtimeProvider::new(OpenAiRealtimeConfig::new("k"));
+        let chunk = capture(vec![1, 0, 2, 0, 3, 0], 24_000);
+        let out = provider.to_wire_rate(&chunk).unwrap();
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(&*out, &chunk.data[..]);
+    }
+
+    #[test]
+    fn downsample_48k_to_24k_halves_the_samples_and_keeps_dc() {
+        let provider = OpenAiRealtimeProvider::new(OpenAiRealtimeConfig::new("k"));
+        let pcm: Vec<u8> = std::iter::repeat_n(1_000i16, 960)
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let chunk = capture(pcm, 48_000);
+        let out = provider.to_wire_rate(&chunk).unwrap();
         let got: Vec<i16> = out
             .as_chunks::<2>()
             .0
@@ -1184,12 +1278,16 @@ mod tests {
             .copied()
             .map(i16::from_le_bytes)
             .collect();
-        assert_eq!(got, vec![200, 600]);
+        assert_eq!(got.len(), 480);
+        assert!(got[64..].iter().all(|&s| (999..=1_001).contains(&s)));
     }
 
     #[test]
     fn downsample_refuses_non_integer_ratio() {
-        let err = downsample_to(&[0u8; 8], 44_100, 24_000).unwrap_err();
+        let provider = OpenAiRealtimeProvider::new(OpenAiRealtimeConfig::new("k"));
+        let err = provider
+            .to_wire_rate(&capture(vec![0u8; 8], 44_100))
+            .unwrap_err();
         assert!(err.to_string().contains("integer multiple"), "got: {err}");
     }
 
@@ -1278,7 +1376,10 @@ mod tests {
             "type": "response.done",
             "response": { "usage": {
                 "input_tokens": 120, "output_tokens": 45,
-                "input_token_details": { "audio_tokens": 100, "text_tokens": 20 },
+                "input_token_details": {
+                    "audio_tokens": 100, "text_tokens": 20, "cached_tokens": 64,
+                    "cached_tokens_details": { "audio_tokens": 48, "text_tokens": 16 },
+                },
                 "output_token_details": { "audio_tokens": 40, "text_tokens": 5 },
             }}
         }));
@@ -1287,6 +1388,8 @@ mod tests {
             output_tokens: 45,
             input_audio_tokens: 100,
             output_audio_tokens: 40,
+            cached_input_tokens: 64,
+            cached_input_audio_tokens: 48,
         };
         assert!(
             matches!(events[0], OmniEvent::Usage(u) if u == want),

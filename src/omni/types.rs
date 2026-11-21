@@ -21,12 +21,17 @@ pub enum TranscriptSource {
 }
 
 /// Token accounting for one turn, as the provider reports it.
+///
+/// The cached counts are subsets of `input_tokens` and `input_audio_tokens`:
+/// input the provider served from its prompt cache and bills at a lower rate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub input_audio_tokens: u64,
     pub output_audio_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cached_input_audio_tokens: u64,
 }
 
 impl std::ops::AddAssign for Usage {
@@ -35,6 +40,8 @@ impl std::ops::AddAssign for Usage {
         self.output_tokens += o.output_tokens;
         self.input_audio_tokens += o.input_audio_tokens;
         self.output_audio_tokens += o.output_audio_tokens;
+        self.cached_input_tokens += o.cached_input_tokens;
+        self.cached_input_audio_tokens += o.cached_input_audio_tokens;
     }
 }
 

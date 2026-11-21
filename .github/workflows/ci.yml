@@ -163,8 +163,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned: Rust 1.100's build-dir layout breaks ort-sys 2.0.0-rc.10's
+      # build script, which voice_activity_detector pins exactly. Unpin when
+      # that dependency moves past rc.10.
       - if: needs.changes.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
 
