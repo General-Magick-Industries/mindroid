@@ -15,7 +15,7 @@ pub mod shell;
 pub mod untrusted;
 
 #[cfg(all(feature = "magickmind", feature = "llm-hosted"))]
-pub use corpus::{CorpusCatalog, CorpusTool};
+pub use corpus::{CorpusCatalog, CorpusTool, QueryMode};
 pub use delegation::DelegationTool;
 #[cfg(feature = "artifacts")]
 pub use get_artifact::{GET_ARTIFACT_TOOL, GetArtifactTool};

@@ -10,6 +10,10 @@ listed under **Breaking Changes** with a migration note.
 
 ### Added
 
+- `CorpusTool::with_query_mode(QueryMode)` sends a retrieval mode with every
+  corpus query; unset, the backend picks its own. `QueryMode::Naive` returns
+  source passages only. The default graph modes put entity and relationship
+  summaries first, which can push the passages past the 16 KiB result cap.
 - Tool results that carry images. `Tool::execute_with_images` returns a
   `ToolOutput` (text plus `ToolImage`s); its default is `execute`'s text and no
   images. `OmniSession` sends a tool's images to the new
@@ -17,7 +21,9 @@ listed under **Breaking Changes** with a migration note.
   bytes' type replaces the declared one, and an image a model would not take,
   one over 2 MiB, or one past the fourth is dropped, with a note in the result's
   text. `GeminiLiveProvider` sends them as `inlineData` in the function
-  response's `parts`; the default, for every other provider, says in the result
+  response's `parts`; `OpenAiRealtimeProvider` sends them as a user message of
+  `input_image` parts right after the `function_call_output`, since that output
+  carries text only; the default, for every other provider, says in the result
   that they could not be shown. `ToolOutput` and `ToolImage` are
   `#[non_exhaustive]`: build them with `ToolOutput::new(..).with_images(..)` and
   `ToolImage::new`.
@@ -289,7 +295,17 @@ mindroid::omni::audio::wav::encode_mono_f32(&samples, 16_000)
 mindroid::omni::audio::wav::encode_pcm16(&pcm_le_bytes, 16_000, channels)
 ```
 
-#### 12. `ApiKeyAuth::try_new` refuses more base URLs
+#### 12. `omni::Usage` reports cached input
+
+`Usage` gained `cached_input_tokens` and `cached_input_audio_tokens`: the part of
+`input_tokens` and `input_audio_tokens` the provider served from its prompt
+cache, which it bills at a lower rate. OpenAI Realtime fills them from
+`input_token_details.cached_tokens` and its audio detail; Gemini Live from
+`cachedContentTokenCount` and the audio entry of `cacheTokensDetails`. A
+`Usage { .. }` literal outside this crate needs the new fields, or
+`..Usage::default()`.
+
+#### 13. `ApiKeyAuth::try_new` refuses more base URLs
 
 It decided a URL was plaintext with `starts_with("http://")`, so `HTTP://host`
 passed and the API key went out unencrypted. It now uses the same
@@ -300,7 +316,7 @@ instead of refusing.
 **Migration:** use an `https://` base URL. For a local plaintext gateway, pass
 `allow_insecure` (`auth.allow_insecure` in config).
 
-#### 13. An end-user `agent_id` must match the token subject
+#### 14. An end-user `agent_id` must match the token subject
 
 On the end-user route, an `agent_id` that differed from the token's `sub` only
 logged a warning, and the agent listened on a channel that belongs to a
@@ -760,6 +776,8 @@ fails at connect.
   with `0600`. Windows is unchanged. Only directories and files it creates get
   the new modes: tighten an existing store yourself, for example
   `chmod -R go-rwx <base>`.
+- `quinn-udp` 0.5.14 → 0.5.16 in `Cargo.lock` (RUSTSEC-2026-0538: the receive
+  loop could spin after a truncated datagram). A lockfile-only update.
 
 ## [0.0.2-a.1] — 2026-08-06
 
