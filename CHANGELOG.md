@@ -64,7 +64,8 @@ listed under **Breaking Changes** with a migration note.
   attachments; `prepare_context` drops it because the caller appends it itself.
 - `ArtifactStore::load_bounded`, a load that fails for an artifact over a size.
   The default loads and then checks; `LocalArtifactStore` and
-  `MagickmindArtifactStore` stop reading at the limit.
+  `MagickmindArtifactStore` stop reading at the limit. An override should fail
+  with `artifacts::exceeds`, so callers can tell too large from missing.
 
 - `MagickmindArtifactStore` (feature `magickmind`): an `ArtifactStore` on Magick Mind's
   artifact service. Uploads go into a magickspace through presign, PUT and finalize;
@@ -304,6 +305,31 @@ cache, which it bills at a lower rate. OpenAI Realtime fills them from
 `Usage { .. }` literal outside this crate needs the new fields, or
 `..Usage::default()`.
 
+#### 13. `ApiKeyAuth::try_new` refuses more base URLs
+
+It decided a URL was plaintext with `starts_with("http://")`, so `HTTP://host`
+passed and the API key went out unencrypted. It now uses the same
+`require_secure_url` check as `EndUserAuth`, which also refuses `ftp://`,
+`file://` and any URL it cannot parse. `ApiKeyAuth::new` warns for the same set
+instead of refusing.
+
+**Migration:** use an `https://` base URL. For a local plaintext gateway, pass
+`allow_insecure` (`auth.allow_insecure` in config).
+
+#### 14. An end-user `agent_id` must match the token subject
+
+On the end-user route, an `agent_id` that differed from the token's `sub` only
+logged a warning, and the agent listened on a channel that belongs to a
+different identity. The handshake now fails with a `Config` error before the
+WebSocket opens, and the Centrifugo listener stops with `Health::Stopped`
+instead of retrying. Only this mismatch stops the listener; any other handshake
+error, including a `Config` error from a host's `Auth::get_token`, still backs
+off and retries.
+
+**Migration:** set `agent_id` to the end user's id, the token's `sub`. A host
+with a custom `ChannelNaming` that ignored `agent_id` connected before and now
+fails at connect.
+
 ### Added
 
 - **`PreparedContext::push_agent_turn`.** Appends the reply a turn just
@@ -523,6 +549,31 @@ cache, which it bills at a lower rate. OpenAI Realtime fills them from
 
 ### Fixed
 
+- `get_artifact` re-attachment could push a request past an endpoint's body cap
+  (Bifrost refuses over 1 MiB, failing the turn with a 413): it loaded each
+  artifact whole (up to 64 MiB) and sent an image again even when the turn
+  already carried it. With `InlineArtifacts` in the pipeline, both executors now
+  re-attach within what is left of its `with_max_bytes` allowance, shared across
+  every round of the turn, skip an image already in the conversation, and tell
+  the model why anything was not attached. A repeat request for something that
+  could not be shown is answered without loading it again. Without
+  `InlineArtifacts` there is no byte bound, as before.
+
+- A scoped `get_artifact` downloaded the whole artifact just to confirm it
+  existed; `ArtifactManager::load_described` now checks with a zero-byte bound.
+
+- `InlineArtifacts` tells the model it can see images on turns where it inlined
+  one, as a sentence in the system prompt (or a system message of its own when
+  there is none). With a persona prompt, gpt-4o-mini otherwise answered "I can't
+  see the photo" about an image in the same request.
+
+- Artifact labels are hardened against participant-authored text: file names
+  and metadata escape `< > &` and fold layout controls, each field is capped
+  after escaping, and a reference renders at most 8 metadata keys and 1 KiB.
+
+- `MagickmindArtifactStore` refuses redirects, which kept the bearer on a
+  same-host https to http hop, and reports a bounded excerpt of an error body.
+
 - Builds without `transport-audio` failed with three unresolved `tts` imports. A
   `cfg` attribute left behind when a re-export was removed gated `pipeline::stages::tts`
   on `transport-audio`, while its re-exports still compiled without it.
@@ -711,8 +762,24 @@ cache, which it bills at a lower rate. OpenAI Realtime fills them from
   keeps the same API; `rusqlite` is not part of this crate's public surface.
 - `openssl` 0.10.76 → 0.10.82 in `Cargo.lock` (RUSTSEC-2026-0463, -0473 to
   -0479). A lockfile-only update.
+- `ApiKeyAuth` refuses redirects, in its own client and its fallback. Its login
+  and refresh calls carry the account credentials, which a redirecting gateway
+  would have replayed to wherever `Location` pointed. A redirect now fails the
+  call, as it already did for the crate's other credential-bearing clients.
+- `to_stored` writes a single text part that begins with `STRUCTURED_PREFIX` in
+  structured form, so it reads back as the same text. Before, `from_stored` read
+  such text as real content parts, so a user could plant image URIs that reached
+  the model provider. Every other message is stored byte for byte as before, and
+  existing rows read the same. `MemoryPersistence` now saves both turns through
+  `to_stored`; it used to bypass it when no `ArtifactOffload` stage ran.
+- On Unix, `LocalArtifactStore` creates directories with mode `0700` and files
+  with `0600`. Windows is unchanged. Only directories and files it creates get
+  the new modes: tighten an existing store yourself, for example
+  `chmod -R go-rwx <base>`.
 - `quinn-udp` 0.5.14 → 0.5.16 in `Cargo.lock` (RUSTSEC-2026-0538: the receive
   loop could spin after a truncated datagram). A lockfile-only update.
+- `url` 2.5.8 → 2.5.9 in `Cargo.lock` (RUSTSEC-2026-0592: `Url::origin()` could
+  overflow the stack on nested `blob:` URLs). A lockfile-only update.
 
 ## [0.0.2-a.1] — 2026-08-06
 
