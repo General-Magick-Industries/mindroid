@@ -778,6 +778,8 @@ fails at connect.
   `chmod -R go-rwx <base>`.
 - `quinn-udp` 0.5.14 → 0.5.16 in `Cargo.lock` (RUSTSEC-2026-0538: the receive
   loop could spin after a truncated datagram). A lockfile-only update.
+- `url` 2.5.8 → 2.5.9 in `Cargo.lock` (RUSTSEC-2026-0592: `Url::origin()` could
+  overflow the stack on nested `blob:` URLs). A lockfile-only update.
 
 ## [0.0.2-a.1] — 2026-08-06
 
