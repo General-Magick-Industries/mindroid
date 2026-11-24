@@ -51,6 +51,12 @@ type ProviderFactory = Box<dyn Fn() -> Box<dyn OmniProvider> + Send + Sync>;
 /// The microphone is unpolled for this long at worst.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a microphone may send nothing before the gate sends silence for it.
+/// A client that mutes its microphone during a reply sends no frames at all, and
+/// a provider closes a session it hears nothing from.
+const MIC_GAP: Duration = Duration::from_secs(1);
+const SILENCE: Duration = Duration::from_millis(100);
+
 /// One session's audio, fed by the gate. `stream()` ends when the gate closes it.
 struct ChannelAudioSource {
     rx: Mutex<Option<mpsc::Receiver<AudioChunk>>>,
@@ -208,6 +214,13 @@ impl VoiceGate {
         let mut preroll_bytes = 0usize;
         let mut live: Option<Live> = None;
         let mut last_speech = Instant::now();
+        let mut silence_due = Instant::now();
+        let silence = AudioChunk {
+            data: vec![0; bytes_per_ms * SILENCE.as_millis() as usize],
+            sample_rate: rate,
+            channels,
+            bits_per_sample: 16,
+        };
         let mut opened = 0usize;
         tracing::info!("voice gate: waiting for speech");
 
@@ -276,6 +289,7 @@ impl VoiceGate {
                     if matches!(decision, VadDecision::SpeechStarted | VadDecision::SpeechContinues) {
                         last_speech = Instant::now();
                     }
+                    silence_due = Instant::now() + MIC_GAP;
                     match live.as_ref() {
                         Some(l) => {
                             if l.tx.try_send(chunk).is_err() {
@@ -295,6 +309,17 @@ impl VoiceGate {
                                 live = Some(self.open(rate, channels, replay, opened)?);
                             }
                         }
+                    }
+                }
+
+                // Off without an idle timeout, where silence would hold open a
+                // session only the provider can end.
+                _ = tokio::time::sleep_until(silence_due),
+                    if live.is_some() && self.idle_timeout.is_some() =>
+                {
+                    silence_due = Instant::now() + SILENCE;
+                    if let Some(l) = live.as_ref() {
+                        let _ = l.tx.try_send(silence.clone());
                     }
                 }
             }
@@ -868,6 +893,61 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(30)).await;
         tracker.play(reply(Duration::from_secs(240))).await.unwrap();
         assert_eq!(idle.await.unwrap().as_secs(), 30 + 240 + 60);
+    }
+
+    /// Speaks, then sends nothing at all for `muted` before closing.
+    struct Muting {
+        muted: Duration,
+    }
+
+    impl AudioSource for Muting {
+        fn stream(&self) -> Pin<Box<dyn Stream<Item = AudioChunk> + Send + '_>> {
+            let muted = self.muted;
+            Box::pin(
+                futures::stream::iter([chunk(1), chunk(1)]).chain(futures::stream::once(
+                    async move {
+                        tokio::time::sleep(muted).await;
+                        chunk(1)
+                    },
+                )),
+            )
+        }
+
+        fn sample_rate(&self) -> u32 {
+            16_000
+        }
+    }
+
+    /// The silence a session hears from a microphone muted for 1.6 s.
+    async fn silence_heard(idle: Option<Duration>) -> usize {
+        let opened: Opened = Arc::default();
+        let mut g = gate(vec![], Duration::from_secs(5), &opened);
+        g.audio_source = Arc::new(Muting {
+            muted: Duration::from_millis(1600),
+        });
+        g.idle_timeout = idle;
+        run_gate(g).await;
+
+        let opened = opened.lock().unwrap();
+        assert_eq!(opened.len(), 1, "one session throughout");
+        let heard = opened[0].0.lock().unwrap();
+        let silence: Vec<_> = heard.iter().filter(|c| c.data.len() == 3200).collect();
+        assert!(silence.iter().all(|c| c.data.iter().all(|&b| b == 0)));
+        silence.len()
+    }
+
+    #[tokio::test]
+    async fn a_muted_microphone_sends_the_session_silence() {
+        let chunks = silence_heard(Some(Duration::from_secs(5))).await;
+        assert!(
+            (1..=7).contains(&chunks),
+            "100 ms apart after 1 s: {chunks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_only_the_provider_ends_gets_no_silence() {
+        assert_eq!(silence_heard(None).await, 0);
     }
 
     #[tokio::test]

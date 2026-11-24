@@ -552,6 +552,9 @@ fails at connect.
 - `VoiceGate`'s idle timer starts once the reply has finished playing, not at the
   person's last speech, so a long reply is no longer cut off mid-sentence. A
   barge-in starts it at once.
+- `VoiceGate` sends an open session silence once the microphone has sent nothing
+  for a second, so a client that mutes it during a long reply no longer has the
+  session closed for inactivity. Off under `provider_closes`.
 - `get_artifact` re-attachment could push a request past an endpoint's body cap
   (Bifrost refuses over 1 MiB, failing the turn with a 413): it loaded each
   artifact whole (up to 64 MiB) and sent an image again even when the turn
