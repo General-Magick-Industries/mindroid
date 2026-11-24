@@ -549,6 +549,9 @@ fails at connect.
 
 ### Fixed
 
+- `VoiceGate`'s idle timer starts once the reply has finished playing, not at the
+  person's last speech, so a long reply is no longer cut off mid-sentence. A
+  barge-in starts it at once.
 - `get_artifact` re-attachment could push a request past an endpoint's body cap
   (Bifrost refuses over 1 MiB, failing the turn with a 413): it loaded each
   artifact whole (up to 64 MiB) and sent an image again even when the turn
