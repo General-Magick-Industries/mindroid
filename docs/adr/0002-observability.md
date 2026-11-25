@@ -42,6 +42,11 @@ combinators are the right tool, because it is a linear read-only tap, not multi-
 
 - New cross-cutting concerns must be a middleware wrapper, an event on the stream, or a
   callback — never a new mutable registry (this is also an AGENTS.md anti-pattern).
+- [ADR-0007](0007-runtime-health.md) adds a fourth form for *level-triggered* state: a
+  single-producer `watch` channel. The three forms above are all edge-triggered, and none
+  can answer "what is the state right now?" without an observer shadowing its own copy —
+  which is the duplicated mutable state the registry ban exists to prevent. The ban itself
+  is unchanged.
 - `OmniSession` (ADR-0003) is observed through provider middleware + callbacks rather than
   `PipelineEvent`, because it is not a `Pipeline`.
 - The middleware pattern is where metrics/tracing hooks are added later without touching the

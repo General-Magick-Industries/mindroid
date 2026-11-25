@@ -3,7 +3,7 @@
 //! Uses Centrifugo transport + MagickMind context/memory + Ollama for inference.
 //! Same pipeline as `magickmind` but calls a local Ollama instance instead of Cortex.
 //!
-//! Run with: `cargo run --example magickmind_ollama --features full`
+//! Run with: `cargo run -p mindroid-example-magickmind-ollama --bin magickmind_ollama`
 //!
 //! Requires:
 //!   - Ollama running at http://localhost:11434 (or set OLLAMA_BASE_URL)

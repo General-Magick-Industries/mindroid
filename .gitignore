@@ -4,6 +4,10 @@
 # Environment and secrets
 .env*
 !.env.example
+# Example configs carry real provider API keys — keep them out of git.
+examples/artifact_agent/config.toml
+# Local artifact store + sqlite db produced by running the example.
+artifact-agent-store/
 
 # IDE / editor
 .zed/
@@ -16,6 +20,7 @@
 # AI tooling
 .claude/
 .omc/
+.omo/
 # AGENTS.md is intentionally committed — it is the shared, cross-tool source of
 # truth for agent + contributor guidance (see docs/adr/). CLAUDE.md imports it.
 
@@ -36,6 +41,9 @@ audit-output.txt
 *.db
 *.db-journal
 *.db-wal
+
+# Local run configs holding real credentials — never commit
+*.local.toml
 
 # Local review notes — not for publication
 pr26-*.md
