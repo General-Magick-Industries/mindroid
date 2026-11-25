@@ -3,7 +3,7 @@
 //! The microphone stays open and a local speech detector watches it. The first
 //! detected speech opens an [`OmniSession`], replaying the last moment of audio so
 //! the opening words are not lost. After [`idle_timeout`](VoiceGateBuilder::idle_timeout)
-//! without speech the session is closed, which flushes its transcripts to memory;
+//! without speech from either side the session is closed, which flushes its transcripts to memory;
 //! the next speech opens a fresh session that seeds that history back in. With
 //! [`provider_closes`](VoiceGateBuilder::provider_closes) the gate only ever opens:
 //! the session lives until the provider ends it, and the next speech reopens.
@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -50,6 +51,12 @@ type ProviderFactory = Box<dyn Fn() -> Box<dyn OmniProvider> + Send + Sync>;
 /// The microphone is unpolled for this long at worst.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a microphone may send nothing before the gate sends silence for it.
+/// A client that mutes its microphone during a reply sends no frames at all, and
+/// a provider closes a session it hears nothing from.
+const MIC_GAP: Duration = Duration::from_secs(1);
+const SILENCE: Duration = Duration::from_millis(100);
+
 /// One session's audio, fed by the gate. `stream()` ends when the gate closes it.
 struct ChannelAudioSource {
     rx: Mutex<Option<mpsc::Receiver<AudioChunk>>>,
@@ -79,6 +86,70 @@ impl AudioSource for ChannelAudioSource {
     }
 }
 
+/// Passes a reply through to the real sink, keeping when it will finish playing.
+/// Providers generate faster than real time, so that is later than the last chunk.
+struct PlaybackTracker {
+    inner: Arc<dyn AudioSink>,
+    ends: Mutex<Option<Instant>>,
+}
+
+impl PlaybackTracker {
+    fn new(inner: Arc<dyn AudioSink>) -> Self {
+        Self {
+            inner,
+            ends: Mutex::new(None),
+        }
+    }
+
+    fn ends(&self) -> Option<Instant> {
+        *self.ends.lock().expect("PlaybackTracker: mutex poisoned")
+    }
+}
+
+#[async_trait]
+impl AudioSink for PlaybackTracker {
+    async fn play(&self, chunk: AudioChunk) -> Result<(), MindroidError> {
+        {
+            let mut ends = self.ends.lock().expect("PlaybackTracker: mutex poisoned");
+            let now = Instant::now();
+            *ends = Some(ends.map_or(now, |at| at.max(now)) + duration(&chunk));
+        }
+        self.inner.play(chunk).await
+    }
+
+    async fn flush(&self) -> Result<(), MindroidError> {
+        self.inner.flush().await
+    }
+
+    async fn stop(&self) -> Result<(), MindroidError> {
+        {
+            let mut ends = self.ends.lock().expect("PlaybackTracker: mutex poisoned");
+            let now = Instant::now();
+            *ends = ends.map(|at| at.min(now));
+        }
+        self.inner.stop().await
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+}
+
+/// Resolves once neither side has spoken for `idle`. Re-reads the reply's end on
+/// each wake, since it moves while the gate is parked here.
+async fn idle_for(idle: Duration, last_speech: Instant, playback: Option<&PlaybackTracker>) {
+    loop {
+        let spoken = playback
+            .and_then(PlaybackTracker::ends)
+            .map_or(last_speech, |ends| ends.max(last_speech));
+        let deadline = spoken + idle;
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
 struct Live {
     tx: mpsc::Sender<AudioChunk>,
     cancel: CancellationToken,
@@ -93,7 +164,7 @@ pub struct VoiceGate {
     /// is present until then.
     detector: Option<Box<dyn SpeechDetector>>,
     audio_source: Arc<dyn AudioSource>,
-    audio_sink: Option<Arc<dyn AudioSink>>,
+    audio_sink: Option<Arc<PlaybackTracker>>,
     tools: Vec<Arc<dyn Tool>>,
     dynamic_tools: Option<(DynamicRegistry, DeclareTools)>,
     config: OmniConfig,
@@ -143,6 +214,13 @@ impl VoiceGate {
         let mut preroll_bytes = 0usize;
         let mut live: Option<Live> = None;
         let mut last_speech = Instant::now();
+        let mut silence_due = Instant::now();
+        let silence = AudioChunk {
+            data: vec![0; bytes_per_ms * SILENCE.as_millis() as usize],
+            sample_rate: rate,
+            channels,
+            bits_per_sample: 16,
+        };
         let mut opened = 0usize;
         tracing::info!("voice gate: waiting for speech");
 
@@ -176,7 +254,7 @@ impl VoiceGate {
                 // ends it: the arm is still declared, but `pending()` never resolves.
                 _ = async {
                     match self.idle_timeout {
-                        Some(d) => tokio::time::sleep_until(last_speech + d).await,
+                        Some(d) => idle_for(d, last_speech, self.audio_sink.as_deref()).await,
                         None => std::future::pending::<()>().await,
                     }
                 }, if live.is_some() => {
@@ -211,6 +289,7 @@ impl VoiceGate {
                     if matches!(decision, VadDecision::SpeechStarted | VadDecision::SpeechContinues) {
                         last_speech = Instant::now();
                     }
+                    silence_due = Instant::now() + MIC_GAP;
                     match live.as_ref() {
                         Some(l) => {
                             if l.tx.try_send(chunk).is_err() {
@@ -230,6 +309,17 @@ impl VoiceGate {
                                 live = Some(self.open(rate, channels, replay, opened)?);
                             }
                         }
+                    }
+                }
+
+                // Off without an idle timeout, where silence would hold open a
+                // session only the provider can end.
+                _ = tokio::time::sleep_until(silence_due),
+                    if live.is_some() && self.idle_timeout.is_some() =>
+                {
+                    silence_due = Instant::now() + SILENCE;
+                    if let Some(l) = live.as_ref() {
+                        let _ = l.tx.try_send(silence.clone());
                     }
                 }
             }
@@ -281,7 +371,7 @@ impl VoiceGate {
             .config(config)
             .cancel_token(cancel.clone());
         if let Some(s) = &self.audio_sink {
-            b = b.audio_sink_shared(Arc::clone(s));
+            b = b.audio_sink_shared(Arc::clone(s) as Arc<dyn AudioSink>);
         }
         if let Some(m) = &self.memory {
             b = b.memory(Arc::clone(m));
@@ -489,7 +579,8 @@ impl VoiceGateBuilder {
         self
     }
 
-    /// Silence after the last detected speech that closes the session. Default 15 s.
+    /// Silence that closes the session, counted from the last detected speech or
+    /// from when the reply finishes playing, whichever is later. Default 15 s.
     pub fn idle_timeout(mut self, d: Duration) -> Self {
         self.idle_timeout = Some(d);
         self
@@ -548,7 +639,7 @@ impl VoiceGateBuilder {
             audio_source: self
                 .audio_source
                 .ok_or_else(|| MindroidError::config("VoiceGate requires an audio source"))?,
-            audio_sink: self.audio_sink,
+            audio_sink: self.audio_sink.map(|s| Arc::new(PlaybackTracker::new(s))),
             tools: self.tools,
             dynamic_tools: self.dynamic_tools,
             config: self.config,
@@ -703,6 +794,160 @@ mod tests {
             2,
             "idle closed the first, speech opened a second"
         );
+    }
+
+    struct QuietSink;
+
+    #[async_trait]
+    impl AudioSink for QuietSink {
+        async fn play(&self, _: AudioChunk) -> Result<(), MindroidError> {
+            Ok(())
+        }
+
+        async fn flush(&self) -> Result<(), MindroidError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), MindroidError> {
+            Ok(())
+        }
+
+        fn sample_rate(&self) -> u32 {
+            24_000
+        }
+    }
+
+    fn reply(audio: Duration) -> AudioChunk {
+        AudioChunk {
+            data: vec![0; audio.as_millis() as usize * 48], // 24 kHz mono PCM16
+            sample_rate: 24_000,
+            channels: 1,
+            bits_per_sample: 16,
+        }
+    }
+
+    /// Opens a session, sends it `events`, then stays silent for over a second:
+    /// the speech after that opens a second one only if idle closed the first.
+    async fn sessions_after(events: Vec<OmniEvent>) -> usize {
+        let opened: Opened = Arc::default();
+        let mut chunks = vec![chunk(1), chunk(1)];
+        chunks.extend(std::iter::repeat_n(chunk(0), 100));
+        chunks.extend([chunk(1), chunk(1), chunk(0)]);
+        let mut g = gate(chunks, Duration::from_millis(300), &opened);
+        g.audio_sink = Some(Arc::new(PlaybackTracker::new(Arc::new(QuietSink))));
+
+        let feeder = async {
+            let tx = loop {
+                let first = opened.lock().unwrap().first().map(|(_, tx)| tx.clone());
+                if let Some(tx) = first {
+                    break tx;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            for event in events {
+                tx.send(event).await.unwrap();
+            }
+        };
+        tokio::join!(run_gate(g), feeder);
+        opened.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_reply_still_playing_holds_the_session_open() {
+        let events = vec![
+            OmniEvent::AudioChunk(reply(Duration::from_secs(10))),
+            OmniEvent::TurnComplete,
+        ];
+        assert_eq!(sessions_after(events).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_idle_timer_runs_once_the_reply_has_played() {
+        let events = vec![
+            OmniEvent::AudioChunk(reply(Duration::from_millis(50))),
+            OmniEvent::TurnComplete,
+        ];
+        assert_eq!(sessions_after(events).await, 2);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_reply_no_longer_holds_the_session_open() {
+        let events = vec![
+            OmniEvent::AudioChunk(reply(Duration::from_secs(10))),
+            OmniEvent::Interrupted,
+        ];
+        assert_eq!(sessions_after(events).await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_starts_while_the_timer_waits_moves_the_deadline() {
+        let tracker = Arc::new(PlaybackTracker::new(Arc::new(QuietSink)));
+        let start = Instant::now();
+        let idle = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                idle_for(Duration::from_secs(60), start, Some(&tracker)).await;
+                start.elapsed()
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tracker.play(reply(Duration::from_secs(240))).await.unwrap();
+        assert_eq!(idle.await.unwrap().as_secs(), 30 + 240 + 60);
+    }
+
+    /// Speaks, then sends nothing at all for `muted` before closing.
+    struct Muting {
+        muted: Duration,
+    }
+
+    impl AudioSource for Muting {
+        fn stream(&self) -> Pin<Box<dyn Stream<Item = AudioChunk> + Send + '_>> {
+            let muted = self.muted;
+            Box::pin(
+                futures::stream::iter([chunk(1), chunk(1)]).chain(futures::stream::once(
+                    async move {
+                        tokio::time::sleep(muted).await;
+                        chunk(1)
+                    },
+                )),
+            )
+        }
+
+        fn sample_rate(&self) -> u32 {
+            16_000
+        }
+    }
+
+    /// The silence a session hears from a microphone muted for 1.6 s.
+    async fn silence_heard(idle: Option<Duration>) -> usize {
+        let opened: Opened = Arc::default();
+        let mut g = gate(vec![], Duration::from_secs(5), &opened);
+        g.audio_source = Arc::new(Muting {
+            muted: Duration::from_millis(1600),
+        });
+        g.idle_timeout = idle;
+        run_gate(g).await;
+
+        let opened = opened.lock().unwrap();
+        assert_eq!(opened.len(), 1, "one session throughout");
+        let heard = opened[0].0.lock().unwrap();
+        let silence: Vec<_> = heard.iter().filter(|c| c.data.len() == 3200).collect();
+        assert!(silence.iter().all(|c| c.data.iter().all(|&b| b == 0)));
+        silence.len()
+    }
+
+    #[tokio::test]
+    async fn a_muted_microphone_sends_the_session_silence() {
+        let chunks = silence_heard(Some(Duration::from_secs(5))).await;
+        assert!(
+            (1..=7).contains(&chunks),
+            "100 ms apart after 1 s: {chunks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_only_the_provider_ends_gets_no_silence() {
+        assert_eq!(silence_heard(None).await, 0);
     }
 
     #[tokio::test]
